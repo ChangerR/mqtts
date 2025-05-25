@@ -94,7 +94,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
     if (bytes_read_ + needed_size > new_size) {
       LOG->error("Packet too large from client {}:{} (needed: {}, max: {})", client_ip_,
                  client_port_, bytes_read_ + needed_size, MAX_BUFFER_SIZE);
-      return -1;
+      return MQ_ERR_PACKET_TOO_LARGE;
     }
 
     // Allocate new buffer
@@ -102,7 +102,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
     if (!new_buffer) {
       LOG->error("Failed to resize buffer for client {}:{} (new size: {})", client_ip_,
                  client_port_, new_size);
-      return -1;
+      return MQ_ERR_MEMORY_ALLOC;
     }
 
     // Copy existing data
@@ -115,7 +115,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
 
     LOG->debug("Buffer resized to {} bytes for client {}:{}", new_size, client_ip_, client_port_);
   }
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTProtocolHandler::read_packet()
@@ -137,7 +137,7 @@ int MQTTProtocolHandler::read_packet()
   int ret = socket_->recv(buffer_ + bytes_read_, len);
   if (MQ_FAIL(ret)) {
     LOG->warn("Client {}:{} disconnected unexpectedly", client_ip_, client_port_);
-    return ret;
+    return MQ_ERR_SOCKET_RECV;
   }
 
   // Check if connection closed
@@ -180,7 +180,7 @@ int MQTTProtocolHandler::read_packet()
           if (remaining_length_ > MAX_BUFFER_SIZE - 2) {  // -2 for header and remaining length
             LOG->error("Packet too large from client {}:{} (size: {}, max: {})", client_ip_,
                        client_port_, remaining_length_, MAX_BUFFER_SIZE - 2);
-            return -1;
+            return MQ_ERR_PACKET_TOO_LARGE;
           }
           // Remaining length complete
           state_ = ReadState::READ_PAYLOAD;
@@ -195,7 +195,7 @@ int MQTTProtocolHandler::read_packet()
         } else if (bytes_read_ >= 4) {
           // Invalid remaining length (more than 4 bytes)
           LOG->error("Invalid remaining length from client {}:{}", client_ip_, client_port_);
-          return -1;
+          return MQ_ERR_PACKET_INVALID;
         } else {
           // Need more bytes for remaining length
           bytes_needed_ = 1;
@@ -217,7 +217,7 @@ int MQTTProtocolHandler::read_packet()
     }
   }
 
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTProtocolHandler::parse_packet()
@@ -228,7 +228,7 @@ int MQTTProtocolHandler::parse_packet()
                                   &packet);  // +2 for header and remaining length
   if (ret != 0) {
     LOG->error("Failed to parse MQTT packet from client {}:{}", client_ip_, client_port_);
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Handle packet based on type
@@ -251,6 +251,7 @@ int MQTTProtocolHandler::parse_packet()
     default:
       LOG->warn("Unsupported packet type: 0x{:02x} from client {}:{}",
                 static_cast<uint8_t>(packet->type), client_ip_, client_port_);
+      ret = MQ_ERR_PACKET_TYPE;
       break;
   }
 
@@ -271,13 +272,13 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   if (packet->protocol_version != 5) {
     LOG->error("Unsupported protocol version: {} from client {}:{}", packet->protocol_version,
                client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_CONNECT_PROTOCOL;
   }
 
   // Check if client ID is valid
   if (packet->client_id.empty()) {
     LOG->error("Empty client ID from client {}:{}", client_ip_, client_port_);
-    return send_connack(ReasonCode::ClientIdentifierNotValid);
+    return MQ_ERR_CONNECT_CLIENT_ID;
   }
 
   // Update session state
@@ -292,13 +293,20 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
 {
   if (!connected_) {
     LOG->error("Client {}:{} not connected", client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   // Check if topic is valid
   if (packet->topic_name.empty()) {
     LOG->error("Empty topic name from client {}:{}", client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_PUBLISH_TOPIC;
+  }
+
+  // Check QoS level
+  if (packet->qos > 2) {
+    LOG->error("Invalid QoS level: {} from client {}:{}", 
+              packet->qos, client_ip_, client_port_);
+    return MQ_ERR_PACKET_QOS;
   }
 
   // Send PUBACK for QoS 1
@@ -306,14 +314,14 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
     return send_puback(packet->packet_id, ReasonCode::Success);
   }
 
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 {
   if (!connected_) {
     LOG->error("Client {}:{} not connected", client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   std::vector<ReasonCode> reason_codes;
@@ -324,6 +332,12 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     // Check if topic filter is valid
     if (topic_filter.empty()) {
       reason_codes.push_back(ReasonCode::TopicFilterInvalid);
+      continue;
+    }
+
+    // Check QoS level
+    if (qos > 2) {
+      reason_codes.push_back(ReasonCode::QoSNotSupported);
       continue;
     }
 
@@ -340,7 +354,7 @@ int MQTTProtocolHandler::handle_pingreq()
 {
   if (!connected_) {
     LOG->error("Client {}:{} not connected", client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   return send_pingresp();
@@ -350,14 +364,14 @@ int MQTTProtocolHandler::handle_disconnect()
 {
   if (!connected_) {
     LOG->error("Client {}:{} not connected", client_ip_, client_port_);
-    return -1;
+    return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   // Remove all subscriptions
   subscriptions_.clear();
   connected_ = false;
 
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTProtocolHandler::send_connack(ReasonCode reason_code)

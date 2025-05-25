@@ -12,7 +12,7 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
 {
   if (length < 2) {
     LOG->error("Packet too short");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   PacketType type = static_cast<PacketType>(buffer[0] & 0xF0);
@@ -22,12 +22,12 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
   int ret = parse_remaining_length(buffer + 1, length - 1, remaining_length, bytes_read);
   if (ret != 0) {
     LOG->error("Failed to parse remaining length");
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   if (length < 1 + bytes_read + remaining_length) {
     LOG->error("Packet incomplete");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   switch (type) {
@@ -39,7 +39,7 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
       return parse_subscribe(buffer, length, reinterpret_cast<SubscribePacket**>(packet));
     default:
       LOG->error("Unsupported packet type: 0x{:02x}", static_cast<uint8_t>(type));
-      return -1;
+      return MQ_ERR_PACKET_TYPE;
   }
 }
 
@@ -47,14 +47,14 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
 {
   if (length < 10) {  // Minimum CONNECT packet size
     LOG->error("CONNECT packet too short");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   ConnectPacket* connect =
       reinterpret_cast<ConnectPacket*>(allocator_->allocate(sizeof(ConnectPacket)));
   if (!connect) {
     LOG->error("Failed to allocate CONNECT packet");
-    return -1;
+    return MQ_ERR_MEMORY_ALLOC;
   }
   new (connect) ConnectPacket();
 
@@ -66,14 +66,14 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   if (ret != 0) {
     LOG->error("Failed to parse protocol name");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse protocol version
   if (pos + 1 > length) {
     LOG->error("Packet too short for protocol version");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
   connect->protocol_version = buffer[pos++];
 
@@ -81,7 +81,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   if (pos + 1 > length) {
     LOG->error("Packet too short for connect flags");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
   uint8_t flags = buffer[pos++];
   connect->flags.clean_start = (flags >> 1) & 0x01;
@@ -95,7 +95,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   if (pos + 2 > length) {
     LOG->error("Packet too short for keep alive");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
   connect->keep_alive = (buffer[pos] << 8) | buffer[pos + 1];
   pos += 2;
@@ -105,7 +105,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   if (ret != 0) {
     LOG->error("Failed to parse properties");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse client ID
@@ -113,7 +113,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   if (ret != 0) {
     LOG->error("Failed to parse client ID");
     allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return ret;
+    return MQ_ERR_CONNECT_CLIENT_ID;
   }
 
   // Parse will topic and payload if will flag is set
@@ -122,14 +122,14 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
     if (ret != 0) {
       LOG->error("Failed to parse will topic");
       allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return ret;
+      return MQ_ERR_PACKET_INVALID;
     }
 
     ret = parse_string(buffer + pos, length - pos, connect->will_payload, pos);
     if (ret != 0) {
       LOG->error("Failed to parse will payload");
       allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return ret;
+      return MQ_ERR_PACKET_INVALID;
     }
   }
 
@@ -139,7 +139,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
     if (ret != 0) {
       LOG->error("Failed to parse username");
       allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return ret;
+      return MQ_ERR_PACKET_INVALID;
     }
   }
 
@@ -149,26 +149,26 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
     if (ret != 0) {
       LOG->error("Failed to parse password");
       allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return ret;
+      return MQ_ERR_PACKET_INVALID;
     }
   }
 
   *packet = connect;
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacket** packet)
 {
   if (length < 2) {
     LOG->error("PUBLISH packet too short");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   PublishPacket* publish =
       reinterpret_cast<PublishPacket*>(allocator_->allocate(sizeof(PublishPacket)));
   if (!publish) {
     LOG->error("Failed to allocate PUBLISH packet");
-    return -1;
+    return MQ_ERR_MEMORY_ALLOC;
   }
   new (publish) PublishPacket();
 
@@ -188,7 +188,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   if (ret != 0) {
     LOG->error("Failed to parse remaining length");
     allocator_->deallocate(publish, sizeof(PublishPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse topic name
@@ -196,7 +196,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   if (ret != 0) {
     LOG->error("Failed to parse topic name");
     allocator_->deallocate(publish, sizeof(PublishPacket));
-    return ret;
+    return MQ_ERR_PUBLISH_TOPIC;
   }
 
   // Parse packet ID if QoS > 0
@@ -204,7 +204,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
     if (pos + 2 > length) {
       LOG->error("Packet too short for packet ID");
       allocator_->deallocate(publish, sizeof(PublishPacket));
-      return -1;
+      return MQ_ERR_PACKET_INCOMPLETE;
     }
     publish->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
     pos += 2;
@@ -215,7 +215,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   if (ret != 0) {
     LOG->error("Failed to parse properties");
     allocator_->deallocate(publish, sizeof(PublishPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse payload
@@ -224,21 +224,21 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   pos += payload_length;
 
   *packet = publish;
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribePacket** packet)
 {
   if (length < 5) {  // Minimum SUBSCRIBE packet size
     LOG->error("SUBSCRIBE packet too short");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   SubscribePacket* subscribe =
       reinterpret_cast<SubscribePacket*>(allocator_->allocate(sizeof(SubscribePacket)));
   if (!subscribe) {
     LOG->error("Failed to allocate SUBSCRIBE packet");
-    return -1;
+    return MQ_ERR_MEMORY_ALLOC;
   }
   new (subscribe) SubscribePacket();
 
@@ -254,14 +254,14 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
   if (ret != 0) {
     LOG->error("Failed to parse remaining length");
     allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse packet ID
   if (pos + 2 > length) {
     LOG->error("Packet too short for packet ID");
     allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
   subscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
   pos += 2;
@@ -271,7 +271,7 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
   if (ret != 0) {
     LOG->error("Failed to parse properties");
     allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // Parse subscriptions
@@ -281,20 +281,20 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
     if (ret != 0) {
       LOG->error("Failed to parse topic filter");
       allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return ret;
+      return MQ_ERR_SUBSCRIBE_TOPIC;
     }
 
     if (pos + 1 > length) {
       LOG->error("Packet too short for QoS");
       allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return -1;
+      return MQ_ERR_PACKET_INCOMPLETE;
     }
     uint8_t qos = buffer[pos++] & 0x03;
     subscribe->subscriptions.push_back(std::make_pair(topic_filter, qos));
   }
 
   *packet = subscribe;
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
@@ -307,13 +307,13 @@ int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
   do {
     if (bytes_read >= length) {
       LOG->error("Packet too short for remaining length");
-      return -1;
+      return MQ_ERR_PACKET_INCOMPLETE;
     }
     remaining_length += (buffer[bytes_read] & 0x7F) * multiplier;
     multiplier *= 128;
   } while ((buffer[bytes_read++] & 0x80) != 0);
 
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& str,
@@ -321,18 +321,18 @@ int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& 
 {
   if (length < 2) {
     LOG->error("Packet too short for string length");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   uint16_t str_length = (buffer[0] << 8) | buffer[1];
   if (length < 2 + str_length) {
     LOG->error("Packet too short for string content");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
   bytes_read += 2 + str_length;
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vector<uint8_t>& data,
@@ -340,18 +340,18 @@ int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vec
 {
   if (length < 2) {
     LOG->error("Packet too short for binary data length");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   uint16_t data_length = (buffer[0] << 8) | buffer[1];
   if (length < 2 + data_length) {
     LOG->error("Packet too short for binary data content");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   data.assign(buffer + 2, buffer + 2 + data_length);
   bytes_read += 2 + data_length;
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
@@ -360,7 +360,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
 {
   if (length < 1) {
     LOG->error("Packet too short for properties length");
-    return -1;
+    return MQ_ERR_PACKET_INCOMPLETE;
   }
 
   uint8_t properties_length = buffer[0];
@@ -369,7 +369,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
   while (bytes_read < properties_length + 1) {
     if (bytes_read >= length) {
       LOG->error("Packet too short for property");
-      return -1;
+      return MQ_ERR_PACKET_INCOMPLETE;
     }
 
     PropertyType type = static_cast<PropertyType>(buffer[bytes_read++]);
@@ -387,7 +387,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
       case PropertyType::SharedSubscriptionAvailable:
         if (bytes_read >= length) {
           LOG->error("Packet too short for property value");
-          return -1;
+          return MQ_ERR_PACKET_INCOMPLETE;
         }
         value = std::to_string(buffer[bytes_read++]);
         break;
@@ -398,7 +398,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
       case PropertyType::MaximumPacketSize:
         if (bytes_read + 4 > length) {
           LOG->error("Packet too short for property value");
-          return -1;
+          return MQ_ERR_PACKET_INCOMPLETE;
         }
         value = std::to_string((buffer[bytes_read] << 24) | (buffer[bytes_read + 1] << 16) |
                                (buffer[bytes_read + 2] << 8) | buffer[bytes_read + 3]);
@@ -416,7 +416,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
         int ret = parse_string(buffer + bytes_read, length - bytes_read, str, bytes_read);
         if (ret != 0) {
           LOG->error("Failed to parse property string value");
-          return ret;
+          return MQ_ERR_PACKET_INVALID;
         }
         value = str;
       } break;
@@ -427,7 +427,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
         int ret = parse_binary_data(buffer + bytes_read, length - bytes_read, data, bytes_read);
         if (ret != 0) {
           LOG->error("Failed to parse property binary value");
-          return ret;
+          return MQ_ERR_PACKET_INVALID;
         }
         value = std::string(data.begin(), data.end());
       } break;
@@ -437,12 +437,12 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
         int ret = parse_string(buffer + bytes_read, length - bytes_read, key_str, bytes_read);
         if (ret != 0) {
           LOG->error("Failed to parse user property key");
-          return ret;
+          return MQ_ERR_PACKET_INVALID;
         }
         ret = parse_string(buffer + bytes_read, length - bytes_read, value_str, bytes_read);
         if (ret != 0) {
           LOG->error("Failed to parse user property value");
-          return ret;
+          return MQ_ERR_PACKET_INVALID;
         }
         key = key_str;
         value = value_str;
@@ -450,13 +450,13 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length,
 
       default:
         LOG->error("Unknown property type: 0x{:02x}", static_cast<uint8_t>(type));
-        return -1;
+        return MQ_ERR_PACKET_INVALID;
     }
 
     properties.push_back(std::make_pair(key, value));
   }
 
-  return 0;
+  return MQ_SUCCESS;
 }
 
 int MQTTParser::serialize_connect(const ConnectPacket* packet, std::vector<uint8_t>& buffer)
