@@ -1,21 +1,21 @@
 #include "mqtt_socket.h"
-#include "mqtt_allocator.h"
 #include "logger.h"
+#include "mqtt_allocator.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/un.h>
-#include <fcntl.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <errno.h>
-#include <sys/wait.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "co_routine.h"
 
-int co_accept(int fd, struct sockaddr *addr, socklen_t *len);
+int co_accept(int fd, struct sockaddr* addr, socklen_t* len);
 
 int MQTTSocket::listen(const char* ip, int port, bool reuse)
 {
@@ -68,15 +68,15 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse)
   return ret;
 }
 
-int MQTTSocket::accept(MQTTSocket *&client)
+int MQTTSocket::accept(MQTTSocket*& client)
 {
   int ret = MQ_SUCCESS;
   struct sockaddr addr;
   socklen_t len = sizeof(struct sockaddr);
-  
+
   while (true) {
-    int fd = co_accept(fd_, (struct sockaddr *)&addr, &len);
-    
+    int fd = co_accept(fd_, (struct sockaddr*)&addr, &len);
+
     if (fd < 0) {
       if (errno == EINTR) {
         // System call was interrupted, try again
@@ -98,7 +98,7 @@ int MQTTSocket::accept(MQTTSocket *&client)
         ::close(fd);
         break;
       }
-      
+
       client = (MQTTSocket*)root->allocate(sizeof(MQTTSocket));
       if (MQ_ISNULL(client)) {
         LOG->error("Failed to allocate socket client");
@@ -106,16 +106,16 @@ int MQTTSocket::accept(MQTTSocket *&client)
         ::close(fd);
         break;
       }
-      
+
       new (client) MQTTSocket(fd);
       client->connected_ = true;
       client->update_peer_info();
-      LOG->debug("Accepted new connection from {}:{}", 
-                 client->get_peer_addr(), client->get_peer_port());
+      LOG->debug("Accepted new connection from {}:{}", client->get_peer_addr(),
+                 client->get_peer_port());
       break;
     }
   }
-  
+
   return ret;
 }
 
@@ -123,9 +123,9 @@ int MQTTSocket::connect(const char* ip, int port)
 {
   int ret = MQ_SUCCESS;
   struct sockaddr_in addr;
-  
+
   set_addr(ip, port, addr);
-  
+
   if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
     LOG->error("Failed to connect to {}:{} - {}", ip, port, strerror(errno));
     ret = MQ_ERR_SOCKET_CONNECT;
@@ -135,14 +135,14 @@ int MQTTSocket::connect(const char* ip, int port)
     update_peer_info();
     LOG->info("Connected to {}:{}", ip, port);
   }
-  
+
   return ret;
 }
 
 int MQTTSocket::send(const char* buf, int len)
 {
   int ret = MQ_SUCCESS;
-  
+
   if (!connected_) {
     LOG->error("Socket not connected");
     ret = MQ_ERR_SOCKET;
@@ -151,14 +151,15 @@ int MQTTSocket::send(const char* buf, int len)
     while (total_sent < len && MQ_SUCC(ret)) {
       int sent = ::write(fd_, buf + total_sent, len - total_sent);
       if (sent < 0) {
-        if (errno == EINTR) continue;
+        if (errno == EINTR)
+          continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           // Use co_poll to wait for buffer space
-          struct pollfd pf = { 0 };
+          struct pollfd pf = {0};
           pf.fd = fd_;
           pf.events = (POLLOUT | POLLERR | POLLHUP);
           co_poll(co_get_epoll_ct(), &pf, 1, -1);  // Wait indefinitely
-          continue;  // Try sending again after poll
+          continue;                                // Try sending again after poll
         } else {
           LOG->error("Failed to send data - {}", strerror(errno));
           ret = MQ_ERR_SOCKET_SEND;
@@ -168,14 +169,14 @@ int MQTTSocket::send(const char* buf, int len)
       }
     }
   }
-  
+
   return ret;
 }
 
-int MQTTSocket::recv(char* buf, int &len)
+int MQTTSocket::recv(char* buf, int& len)
 {
   int ret = MQ_SUCCESS;
-  
+
   if (!connected_) {
     LOG->error("Socket not connected");
     ret = MQ_ERR_SOCKET;
@@ -187,7 +188,7 @@ int MQTTSocket::recv(char* buf, int &len)
           continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
           // Use co_poll to wait for data
-          struct pollfd pf = { 0 };
+          struct pollfd pf = {0};
           pf.fd = fd_;
           pf.events = (POLLIN | POLLERR | POLLHUP);
           co_poll(co_get_epoll_ct(), &pf, 1, -1);  // Wait indefinitely
@@ -207,7 +208,7 @@ int MQTTSocket::recv(char* buf, int &len)
       }
     }
   }
-  
+
   return ret;
 }
 
@@ -228,7 +229,7 @@ int MQTTSocket::set_nonblocking(bool nonblocking)
 {
   int ret = MQ_SUCCESS;
   int flags = fcntl(fd_, F_GETFL, 0);
-  
+
   if (flags < 0) {
     LOG->error("Failed to get socket flags - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
@@ -239,7 +240,7 @@ int MQTTSocket::set_nonblocking(bool nonblocking)
       ret = MQ_ERR_SOCKET;
     }
   }
-  
+
   return ret;
 }
 
@@ -247,7 +248,7 @@ int MQTTSocket::set_keepalive(bool keepalive, int idle, int interval, int count)
 {
   int ret = MQ_SUCCESS;
   int optval = keepalive ? 1 : 0;
-  
+
   if (setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0) {
     LOG->error("Failed to set SO_KEEPALIVE - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
@@ -263,14 +264,14 @@ int MQTTSocket::set_keepalive(bool keepalive, int idle, int interval, int count)
       ret = MQ_ERR_SOCKET;
     }
   }
-  
+
   return ret;
 }
 
 int MQTTSocket::set_buffer_size(int rcvbuf, int sndbuf)
 {
   int ret = MQ_SUCCESS;
-  
+
   if (setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
     LOG->error("Failed to set SO_RCVBUF - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
@@ -278,7 +279,7 @@ int MQTTSocket::set_buffer_size(int rcvbuf, int sndbuf)
     LOG->error("Failed to set SO_SNDBUF - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
   }
-  
+
   return ret;
 }
 
@@ -286,12 +287,12 @@ int MQTTSocket::set_reuse_addr(bool reuse)
 {
   int ret = MQ_SUCCESS;
   int optval = reuse ? 1 : 0;
-  
+
   if (setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
     LOG->error("Failed to set SO_REUSEADDR - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
   }
-  
+
   return ret;
 }
 
@@ -299,12 +300,12 @@ int MQTTSocket::set_tcp_nodelay(bool nodelay)
 {
   int ret = MQ_SUCCESS;
   int optval = nodelay ? 1 : 0;
-  
+
   if (setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
     LOG->error("Failed to set TCP_NODELAY - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
   }
-  
+
   return ret;
 }
 
@@ -322,7 +323,7 @@ void MQTTSocket::update_peer_info()
 {
   struct sockaddr_in addr;
   socklen_t len = sizeof(addr);
-  
+
   if (getpeername(fd_, (struct sockaddr*)&addr, &len) == 0) {
     peer_addr_ = inet_ntoa(addr.sin_addr);
     peer_port_ = ntohs(addr.sin_port);
@@ -334,7 +335,7 @@ int MQTTSocket::check_socket_error()
   int ret = MQ_SUCCESS;
   int error = 0;
   socklen_t len = sizeof(error);
-  
+
   if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
     LOG->error("Failed to get socket error - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
@@ -342,16 +343,16 @@ int MQTTSocket::check_socket_error()
     LOG->error("Socket error: {}", strerror(error));
     ret = MQ_ERR_SOCKET;
   }
-  
+
   return ret;
 }
 
-int MQTTSocket::create_tcp_socket(MQTTSocket *&out_sock)
+int MQTTSocket::create_tcp_socket(MQTTSocket*& out_sock)
 {
   int ret = MQ_SUCCESS;
-  MQTTSocket *sock = NULL;
+  MQTTSocket* sock = NULL;
   int fd = -1;
-  
+
   if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
     LOG->error("Failed to create socket - {}", strerror(errno));
     ret = MQ_ERR_SOCKET;
@@ -374,22 +375,19 @@ int MQTTSocket::create_tcp_socket(MQTTSocket *&out_sock)
       }
     }
   }
-  
+
   return ret;
 }
 
-void MQTTSocket::set_addr(const char *ip,
-                         const unsigned short port,
-                         struct sockaddr_in &addr)
+void MQTTSocket::set_addr(const char* ip, const unsigned short port, struct sockaddr_in& addr)
 {
   int n_ip = 0;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
-  
-  if (!ip || '\0' == *ip || 
-      0 == strcmp(ip,"0") || 0 == strcmp(ip,"0.0.0.0") || 
-      0 == strcmp(ip,"*")) {
+
+  if (!ip || '\0' == *ip || 0 == strcmp(ip, "0") || 0 == strcmp(ip, "0.0.0.0") ||
+      0 == strcmp(ip, "*")) {
     n_ip = htonl(INADDR_ANY);
   } else {
     n_ip = inet_addr(ip);

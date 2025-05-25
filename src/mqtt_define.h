@@ -19,8 +19,8 @@
 #define MQ_ERR_MEMORY_LIMIT -101
 #define MQ_ERR_MEMORY_PARENT_LIMIT -102
 
-#define MQ_LIKELY(x)       __builtin_expect(!!(x),!!1)
-#define MQ_UNLIKELY(x)     __builtin_expect(!!(x),!!0)
+#define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
+#define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
 
 // Helper macros
 #define MQ_SUCC(arg) (MQ_LIKELY(MQ_SUCCESS == (ret = (arg))))

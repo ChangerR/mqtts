@@ -22,6 +22,7 @@ set(GPERFTOOLS_BUILD_STATIC ON CACHE BOOL "Build static libraries")
 set(GPERFTOOLS_BUILD_SHARED OFF CACHE BOOL "Build shared libraries")
 set(GPERFTOOLS_BUILD_TCMALLOC ON CACHE BOOL "Build tcmalloc")
 set(GPERFTOOLS_BUILD_TCMALLOC_MINIMAL ON CACHE BOOL "Build tcmalloc minimal")
+set(gperftools_build_minimal ON CACHE BOOL "Build gperftools minimal")
 
 add_subdirectory(3rd/gperftools)
 add_subdirectory(3rd EXCLUDE_FROM_ALL)
@@ -30,6 +31,8 @@ add_executable(mqtts
 	src/mqtt_socket.cpp 
 	src/mqtt_server.cpp
 	src/mqtt_allocator.cpp
+	src/mqtt_protocol_handler.cpp
+	src/mqtt_parser.cpp
 )
 
 target_link_libraries(mqtts 
