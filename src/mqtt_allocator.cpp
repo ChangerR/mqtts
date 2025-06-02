@@ -55,7 +55,7 @@ void* MQTTAllocator::allocate(size_t size)
 {
   // Check memory limit
   if (limit_ > 0 && usage_ + size > limit_) {
-    LOG->warn(
+    LOG_WARN(
         "Memory allocation failed: limit exceeded for id {} tag {} (limit: {}, used: {}, "
         "requested: {})",
         id_.c_str(), tag_.c_str(), limit_, usage_.load(), size);
@@ -66,8 +66,8 @@ void* MQTTAllocator::allocate(size_t size)
   if (ptr) {
     usage_ += size;
     MQTTMemoryManager::get_instance().add_tag_usage(tag_, size);
-    LOG->debug("Allocated {} bytes for id {} tag {} (used: {}/{})", size, id_.c_str(), tag_.c_str(),
-               usage_.load(), limit_);
+    LOG_DEBUG("Allocated {} bytes for id {} tag {} (used: {}/{})", size, id_.c_str(), tag_.c_str(),
+              usage_.load(), limit_);
   }
   return ptr;
 }
@@ -80,8 +80,8 @@ void MQTTAllocator::deallocate(void* ptr, size_t size)
   tc_free(ptr);
   usage_ -= size;
   MQTTMemoryManager::get_instance().sub_tag_usage(tag_, size);
-  LOG->debug("Freed {} bytes from id {} tag {} (used: {}/{})", size, id_.c_str(), tag_.c_str(),
-             usage_.load(), limit_);
+  LOG_DEBUG("Freed {} bytes from id {} tag {} (used: {}/{})", size, id_.c_str(), tag_.c_str(),
+            usage_.load(), limit_);
 }
 
 MQTTAllocator* MQTTAllocator::create_child(const std::string& child_id, const std::string& tag,

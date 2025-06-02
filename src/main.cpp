@@ -11,15 +11,15 @@ void server_thread_func(const char* ip, int port)
 {
   g_server = new MQTTServer(ip, port);
   if (!g_server) {
-    LOG->error("Failed to create MQTT server");
+    LOG_ERROR("Failed to create MQTT server");
     return;
   }
 
-  LOG->info("Starting MQTT server on {}:{}", ip, port);
+  LOG_INFO("Starting MQTT server on {}:{}", ip, port);
 
   int ret = g_server->start();
   if (ret != MQ_SUCCESS) {
-    LOG->error("Failed to start MQTT server, error code: {}", ret);
+    LOG_ERROR("Failed to start MQTT server, error code: {}", ret);
     delete g_server;
     g_server = nullptr;
     return;
@@ -35,7 +35,7 @@ void server_thread_func(const char* ip, int port)
     g_server = nullptr;
   }
 
-  LOG->info("MQTT server thread stopped");
+  LOG_INFO("MQTT server thread stopped");
 }
 
 int main(int argc, char* argv[])
@@ -54,7 +54,7 @@ int main(int argc, char* argv[])
         port = atoi(optarg);
         break;
       default:
-        LOG->error("Usage: {} [-i ip] [-p port]", argv[0]);
+        LOG_ERROR("Usage: {} [-i ip] [-p port]", argv[0]);
         return 1;
     }
   }
@@ -65,6 +65,6 @@ int main(int argc, char* argv[])
   // Wait for server thread to finish
   g_server_thread.join();
 
-  LOG->info("MQTT server stopped");
+  LOG_INFO("MQTT server stopped");
   return 0;
 }

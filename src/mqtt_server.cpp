@@ -19,19 +19,19 @@ int MQTTServer::start()
 {
   int ret = MQ_SUCCESS;
   if (running_) {
-    LOG->warn("Server is already running");
+    LOG_WARN("Server is already running");
     return MQ_SUCCESS;
   }
 
   // Create server socket
   if (MQ_FAIL(MQTTSocket::create_tcp_socket(server_socket_))) {
-    LOG->error("Failed to create server socket for {}:{}", host_, port_);
+    LOG_ERROR("Failed to create server socket for {}:{}", host_, port_);
     return MQ_ERR_SOCKET;
   }
 
   // Start listening
   if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true))) {
-    LOG->error("Failed to start listening on {}:{}", host_, port_);
+    LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     if (MQ_NOT_NULL(server_socket_)) {
       server_socket_->~MQTTSocket();  // Call destructor explicitly
@@ -42,14 +42,14 @@ int MQTTServer::start()
   }
 
   running_ = true;
-  LOG->info("MQTT Server initialized on {}:{}", host_, port_);
+  LOG_INFO("MQTT Server initialized on {}:{}", host_, port_);
   return MQ_SUCCESS;
 }
 
 void MQTTServer::run()
 {
   if (!running_) {
-    LOG->warn("Server is not running");
+    LOG_WARN("Server is not running");
     return;
   }
 
@@ -57,7 +57,7 @@ void MQTTServer::run()
   co_create(&accept_co_, NULL, accept_routine, this);
   co_resume(accept_co_);
 
-  LOG->info("MQTT Server running on {}:{}", host_, port_);
+  LOG_INFO("MQTT Server running on {}:{}", host_, port_);
 
   co_eventloop(co_get_epoll_ct(), 0, 0);
 }
@@ -68,7 +68,7 @@ void MQTTServer::stop()
     return;
   }
 
-  LOG->info("Stopping MQTT Server on {}:{}", host_, port_);
+  LOG_INFO("Stopping MQTT Server on {}:{}", host_, port_);
   running_ = false;
 
   if (MQ_NOT_NULL(accept_co_)) {
@@ -84,7 +84,7 @@ void MQTTServer::stop()
     server_socket_ = NULL;
   }
 
-  LOG->info("MQTT Server stopped");
+  LOG_INFO("MQTT Server stopped");
 }
 
 void* MQTTServer::accept_routine(void* arg)
@@ -94,11 +94,11 @@ void* MQTTServer::accept_routine(void* arg)
   int ret = MQ_SUCCESS;
 
   if (MQ_ISNULL(server->server_socket_)) {
-    LOG->error("Server socket is NULL");
+    LOG_ERROR("Server socket is NULL");
     return NULL;
   }
 
-  LOG->info("Accept routine started, running: {}", server->running_);
+  LOG_INFO("Accept routine started, running: {}", server->running_);
   while (server->running_ && MQ_SUCC(ret)) {
     // Use co_poll to wait for new connection
     struct pollfd pf = {0};
@@ -108,7 +108,7 @@ void* MQTTServer::accept_routine(void* arg)
 
     // Check if socket is still valid
     if (!server->server_socket_->is_connected()) {
-      LOG->warn("Server socket disconnected");
+      LOG_WARN("Server socket disconnected");
       ret = MQ_ERR_SOCKET;
       break;
     }
@@ -118,7 +118,7 @@ void* MQTTServer::accept_routine(void* arg)
         ret = MQ_SUCCESS;
         continue;
       }
-      LOG->error("Failed to accept connection");
+      LOG_ERROR("Failed to accept connection");
       break;
     }
 
@@ -130,20 +130,20 @@ void* MQTTServer::accept_routine(void* arg)
     MQTTAllocator* client_allocator =
         root->create_child(client_id, "client", 1024 * 1024);  // 1MB limit
     if (MQ_ISNULL(client_allocator)) {
-      LOG->error("Failed to create client allocator");
+      LOG_ERROR("Failed to create client allocator");
       if (MQ_NOT_NULL(client)) {
         client->~MQTTSocket();  // Call destructor explicitly
         root->deallocate(client, sizeof(MQTTSocket));
       }
       continue;
     }
-    LOG->info("Accepted new connection from {}:{}", client->get_peer_addr(),
-              client->get_peer_port());
+    LOG_INFO("Accepted new connection from {}:{}", client->get_peer_addr(),
+             client->get_peer_port());
 
     // Create client context using client's allocator
     void* ctx_mem = client_allocator->allocate(sizeof(ClientContext));
     if (MQ_ISNULL(ctx_mem)) {
-      LOG->error("Failed to allocate client context");
+      LOG_ERROR("Failed to allocate client context");
       root->remove_child(client_id);
       if (MQ_NOT_NULL(client)) {
         client->~MQTTSocket();  // Call destructor explicitly
@@ -210,7 +210,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
   // Process packets until client disconnects
   int ret = handler->process();
   if (ret != 0) {
-    LOG->warn("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
+    LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
   }
 
   // Cleanup

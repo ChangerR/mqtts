@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.22)
 
 project(mqtts)
 
+# Enable compilation database for ccls
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
 endif()
@@ -26,13 +29,23 @@ set(gperftools_build_minimal ON CACHE BOOL "Build gperftools minimal")
 
 add_subdirectory(3rd/gperftools)
 add_subdirectory(3rd EXCLUDE_FROM_ALL)
+
+# 添加mqtt_parser库
+add_library(mqtt_parser STATIC
+    src/mqtt_parser.cpp
+    src/mqtt_allocator.cpp
+)
+
+target_include_directories(mqtt_parser PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# 添加主程序
 add_executable(mqtts 
 	src/main.cpp 
 	src/mqtt_socket.cpp 
 	src/mqtt_server.cpp
-	src/mqtt_allocator.cpp
 	src/mqtt_protocol_handler.cpp
-	src/mqtt_parser.cpp
 )
 
 target_link_libraries(mqtts 
@@ -40,4 +53,8 @@ target_link_libraries(mqtts
 	pthread 
 	dl 
 	tcmalloc_minimal
+    mqtt_parser
 )
+
+# 添加测试目录
+add_subdirectory(unittest)

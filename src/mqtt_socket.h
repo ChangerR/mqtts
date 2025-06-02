@@ -13,7 +13,7 @@ class MQTTSocket
   int listen(const char* ip, int port, bool reuse = true);
   int accept(MQTTSocket*& client);  // 返回具体错误码
   int connect(const char* ip, int port);
-  int send(const char* buf, int len);
+  int send(const uint8_t* buf, int len);
   int recv(char* buf, int& len);
   int close();
 
