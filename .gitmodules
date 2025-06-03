@@ -1,0 +1,9 @@
+[submodule "3rd/libco"]
+	path = 3rd/libco
+	url = https://github.com/Tencent/libco.git
+	branch = master
+
+[submodule "3rd/gperftools"]
+	path = 3rd/gperftools
+	url = https://github.com/gperftools/gperftools.git
+	branch = master 
