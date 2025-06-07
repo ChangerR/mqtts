@@ -83,14 +83,14 @@ struct Properties
   // 构造函数，初始化自定义分配器的容器
   Properties(MQTTAllocator* allocator = nullptr) 
     : user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),
-      authentication_method(MQTTSTLAllocator<char>(allocator)),
+      authentication_method(MQTTStrAllocator(allocator)),
       authentication_data(MQTTSTLAllocator<uint8_t>(allocator)),
-      assigned_client_identifier(MQTTSTLAllocator<char>(allocator)),
-      response_information(MQTTSTLAllocator<char>(allocator)),
-      server_reference(MQTTSTLAllocator<char>(allocator)),
-      reason_string(MQTTSTLAllocator<char>(allocator)),
-      content_type(MQTTSTLAllocator<char>(allocator)),
-      response_topic(MQTTSTLAllocator<char>(allocator)),
+      assigned_client_identifier(MQTTStrAllocator(allocator)),
+      response_information(MQTTStrAllocator(allocator)),
+      server_reference(MQTTStrAllocator(allocator)),
+      reason_string(MQTTStrAllocator(allocator)),
+      content_type(MQTTStrAllocator(allocator)),
+      response_topic(MQTTStrAllocator(allocator)),
       correlation_data(MQTTSTLAllocator<uint8_t>(allocator))
   {}
 
@@ -104,17 +104,17 @@ struct Properties
       request_response_information(other.request_response_information),
       request_problem_information(other.request_problem_information),
       user_properties(other.user_properties.begin(), other.user_properties.end(), MQTTSTLAllocator<MQTTStringPair>(allocator)),
-      authentication_method(other.authentication_method.begin(), other.authentication_method.end(), MQTTSTLAllocator<char>(allocator)),
+      authentication_method(other.authentication_method.begin(), other.authentication_method.end(), MQTTStrAllocator(allocator)),
       authentication_data(other.authentication_data.begin(), other.authentication_data.end(), MQTTSTLAllocator<uint8_t>(allocator)),
-      assigned_client_identifier(other.assigned_client_identifier.begin(), other.assigned_client_identifier.end(), MQTTSTLAllocator<char>(allocator)),
+      assigned_client_identifier(other.assigned_client_identifier.begin(), other.assigned_client_identifier.end(), MQTTStrAllocator(allocator)),
       server_keep_alive(other.server_keep_alive),
-      response_information(other.response_information.begin(), other.response_information.end(), MQTTSTLAllocator<char>(allocator)),
-      server_reference(other.server_reference.begin(), other.server_reference.end(), MQTTSTLAllocator<char>(allocator)),
-      reason_string(other.reason_string.begin(), other.reason_string.end(), MQTTSTLAllocator<char>(allocator)),
+      response_information(other.response_information.begin(), other.response_information.end(), MQTTStrAllocator(allocator)),
+      server_reference(other.server_reference.begin(), other.server_reference.end(), MQTTStrAllocator(allocator)),
+      reason_string(other.reason_string.begin(), other.reason_string.end(), MQTTStrAllocator(allocator)),
       payload_format_indicator(other.payload_format_indicator),
       message_expiry_interval(other.message_expiry_interval),
-      content_type(other.content_type.begin(), other.content_type.end(), MQTTSTLAllocator<char>(allocator)),
-      response_topic(other.response_topic.begin(), other.response_topic.end(), MQTTSTLAllocator<char>(allocator)),
+      content_type(other.content_type.begin(), other.content_type.end(), MQTTStrAllocator(allocator)),
+      response_topic(other.response_topic.begin(), other.response_topic.end(), MQTTStrAllocator(allocator)),
       correlation_data(other.correlation_data.begin(), other.correlation_data.end(), MQTTSTLAllocator<uint8_t>(allocator)),
       subscription_identifier(other.subscription_identifier),
       will_delay_interval(other.will_delay_interval),
@@ -235,12 +235,12 @@ struct ConnectPacket : public Packet
   
   ConnectPacket(MQTTAllocator* allocator = nullptr)
     : Packet(allocator),
-      protocol_name(MQTTSTLAllocator<char>(allocator)),
-      client_id(MQTTSTLAllocator<char>(allocator)),
-      will_topic(MQTTSTLAllocator<char>(allocator)),
-      will_payload(MQTTSTLAllocator<char>(allocator)),
-      username(MQTTSTLAllocator<char>(allocator)),
-      password(MQTTSTLAllocator<char>(allocator)),
+      protocol_name(MQTTStrAllocator(allocator)),
+      client_id(MQTTStrAllocator(allocator)),
+      will_topic(MQTTStrAllocator(allocator)),
+      will_payload(MQTTStrAllocator(allocator)),
+      username(MQTTStrAllocator(allocator)),
+      password(MQTTStrAllocator(allocator)),
       will_properties(allocator) {}
 };
 
@@ -256,7 +256,7 @@ struct PublishPacket : public Packet
   
   PublishPacket(MQTTAllocator* allocator = nullptr)
     : Packet(allocator),
-      topic_name(MQTTSTLAllocator<char>(allocator)),
+      topic_name(MQTTStrAllocator(allocator)),
       payload(MQTTSTLAllocator<uint8_t>(allocator)) {}
 };
 

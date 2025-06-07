@@ -348,7 +348,7 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
 
   // Parse subscriptions
   while (pos < payload_end) {
-    MQTTString topic_filter{MQTTSTLAllocator<char>(allocator_)};
+    MQTTString topic_filter{MQTTStrAllocator(allocator_)};
     ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, pos);
     if (ret != 0) {
       LOG_ERROR("Failed to parse topic filter");
@@ -613,25 +613,58 @@ int MQTTParser::parse_pingresp(const uint8_t* buffer, size_t length, PingRespPac
 
 int MQTTParser::parse_disconnect(const uint8_t* buffer, size_t length, DisconnectPacket** packet)
 {
+  if (length < 2) {
+    LOG_ERROR("DISCONNECT packet too short");
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
   DisconnectPacket* disconnect =
       new (allocator_->allocate(sizeof(DisconnectPacket))) DisconnectPacket();
   disconnect->type = PacketType::DISCONNECT;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+  
+  // 跳过包类型字节
+  pos++;
 
-  // 解析原因码
-  if (length > 0) {
-    disconnect->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  // 解析剩余长度
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    LOG_ERROR("Failed to parse remaining length");
+    allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
 
-    // 解析属性
-    if (bytes_read < length) {
-      int ret = parse_properties(buffer + bytes_read, length - bytes_read, disconnect->properties,
-                                 bytes_read);
+  // 记录payload结束位置
+  size_t payload_end = pos + remaining_length;
+  if (payload_end > length) {
+    LOG_ERROR("Packet too short for payload");
+    allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  // 解析原因码 (如果有payload)
+  if (remaining_length > 0) {
+    if (pos >= payload_end) {
+      LOG_ERROR("Packet too short for reason code");
+      allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+      return MQ_ERR_PACKET_INCOMPLETE;
+    }
+    disconnect->reason_code = static_cast<ReasonCode>(buffer[pos++]);
+
+    // 解析属性 (如果还有数据)
+    if (pos < payload_end) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, payload_end - pos, disconnect->properties, properties_bytes_read);
       if (ret != 0) {
+        LOG_ERROR("Failed to parse properties");
         allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
         return ret;
       }
+      pos += properties_bytes_read;
     }
   }
 
@@ -902,8 +935,8 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::UserProperty: {
         size_t local_read = 0;
-        MQTTString key{MQTTSTLAllocator<char>(allocator_)};
-        MQTTString value{MQTTSTLAllocator<char>(allocator_)};
+        MQTTString key{MQTTStrAllocator(allocator_)};
+        MQTTString value{MQTTStrAllocator(allocator_)};
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, key, local_read);
         if (ret != 0)
           return ret;

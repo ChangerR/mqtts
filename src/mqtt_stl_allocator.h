@@ -87,7 +87,8 @@ private:
 };
 
 // 使用自定义分配器的容器类型别名
-using MQTTString = std::basic_string<char, std::char_traits<char>, MQTTSTLAllocator<char>>;
+using MQTTStrAllocator = MQTTSTLAllocator<char>;
+using MQTTString = std::basic_string<char, std::char_traits<char>, MQTTStrAllocator>;
 using MQTTByteVector = std::vector<uint8_t, MQTTSTLAllocator<uint8_t>>;
 
 template<typename T>
@@ -98,7 +99,7 @@ using MQTTUserProperties = MQTTVector<MQTTStringPair>;
 
 // 辅助函数：从std::string转换为MQTTString
 inline MQTTString to_mqtt_string(const std::string& str, MQTTAllocator* allocator) {
-    MQTTSTLAllocator<char> alloc(allocator);
+    MQTTStrAllocator alloc(allocator);
     return MQTTString(str.begin(), str.end(), alloc);
 }
 
