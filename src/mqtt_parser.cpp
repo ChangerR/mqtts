@@ -348,8 +348,8 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
 
   // Parse subscriptions
   while (pos < payload_end) {
-    std::string topic_filter;
-    ret = parse_string(buffer + pos, payload_end - pos, topic_filter, pos);
+    MQTTString topic_filter{MQTTSTLAllocator<char>(allocator_)};
+    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, pos);
     if (ret != 0) {
       LOG_ERROR("Failed to parse topic filter");
       subscribe->~SubscribePacket();
@@ -365,9 +365,8 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
     }
     uint8_t qos = buffer[pos++] & 0x03;
     
-    // 转换为MQTTString并添加到subscriptions
-    MQTTString mqtt_topic = to_mqtt_string(topic_filter, allocator_);
-    subscribe->subscriptions.push_back(std::make_pair(mqtt_topic, qos));
+    // 直接添加到subscriptions，不需要转换
+    subscribe->subscriptions.push_back(std::make_pair(std::move(topic_filter), qos));
   }
 
   *packet = subscribe;
@@ -686,6 +685,24 @@ int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
   return MQ_SUCCESS;
 }
 
+int MQTTParser::parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTString& str, size_t& bytes_read)
+{
+  if (length < 2) {
+    LOG_ERROR("Packet too short for string length");
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  uint16_t str_length = (buffer[0] << 8) | buffer[1];
+  if (length < 2 + str_length) {
+    LOG_ERROR("Packet too short for string content");
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
+  bytes_read += 2 + str_length;
+  return MQ_SUCCESS;
+}
+
 int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& str,
                              size_t& bytes_read)
 {
@@ -724,6 +741,14 @@ int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vec
   return MQ_SUCCESS;
 }
 
+int MQTTParser::parse_mqtt_binary_data(const uint8_t* buffer, size_t length, MQTTByteVector& data,
+                                       size_t& bytes_read)
+{
+  data.assign(buffer, buffer + length);
+  bytes_read = length;
+  return MQ_SUCCESS;
+}
+
 int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Properties& properties,
                                  size_t& bytes_read)
 {
@@ -751,21 +776,17 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::ContentType: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.content_type, local_read);
         if (ret != 0)
           return ret;
-        properties.content_type = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
       case PropertyType::ResponseTopic: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.response_topic, local_read);
         if (ret != 0)
           return ret;
-        properties.response_topic = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
@@ -797,11 +818,9 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::AssignedClientIdentifier: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.assigned_client_identifier, local_read);
         if (ret != 0)
           return ret;
-        properties.assigned_client_identifier = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
@@ -811,11 +830,9 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::AuthenticationMethod: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.authentication_method, local_read);
         if (ret != 0)
           return ret;
-        properties.authentication_method = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
@@ -843,31 +860,25 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::ResponseInformation: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.response_information, local_read);
         if (ret != 0)
           return ret;
-        properties.response_information = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
       case PropertyType::ServerReference: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.server_reference, local_read);
         if (ret != 0)
           return ret;
-        properties.server_reference = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
       case PropertyType::ReasonString: {
         size_t local_read = 0;
-        std::string temp_str;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, temp_str, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.reason_string, local_read);
         if (ret != 0)
           return ret;
-        properties.reason_string = to_mqtt_string(temp_str, allocator_);
         bytes_read += local_read;
         break;
       }
@@ -891,21 +902,20 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::UserProperty: {
         size_t local_read = 0;
-        std::string key, value;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, key, local_read);
+        MQTTString key{MQTTSTLAllocator<char>(allocator_)};
+        MQTTString value{MQTTSTLAllocator<char>(allocator_)};
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, key, local_read);
         if (ret != 0)
           return ret;
         bytes_read += local_read;
         local_read = 0;
-        ret = parse_string(buffer + bytes_read, length - bytes_read, value, local_read);
+        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, value, local_read);
         if (ret != 0)
           return ret;
         bytes_read += local_read;
         
-        // 转换为MQTTString pair并添加
-        MQTTString mqtt_key = to_mqtt_string(key, allocator_);
-        MQTTString mqtt_value = to_mqtt_string(value, allocator_);
-        properties.user_properties.push_back(std::make_pair(mqtt_key, mqtt_value));
+        // 直接添加MQTTString pair
+        properties.user_properties.push_back(std::make_pair(std::move(key), std::move(value)));
         break;
       }
       case PropertyType::MaximumPacketSize:
@@ -1374,23 +1384,6 @@ int MQTTParser::serialize_auth(const AuthPacket* packet, std::vector<uint8_t>& b
   buffer.insert(buffer.end(), properties_buffer.begin(), properties_buffer.end());
 
   return MQ_SUCCESS;
-}
-
-int MQTTParser::parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTString& str, size_t& bytes_read)
-{
-  std::string temp_str;
-  int ret = parse_string(buffer, length, temp_str, bytes_read);
-  if (ret == 0) {
-    str = to_mqtt_string(temp_str, allocator_);
-  }
-  return ret;
-}
-
-int MQTTParser::parse_mqtt_binary_data(const uint8_t* buffer, size_t length, MQTTByteVector& data, size_t& bytes_read)
-{
-  data.assign(buffer, buffer + length);
-  bytes_read = length;
-  return 0;
 }
 
 int MQTTParser::serialize_mqtt_string(const MQTTString& str, std::vector<uint8_t>& buffer)
