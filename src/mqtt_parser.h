@@ -56,8 +56,11 @@ class MQTTParser
   int parse_remaining_length(const uint8_t* buffer, size_t length, uint32_t& remaining_length,
                              size_t& bytes_read);
   int parse_string(const uint8_t* buffer, size_t length, std::string& str, size_t& bytes_read);
+  int parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTString& str, size_t& bytes_read);
   int parse_binary_data(const uint8_t* buffer, size_t length, std::vector<uint8_t>& data,
                         size_t& bytes_read);
+  int parse_mqtt_binary_data(const uint8_t* buffer, size_t length, MQTTByteVector& data,
+                             size_t& bytes_read);
   int parse_properties(const uint8_t* buffer, size_t length, Properties& properties,
                        size_t& bytes_read);
   int parse_reason_codes(const uint8_t* buffer, size_t length,
@@ -66,7 +69,9 @@ class MQTTParser
   // Helper functions for serialization
   int serialize_remaining_length(uint32_t remaining_length, std::vector<uint8_t>& buffer);
   int serialize_string(const std::string& str, std::vector<uint8_t>& buffer);
+  int serialize_mqtt_string(const MQTTString& str, std::vector<uint8_t>& buffer);
   int serialize_binary_data(const std::vector<uint8_t>& data, std::vector<uint8_t>& buffer);
+  int serialize_mqtt_binary_data(const MQTTByteVector& data, std::vector<uint8_t>& buffer);
   int serialize_properties(const Properties& properties, std::vector<uint8_t>& buffer);
   int serialize_reason_codes(const std::vector<ReasonCode>& reason_codes,
                              std::vector<uint8_t>& buffer);

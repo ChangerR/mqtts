@@ -6,7 +6,7 @@
 void test_basic_allocation() {
     std::cout << "测试基本内存分配..." << std::endl;
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     
     // 测试分配内存
     void* ptr = allocator.allocate(1024);
@@ -21,7 +21,7 @@ void test_basic_allocation() {
 void test_multiple_allocations() {
     std::cout << "\n测试多次内存分配..." << std::endl;
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     std::vector<void*> ptrs;
     
     // 分配多个不同大小的内存块
@@ -43,7 +43,7 @@ void test_multiple_allocations() {
 void test_large_allocation() {
     std::cout << "\n测试大内存分配..." << std::endl;
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     
     // 测试分配较大内存块
     const size_t large_size = 1024 * 1024;  // 1MB

@@ -23,7 +23,10 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       state_(ReadState::READ_HEADER),
       packet_type_(0),
       remaining_length_(0),
-      header_size_(0)
+      header_size_(0),
+      client_id_(MQTTSTLAllocator<char>(allocator)),
+      client_ip_(MQTTSTLAllocator<char>(allocator)),
+      subscriptions_(MQTTSTLAllocator<MQTTString>(allocator))
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -51,7 +54,7 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
 void MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, int client_port)
 {
   socket_ = socket;
-  client_ip_ = client_ip;
+  client_ip_ = to_mqtt_string(client_ip, allocator_);
   client_port_ = client_port;
 }
 
@@ -110,7 +113,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
   if (bytes_read_ + needed_size > current_buffer_size_) {
     size_t new_size = std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE);
     if (bytes_read_ + needed_size > new_size) {
-      LOG_ERROR("Packet too large from client {}:{} (needed: {}, max: {})", client_ip_,
+      LOG_ERROR("Packet too large from client {}:{} (needed: {}, max: {})", from_mqtt_string(client_ip_),
                 client_port_, bytes_read_ + needed_size, MAX_BUFFER_SIZE);
       return MQ_ERR_PACKET_TOO_LARGE;
     }
@@ -118,7 +121,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
     // Allocate new buffer
     char* new_buffer = (char*)allocator_->allocate(new_size);
     if (!new_buffer) {
-      LOG_ERROR("Failed to resize buffer for client {}:{} (new size: {})", client_ip_, client_port_,
+      LOG_ERROR("Failed to resize buffer for client {}:{} (new size: {})", from_mqtt_string(client_ip_), client_port_,
                 new_size);
       return MQ_ERR_MEMORY_ALLOC;
     }
@@ -131,7 +134,7 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
     buffer_ = new_buffer;
     current_buffer_size_ = new_size;
 
-    LOG_DEBUG("Buffer resized to {} bytes for client {}:{}", new_size, client_ip_, client_port_);
+    LOG_DEBUG("Buffer resized to {} bytes for client {}:{}", new_size, from_mqtt_string(client_ip_), client_port_);
   }
   return MQ_SUCCESS;
 }
@@ -146,7 +149,7 @@ int MQTTProtocolHandler::read_packet()
 
   // Check if socket is still valid
   if (!socket_->is_connected()) {
-    LOG_WARN("Client {}:{} disconnected", client_ip_, client_port_);
+    LOG_WARN("Client {}:{} disconnected", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SOCKET;
   }
 
@@ -154,13 +157,13 @@ int MQTTProtocolHandler::read_packet()
   int len = bytes_needed_;
   int ret = socket_->recv(buffer_ + bytes_read_, len);
   if (MQ_FAIL(ret)) {
-    LOG_WARN("Client {}:{} disconnected unexpectedly", client_ip_, client_port_);
+    LOG_WARN("Client {}:{} disconnected unexpectedly", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SOCKET_RECV;
   }
 
   // Check if connection closed
   if (len == 0) {
-    LOG_WARN("Client {}:{} closed connection", client_ip_, client_port_);
+    LOG_WARN("Client {}:{} closed connection", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SOCKET;
   }
 
@@ -198,7 +201,7 @@ int MQTTProtocolHandler::read_packet()
         if ((byte & 0x80) == 0) {
           // Check if remaining length is too large
           if (remaining_length_ > MAX_BUFFER_SIZE - bytes_read_) {
-            LOG_ERROR("Packet too large from client {}:{} (size: {}, max: {})", client_ip_,
+            LOG_ERROR("Packet too large from client {}:{} (size: {}, max: {})", from_mqtt_string(client_ip_),
                       client_port_, remaining_length_ + bytes_read_, MAX_BUFFER_SIZE);
             return MQ_ERR_PACKET_TOO_LARGE;
           }
@@ -209,7 +212,7 @@ int MQTTProtocolHandler::read_packet()
           // 保留header和remaining length，不重置bytes_read_
         } else if (remaining_length_index >= 3) {
           // Invalid remaining length (more than 4 bytes)
-          LOG_ERROR("Invalid remaining length from client {}:{}", client_ip_, client_port_);
+          LOG_ERROR("Invalid remaining length from client {}:{}", from_mqtt_string(client_ip_), client_port_);
           return MQ_ERR_PACKET_INVALID;
         } else {
           // Need more bytes for remaining length
@@ -241,68 +244,157 @@ int MQTTProtocolHandler::parse_packet()
 {
   // Complete packet received, parse it
   Packet* packet = nullptr;
+  LOG_DEBUG("Parsing packet from client {}:{}, type: 0x{:02x}, size: {}", 
+            from_mqtt_string(client_ip_), client_port_, packet_type_, bytes_read_);
+
   int ret = parser_->parse_packet(reinterpret_cast<const uint8_t*>(buffer_), bytes_read_, &packet);
   if (ret != 0) {
-    LOG_ERROR("Failed to parse MQTT packet from client {}:{}", client_ip_, client_port_);
+    LOG_ERROR("Failed to parse MQTT packet from client {}:{}, error: {}", 
+              from_mqtt_string(client_ip_), client_port_, ret);
     return MQ_ERR_PACKET_INVALID;
   }
 
+  LOG_DEBUG("Successfully parsed packet type: 0x{:02x} from client {}:{}", 
+            static_cast<uint8_t>(packet->type), from_mqtt_string(client_ip_), client_port_);
+
   // Handle packet based on type
   switch (packet->type) {
-    case PacketType::CONNECT:
-      ret = handle_connect(reinterpret_cast<ConnectPacket*>(packet));
+    case PacketType::CONNECT: {
+      LOG_DEBUG("Processing CONNECT packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      ConnectPacket* connect = reinterpret_cast<ConnectPacket*>(packet);
+      ret = handle_connect(connect);
+      connect->~ConnectPacket();
+      allocator_->deallocate(packet, sizeof(ConnectPacket));
       break;
-    case PacketType::CONNACK:
-      ret = handle_connack(reinterpret_cast<ConnAckPacket*>(packet));
+    }
+    case PacketType::CONNACK: {
+      LOG_DEBUG("Processing CONNACK packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      ConnAckPacket* connack = reinterpret_cast<ConnAckPacket*>(packet);
+      ret = handle_connack(connack);
+      connack->~ConnAckPacket();
+      allocator_->deallocate(packet, sizeof(ConnAckPacket));
       break;
-    case PacketType::PUBLISH:
-      ret = handle_publish(reinterpret_cast<PublishPacket*>(packet));
+    }
+    case PacketType::PUBLISH: {
+      LOG_DEBUG("Processing PUBLISH packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PublishPacket* publish = reinterpret_cast<PublishPacket*>(packet);
+      ret = handle_publish(publish);
+      publish->~PublishPacket();
+      allocator_->deallocate(packet, sizeof(PublishPacket));
       break;
-    case PacketType::PUBACK:
-      ret = handle_puback(reinterpret_cast<PubAckPacket*>(packet));
+    }
+    case PacketType::PUBACK: {
+      LOG_DEBUG("Processing PUBACK packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PubAckPacket* puback = reinterpret_cast<PubAckPacket*>(packet);
+      ret = handle_puback(puback);
+      puback->~PubAckPacket();
+      allocator_->deallocate(packet, sizeof(PubAckPacket));
       break;
-    case PacketType::PUBREC:
-      ret = handle_pubrec(reinterpret_cast<PubRecPacket*>(packet));
+    }
+    case PacketType::PUBREC: {
+      LOG_DEBUG("Processing PUBREC packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PubRecPacket* pubrec = reinterpret_cast<PubRecPacket*>(packet);
+      ret = handle_pubrec(pubrec);
+      pubrec->~PubRecPacket();
+      allocator_->deallocate(packet, sizeof(PubRecPacket));
       break;
-    case PacketType::PUBREL:
-      ret = handle_pubrel(reinterpret_cast<PubRelPacket*>(packet));
+    }
+    case PacketType::PUBREL: {
+      LOG_DEBUG("Processing PUBREL packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PubRelPacket* pubrel = reinterpret_cast<PubRelPacket*>(packet);
+      ret = handle_pubrel(pubrel);
+      pubrel->~PubRelPacket();
+      allocator_->deallocate(packet, sizeof(PubRelPacket));
       break;
-    case PacketType::PUBCOMP:
-      ret = handle_pubcomp(reinterpret_cast<PubCompPacket*>(packet));
+    }
+    case PacketType::PUBCOMP: {
+      LOG_DEBUG("Processing PUBCOMP packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PubCompPacket* pubcomp = reinterpret_cast<PubCompPacket*>(packet);
+      ret = handle_pubcomp(pubcomp);
+      pubcomp->~PubCompPacket();
+      allocator_->deallocate(packet, sizeof(PubCompPacket));
       break;
-    case PacketType::SUBSCRIBE:
-      ret = handle_subscribe(reinterpret_cast<SubscribePacket*>(packet));
+    }
+    case PacketType::SUBSCRIBE: {
+      LOG_DEBUG("Processing SUBSCRIBE packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      SubscribePacket* subscribe = reinterpret_cast<SubscribePacket*>(packet);
+      ret = handle_subscribe(subscribe);
+      subscribe->~SubscribePacket();
+      allocator_->deallocate(packet, sizeof(SubscribePacket));
       break;
-    case PacketType::SUBACK:
-      ret = handle_suback(reinterpret_cast<SubAckPacket*>(packet));
+    }
+    case PacketType::SUBACK: {
+      LOG_DEBUG("Processing SUBACK packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      SubAckPacket* suback = reinterpret_cast<SubAckPacket*>(packet);
+      ret = handle_suback(suback);
+      suback->~SubAckPacket();
+      allocator_->deallocate(packet, sizeof(SubAckPacket));
       break;
-    case PacketType::UNSUBSCRIBE:
-      ret = handle_unsubscribe(reinterpret_cast<UnsubscribePacket*>(packet));
+    }
+    case PacketType::UNSUBSCRIBE: {
+      LOG_DEBUG("Processing UNSUBSCRIBE packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      UnsubscribePacket* unsubscribe = reinterpret_cast<UnsubscribePacket*>(packet);
+      ret = handle_unsubscribe(unsubscribe);
+      unsubscribe->~UnsubscribePacket();
+      allocator_->deallocate(packet, sizeof(UnsubscribePacket));
       break;
-    case PacketType::UNSUBACK:
-      ret = handle_unsuback(reinterpret_cast<UnsubAckPacket*>(packet));
+    }
+    case PacketType::UNSUBACK: {
+      LOG_DEBUG("Processing UNSUBACK packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      UnsubAckPacket* unsuback = reinterpret_cast<UnsubAckPacket*>(packet);
+      ret = handle_unsuback(unsuback);
+      unsuback->~UnsubAckPacket();
+      allocator_->deallocate(packet, sizeof(UnsubAckPacket));
       break;
-    case PacketType::PINGREQ:
+    }
+    case PacketType::PINGREQ: {
+      LOG_DEBUG("Processing PINGREQ packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PingReqPacket* pingreq = reinterpret_cast<PingReqPacket*>(packet);
       ret = handle_pingreq();
+      pingreq->~PingReqPacket();
+      allocator_->deallocate(packet, sizeof(PingReqPacket));
       break;
-    case PacketType::PINGRESP:
+    }
+    case PacketType::PINGRESP: {
+      LOG_DEBUG("Processing PINGRESP packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      PingRespPacket* pingresp = reinterpret_cast<PingRespPacket*>(packet);
       ret = handle_pingresp();
+      pingresp->~PingRespPacket();
+      allocator_->deallocate(packet, sizeof(PingRespPacket));
       break;
-    case PacketType::DISCONNECT:
-      ret = handle_disconnect(reinterpret_cast<DisconnectPacket*>(packet));
+    }
+    case PacketType::DISCONNECT: {
+      LOG_DEBUG("Processing DISCONNECT packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      DisconnectPacket* disconnect = reinterpret_cast<DisconnectPacket*>(packet);
+      ret = handle_disconnect(disconnect);
+      disconnect->~DisconnectPacket();
+      allocator_->deallocate(packet, sizeof(DisconnectPacket));
       break;
-    case PacketType::AUTH:
-      ret = handle_auth(reinterpret_cast<AuthPacket*>(packet));
+    }
+    case PacketType::AUTH: {
+      LOG_DEBUG("Processing AUTH packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+      AuthPacket* auth = reinterpret_cast<AuthPacket*>(packet);
+      ret = handle_auth(auth);
+      auth->~AuthPacket();
+      allocator_->deallocate(packet, sizeof(AuthPacket));
       break;
+    }
     default:
       LOG_WARN("Unsupported packet type: 0x{:02x} from client {}:{}",
-               static_cast<uint8_t>(packet->type), client_ip_, client_port_);
+               static_cast<uint8_t>(packet->type), from_mqtt_string(client_ip_), client_port_);
+      packet->~Packet();
+      allocator_->deallocate(packet, sizeof(Packet));
       ret = MQ_ERR_PACKET_TYPE;
       break;
   }
 
-  // Free packet
-  allocator_->deallocate(packet, sizeof(Packet));
+  if (ret != 0) {
+    LOG_ERROR("Failed to handle packet type: 0x{:02x} from client {}:{}, error: {}", 
+              static_cast<uint8_t>(packet->type), from_mqtt_string(client_ip_), client_port_, ret);
+  } else {
+    LOG_DEBUG("Successfully handled packet type: 0x{:02x} from client {}:{}", 
+              static_cast<uint8_t>(packet->type), from_mqtt_string(client_ip_), client_port_);
+  }
 
   // Reset state machine for next packet
   state_ = ReadState::READ_HEADER;
@@ -316,22 +408,29 @@ int MQTTProtocolHandler::parse_packet()
 
 int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 {
+  LOG_DEBUG("Processing CONNECT from client {}:{} (protocol: v{}, client_id: {})", 
+            from_mqtt_string(client_ip_), client_port_, packet->protocol_version, from_mqtt_string(packet->client_id));
+
   // Check protocol version
   if (packet->protocol_version != 5) {
-    LOG_ERROR("Unsupported protocol version: {} from client {}:{}", packet->protocol_version,
-              client_ip_, client_port_);
+    LOG_ERROR("Unsupported protocol version: {} from client {}:{}", 
+              packet->protocol_version, from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_CONNECT_PROTOCOL;
   }
 
   // Check if client ID is valid
   if (packet->client_id.empty()) {
-    LOG_ERROR("Empty client ID from client {}:{}", client_ip_, client_port_);
+    LOG_ERROR("Empty client ID from client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_CONNECT_CLIENT_ID;
   }
 
-  // Update session state
-  client_id_ = packet->client_id;
+  // Update session state - 使用拷贝构造
+  client_id_ = MQTTString(packet->client_id.begin(), packet->client_id.end(), 
+                          MQTTSTLAllocator<char>(allocator_));
   connected_ = true;
+
+  LOG_DEBUG("Client {}:{} connected successfully with client_id: {}", 
+            from_mqtt_string(client_ip_), client_port_, from_mqtt_string(client_id_));
 
   // Send CONNACK
   return send_connack(ReasonCode::Success, true);
@@ -364,22 +463,28 @@ int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)
 
 int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
 {
+  LOG_DEBUG("Processing PUBLISH from client {}:{} (topic: {}, qos: {}, retain: {})", 
+            from_mqtt_string(client_ip_), client_port_, from_mqtt_string(packet->topic_name), packet->qos, packet->retain);
+
   if (!connected_) {
-    LOG_ERROR("Client {}:{} not connected", client_ip_, client_port_);
+    LOG_ERROR("Client {}:{} not connected", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   // Check if topic is valid
   if (packet->topic_name.empty()) {
-    LOG_ERROR("Empty topic name from client {}:{}", client_ip_, client_port_);
+    LOG_ERROR("Empty topic name from client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_PUBLISH_TOPIC;
   }
 
   // Check QoS level
   if (packet->qos > 2) {
-    LOG_ERROR("Invalid QoS level: {} from client {}:{}", packet->qos, client_ip_, client_port_);
+    LOG_ERROR("Invalid QoS level: {} from client {}:{}", packet->qos, from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_PACKET_QOS;
   }
+
+  LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})", 
+            from_mqtt_string(client_ip_), client_port_, packet->payload.size());
 
   // Send PUBACK for QoS 1
   if (packet->qos == 1) {
@@ -478,7 +583,7 @@ int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
 
   // 处理取消订阅
   std::vector<ReasonCode> reason_codes;
-  for (const auto& topic : packet->topic_filters) {
+  for (const MQTTString& topic : packet->topic_filters) {
     remove_subscription(topic);
     reason_codes.push_back(ReasonCode::Success);
   }
@@ -507,11 +612,14 @@ int MQTTProtocolHandler::handle_unsuback(const UnsubAckPacket* packet)
 
 int MQTTProtocolHandler::handle_pingreq()
 {
+  LOG_DEBUG("Processing PINGREQ from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+
   if (!connected_) {
-    LOG_ERROR("Received PINGREQ but not connected");
+    LOG_ERROR("Received PINGREQ but client {}:{} not connected", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
+  LOG_DEBUG("Sending PINGRESP to client {}:{}", from_mqtt_string(client_ip_), client_port_);
   return send_pingresp();
 }
 
@@ -527,15 +635,25 @@ int MQTTProtocolHandler::handle_pingresp()
 
 int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
 {
+  LOG_DEBUG("Processing DISCONNECT from client {}:{} (reason: 0x{:02x})", 
+            from_mqtt_string(client_ip_), client_port_, static_cast<uint8_t>(packet->reason_code));
+
   if (!connected_) {
-    LOG_ERROR("Received DISCONNECT but not connected");
+    LOG_ERROR("Received DISCONNECT but client {}:{} not connected", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
   // 处理断开连接
   connected_ = false;
-  LOG_INFO("Client {}:{} disconnected with reason code: 0x{:02x}", client_ip_, client_port_,
-           static_cast<uint8_t>(packet->reason_code));
+  LOG_INFO("Client {}:{} disconnected with reason code: 0x{:02x}", 
+           from_mqtt_string(client_ip_), client_port_, static_cast<uint8_t>(packet->reason_code));
+
+  // 关闭socket连接
+  if (socket_) {
+    LOG_DEBUG("Closing socket for client {}:{}", from_mqtt_string(client_ip_), client_port_);
+    socket_->close();
+    socket_ = nullptr;
+  }
 
   return MQ_SUCCESS;
 }
@@ -559,18 +677,27 @@ int MQTTProtocolHandler::handle_auth(const AuthPacket* packet)
 
 int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 {
+  LOG_DEBUG("Processing SUBSCRIBE from client {}:{} (packet_id: {})", 
+            from_mqtt_string(client_ip_), client_port_, packet->packet_id);
+
   if (!packet) {
-    return MQ_ERR_PACKET_INVALID;  // 使用已定义的错误码
+    LOG_ERROR("Invalid SUBSCRIBE packet from client {}:{}", from_mqtt_string(client_ip_), client_port_);
+    return MQ_ERR_PACKET_INVALID;
   }
 
   // 处理订阅请求
   std::vector<ReasonCode> reason_codes;
-  for (const auto& subscription : packet->subscriptions) {
-    const std::string& topic = subscription.first;
+  for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
+    const MQTTString& topic = subscription.first;
     uint8_t qos = subscription.second;
+
+    LOG_DEBUG("Client {}:{} subscribing to topic: {} with QoS: {}", 
+              from_mqtt_string(client_ip_), client_port_, from_mqtt_string(topic), qos);
 
     // 验证QoS级别
     if (qos > 2) {
+      LOG_WARN("Unsupported QoS level {} for topic {} from client {}:{}", 
+               qos, from_mqtt_string(topic), from_mqtt_string(client_ip_), client_port_);
       reason_codes.push_back(ReasonCode::QoSNotSupported);
       continue;
     }
@@ -578,6 +705,8 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     // 添加订阅
     add_subscription(topic);
     reason_codes.push_back(static_cast<ReasonCode>(qos));
+    LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}", 
+              from_mqtt_string(client_ip_), client_port_, from_mqtt_string(topic), qos);
   }
 
   // 发送SUBACK响应
@@ -586,13 +715,18 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
 int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_present)
 {
+  LOG_DEBUG("Sending CONNACK to client {}:{} (reason: 0x{:02x}, session_present: {})", 
+            from_mqtt_string(client_ip_), client_port_, static_cast<uint8_t>(reason_code), session_present);
+
   if (!socket_) {
+    LOG_ERROR("Cannot send CONNACK: socket is null for client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SOCKET;
   }
 
   // 创建CONNACK包
   ConnAckPacket* packet = new (allocator_->allocate(sizeof(ConnAckPacket))) ConnAckPacket();
   if (!packet) {
+    LOG_ERROR("Failed to allocate CONNACK packet for client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_MEMORY_ALLOC;
   }
 
@@ -604,12 +738,22 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
   std::vector<uint8_t> buffer;
   int ret = parser_->serialize_connack(packet, buffer);
   if (ret != 0) {
+    LOG_ERROR("Failed to serialize CONNACK packet for client {}:{}, error: {}", 
+              from_mqtt_string(client_ip_), client_port_, ret);
     allocator_->deallocate(packet, sizeof(ConnAckPacket));
     return ret;
   }
 
   // 发送数据
   ret = socket_->send(buffer.data(), static_cast<int>(buffer.size()));
+  if (ret != 0) {
+    LOG_ERROR("Failed to send CONNACK packet to client {}:{}, error: {}", 
+              from_mqtt_string(client_ip_), client_port_, ret);
+  } else {
+    LOG_DEBUG("Successfully sent CONNACK packet to client {}:{} (size: {})", 
+              from_mqtt_string(client_ip_), client_port_, buffer.size());
+  }
+
   allocator_->deallocate(packet, sizeof(ConnAckPacket));
   return ret;
 }
@@ -712,25 +856,30 @@ int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
   }
 
   // 创建UNSUBACK包
-  UnsubAckPacket* packet = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket();
+  UnsubAckPacket* packet = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
   if (!packet) {
     return MQ_ERR_MEMORY_ALLOC;
   }
 
   packet->type = PacketType::UNSUBACK;
   packet->packet_id = packet_id;
-  packet->reason_codes = reason_codes;
+  // 转换std::vector到MQTTVector
+  for (const ReasonCode& code : reason_codes) {
+    packet->reason_codes.push_back(code);
+  }
 
   // 序列化包
   std::vector<uint8_t> buffer;
   int ret = parser_->serialize_unsuback(packet, buffer);
   if (ret != 0) {
+    packet->~UnsubAckPacket();
     allocator_->deallocate(packet, sizeof(UnsubAckPacket));
     return ret;
   }
 
   // 发送数据
   ret = socket_->send(buffer.data(), static_cast<int>(buffer.size()));
+  packet->~UnsubAckPacket();
   allocator_->deallocate(packet, sizeof(UnsubAckPacket));
   return ret;
 }
@@ -794,12 +943,12 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
   return ret;
 }
 
-void MQTTProtocolHandler::add_subscription(const std::string& topic)
+void MQTTProtocolHandler::add_subscription(const MQTTString& topic)
 {
   subscriptions_.push_back(topic);
 }
 
-void MQTTProtocolHandler::remove_subscription(const std::string& topic)
+void MQTTProtocolHandler::remove_subscription(const MQTTString& topic)
 {
   subscriptions_.erase(std::remove(subscriptions_.begin(), subscriptions_.end(), topic),
                        subscriptions_.end());
@@ -813,38 +962,48 @@ int MQTTProtocolHandler::send_suback(uint16_t packet_id,
   }
 
   // 创建SUBACK包
-  SubAckPacket* packet = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket();
+  SubAckPacket* packet = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket(allocator_);
   if (!packet) {
     return MQ_ERR_MEMORY_ALLOC;
   }
 
   packet->type = PacketType::SUBACK;
   packet->packet_id = packet_id;
-  packet->reason_codes = reason_codes;
+  // 转换std::vector到MQTTVector
+  for (const ReasonCode& code : reason_codes) {
+    packet->reason_codes.push_back(code);
+  }
 
   // 序列化包
   std::vector<uint8_t> buffer;
   int ret = parser_->serialize_suback(packet, buffer);
   if (ret != 0) {
+    packet->~SubAckPacket();
     allocator_->deallocate(packet, sizeof(SubAckPacket));
     return ret;
   }
 
   // 发送数据
   ret = socket_->send(buffer.data(), static_cast<int>(buffer.size()));
+  packet->~SubAckPacket();
   allocator_->deallocate(packet, sizeof(SubAckPacket));
   return ret;
 }
 
 int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
 {
+  LOG_DEBUG("Sending PUBACK to client {}:{} (packet_id: {}, reason: 0x{:02x})", 
+            from_mqtt_string(client_ip_), client_port_, packet_id, static_cast<uint8_t>(reason_code));
+
   if (!socket_) {
+    LOG_ERROR("Cannot send PUBACK: socket is null for client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_SOCKET;
   }
 
   // 创建PUBACK包
   PubAckPacket* packet = new (allocator_->allocate(sizeof(PubAckPacket))) PubAckPacket();
   if (!packet) {
+    LOG_ERROR("Failed to allocate PUBACK packet for client {}:{}", from_mqtt_string(client_ip_), client_port_);
     return MQ_ERR_MEMORY_ALLOC;
   }
 
@@ -856,12 +1015,22 @@ int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
   std::vector<uint8_t> buffer;
   int ret = parser_->serialize_puback(packet, buffer);
   if (ret != 0) {
+    LOG_ERROR("Failed to serialize PUBACK packet for client {}:{}, error: {}", 
+              from_mqtt_string(client_ip_), client_port_, ret);
     allocator_->deallocate(packet, sizeof(PubAckPacket));
     return ret;
   }
 
   // 发送数据
   ret = socket_->send(buffer.data(), static_cast<int>(buffer.size()));
+  if (ret != 0) {
+    LOG_ERROR("Failed to send PUBACK packet to client {}:{}, error: {}", 
+              from_mqtt_string(client_ip_), client_port_, ret);
+  } else {
+    LOG_DEBUG("Successfully sent PUBACK packet to client {}:{} (size: {})", 
+              from_mqtt_string(client_ip_), client_port_, buffer.size());
+  }
+
   allocator_->deallocate(packet, sizeof(PubAckPacket));
   return ret;
 }

@@ -15,7 +15,7 @@ void test_parse_connect() {
         0x30, 0x65, 0x00, 0x04, 0x74, 0x65, 0x73, 0x74, 0x00, 0x04, 0x74, 0x65, 0x73, 0x74
     };
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
     
     mqtt::Packet* packet = nullptr;
@@ -47,7 +47,7 @@ void test_parse_publish() {
         0x05, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f
     };
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
     
     mqtt::Packet* packet = nullptr;
@@ -78,7 +78,7 @@ void test_parse_subscribe() {
         0x2f, 0x74, 0x6f, 0x70, 0x69, 0x63, 0x01, 0x00, 0x0a, 0x74, 0x65, 0x73, 0x74, 0x2f, 0x2b, 0x00
     };
     
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
     
     mqtt::Packet* packet = nullptr;

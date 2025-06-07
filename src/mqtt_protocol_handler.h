@@ -4,11 +4,15 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <poll.h>
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
 #include "mqtt_socket.h"
+#include "mqtt_define.h"
+#include "mqtt_stl_allocator.h"
+
 namespace mqtt {
 
 class MQTTProtocolHandler
@@ -53,15 +57,15 @@ class MQTTProtocolHandler
   int send_auth(ReasonCode reason_code);
 
   // Session management
-  void set_client_id(const std::string& client_id) { client_id_ = client_id; }
-  const std::string& get_client_id() const { return client_id_; }
   bool is_connected() const { return connected_; }
-  void set_connected(bool connected) { connected_ = connected; }
+  void set_client_id(const MQTTString& client_id) { client_id_ = client_id; }
+  const MQTTString& get_client_id() const { return client_id_; }
+  uint16_t get_next_packet_id() { return next_packet_id_++; }
 
   // Topic subscription management
-  void add_subscription(const std::string& topic);
-  void remove_subscription(const std::string& topic);
-  const std::vector<std::string>& get_subscriptions() const { return subscriptions_; }
+  void add_subscription(const MQTTString& topic);
+  void remove_subscription(const MQTTString& topic);
+  const MQTTVector<MQTTString>& get_subscriptions() const { return subscriptions_; }
 
  private:
   // Buffer management
@@ -91,14 +95,14 @@ class MQTTProtocolHandler
 
   // Session state
   MQTTSocket* socket_;
-  std::string client_ip_;
+  MQTTString client_ip_;
   int client_port_;
-  std::string client_id_;
+  MQTTString client_id_;
   bool connected_;
   uint16_t next_packet_id_;
 
   // Topic subscriptions
-  std::vector<std::string> subscriptions_;
+  MQTTVector<MQTTString> subscriptions_;
 
   // Memory management
   MQTTAllocator* allocator_;

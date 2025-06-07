@@ -35,7 +35,7 @@ int main() {
     print_hex(connect_data, data_len);
     
     // 创建allocator和解析器
-    MQTTAllocator allocator("test_client", "test", 0);
+    MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
     
     // 解析包

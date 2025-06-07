@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_memory_tags.h"
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
@@ -128,7 +129,7 @@ void* MQTTServer::accept_routine(void* arg)
         std::to_string(client->get_peer_port());  // Use IP and port for client ID
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     MQTTAllocator* client_allocator =
-        root->create_child(client_id, "client", 1024 * 1024);  // 1MB limit
+        root->create_child(client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, 1024 * 1024);  // 1MB limit
     if (MQ_ISNULL(client_allocator)) {
       LOG_ERROR("Failed to create client allocator");
       if (MQ_NOT_NULL(client)) {
