@@ -7,3 +7,8 @@
 	path = 3rd/gperftools
 	url = https://github.com/gperftools/gperftools.git
 	branch = master 
+
+[submodule "3rd/spdlog"]
+	path = 3rd/spdlog
+	url = https://github.com/gabime/spdlog.git
+	branch = v1.x
