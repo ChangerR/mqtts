@@ -1,0 +1,37 @@
+# MQTT服务器配置文件
+# 服务器配置
+server:
+  bind_address: "0.0.0.0"  # 绑定地址
+  port: 1883  # 监听端口
+  max_connections: 1000  # 最大连接数
+  backlog: 128  # socket backlog
+
+# MQTT协议配置
+mqtt:
+  max_packet_size: 1048576  # 最大包大小(字节)
+  keep_alive_default: 60  # 默认保活时间(秒)
+  keep_alive_max: 3600  # 最大保活时间(秒)
+  max_qos: 2  # 最大QoS级别
+  retain_available: true  # 支持retain消息
+  wildcard_subscription_available: true  # 支持通配符订阅
+  subscription_identifier_available: true  # 支持订阅标识符
+  shared_subscription_available: false  # 支持共享订阅
+  topic_alias_maximum: 65535  # 主题别名最大值
+  receive_maximum: 65535  # 接收最大值
+
+# 内存配置
+memory:
+  initial_pool_size: 67108864  # 初始内存池大小(字节)
+  max_pool_size: 536870912  # 最大内存池大小(字节)
+  block_size: 4096  # 内存块大小(字节)
+  use_tcmalloc: true  # 使用tcmalloc
+  buffer_initial_size: 1024  # 缓冲区初始大小(字节)
+  buffer_max_size: 1048576  # 缓冲区最大大小(字节)
+
+# 日志配置
+log:
+  level: "info"  # 日志级别: trace, debug, info, warn, error, critical
+  file_path: ""  # 日志文件路径，空字符串输出到控制台
+  max_file_size: 104857600  # 日志文件最大大小(字节)
+  max_files: 10  # 最大日志文件数量
+  flush_immediately: false  # 立即刷新 

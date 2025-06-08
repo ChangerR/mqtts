@@ -35,10 +35,20 @@ add_library(mqtt_parser STATIC
     src/mqtt_parser.cpp
     src/mqtt_allocator.cpp
     src/mqtt_serialize_buffer.cpp
+    src/mqtt_config.cpp
 )
+
+# 查找yaml-cpp库
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(YAML_CPP REQUIRED yaml-cpp)
 
 target_include_directories(mqtt_parser PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(mqtt_parser 
+    ${YAML_CPP_LIBRARIES}
 )
 
 # 添加主程序
