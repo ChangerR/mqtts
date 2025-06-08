@@ -548,11 +548,11 @@ int MQTTParser::parse_pubcomp(const uint8_t* buffer, size_t length, PubCompPacke
 
 int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket** packet)
 {
-  if (length < 2) {
+  if (length < 4) {  // 至少需要包ID(2字节) + 属性长度(1字节) + 至少1个原因码(1字节)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  SubAckPacket* suback = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket();
+  SubAckPacket* suback = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket(allocator_);
   suback->type = PacketType::SUBACK;
 
   size_t bytes_read = 0;
@@ -561,10 +561,54 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
   suback->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
   bytes_read += 2;
 
+  // 解析属性长度
+  uint32_t properties_length;
+  size_t properties_length_bytes;
+  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, 
+                                   properties_length, properties_length_bytes);
+  if (ret != 0) {
+    suback->~SubAckPacket();
+    allocator_->deallocate(suback, sizeof(SubAckPacket));
+    return ret;
+  }
+  bytes_read += properties_length_bytes;
+
+  // 检查数据完整性
+  if (bytes_read + properties_length > length) {
+    suback->~SubAckPacket();
+    allocator_->deallocate(suback, sizeof(SubAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  // 解析属性
+  if (properties_length > 0) {
+    size_t properties_bytes_read = 0;
+    ret = parse_properties(buffer + bytes_read, properties_length, 
+                           suback->properties, properties_bytes_read);
+    if (ret != 0) {
+      suback->~SubAckPacket();
+      allocator_->deallocate(suback, sizeof(SubAckPacket));
+      return ret;
+    }
+    if (properties_bytes_read != properties_length) {
+      suback->~SubAckPacket();
+      allocator_->deallocate(suback, sizeof(SubAckPacket));
+      return MQ_ERR_PACKET_INVALID;
+    }
+  }
+  bytes_read += properties_length;
+
   // 解析原因码列表
   while (bytes_read < length) {
     suback->reason_codes.push_back(static_cast<ReasonCode>(buffer[bytes_read]));
     bytes_read++;
+  }
+
+  // 验证至少有一个原因码
+  if (suback->reason_codes.empty()) {
+    suback->~SubAckPacket();
+    allocator_->deallocate(suback, sizeof(SubAckPacket));
+    return MQ_ERR_PACKET_INVALID;
   }
 
   *packet = suback;
@@ -573,11 +617,11 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
 
 int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPacket** packet)
 {
-  if (length < 2) {
+  if (length < 4) {  // 至少需要包ID(2字节) + 属性长度(1字节) + 至少1个原因码(1字节)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  UnsubAckPacket* unsuback = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket();
+  UnsubAckPacket* unsuback = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
   unsuback->type = PacketType::UNSUBACK;
 
   size_t bytes_read = 0;
@@ -586,10 +630,54 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
   unsuback->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
   bytes_read += 2;
 
+  // 解析属性长度
+  uint32_t properties_length;
+  size_t properties_length_bytes;
+  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, 
+                                   properties_length, properties_length_bytes);
+  if (ret != 0) {
+    unsuback->~UnsubAckPacket();
+    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+    return ret;
+  }
+  bytes_read += properties_length_bytes;
+
+  // 检查数据完整性
+  if (bytes_read + properties_length > length) {
+    unsuback->~UnsubAckPacket();
+    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  // 解析属性
+  if (properties_length > 0) {
+    size_t properties_bytes_read = 0;
+    ret = parse_properties(buffer + bytes_read, properties_length, 
+                           unsuback->properties, properties_bytes_read);
+    if (ret != 0) {
+      unsuback->~UnsubAckPacket();
+      allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+      return ret;
+    }
+    if (properties_bytes_read != properties_length) {
+      unsuback->~UnsubAckPacket();
+      allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+      return MQ_ERR_PACKET_INVALID;
+    }
+  }
+  bytes_read += properties_length;
+
   // 解析原因码列表
   while (bytes_read < length) {
     unsuback->reason_codes.push_back(static_cast<ReasonCode>(buffer[bytes_read]));
     bytes_read++;
+  }
+
+  // 验证至少有一个原因码
+  if (unsuback->reason_codes.empty()) {
+    unsuback->~UnsubAckPacket();
+    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+    return MQ_ERR_PACKET_INVALID;
   }
 
   *packet = unsuback;
@@ -1409,8 +1497,17 @@ int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer
   if (ret != 0)
     return ret;
 
-  // 计算剩余长度
-  uint32_t remaining_length = 2 + packet->reason_codes.size();  // 包ID + 原因码列表
+  // 序列化属性到临时缓冲区
+  MQTTSerializeBuffer properties_buffer(allocator_);
+  ret = serialize_properties(packet->properties, properties_buffer);
+  if (ret != 0) {
+    return ret;
+  }
+
+  // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
+  uint32_t remaining_length = 2;  // 包ID
+  remaining_length += static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+  remaining_length += packet->reason_codes.size();  // 原因码列表
 
   // 序列化剩余长度
   ret = serialize_remaining_length(remaining_length, buffer);
@@ -1423,6 +1520,11 @@ int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer
   if (ret != 0)
     return ret;
   ret = buffer.push_back(packet->packet_id & 0xFF);
+  if (ret != 0)
+    return ret;
+
+  // 添加属性内容（已包含长度编码）
+  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
   if (ret != 0)
     return ret;
 
@@ -1443,8 +1545,17 @@ int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBu
   if (ret != 0)
     return ret;
 
-  // 计算剩余长度
-  uint32_t remaining_length = 2 + packet->reason_codes.size();  // 包ID + 原因码列表
+  // 序列化属性到临时缓冲区
+  MQTTSerializeBuffer properties_buffer(allocator_);
+  ret = serialize_properties(packet->properties, properties_buffer);
+  if (ret != 0) {
+    return ret;
+  }
+
+  // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
+  uint32_t remaining_length = 2;  // 包ID
+  remaining_length += static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+  remaining_length += packet->reason_codes.size();  // 原因码列表
 
   // 序列化剩余长度
   ret = serialize_remaining_length(remaining_length, buffer);
@@ -1457,6 +1568,11 @@ int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBu
   if (ret != 0)
     return ret;
   ret = buffer.push_back(packet->packet_id & 0xFF);
+  if (ret != 0)
+    return ret;
+
+  // 添加属性内容（已包含长度编码）
+  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
   if (ret != 0)
     return ret;
 
