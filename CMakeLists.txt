@@ -34,6 +34,7 @@ add_subdirectory(3rd EXCLUDE_FROM_ALL)
 add_library(mqtt_parser STATIC
     src/mqtt_parser.cpp
     src/mqtt_allocator.cpp
+    src/mqtt_serialize_buffer.cpp
 )
 
 target_include_directories(mqtt_parser PUBLIC

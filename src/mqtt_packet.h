@@ -81,49 +81,62 @@ struct Properties
   bool shared_subscription_available = true;
 
   // 构造函数，初始化自定义分配器的容器
-  Properties(MQTTAllocator* allocator = nullptr) 
-    : user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),
-      authentication_method(MQTTStrAllocator(allocator)),
-      authentication_data(MQTTSTLAllocator<uint8_t>(allocator)),
-      assigned_client_identifier(MQTTStrAllocator(allocator)),
-      response_information(MQTTStrAllocator(allocator)),
-      server_reference(MQTTStrAllocator(allocator)),
-      reason_string(MQTTStrAllocator(allocator)),
-      content_type(MQTTStrAllocator(allocator)),
-      response_topic(MQTTStrAllocator(allocator)),
-      correlation_data(MQTTSTLAllocator<uint8_t>(allocator))
-  {}
+  Properties(MQTTAllocator* allocator = nullptr)
+      : user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),
+        authentication_method(MQTTStrAllocator(allocator)),
+        authentication_data(MQTTSTLAllocator<uint8_t>(allocator)),
+        assigned_client_identifier(MQTTStrAllocator(allocator)),
+        response_information(MQTTStrAllocator(allocator)),
+        server_reference(MQTTStrAllocator(allocator)),
+        reason_string(MQTTStrAllocator(allocator)),
+        content_type(MQTTStrAllocator(allocator)),
+        response_topic(MQTTStrAllocator(allocator)),
+        correlation_data(MQTTSTLAllocator<uint8_t>(allocator))
+  {
+  }
 
   // 拷贝构造函数
   Properties(const Properties& other, MQTTAllocator* allocator = nullptr)
-    : session_expiry_interval(other.session_expiry_interval),
-      receive_maximum(other.receive_maximum),
-      maximum_packet_size(other.maximum_packet_size),
-      topic_alias_maximum(other.topic_alias_maximum),
-      topic_alias(other.topic_alias),
-      request_response_information(other.request_response_information),
-      request_problem_information(other.request_problem_information),
-      user_properties(other.user_properties.begin(), other.user_properties.end(), MQTTSTLAllocator<MQTTStringPair>(allocator)),
-      authentication_method(other.authentication_method.begin(), other.authentication_method.end(), MQTTStrAllocator(allocator)),
-      authentication_data(other.authentication_data.begin(), other.authentication_data.end(), MQTTSTLAllocator<uint8_t>(allocator)),
-      assigned_client_identifier(other.assigned_client_identifier.begin(), other.assigned_client_identifier.end(), MQTTStrAllocator(allocator)),
-      server_keep_alive(other.server_keep_alive),
-      response_information(other.response_information.begin(), other.response_information.end(), MQTTStrAllocator(allocator)),
-      server_reference(other.server_reference.begin(), other.server_reference.end(), MQTTStrAllocator(allocator)),
-      reason_string(other.reason_string.begin(), other.reason_string.end(), MQTTStrAllocator(allocator)),
-      payload_format_indicator(other.payload_format_indicator),
-      message_expiry_interval(other.message_expiry_interval),
-      content_type(other.content_type.begin(), other.content_type.end(), MQTTStrAllocator(allocator)),
-      response_topic(other.response_topic.begin(), other.response_topic.end(), MQTTStrAllocator(allocator)),
-      correlation_data(other.correlation_data.begin(), other.correlation_data.end(), MQTTSTLAllocator<uint8_t>(allocator)),
-      subscription_identifier(other.subscription_identifier),
-      will_delay_interval(other.will_delay_interval),
-      maximum_qos(other.maximum_qos),
-      retain_available(other.retain_available),
-      wildcard_subscription_available(other.wildcard_subscription_available),
-      subscription_identifier_available(other.subscription_identifier_available),
-      shared_subscription_available(other.shared_subscription_available)
-  {}
+      : session_expiry_interval(other.session_expiry_interval),
+        receive_maximum(other.receive_maximum),
+        maximum_packet_size(other.maximum_packet_size),
+        topic_alias_maximum(other.topic_alias_maximum),
+        topic_alias(other.topic_alias),
+        request_response_information(other.request_response_information),
+        request_problem_information(other.request_problem_information),
+        user_properties(other.user_properties.begin(), other.user_properties.end(),
+                        MQTTSTLAllocator<MQTTStringPair>(allocator)),
+        authentication_method(other.authentication_method.begin(),
+                              other.authentication_method.end(), MQTTStrAllocator(allocator)),
+        authentication_data(other.authentication_data.begin(), other.authentication_data.end(),
+                            MQTTSTLAllocator<uint8_t>(allocator)),
+        assigned_client_identifier(other.assigned_client_identifier.begin(),
+                                   other.assigned_client_identifier.end(),
+                                   MQTTStrAllocator(allocator)),
+        server_keep_alive(other.server_keep_alive),
+        response_information(other.response_information.begin(), other.response_information.end(),
+                             MQTTStrAllocator(allocator)),
+        server_reference(other.server_reference.begin(), other.server_reference.end(),
+                         MQTTStrAllocator(allocator)),
+        reason_string(other.reason_string.begin(), other.reason_string.end(),
+                      MQTTStrAllocator(allocator)),
+        payload_format_indicator(other.payload_format_indicator),
+        message_expiry_interval(other.message_expiry_interval),
+        content_type(other.content_type.begin(), other.content_type.end(),
+                     MQTTStrAllocator(allocator)),
+        response_topic(other.response_topic.begin(), other.response_topic.end(),
+                       MQTTStrAllocator(allocator)),
+        correlation_data(other.correlation_data.begin(), other.correlation_data.end(),
+                         MQTTSTLAllocator<uint8_t>(allocator)),
+        subscription_identifier(other.subscription_identifier),
+        will_delay_interval(other.will_delay_interval),
+        maximum_qos(other.maximum_qos),
+        retain_available(other.retain_available),
+        wildcard_subscription_available(other.wildcard_subscription_available),
+        subscription_identifier_available(other.subscription_identifier_available),
+        shared_subscription_available(other.shared_subscription_available)
+  {
+  }
 };
 
 // MQTT v5 Reason Codes
@@ -212,10 +225,9 @@ struct Packet
   PacketType type;
   uint32_t remaining_length;
   Properties properties;
-  
-  Packet(MQTTAllocator* allocator = nullptr) 
-    : properties(allocator) {}
-    
+
+  Packet(MQTTAllocator* allocator = nullptr) : properties(allocator) {}
+
   virtual ~Packet() = default;
 };
 
@@ -232,16 +244,18 @@ struct ConnectPacket : public Packet
   MQTTString username;
   MQTTString password;
   Properties will_properties;  // Will消息的属性
-  
+
   ConnectPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      protocol_name(MQTTStrAllocator(allocator)),
-      client_id(MQTTStrAllocator(allocator)),
-      will_topic(MQTTStrAllocator(allocator)),
-      will_payload(MQTTStrAllocator(allocator)),
-      username(MQTTStrAllocator(allocator)),
-      password(MQTTStrAllocator(allocator)),
-      will_properties(allocator) {}
+      : Packet(allocator),
+        protocol_name(MQTTStrAllocator(allocator)),
+        client_id(MQTTStrAllocator(allocator)),
+        will_topic(MQTTStrAllocator(allocator)),
+        will_payload(MQTTStrAllocator(allocator)),
+        username(MQTTStrAllocator(allocator)),
+        password(MQTTStrAllocator(allocator)),
+        will_properties(allocator)
+  {
+  }
 };
 
 // MQTT v5 Publish Packet
@@ -253,11 +267,13 @@ struct PublishPacket : public Packet
   MQTTString topic_name;
   uint16_t packet_id;
   MQTTByteVector payload;
-  
+
   PublishPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      topic_name(MQTTStrAllocator(allocator)),
-      payload(MQTTSTLAllocator<uint8_t>(allocator)) {}
+      : Packet(allocator),
+        topic_name(MQTTStrAllocator(allocator)),
+        payload(MQTTSTLAllocator<uint8_t>(allocator))
+  {
+  }
 };
 
 // MQTT v5 Subscribe Packet
@@ -265,10 +281,12 @@ struct SubscribePacket : public Packet
 {
   uint16_t packet_id;
   MQTTVector<std::pair<MQTTString, uint8_t>> subscriptions;
-  
+
   SubscribePacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      subscriptions(MQTTSTLAllocator<std::pair<MQTTString, uint8_t>>(allocator)) {}
+      : Packet(allocator),
+        subscriptions(MQTTSTLAllocator<std::pair<MQTTString, uint8_t>>(allocator))
+  {
+  }
 };
 
 // MQTT v5 SubAck Packet
@@ -276,10 +294,11 @@ struct SubAckPacket : public Packet
 {
   uint16_t packet_id;
   MQTTVector<ReasonCode> reason_codes;
-  
+
   SubAckPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      reason_codes(MQTTSTLAllocator<ReasonCode>(allocator)) {}
+      : Packet(allocator), reason_codes(MQTTSTLAllocator<ReasonCode>(allocator))
+  {
+  }
 };
 
 // MQTT v5 Unsubscribe Packet
@@ -287,10 +306,11 @@ struct UnsubscribePacket : public Packet
 {
   uint16_t packet_id;
   MQTTVector<MQTTString> topic_filters;
-  
+
   UnsubscribePacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      topic_filters(MQTTSTLAllocator<MQTTString>(allocator)) {}
+      : Packet(allocator), topic_filters(MQTTSTLAllocator<MQTTString>(allocator))
+  {
+  }
 };
 
 // MQTT v5 UnsubAck Packet
@@ -298,28 +318,27 @@ struct UnsubAckPacket : public Packet
 {
   uint16_t packet_id;
   MQTTVector<ReasonCode> reason_codes;
-  
+
   UnsubAckPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator),
-      reason_codes(MQTTSTLAllocator<ReasonCode>(allocator)) {}
+      : Packet(allocator), reason_codes(MQTTSTLAllocator<ReasonCode>(allocator))
+  {
+  }
 };
 
 // MQTT v5 Disconnect Packet
 struct DisconnectPacket : public Packet
 {
   ReasonCode reason_code;
-  
-  DisconnectPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  DisconnectPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 Auth Packet
 struct AuthPacket : public Packet
 {
   ReasonCode reason_code;
-  
-  AuthPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  AuthPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 ConnAck Packet
@@ -327,9 +346,8 @@ struct ConnAckPacket : public Packet
 {
   bool session_present;
   ReasonCode reason_code;
-  
-  ConnAckPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  ConnAckPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PubAck Packet
@@ -337,9 +355,8 @@ struct PubAckPacket : public Packet
 {
   uint16_t packet_id;
   ReasonCode reason_code;
-  
-  PubAckPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  PubAckPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PubRec Packet
@@ -347,9 +364,8 @@ struct PubRecPacket : public Packet
 {
   uint16_t packet_id;
   ReasonCode reason_code;
-  
-  PubRecPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  PubRecPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PubRel Packet
@@ -357,9 +373,8 @@ struct PubRelPacket : public Packet
 {
   uint16_t packet_id;
   ReasonCode reason_code;
-  
-  PubRelPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  PubRelPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PubComp Packet
@@ -367,23 +382,20 @@ struct PubCompPacket : public Packet
 {
   uint16_t packet_id;
   ReasonCode reason_code;
-  
-  PubCompPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+
+  PubCompPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PingReq Packet
 struct PingReqPacket : public Packet
 {
-  PingReqPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+  PingReqPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 // MQTT v5 PingResp Packet
 struct PingRespPacket : public Packet
 {
-  PingRespPacket(MQTTAllocator* allocator = nullptr)
-    : Packet(allocator) {}
+  PingRespPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
 
 }  // namespace mqtt

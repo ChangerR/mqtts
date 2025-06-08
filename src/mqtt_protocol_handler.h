@@ -1,16 +1,17 @@
 #pragma once
 
+#include <poll.h>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <poll.h>
 #include "logger.h"
 #include "mqtt_allocator.h"
+#include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
+#include "mqtt_serialize_buffer.h"
 #include "mqtt_socket.h"
-#include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
 
 namespace mqtt {
@@ -81,7 +82,6 @@ class MQTTProtocolHandler
   };
 
   // Buffer management
-
   char* buffer_;
   size_t current_buffer_size_;
   size_t bytes_read_;
@@ -116,6 +116,8 @@ class MQTTProtocolHandler
   uint16_t topic_alias_maximum_;
   bool request_response_information_;
   bool request_problem_information_;
+
+  MQTTSerializeBuffer* serialize_buffer_;  // 复用的序列化缓冲区
 };
 
 }  // namespace mqtt

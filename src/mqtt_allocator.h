@@ -7,8 +7,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 #include "gperftools/tcmalloc.h"
 #include "mqtt_define.h"
 #include "mqtt_memory_tags.h"
@@ -25,8 +25,7 @@ class MQTTAllocator
   void deallocate(void* ptr, size_t size);
 
   // Child allocator management - thread unsafe
-  MQTTAllocator* create_child(const std::string& child_id, MQTTMemoryTag tag,
-                              size_t limit = 0);
+  MQTTAllocator* create_child(const std::string& child_id, MQTTMemoryTag tag, size_t limit = 0);
   void remove_child(const std::string& child_id);
   MQTTAllocator* get_child(const std::string& child_id) const
   {
@@ -44,7 +43,7 @@ class MQTTAllocator
 
  private:
   std::string id_;             // Unique identifier (e.g. client id)
-  MQTTMemoryTag tag_;         // Memory usage category
+  MQTTMemoryTag tag_;          // Memory usage category
   size_t limit_;               // 0 means no limit
   std::atomic<size_t> usage_;  // Use atomic for memory usage tracking
   MQTTAllocator* parent_;
