@@ -7,19 +7,30 @@
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
-    : accept_co_(NULL), server_socket_(NULL), running_(false), host_(host), port_(port), current_connections_(0)
+    : accept_co_(NULL),
+      server_socket_(NULL),
+      running_(false),
+      host_(host),
+      port_(port),
+      current_connections_(0)
 {
   // 使用默认配置
   server_config_.bind_address = host;
   server_config_.port = static_cast<uint16_t>(port);
   server_config_.max_connections = 1000;
   server_config_.backlog = 128;
+  memory_config_.client_max_size = 1048576;
 }
 
-MQTTServer::MQTTServer(const mqtt::ServerConfig& config)
-    : accept_co_(NULL), server_socket_(NULL), running_(false), 
-      host_(config.bind_address), port_(config.port), 
-      server_config_(config), current_connections_(0)
+MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config)
+    : accept_co_(NULL),
+      server_socket_(NULL),
+      running_(false),
+      host_(config.bind_address),
+      port_(config.port),
+      server_config_(config),
+      memory_config_(memory_config),
+      current_connections_(0)
 {
 }
 
@@ -36,13 +47,15 @@ bool MQTTServer::can_accept_connection() const
 void MQTTServer::add_connection()
 {
   current_connections_.fetch_add(1);
-  LOG_DEBUG("新连接建立，当前连接数: {}/{}", current_connections_.load(), server_config_.max_connections);
+  LOG_DEBUG("新连接建立，当前连接数: {}/{}", current_connections_.load(),
+            server_config_.max_connections);
 }
 
 void MQTTServer::remove_connection()
 {
   current_connections_.fetch_sub(1);
-  LOG_DEBUG("连接断开，当前连接数: {}/{}", current_connections_.load(), server_config_.max_connections);
+  LOG_DEBUG("连接断开，当前连接数: {}/{}", current_connections_.load(),
+            server_config_.max_connections);
 }
 
 int MQTTServer::start()
@@ -72,8 +85,8 @@ int MQTTServer::start()
   }
 
   running_ = true;
-  LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", 
-           host_, port_, server_config_.max_connections, server_config_.backlog);
+  LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", host_, port_,
+           server_config_.max_connections, server_config_.backlog);
   return MQ_SUCCESS;
 }
 
@@ -170,7 +183,7 @@ void* MQTTServer::accept_routine(void* arg)
         std::to_string(client->get_peer_port());  // Use IP and port for client ID
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     MQTTAllocator* client_allocator = root->create_child(
-        client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, 1024 * 1024);  // 1MB limit
+        client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, server->memory_config_.client_max_size);
     if (MQ_ISNULL(client_allocator)) {
       LOG_ERROR("Failed to create client allocator");
       if (MQ_NOT_NULL(client)) {
@@ -179,10 +192,10 @@ void* MQTTServer::accept_routine(void* arg)
       }
       continue;
     }
-    
+
     // 增加连接计数
     server->add_connection();
-    
+
     LOG_INFO("Accepted new connection from {}:{}", client->get_peer_addr(),
              client->get_peer_port());
 

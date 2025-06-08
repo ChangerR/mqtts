@@ -57,6 +57,7 @@ add_executable(mqtts
 	src/mqtt_socket.cpp 
 	src/mqtt_server.cpp
 	src/mqtt_protocol_handler.cpp
+	src/logger.cpp
 )
 
 target_link_libraries(mqtts 

@@ -1,8 +1,14 @@
 #pragma once
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 #include "singleton.h"
+
+// 前向声明
+namespace mqtt {
+struct LogConfig;
+}
 
 class Logger
 {
@@ -15,6 +21,21 @@ class Logger
   }
 
   ~Logger() { log_ = nullptr; }
+
+  /**
+   * @brief 根据配置初始化日志系统
+   * @param config 日志配置
+   * @return 0成功，非0失败
+   */
+  int configure(const mqtt::LogConfig& config);
+
+ private:
+  /**
+   * @brief 将字符串转换为spdlog日志级别
+   * @param level_str 日志级别字符串
+   * @return spdlog日志级别
+   */
+  spdlog::level::level_enum string_to_level(const std::string& level_str);
 
  public:
   std::shared_ptr<spdlog::logger> log_;

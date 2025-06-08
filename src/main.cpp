@@ -1,17 +1,17 @@
 #include <unistd.h>
+#include <fstream>
 #include <iostream>
 #include <thread>
-#include <fstream>
 #include "logger.h"
-#include "mqtt_server.h"
 #include "mqtt_config.h"
+#include "mqtt_server.h"
 
 static MQTTServer* g_server = nullptr;
 static std::thread g_server_thread;
 
 void server_thread_func(const mqtt::Config& config)
 {
-  g_server = new MQTTServer(config.server);
+  g_server = new MQTTServer(config.server, config.memory);
   if (!g_server) {
     LOG_ERROR("Failed to create MQTT server");
     return;
@@ -40,12 +40,14 @@ void server_thread_func(const mqtt::Config& config)
   LOG_INFO("MQTT server thread stopped");
 }
 
-bool file_exists(const std::string& filename) {
+bool file_exists(const std::string& filename)
+{
   std::ifstream file(filename);
   return file.good();
 }
 
-void print_usage(const char* program_name) {
+void print_usage(const char* program_name)
+{
   std::cout << "用法: " << program_name << " [选项]\n";
   std::cout << "选项:\n";
   std::cout << "  -c <config_file>  指定配置文件路径 (默认: mqtts.yaml)\n";
@@ -88,7 +90,7 @@ int main(int argc, char* argv[])
 
   // 加载配置文件
   mqtt::ConfigManager config_manager;
-  
+
   // 检查配置文件是否存在
   if (!file_exists(config_file)) {
     LOG_ERROR("配置文件不存在: {}", config_file);
@@ -105,13 +107,20 @@ int main(int argc, char* argv[])
 
   // 获取配置
   mqtt::Config config = config_manager.get_config();
-  
+
+  // 配置日志系统
+  int log_ret = SingletonLogger::instance().configure(config.log);
+  if (log_ret != 0) {
+    std::cerr << "日志系统配置失败" << std::endl;
+    return 1;
+  }
+
   // 应用命令行覆盖
   if (!override_ip.empty()) {
     config.server.bind_address = override_ip;
     LOG_INFO("使用命令行覆盖绑定地址: {}", override_ip);
   }
-  
+
   if (override_port > 0) {
     config.server.port = static_cast<uint16_t>(override_port);
     LOG_INFO("使用命令行覆盖监听端口: {}", override_port);
@@ -124,7 +133,7 @@ int main(int argc, char* argv[])
   LOG_INFO("  最大连接数: {}", config.server.max_connections);
   LOG_INFO("  最大包大小: {} bytes", config.mqtt.max_packet_size);
   LOG_INFO("  保活时间: {} seconds", config.mqtt.keep_alive_default);
-  LOG_INFO("  内存池大小: {} MB", config.memory.initial_pool_size / (1024 * 1024));
+  LOG_INFO("  客户端内存大小: {} MB", config.memory.client_max_size / (1024 * 1024));
 
   // 在独立线程中启动服务器
   g_server_thread = std::thread(server_thread_func, std::cref(config));

@@ -73,7 +73,6 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
     LOG_ERROR("CONNECT packet too short");
     return MQ_ERR_PACKET_INCOMPLETE;
   }
-  LOG_HEXDUMP(buffer, length);
 
   ConnectPacket* connect =
       new (allocator_->allocate(sizeof(ConnectPacket))) ConnectPacket(allocator_);
@@ -1724,7 +1723,8 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
   }
 
   if (!properties.content_type.empty()) {
-    properties_total_length += 1 + 2 + properties.content_type.length();  // PropertyType + length + content
+    properties_total_length +=
+        1 + 2 + properties.content_type.length();  // PropertyType + length + content
   }
 
   if (!properties.response_topic.empty()) {
@@ -1810,7 +1810,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
   }
 
   for (const MQTTStringPair& prop : properties.user_properties) {
-    properties_total_length += 1;  // PropertyType
+    properties_total_length += 1;                         // PropertyType
     properties_total_length += 2 + prop.first.length();   // key length + key
     properties_total_length += 2 + prop.second.length();  // value length + value
   }
@@ -1840,48 +1840,62 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
   // 第二遍：直接序列化所有属性到目标buffer
   if (properties.payload_format_indicator != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::PayloadFormatIndicator));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.payload_format_indicator);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.message_expiry_interval != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MessageExpiryInterval));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.message_expiry_interval >> 24) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.message_expiry_interval >> 16) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.message_expiry_interval >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.message_expiry_interval & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.content_type.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ContentType));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.content_type, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.response_topic.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseTopic));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.response_topic, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.correlation_data.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::CorrelationData));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_binary_data(properties.correlation_data, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.subscription_identifier != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifier));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     uint32_t value = properties.subscription_identifier;
     // 变长整数序列化
     do {
@@ -1890,183 +1904,240 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
       if (value != 0)
         byte |= 0x80;
       ret = buffer.push_back(byte);
-      if (ret != 0) return ret;
+      if (ret != 0)
+        return ret;
     } while (value != 0);
   }
 
   if (properties.session_expiry_interval != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SessionExpiryInterval));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.session_expiry_interval >> 24) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.session_expiry_interval >> 16) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.session_expiry_interval >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.session_expiry_interval & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.assigned_client_identifier.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AssignedClientIdentifier));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.assigned_client_identifier, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.server_keep_alive != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerKeepAlive));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.server_keep_alive >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.server_keep_alive & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.authentication_method.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationMethod));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.authentication_method, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.authentication_data.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationData));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_binary_data(properties.authentication_data, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.request_problem_information) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestProblemInformation));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(1);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.will_delay_interval != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WillDelayInterval));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.will_delay_interval >> 24) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.will_delay_interval >> 16) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.will_delay_interval >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.will_delay_interval & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.request_response_information) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestResponseInformation));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(1);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.response_information.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseInformation));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.response_information, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.server_reference.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerReference));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.server_reference, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.reason_string.empty()) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReasonString));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(properties.reason_string, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.receive_maximum != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReceiveMaximum));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.receive_maximum >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.receive_maximum & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.topic_alias_maximum != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAliasMaximum));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.topic_alias_maximum >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.topic_alias_maximum & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.topic_alias != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAlias));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.topic_alias >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.topic_alias & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.maximum_qos != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumQoS));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.maximum_qos);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.retain_available) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RetainAvailable));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(0);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   for (const MQTTStringPair& prop : properties.user_properties) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::UserProperty));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(prop.first, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = serialize_mqtt_string(prop.second, buffer);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (properties.maximum_packet_size != 0) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumPacketSize));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.maximum_packet_size >> 24) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.maximum_packet_size >> 16) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back((properties.maximum_packet_size >> 8) & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(properties.maximum_packet_size & 0xFF);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.wildcard_subscription_available) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WildcardSubscriptionAvailable));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(0);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.subscription_identifier_available) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifierAvailable));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(0);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   if (!properties.shared_subscription_available) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SharedSubscriptionAvailable));
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
     ret = buffer.push_back(0);
-    if (ret != 0) return ret;
+    if (ret != 0)
+      return ret;
   }
 
   return MQ_SUCCESS;
@@ -2188,7 +2259,8 @@ int MQTTParser::parse_unsubscribe(const uint8_t* buffer, size_t length, Unsubscr
 
   // Parse properties
   size_t properties_bytes_read = 0;
-  ret = parse_properties(buffer + pos, length - pos, unsubscribe->properties, properties_bytes_read);
+  ret =
+      parse_properties(buffer + pos, length - pos, unsubscribe->properties, properties_bytes_read);
   if (ret != 0) {
     LOG_ERROR("Failed to parse properties");
     unsubscribe->~UnsubscribePacket();
