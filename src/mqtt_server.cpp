@@ -7,13 +7,42 @@
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
-    : accept_co_(NULL), server_socket_(NULL), running_(false), host_(host), port_(port)
+    : accept_co_(NULL), server_socket_(NULL), running_(false), host_(host), port_(port), current_connections_(0)
+{
+  // 使用默认配置
+  server_config_.bind_address = host;
+  server_config_.port = static_cast<uint16_t>(port);
+  server_config_.max_connections = 1000;
+  server_config_.backlog = 128;
+}
+
+MQTTServer::MQTTServer(const mqtt::ServerConfig& config)
+    : accept_co_(NULL), server_socket_(NULL), running_(false), 
+      host_(config.bind_address), port_(config.port), 
+      server_config_(config), current_connections_(0)
 {
 }
 
 MQTTServer::~MQTTServer()
 {
   stop();
+}
+
+bool MQTTServer::can_accept_connection() const
+{
+  return current_connections_.load() < server_config_.max_connections;
+}
+
+void MQTTServer::add_connection()
+{
+  current_connections_.fetch_add(1);
+  LOG_DEBUG("新连接建立，当前连接数: {}/{}", current_connections_.load(), server_config_.max_connections);
+}
+
+void MQTTServer::remove_connection()
+{
+  current_connections_.fetch_sub(1);
+  LOG_DEBUG("连接断开，当前连接数: {}/{}", current_connections_.load(), server_config_.max_connections);
 }
 
 int MQTTServer::start()
@@ -30,8 +59,8 @@ int MQTTServer::start()
     return MQ_ERR_SOCKET;
   }
 
-  // Start listening
-  if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true))) {
+  // Start listening - 使用配置中的backlog参数
+  if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true, server_config_.backlog))) {
     LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     if (MQ_NOT_NULL(server_socket_)) {
@@ -43,7 +72,8 @@ int MQTTServer::start()
   }
 
   running_ = true;
-  LOG_INFO("MQTT Server initialized on {}:{}", host_, port_);
+  LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", 
+           host_, port_, server_config_.max_connections, server_config_.backlog);
   return MQ_SUCCESS;
 }
 
@@ -101,6 +131,17 @@ void* MQTTServer::accept_routine(void* arg)
 
   LOG_INFO("Accept routine started, running: {}", server->running_);
   while (server->running_ && MQ_SUCC(ret)) {
+    // 检查连接数限制
+    if (!server->can_accept_connection()) {
+      LOG_WARN("达到最大连接数限制 ({}), 等待连接释放", server->server_config_.max_connections);
+      // 等待一段时间后继续检查
+      struct pollfd pf = {0};
+      pf.fd = server->server_socket_->get_fd();
+      pf.events = (POLLIN | POLLERR | POLLHUP);
+      co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 1秒超时
+      continue;
+    }
+
     // Use co_poll to wait for new connection
     struct pollfd pf = {0};
     pf.fd = server->server_socket_->get_fd();
@@ -138,6 +179,10 @@ void* MQTTServer::accept_routine(void* arg)
       }
       continue;
     }
+    
+    // 增加连接计数
+    server->add_connection();
+    
     LOG_INFO("Accepted new connection from {}:{}", client->get_peer_addr(),
              client->get_peer_port());
 
@@ -146,6 +191,7 @@ void* MQTTServer::accept_routine(void* arg)
     if (MQ_ISNULL(ctx_mem)) {
       LOG_ERROR("Failed to allocate client context");
       root->remove_child(client_id);
+      server->remove_connection();  // 减少连接计数
       if (MQ_NOT_NULL(client)) {
         client->~MQTTSocket();  // Call destructor explicitly
         root->deallocate(client, sizeof(MQTTSocket));
@@ -186,6 +232,9 @@ void* MQTTServer::client_routine(void* arg)
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     root->deallocate(client, sizeof(MQTTSocket));
   }
+
+  // 减少连接计数
+  ctx->server->remove_connection();
 
   // Cleanup client allocator and context
   if (MQ_NOT_NULL(ctx->allocator)) {

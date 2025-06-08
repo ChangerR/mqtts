@@ -3,7 +3,7 @@
 server:
   bind_address: "0.0.0.0"  # 绑定地址
   port: 1883  # 监听端口
-  max_connections: 1000  # 最大连接数
+  max_connections: 10000  # 最大连接数
   backlog: 128  # socket backlog
 
 # MQTT协议配置
@@ -21,12 +21,7 @@ mqtt:
 
 # 内存配置
 memory:
-  initial_pool_size: 67108864  # 初始内存池大小(字节)
-  max_pool_size: 536870912  # 最大内存池大小(字节)
-  block_size: 4096  # 内存块大小(字节)
-  use_tcmalloc: true  # 使用tcmalloc
-  buffer_initial_size: 1024  # 缓冲区初始大小(字节)
-  buffer_max_size: 1048576  # 缓冲区最大大小(字节)
+  client_max_size: 1048576  # 客户端最大内存大小(字节)
 
 # 日志配置
 log:

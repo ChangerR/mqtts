@@ -17,7 +17,7 @@
 
 int co_accept(int fd, struct sockaddr* addr, socklen_t* len);
 
-int MQTTSocket::listen(const char* ip, int port, bool reuse)
+int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
 {
   int ret = MQ_SUCCESS;
   struct sockaddr_in addr;
@@ -52,7 +52,7 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse)
   }
 
   if (MQ_SUCC(ret)) {
-    sock_ret = ::listen(fd_, 1024);
+    sock_ret = ::listen(fd_, backlog);
     if (sock_ret != 0) {
       LOG_ERROR("Failed to listen on socket - {}", strerror(errno));
       ret = MQ_ERR_SOCKET_LISTEN;
@@ -62,7 +62,7 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse)
 
   if (MQ_SUCC(ret)) {
     co_enable_hook_sys();
-    LOG_INFO("Socket listening on {}:{}", ip, port);
+    LOG_INFO("Socket listening on {}:{} (backlog: {})", ip, port, backlog);
   }
 
   return ret;

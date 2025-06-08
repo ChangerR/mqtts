@@ -37,6 +37,8 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
       return parse_publish(buffer, length, reinterpret_cast<PublishPacket**>(packet));
     case PacketType::SUBSCRIBE:
       return parse_subscribe(buffer, length, reinterpret_cast<SubscribePacket**>(packet));
+    case PacketType::UNSUBSCRIBE:
+      return parse_unsubscribe(buffer, length, reinterpret_cast<UnsubscribePacket**>(packet));
     case PacketType::CONNACK:
       return parse_connack(buffer, length, reinterpret_cast<ConnAckPacket**>(packet));
     case PacketType::PUBACK:
@@ -2134,6 +2136,83 @@ int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSeria
       return ret;
   }
 
+  return MQ_SUCCESS;
+}
+
+int MQTTParser::parse_unsubscribe(const uint8_t* buffer, size_t length, UnsubscribePacket** packet)
+{
+  if (length < 5) {  // Minimum UNSUBSCRIBE packet size
+    LOG_ERROR("UNSUBSCRIBE packet too short");
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  UnsubscribePacket* unsubscribe =
+      new (allocator_->allocate(sizeof(UnsubscribePacket))) UnsubscribePacket(allocator_);
+  if (!unsubscribe) {
+    LOG_ERROR("Failed to allocate UNSUBSCRIBE packet");
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+
+  size_t pos = 0;
+  unsubscribe->type = PacketType::UNSUBSCRIBE;
+
+  // Skip packet type
+  pos++;
+
+  // Parse remaining length
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret =
+      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    LOG_ERROR("Failed to parse remaining length");
+    unsubscribe->~UnsubscribePacket();
+    allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
+
+  // 记录header + remaining length的总大小
+  size_t header_size = pos;
+  size_t payload_end = header_size + remaining_length;
+
+  // Parse packet ID
+  if (pos + 2 > length) {
+    LOG_ERROR("Packet too short for packet ID");
+    unsubscribe->~UnsubscribePacket();
+    allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+  unsubscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
+
+  // Parse properties
+  size_t properties_bytes_read = 0;
+  ret = parse_properties(buffer + pos, length - pos, unsubscribe->properties, properties_bytes_read);
+  if (ret != 0) {
+    LOG_ERROR("Failed to parse properties");
+    unsubscribe->~UnsubscribePacket();
+    allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += properties_bytes_read;
+
+  // Parse topic filters
+  while (pos < payload_end) {
+    MQTTString topic_filter{MQTTStrAllocator(allocator_)};
+    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, pos);
+    if (ret != 0) {
+      LOG_ERROR("Failed to parse topic filter");
+      unsubscribe->~UnsubscribePacket();
+      allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+      return MQ_ERR_PACKET_INVALID;
+    }
+
+    // 直接添加到topic_filters
+    unsubscribe->topic_filters.push_back(std::move(topic_filter));
+  }
+
+  *packet = unsubscribe;
   return MQ_SUCCESS;
 }
 

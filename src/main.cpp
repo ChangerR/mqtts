@@ -11,7 +11,7 @@ static std::thread g_server_thread;
 
 void server_thread_func(const mqtt::Config& config)
 {
-  g_server = new MQTTServer(config.server.bind_address.c_str(), config.server.port);
+  g_server = new MQTTServer(config.server);
   if (!g_server) {
     LOG_ERROR("Failed to create MQTT server");
     return;
