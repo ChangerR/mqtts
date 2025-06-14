@@ -5,6 +5,10 @@ project(mqtts)
 # Enable compilation database for ccls
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 设置静态链接
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+set(BUILD_SHARED_LIBS OFF)
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
 endif()
@@ -36,19 +40,22 @@ add_library(mqtt_parser STATIC
     src/mqtt_allocator.cpp
     src/mqtt_serialize_buffer.cpp
     src/mqtt_config.cpp
+    src/mqtt_session_manager.cpp
 )
 
-# 查找yaml-cpp库
+# 查找yaml-cpp库的静态版本
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(YAML_CPP REQUIRED yaml-cpp)
+pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
 
 target_include_directories(mqtt_parser PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${YAML_CPP_INCLUDE_DIRS}
 )
 
+# 使用yaml-cpp的静态库
 target_link_libraries(mqtt_parser 
-    ${YAML_CPP_LIBRARIES}
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
 )
 
 # 添加主程序
@@ -60,12 +67,13 @@ add_executable(mqtts
 	src/logger.cpp
 )
 
+# 静态链接所有库
 target_link_libraries(mqtts 
-	colib_static 
-	pthread 
-	dl 
-	tcmalloc_minimal
+    colib_static 
     mqtt_parser
+    tcmalloc_minimal
+    pthread 
+    dl
 )
 
 # 添加测试目录
