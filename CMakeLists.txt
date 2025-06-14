@@ -2,11 +2,36 @@ cmake_minimum_required(VERSION 3.22)
 
 project(mqtts)
 
+# 获取Git信息
+find_package(Git REQUIRED)
+execute_process(
+	COMMAND ${GIT_EXECUTABLE} describe --tags --always
+	OUTPUT_VARIABLE GIT_TAG
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+	COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+	OUTPUT_VARIABLE GIT_HASH
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# 获取构建时间
+string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")
+
+# 配置版本头文件
+configure_file(
+	${CMAKE_SOURCE_DIR}/src/version.h.in
+	${CMAKE_BINARY_DIR}/generated/version.h
+	@ONLY
+)
+
+# 添加生成的头文件目录
+include_directories(${CMAKE_BINARY_DIR}/generated)
+
 # Enable compilation database for ccls
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 设置静态链接
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
 set(BUILD_SHARED_LIBS OFF)
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
@@ -30,7 +55,7 @@ set(GPERFTOOLS_BUILD_SHARED OFF CACHE BOOL "Build shared libraries")
 set(GPERFTOOLS_BUILD_TCMALLOC ON CACHE BOOL "Build tcmalloc")
 set(GPERFTOOLS_BUILD_TCMALLOC_MINIMAL ON CACHE BOOL "Build tcmalloc minimal")
 set(gperftools_build_minimal ON CACHE BOOL "Build gperftools minimal")
-
+set(GPERFTOOLS_BUILD_TESTING OFF CACHE BOOL "Build gperftools testing")
 add_subdirectory(3rd/gperftools)
 add_subdirectory(3rd EXCLUDE_FROM_ALL)
 
@@ -56,6 +81,7 @@ target_include_directories(mqtt_parser PUBLIC
 target_link_libraries(mqtt_parser 
     -Wl,-Bstatic
     ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
 )
 
 # 添加主程序
