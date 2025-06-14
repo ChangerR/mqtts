@@ -5,6 +5,7 @@ server:
   port: 1883  # 监听端口
   max_connections: 10000  # 最大连接数
   backlog: 128  # socket backlog
+  thread_count: 2  # 线程数
 
 # MQTT协议配置
 mqtt:
@@ -27,6 +28,6 @@ memory:
 log:
   level: "info"  # 日志级别: trace, debug, info, warn, error, critical
   file_path: "logs/mqtt.log"  # 日志文件路径，空字符串输出到控制台
-  max_file_size: 104857600  # 日志文件最大大小(字节)
+  max_file_size: 10485760  # 日志文件最大大小(字节)
   max_files: 10  # 最大日志文件数量
   flush_immediately: false  # 立即刷新 

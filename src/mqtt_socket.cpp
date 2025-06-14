@@ -110,6 +110,7 @@ int MQTTSocket::accept(MQTTSocket*& client)
       new (client) MQTTSocket(fd);
       client->connected_ = true;
       client->update_peer_info();
+      client->set_nonblocking(true);
       LOG_DEBUG("Accepted new connection from {}:{}", client->get_peer_addr(),
                 client->get_peer_port());
       break;
@@ -149,7 +150,7 @@ int MQTTSocket::send(const uint8_t* buf, int len)
   } else {
     int total_sent = 0;
     while (total_sent < len && MQ_SUCC(ret)) {
-      int sent = ::write(fd_, buf + total_sent, len - total_sent);
+      int sent = ::send(fd_, buf + total_sent, len - total_sent, MSG_NOSIGNAL);
       if (sent < 0) {
         if (errno == EINTR)
           continue;
@@ -181,8 +182,8 @@ int MQTTSocket::recv(char* buf, int& len)
     LOG_ERROR("Socket not connected");
     ret = MQ_ERR_SOCKET;
   } else {
-    while (MQ_SUCC(ret)) {
-      int received = ::read(fd_, buf, len);
+    while (MQ_SUCC(ret) && connected_) {
+      int received = ::recv(fd_, buf, len, MSG_NOSIGNAL);
       if (received < 0) {
         if (errno == EINTR) {
           continue;
@@ -191,7 +192,7 @@ int MQTTSocket::recv(char* buf, int& len)
           struct pollfd pf = {0};
           pf.fd = fd_;
           pf.events = (POLLIN | POLLERR | POLLHUP);
-          co_poll(co_get_epoll_ct(), &pf, 1, -1);  // Wait indefinitely
+          co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // Wait indefinitely
           continue;
         } else {
           LOG_ERROR("Failed to receive data - {}", strerror(errno));

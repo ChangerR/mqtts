@@ -1,6 +1,7 @@
 #include "logger.h"
 #include <iostream>
 #include "mqtt_config.h"
+#include "version.h"
 
 int Logger::configure(const mqtt::LogConfig& config)
 {
@@ -45,16 +46,23 @@ int Logger::configure(const mqtt::LogConfig& config)
     // 设置为默认logger
     spdlog::set_default_logger(log_);
 
-    std::cout << "日志系统配置完成: 级别=" << config.level;
-    std::cout << ", 控制台输出=是";
+    // 打印版本信息
+    LOG_INFO("MQTTS启动\n{}", get_version_string());
+
+    std::string file_info;
     if (!config.file_path.empty()) {
-      std::cout << ", 文件=" << config.file_path
-                << ", 最大大小=" << config.max_file_size / (1024 * 1024) << "MB"
-                << ", 最大文件数=" << config.max_files;
+      file_info = fmt::format(", 文件={}, 最大大小={}MB, 最大文件数={}", 
+                            config.file_path,
+                            config.max_file_size / (1024 * 1024),
+                            config.max_files);
     } else {
-      std::cout << ", 文件输出=否";
+      file_info = ", 文件输出=否";
     }
-    std::cout << ", 立即刷新=" << (config.flush_immediately ? "是" : "否") << std::endl;
+
+    LOG_INFO("日志系统配置完成: 级别={}, 控制台输出=是{}, 立即刷新={}",
+             config.level,
+             file_info,
+             config.flush_immediately ? "是" : "否");
 
     return 0;
   } catch (const std::exception& e) {

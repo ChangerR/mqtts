@@ -104,6 +104,11 @@ void MQTTServer::run()
   LOG_INFO("MQTT Server running on {}:{}", host_, port_);
 
   co_eventloop(co_get_epoll_ct(), 0, 0);
+
+  if (MQ_NOT_NULL(accept_co_)) {
+    co_release(accept_co_);
+    accept_co_ = NULL;
+  }
 }
 
 void MQTTServer::stop()
@@ -114,11 +119,6 @@ void MQTTServer::stop()
 
   LOG_INFO("Stopping MQTT Server on {}:{}", host_, port_);
   running_ = false;
-
-  if (MQ_NOT_NULL(accept_co_)) {
-    co_release(accept_co_);
-    accept_co_ = NULL;
-  }
 
   if (MQ_NOT_NULL(server_socket_)) {
     server_socket_->close();
@@ -160,7 +160,6 @@ void* MQTTServer::accept_routine(void* arg)
     pf.fd = server->server_socket_->get_fd();
     pf.events = (POLLIN | POLLERR | POLLHUP);
     co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 100ms timeout
-
     // Check if socket is still valid
     if (!server->server_socket_->is_connected()) {
       LOG_WARN("Server socket disconnected");

@@ -50,7 +50,7 @@ class MQTTServer
  private:
   stCoRoutine_t* accept_co_;
   MQTTSocket* server_socket_;
-  bool running_;
+  mutable bool running_;
   std::string host_;
   int port_;
 

@@ -20,6 +20,7 @@ struct ServerConfig
   uint16_t port = 1883;                  // 监听端口
   int max_connections = 1000;            // 最大连接数
   int backlog = 128;                     // socket backlog
+  int thread_count = 1;                  // 线程数
 };
 
 /**

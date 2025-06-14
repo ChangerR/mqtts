@@ -5,37 +5,38 @@
 #include "logger.h"
 #include "mqtt_config.h"
 #include "mqtt_server.h"
+#include "version.h"
 
-static MQTTServer* g_server = nullptr;
-static std::thread g_server_thread;
-
-void server_thread_func(const mqtt::Config& config)
+void run_mqtt_server(const mqtt::Config& config)
 {
-  g_server = new MQTTServer(config.server, config.memory);
-  if (!g_server) {
-    LOG_ERROR("Failed to create MQTT server");
-    return;
-  }
+  std::vector<std::thread> threads;
+  
+  MQTTServer server(config.server, config.memory);
 
   LOG_INFO("Starting MQTT server on {}:{}", config.server.bind_address, config.server.port);
 
-  int ret = g_server->start();
+  int ret = server.start();
   if (ret != MQ_SUCCESS) {
     LOG_ERROR("Failed to start MQTT server, error code: {}", ret);
-    delete g_server;
-    g_server = nullptr;
     return;
   }
-
-  // Start running the server
-  g_server->run();
-
-  // Cleanup
-  if (g_server) {
-    g_server->stop();
-    delete g_server;
-    g_server = nullptr;
+ 
+  if (config.server.thread_count > 1) {
+    for (int i = 0; i < config.server.thread_count; i++) {
+      threads.push_back(std::thread([&] {
+        LOG_INFO("MQTT server thread started");
+        server.run();
+        LOG_INFO("MQTT server thread stopped");
+      }));
+    }
+  } else {
+    server.run();
   }
+  
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  server.stop();
 
   LOG_INFO("MQTT server thread stopped");
 }
@@ -46,21 +47,33 @@ bool file_exists(const std::string& filename)
   return file.good();
 }
 
-void print_usage(const char* program_name)
+void print_usage(const char* program)
 {
-  std::cout << "用法: " << program_name << " [选项]\n";
-  std::cout << "选项:\n";
-  std::cout << "  -c <config_file>  指定配置文件路径 (默认: mqtts.yaml)\n";
-  std::cout << "  -i <bind_address> 绑定地址 (覆盖配置文件)\n";
-  std::cout << "  -p <port>         监听端口 (覆盖配置文件)\n";
-  std::cout << "  -h                显示此帮助信息\n";
-  std::cout << "\n示例:\n";
-  std::cout << "  " << program_name << " -c /etc/mqtts.yaml\n";
-  std::cout << "  " << program_name << " -i 127.0.0.1 -p 8883\n";
+  std::cout << "用法: " << program << " [选项] <配置文件>\n"
+            << "选项:\n"
+            << "  -h, --help     显示帮助信息\n"
+            << "  -v, --version  显示版本信息\n";
 }
 
 int main(int argc, char* argv[])
 {
+  if (argc < 2) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
+  // 解析命令行参数
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help") {
+      print_usage(argv[0]);
+      return 0;
+    } else if (arg == "-v" || arg == "--version") {
+      std::cout << get_version_string() << std::endl;
+      return 0;
+    }
+  }
+
   // 默认配置
   std::string config_file = "mqtts.yaml";
   std::string override_ip;
@@ -131,15 +144,12 @@ int main(int argc, char* argv[])
   LOG_INFO("  服务器地址: {}", config.server.bind_address);
   LOG_INFO("  监听端口: {}", config.server.port);
   LOG_INFO("  最大连接数: {}", config.server.max_connections);
+  LOG_INFO("  线程数: {}", config.server.thread_count);
   LOG_INFO("  最大包大小: {} bytes", config.mqtt.max_packet_size);
   LOG_INFO("  保活时间: {} seconds", config.mqtt.keep_alive_default);
   LOG_INFO("  客户端内存大小: {} MB", config.memory.client_max_size / (1024 * 1024));
 
-  // 在独立线程中启动服务器
-  g_server_thread = std::thread(server_thread_func, std::cref(config));
-
-  // 等待服务器线程结束
-  g_server_thread.join();
+  run_mqtt_server(config);
 
   LOG_INFO("MQTT服务器已停止");
   return 0;

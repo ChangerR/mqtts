@@ -62,6 +62,11 @@ int ConfigManager::validate() const
     return -1;
   }
 
+  if (config_.server.thread_count <= 0) {
+    LOG_ERROR("无效的线程数: {}", config_.server.thread_count);
+    return -1;
+  }
+
   // 验证MQTT配置
   if (config_.mqtt.max_packet_size == 0) {
     LOG_ERROR("最大包大小不能为0");
@@ -97,6 +102,10 @@ void ConfigManager::parse_server_config(const YAML::Node& node)
 
   if (node["backlog"]) {
     config_.server.backlog = node["backlog"].as<int>();
+  }
+
+  if (node["thread_count"]) {
+    config_.server.thread_count = node["thread_count"].as<int>();
   }
 }
 

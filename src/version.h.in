@@ -1,0 +1,19 @@
+#pragma once
+
+#define MQTTS_VERSION "@GIT_TAG@"
+#define MQTTS_GIT_HASH "@GIT_HASH@"
+#define MQTTS_BUILD_TIME "@BUILD_TIME@"
+
+// 获取完整的版本信息字符串
+inline const char* get_version_string() {
+    static const char version[] = 
+        "版本: " MQTTS_VERSION "\n"
+        "Git Hash: " MQTTS_GIT_HASH "\n"
+        "构建时间: " MQTTS_BUILD_TIME;
+    return version;
+}
+
+// 获取简短版本号
+inline const char* get_short_version() {
+    return MQTTS_VERSION;
+} 

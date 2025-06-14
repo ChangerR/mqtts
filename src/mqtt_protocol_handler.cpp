@@ -80,6 +80,8 @@ int MQTTProtocolHandler::process()
     // Read packet data
     ret = read_packet();
     if (ret != 0) {
+      LOG_ERROR("Failed to read packet from client {}:{}, error: {}", client_ip_.c_str(),
+                client_port_, mqtt_error_string(ret));
       break;
     }
 
@@ -160,7 +162,7 @@ int MQTTProtocolHandler::read_packet()
 
   pf.fd = socket_->get_fd();
   pf.events = (POLLIN | POLLERR | POLLHUP);
-  co_poll(co_get_epoll_ct(), &pf, 1, 100);  // 100ms timeout
+  co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 100ms timeout
 
   // Try to receive data
   int len = bytes_needed_;
