@@ -5,9 +5,11 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 #include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_message_queue.h"
@@ -15,11 +17,14 @@
 #include "mqtt_session_info.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
+#include "mqtt_send_worker_pool.h"
 
 namespace mqtt {
 
 // 前向声明
 class MQTTProtocolHandler;
+struct SessionInfo;
+class SafeHandlerRef;
 
 /**
  * @brief 线程本地会话管理器，管理单个线程下的所有Handler
@@ -94,6 +99,19 @@ class ThreadLocalSessionManager
    */
   int cleanup_invalid_handlers();
 
+  /**
+   * @brief 配置Worker池
+   * @param worker_count Worker数量
+   * @param max_queue_size 每个Worker最大队列长度
+   * @return 0成功，非0失败
+   */
+  int configure_worker_pool(size_t worker_count = 4, size_t max_queue_size = 1000);
+
+  /**
+   * @brief 获取Worker池统计信息
+   */
+  SendWorkerPool::Statistics get_worker_statistics() const;
+
  private:
   std::thread::id thread_id_;
   mutable CoroMutex sessions_mutex_;
@@ -105,6 +123,9 @@ class ThreadLocalSessionManager
 
   CoroCondition new_message_cond_;
   std::atomic<bool> has_new_messages_;
+
+  // 发送Worker池
+  std::unique_ptr<SendWorkerPool> worker_pool_;
 
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
   void safe_remove_session(const std::string& client_id, SessionInfo* info);

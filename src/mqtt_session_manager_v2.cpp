@@ -23,10 +23,21 @@ ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id)
 {
   LOG_INFO("ThreadLocalSessionManager created for thread: {}",
            std::hash<std::thread::id>{}(thread_id_));
+  
+  // 创建默认的Worker池（4个Worker）
+  worker_pool_.reset(new SendWorkerPool(4, 1000));
+  worker_pool_->set_session_manager(this);
+  worker_pool_->start();
 }
 
 ThreadLocalSessionManager::~ThreadLocalSessionManager()
 {
+  // 首先停止Worker池
+  if (worker_pool_) {
+    worker_pool_->stop();
+    worker_pool_.reset();
+  }
+
   CoroLockGuard sessions_lock(&sessions_mutex_);
   std::lock_guard<std::mutex> queue_lock(queue_mutex_);
 
@@ -176,7 +187,73 @@ int ThreadLocalSessionManager::process_pending_messages(int max_process_count, i
 
 int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_count)
 {
-  return internal_process_messages(max_process_count);
+  if (!worker_pool_ || !worker_pool_->is_running()) {
+    LOG_WARN("Worker pool not available, falling back to direct processing");
+    return internal_process_messages(max_process_count);
+  }
+
+  if (max_process_count < 0) {
+    max_process_count = 0;  // 0表示处理所有
+  }
+
+  int dispatched_count = 0;
+
+  while (dispatched_count != max_process_count) {
+    PendingMessage message(PublishPacket{}, MQTTString(), MQTTString());
+    bool has_message = false;
+
+    // 从队列中取出一个消息
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (!pending_messages_.empty()) {
+        message = pending_messages_.front();
+        pending_messages_.pop();
+        has_message = true;
+
+        // 如果队列空了，重置新消息标志
+        if (pending_messages_.empty()) {
+          has_new_messages_.store(false);
+        }
+      }
+    }
+
+    if (!has_message) {
+      break;  // 队列为空
+    }
+
+    // 创建Worker任务并提交给Worker池
+    WorkerSendTask task(message.packet, message.target_client_id, message.sender_client_id);
+    
+    int submit_result = worker_pool_->submit_task(task);
+    if (submit_result == MQ_SUCCESS) {
+      dispatched_count++;
+      LOG_DEBUG("Message dispatched to worker pool for client: {}", 
+                from_mqtt_string(message.target_client_id));
+    } else {
+      LOG_WARN("Failed to dispatch message to worker pool for client: {}, error: {}", 
+               from_mqtt_string(message.target_client_id), submit_result);
+      
+      // Worker池满了或出错，将消息放回队列头部
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::queue<PendingMessage> temp_queue;
+        temp_queue.push(message);
+        while (!pending_messages_.empty()) {
+          temp_queue.push(pending_messages_.front());
+          pending_messages_.pop();
+        }
+        pending_messages_ = std::move(temp_queue);
+        has_new_messages_.store(true);
+      }
+      break;
+    }
+  }
+
+  if (dispatched_count > 0) {
+    LOG_DEBUG("Dispatched {} messages to worker pool in thread", dispatched_count);
+  }
+
+  return dispatched_count;
 }
 
 bool ThreadLocalSessionManager::wait_for_new_message(int timeout_ms)
@@ -328,6 +405,37 @@ int ThreadLocalSessionManager::cleanup_invalid_handlers()
   }
 
   return cleaned_count;
+}
+
+int ThreadLocalSessionManager::configure_worker_pool(size_t worker_count, size_t max_queue_size)
+{
+  if (worker_pool_ && worker_pool_->is_running()) {
+    worker_pool_->stop();
+  }
+  
+  worker_pool_.reset(new SendWorkerPool(worker_count, max_queue_size));
+  worker_pool_->set_session_manager(this);
+  
+  int result = worker_pool_->start();
+  if (result != MQ_SUCCESS) {
+    LOG_ERROR("Failed to start worker pool: {}", result);
+    worker_pool_.reset();
+    return result;
+  }
+  
+  LOG_INFO("Worker pool configured with {} workers, max queue size: {}", 
+           worker_count, max_queue_size);
+  return MQ_SUCCESS;
+}
+
+SendWorkerPool::Statistics ThreadLocalSessionManager::get_worker_statistics() const
+{
+  if (worker_pool_) {
+    return worker_pool_->get_statistics();
+  }
+  
+  SendWorkerPool::Statistics empty_stats = {};
+  return empty_stats;
 }
 
 bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) const
@@ -761,3 +869,4 @@ bool GlobalSessionManager::match_topic_filter(const MQTTString& topic,
 }
 
 }  // namespace mqtt
+
