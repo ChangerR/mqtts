@@ -51,17 +51,13 @@ int Logger::configure(const mqtt::LogConfig& config)
 
     std::string file_info;
     if (!config.file_path.empty()) {
-      file_info = fmt::format(", 文件={}, 最大大小={}MB, 最大文件数={}", 
-                            config.file_path,
-                            config.max_file_size / (1024 * 1024),
-                            config.max_files);
+      file_info = fmt::format(", 文件={}, 最大大小={}MB, 最大文件数={}", config.file_path,
+                              config.max_file_size / (1024 * 1024), config.max_files);
     } else {
       file_info = ", 文件输出=否";
     }
 
-    LOG_INFO("日志系统配置完成: 级别={}, 控制台输出=是{}, 立即刷新={}",
-             config.level,
-             file_info,
+    LOG_INFO("日志系统配置完成: 级别={}, 控制台输出=是{}, 立即刷新={}", config.level, file_info,
              config.flush_immediately ? "是" : "否");
 
     return 0;

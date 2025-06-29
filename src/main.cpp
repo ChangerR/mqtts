@@ -10,7 +10,7 @@
 void run_mqtt_server(const mqtt::Config& config)
 {
   std::vector<std::thread> threads;
-  
+
   MQTTServer server(config.server, config.memory);
 
   LOG_INFO("Starting MQTT server on {}:{}", config.server.bind_address, config.server.port);
@@ -20,7 +20,7 @@ void run_mqtt_server(const mqtt::Config& config)
     LOG_ERROR("Failed to start MQTT server, error code: {}", ret);
     return;
   }
- 
+
   if (config.server.thread_count > 1) {
     for (int i = 0; i < config.server.thread_count; i++) {
       threads.push_back(std::thread([&] {
@@ -32,7 +32,7 @@ void run_mqtt_server(const mqtt::Config& config)
   } else {
     server.run();
   }
-  
+
   for (auto& thread : threads) {
     thread.join();
   }

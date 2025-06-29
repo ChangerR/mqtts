@@ -65,7 +65,8 @@ add_library(mqtt_parser STATIC
     src/mqtt_allocator.cpp
     src/mqtt_serialize_buffer.cpp
     src/mqtt_config.cpp
-    src/mqtt_session_manager.cpp
+    src/mqtt_session_manager_v2.cpp
+	src/mqtt_session_info.cpp
 )
 
 # 查找yaml-cpp库的静态版本

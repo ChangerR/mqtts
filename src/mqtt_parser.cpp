@@ -564,8 +564,8 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
   // 解析属性长度
   uint32_t properties_length;
   size_t properties_length_bytes;
-  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, 
-                                   properties_length, properties_length_bytes);
+  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, properties_length,
+                                   properties_length_bytes);
   if (ret != 0) {
     suback->~SubAckPacket();
     allocator_->deallocate(suback, sizeof(SubAckPacket));
@@ -583,8 +583,8 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
   // 解析属性
   if (properties_length > 0) {
     size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + bytes_read, properties_length, 
-                           suback->properties, properties_bytes_read);
+    ret = parse_properties(buffer + bytes_read, properties_length, suback->properties,
+                           properties_bytes_read);
     if (ret != 0) {
       suback->~SubAckPacket();
       allocator_->deallocate(suback, sizeof(SubAckPacket));
@@ -621,7 +621,8 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
     return MQ_ERR_PACKET_INVALID;
   }
 
-  UnsubAckPacket* unsuback = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
+  UnsubAckPacket* unsuback =
+      new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
   unsuback->type = PacketType::UNSUBACK;
 
   size_t bytes_read = 0;
@@ -633,8 +634,8 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
   // 解析属性长度
   uint32_t properties_length;
   size_t properties_length_bytes;
-  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, 
-                                   properties_length, properties_length_bytes);
+  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, properties_length,
+                                   properties_length_bytes);
   if (ret != 0) {
     unsuback->~UnsubAckPacket();
     allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
@@ -652,8 +653,8 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
   // 解析属性
   if (properties_length > 0) {
     size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + bytes_read, properties_length, 
-                           unsuback->properties, properties_bytes_read);
+    ret = parse_properties(buffer + bytes_read, properties_length, unsuback->properties,
+                           properties_bytes_read);
     if (ret != 0) {
       unsuback->~UnsubAckPacket();
       allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
@@ -1506,8 +1507,9 @@ int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer
 
   // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
   uint32_t remaining_length = 2;  // 包ID
-  remaining_length += static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
-  remaining_length += packet->reason_codes.size();  // 原因码列表
+  remaining_length +=
+      static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+  remaining_length += packet->reason_codes.size();      // 原因码列表
 
   // 序列化剩余长度
   ret = serialize_remaining_length(remaining_length, buffer);
@@ -1554,8 +1556,9 @@ int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBu
 
   // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
   uint32_t remaining_length = 2;  // 包ID
-  remaining_length += static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
-  remaining_length += packet->reason_codes.size();  // 原因码列表
+  remaining_length +=
+      static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+  remaining_length += packet->reason_codes.size();      // 原因码列表
 
   // 序列化剩余长度
   ret = serialize_remaining_length(remaining_length, buffer);

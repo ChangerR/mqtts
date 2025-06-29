@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
+#include <chrono>
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_define.h"
@@ -13,6 +15,7 @@
 #include "mqtt_serialize_buffer.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_coroutine_utils.h"
 
 namespace mqtt {
 
@@ -74,6 +77,9 @@ class MQTTProtocolHandler
   int read_packet();
   int parse_packet();
 
+  // 统一的协程安全写入函数，timeout_ms控制锁等待时间
+  int send_data_with_lock(const char* data, size_t size, int timeout_ms = 5000);
+
   // Packet reading state
   enum class ReadState {
     READ_HEADER,     // Reading packet type
@@ -118,6 +124,10 @@ class MQTTProtocolHandler
   bool request_problem_information_;
 
   MQTTSerializeBuffer* serialize_buffer_;  // 复用的序列化缓冲区
+  
+  // 写入锁状态和条件变量，支持超时等待
+  mutable std::atomic<bool> write_lock_acquired_;
+  mutable CoroCondition write_lock_condition_;
 };
 
 }  // namespace mqtt

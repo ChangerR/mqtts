@@ -26,7 +26,8 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       header_size_(0),
       client_id_(MQTTStrAllocator(allocator)),
       client_ip_(MQTTStrAllocator(allocator)),
-      subscriptions_(MQTTSTLAllocator<MQTTString>(allocator))
+      subscriptions_(MQTTSTLAllocator<MQTTString>(allocator)),
+      write_lock_acquired_(false)
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -728,6 +729,62 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
   return send_suback(packet->packet_id, reason_codes);
 }
 
+int MQTTProtocolHandler::send_data_with_lock(const char* data, size_t size, int timeout_ms)
+{
+  if (!socket_ || !data || size == 0) {
+    LOG_ERROR("Invalid parameters for send_data_with_lock: socket={}, data={}, size={}",
+              socket_ ? "valid" : "null", data ? "valid" : "null", size);
+    return MQ_ERR_INVALID_ARGS;
+  }
+
+  // 尝试在超时时间内获取写入锁
+  auto start_time = std::chrono::steady_clock::now();
+  
+  while (true) {
+    // 尝试获取锁
+    bool expected = false;
+    if (write_lock_acquired_.compare_exchange_weak(expected, true)) {
+      // 成功获取锁，执行发送操作
+      int result = socket_->send(reinterpret_cast<const uint8_t*>(data), static_cast<int>(size));
+      
+      // 释放锁并通知等待的协程
+      write_lock_acquired_.store(false);
+      write_lock_condition_.broadcast();
+      
+      if (result != 0) {
+        LOG_ERROR("Failed to send data to client {}:{}, error: {}", 
+                  client_ip_.c_str(), client_port_, result);
+      } else {
+        LOG_DEBUG("Successfully sent {} bytes to client {}:{}", 
+                  size, client_ip_.c_str(), client_port_);
+      }
+      
+      return result;
+    }
+    
+    // 锁被占用，检查是否超时
+    if (timeout_ms > 0) {
+      std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+      int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+      
+      if (elapsed >= timeout_ms) {
+        LOG_WARN("Failed to acquire write lock within {}ms for client {}:{}", 
+                 timeout_ms, client_ip_.c_str(), client_port_);
+        return MQ_ERR_TIMEOUT;
+      }
+      
+      // 等待锁释放信号，剩余时间
+      int remaining_time = timeout_ms - static_cast<int>(elapsed);
+      if (remaining_time > 0) {
+        write_lock_condition_.wait(std::min(remaining_time, 100)); // 最多等待100ms
+      }
+    } else {
+      // 无超时限制，等待锁释放信号
+      write_lock_condition_.wait(100); // 每100ms检查一次
+    }
+  }
+}
+
 int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_present)
 {
   LOG_DEBUG("Sending CONNACK to client {}:{} (reason: 0x{:02x}, session_present: {})",
@@ -760,8 +817,8 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   if (ret != 0) {
     LOG_ERROR("Failed to send CONNACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -797,8 +854,8 @@ int MQTTProtocolHandler::send_pubrec(uint16_t packet_id, ReasonCode reason_code)
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubRecPacket));
   return ret;
 }
@@ -826,8 +883,8 @@ int MQTTProtocolHandler::send_pubrel(uint16_t packet_id, ReasonCode reason_code)
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubRelPacket));
   return ret;
 }
@@ -855,8 +912,8 @@ int MQTTProtocolHandler::send_pubcomp(uint16_t packet_id, ReasonCode reason_code
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubCompPacket));
   return ret;
 }
@@ -890,8 +947,8 @@ int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   packet->~UnsubAckPacket();
   allocator_->deallocate(packet, sizeof(UnsubAckPacket));
   return ret;
@@ -920,8 +977,8 @@ int MQTTProtocolHandler::send_disconnect(ReasonCode reason_code)
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(DisconnectPacket));
   return ret;
 }
@@ -948,8 +1005,8 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(AuthPacket));
   return ret;
 }
@@ -993,8 +1050,8 @@ int MQTTProtocolHandler::send_suback(uint16_t packet_id,
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   packet->~SubAckPacket();
   allocator_->deallocate(packet, sizeof(SubAckPacket));
   return ret;
@@ -1032,8 +1089,8 @@ int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   if (ret != 0) {
     LOG_ERROR("Failed to send PUBACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -1067,8 +1124,8 @@ int MQTTProtocolHandler::send_pingresp()
     return ret;
   }
 
-  // 发送数据
-  ret = socket_->send(serialize_buffer_->data(), static_cast<int>(serialize_buffer_->size()));
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PingRespPacket));
   return ret;
 }

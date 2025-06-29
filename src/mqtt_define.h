@@ -55,6 +55,10 @@
 #define MQ_ERR_SESSION_ALREADY_CONNECTED -602
 #define MQ_ERR_SESSION_EXPIRED -603
 
+// 通用错误
+#define MQ_ERR_INVALID_ARGS -700
+#define MQ_ERR_TIMEOUT -701
+
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
 
@@ -170,6 +174,12 @@ static inline const char* mqtt_error_string(int error_code)
       return "Already connected";
     case MQ_ERR_SESSION_EXPIRED:
       return "Session expired";
+
+    // 通用错误
+    case MQ_ERR_INVALID_ARGS:
+      return "Invalid arguments";
+    case MQ_ERR_TIMEOUT:
+      return "Operation timeout";
 
     default:
       return "Unknown error";
