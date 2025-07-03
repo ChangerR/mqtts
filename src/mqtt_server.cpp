@@ -4,6 +4,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_memory_tags.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_session_manager_v2.h"
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
@@ -268,6 +269,10 @@ void MQTTServer::handle_client(ClientContext* ctx)
 
   // Initialize handler
   handler->init(ctx->client, ctx->client_ip, ctx->client_port);
+
+  // Set session manager reference
+  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+  handler->set_session_manager(&session_manager);
 
   // Process packets until client disconnects
   int ret = handler->process();

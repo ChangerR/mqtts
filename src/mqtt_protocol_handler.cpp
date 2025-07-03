@@ -1,7 +1,12 @@
 #include "mqtt_protocol_handler.h"
+#include <arpa/inet.h>
 #include <cstring>
-#include "co_routine.h"
+#include <unistd.h>
 #include "logger.h"
+#include "mqtt_coroutine_utils.h"
+#include "mqtt_memory_tags.h"
+#include "mqtt_session_manager_v2.h"
+#include "co_routine.h"
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
 #include "mqtt_socket.h"
@@ -11,12 +16,7 @@ static const size_t INITIAL_BUFFER_SIZE = 1024;
 static const size_t MAX_BUFFER_SIZE = 1024 * 1024;  // 1MB max size
 
 MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
-    : allocator_(allocator),
-      socket_(nullptr),
-      client_port_(0),
-      connected_(false),
-      next_packet_id_(1),
-      buffer_(nullptr),
+    : buffer_(nullptr),
       current_buffer_size_(0),
       bytes_read_(0),
       bytes_needed_(1),
@@ -24,10 +24,25 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       packet_type_(0),
       remaining_length_(0),
       header_size_(0),
-      client_id_(MQTTStrAllocator(allocator)),
+      socket_(nullptr),
       client_ip_(MQTTStrAllocator(allocator)),
-      subscriptions_(MQTTSTLAllocator<MQTTString>(allocator)),
-      write_lock_acquired_(false)
+      client_port_(0),
+      client_id_(MQTTStrAllocator(allocator)),
+      connected_(false),
+      next_packet_id_(1),
+      subscriptions_(MQTTStrAllocator(allocator)),
+      allocator_(allocator),
+      parser_(nullptr),
+      session_expiry_interval_(0),
+      receive_maximum_(65535),
+      maximum_packet_size_(268435455),
+      topic_alias_maximum_(0),
+      request_response_information_(false),
+      request_problem_information_(true),
+      serialize_buffer_(nullptr),
+      write_lock_acquired_(false),
+      write_lock_condition_(),
+      session_manager_(nullptr)
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -47,6 +62,18 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
 
 MQTTProtocolHandler::~MQTTProtocolHandler()
 {
+  // Unregister from session manager if still connected
+  if (connected_ && session_manager_ && !client_id_.empty()) {
+    int ret = session_manager_->unregister_session(client_id_);
+    if (ret != 0) {
+      LOG_WARN("Failed to unregister session for client {} in destructor, error: {}", 
+               from_mqtt_string(client_id_), ret);
+    } else {
+      LOG_DEBUG("Client {} unregistered from session manager in destructor", 
+                from_mqtt_string(client_id_));
+    }
+  }
+
   if (buffer_) {
     allocator_->deallocate(buffer_, current_buffer_size_);
   }
@@ -446,6 +473,21 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   LOG_DEBUG("Client {}:{} connected successfully with client_id: {}", client_ip_.c_str(),
             client_port_, from_mqtt_string(client_id_));
 
+  // Register this handler with the session manager
+  if (session_manager_) {
+    int ret = session_manager_->register_session(client_id_, this);
+    if (ret != 0) {
+      LOG_ERROR("Failed to register session for client {}, error: {}", 
+                from_mqtt_string(client_id_), ret);
+      connected_ = false;
+      return MQ_ERR_SESSION_REGISTER;
+    }
+    LOG_INFO("Client {} successfully registered with session manager", 
+             from_mqtt_string(client_id_));
+  } else {
+    LOG_WARN("Session manager not available for client {}", from_mqtt_string(client_id_));
+  }
+
   // Send CONNACK
   return send_connack(ReasonCode::Success, true);
 }
@@ -658,6 +700,18 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
     LOG_ERROR("Received DISCONNECT but client {}:{} not connected", client_ip_.c_str(),
               client_port_);
     return MQ_ERR_SESSION_NOT_CONNECTED;
+  }
+
+  // Unregister from session manager before marking as disconnected
+  if (session_manager_ && !client_id_.empty()) {
+    int ret = session_manager_->unregister_session(client_id_);
+    if (ret != 0) {
+      LOG_WARN("Failed to unregister session for client {}, error: {}", 
+               from_mqtt_string(client_id_), ret);
+    } else {
+      LOG_INFO("Client {} successfully unregistered from session manager", 
+               from_mqtt_string(client_id_));
+    }
   }
 
   // 处理断开连接
