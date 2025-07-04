@@ -63,16 +63,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
 MQTTProtocolHandler::~MQTTProtocolHandler()
 {
   // Final cleanup - unregister from session manager if still connected (failsafe)
-  if (connected_ && session_manager_ && !client_id_.empty()) {
-    int ret = session_manager_->unregister_session(client_id_);
-    if (ret != 0) {
-      LOG_WARN("Failed to unregister session for client {} in destructor, error: {}", 
-               from_mqtt_string(client_id_), ret);
-    } else {
-      LOG_DEBUG("Client {} unregistered from session manager in destructor", 
-                from_mqtt_string(client_id_));
-    }
-  }
+  cleanup_session_registration("in destructor");
 
   if (buffer_) {
     allocator_->deallocate(buffer_, current_buffer_size_);
@@ -144,17 +135,7 @@ int MQTTProtocolHandler::process()
   }
 
   // Cleanup session registration when process() exits (for any reason: socket disconnect, error, etc.)
-  if (connected_ && session_manager_ && !client_id_.empty()) {
-    int session_ret = session_manager_->unregister_session(client_id_);
-    if (session_ret != 0) {
-      LOG_WARN("Failed to unregister session for client {} on process exit, error: {}", 
-               from_mqtt_string(client_id_), session_ret);
-    } else {
-      LOG_DEBUG("Client {} unregistered from session manager on process exit", 
-                from_mqtt_string(client_id_));
-    }
-    connected_ = false;  // Mark as disconnected
-  }
+  cleanup_session_registration("on process exit");
 
   return ret;
 }
@@ -716,19 +697,7 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
   }
 
   // Unregister from session manager before marking as disconnected
-  if (session_manager_ && !client_id_.empty()) {
-    int ret = session_manager_->unregister_session(client_id_);
-    if (ret != 0) {
-      LOG_WARN("Failed to unregister session for client {}, error: {}", 
-               from_mqtt_string(client_id_), ret);
-    } else {
-      LOG_INFO("Client {} successfully unregistered from session manager", 
-               from_mqtt_string(client_id_));
-    }
-  }
-
-  // Mark as disconnected to prevent double unregistration in process()
-  connected_ = false;
+  cleanup_session_registration("on DISCONNECT packet");
   LOG_INFO("Client {}:{} disconnected with reason code: 0x{:02x}", client_ip_.c_str(), client_port_,
            static_cast<uint8_t>(packet->reason_code));
 
@@ -1195,6 +1164,21 @@ int MQTTProtocolHandler::send_pingresp()
   ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PingRespPacket));
   return ret;
+}
+
+void MQTTProtocolHandler::cleanup_session_registration(const char* context)
+{
+  if (connected_ && session_manager_ && !client_id_.empty()) {
+    int ret = session_manager_->unregister_session(client_id_);
+    if (ret != 0) {
+      LOG_WARN("Failed to unregister session for client {} {}, error: {}", 
+               from_mqtt_string(client_id_), context ? context : "", ret);
+    } else {
+      LOG_DEBUG("Client {} unregistered from session manager {}", 
+                from_mqtt_string(client_id_), context ? context : "");
+    }
+    connected_ = false;
+  }
 }
 
 }  // namespace mqtt

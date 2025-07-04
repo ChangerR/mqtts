@@ -138,6 +138,9 @@ class MQTTProtocolHandler
 
   // Session manager
   GlobalSessionManager* session_manager_;
+
+  // Helper method to unregister from session manager
+  void cleanup_session_registration(const char* context = nullptr);
 };
 
 }  // namespace mqtt
