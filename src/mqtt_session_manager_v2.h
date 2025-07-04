@@ -60,6 +60,16 @@ class ThreadLocalSessionManager
   void enqueue_message(const PendingMessage& message);
 
   /**
+   * @brief 将共享消息内容加入待发送队列（优化版本）
+   */
+  void enqueue_shared_message(const SharedPublishContentPtr& content, const MQTTString& target_client_id);
+
+  /**
+   * @brief 批量将共享消息内容加入待发送队列（批量优化版本）
+   */
+  void enqueue_shared_messages(const SharedPublishContentPtr& content, const std::vector<MQTTString>& target_client_ids);
+
+  /**
    * @brief 处理待发送队列中的消息（协程友好的阻塞等待）
    */
   int process_pending_messages(int max_process_count = 0, int timeout_ms = -1);
@@ -112,6 +122,13 @@ class ThreadLocalSessionManager
    */
   SendWorkerPool::Statistics get_worker_statistics() const;
 
+  /**
+   * @brief 为指定客户端生成新的packet_id
+   * @param client_id 客户端ID
+   * @return 新的packet_id，如果失败返回0
+   */
+  uint16_t generate_packet_id(const MQTTString& client_id);
+
  private:
   std::thread::id thread_id_;
   mutable CoroMutex sessions_mutex_;
@@ -127,9 +144,14 @@ class ThreadLocalSessionManager
   // 发送Worker池
   std::unique_ptr<SendWorkerPool> worker_pool_;
 
+  // Packet ID管理（每个客户端独立的ID空间）
+  mutable std::mutex packet_id_mutex_;
+  std::unordered_map<std::string, uint16_t> client_packet_ids_;
+
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
   void safe_remove_session(const std::string& client_id, SessionInfo* info);
   int internal_process_messages(int max_process_count);
+  uint16_t get_next_packet_id(const std::string& client_id);
 };
 
 /**
@@ -193,10 +215,25 @@ class GlobalSessionManager
                       const MQTTString& sender_client_id);
 
   /**
+   * @brief 转发PUBLISH消息到指定客户端（使用共享内容，内存优化版本）
+   */
+  int forward_publish_shared(const MQTTString& target_client_id, const SharedPublishContentPtr& content);
+
+  /**
    * @brief 转发PUBLISH消息到订阅指定主题的所有客户端
    */
   int forward_publish_by_topic(const MQTTString& topic, const PublishPacket& packet,
                                const MQTTString& sender_client_id);
+
+  /**
+   * @brief 转发PUBLISH消息到订阅指定主题的所有客户端（使用共享内容，内存优化版本）
+   */
+  int forward_publish_by_topic_shared(const MQTTString& topic, const SharedPublishContentPtr& content);
+
+  /**
+   * @brief 获取或创建共享消息内容
+   */
+  SharedPublishContentPtr get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id);
 
   /**
    * @brief 获取所有活跃会话的数量
@@ -223,6 +260,16 @@ class GlobalSessionManager
    */
   int cleanup_all_invalid_sessions();
 
+  /**
+   * @brief 清理过期的消息内容缓存
+   */
+  void cleanup_message_cache(int max_age_seconds = 300);
+
+  /**
+   * @brief 获取消息缓存统计信息
+   */
+  size_t get_message_cache_size() const;
+
  private:
   // 运行状态
   enum class ManagerState {
@@ -242,6 +289,9 @@ class GlobalSessionManager
   mutable RWMutex client_index_mutex_;  // 读写锁
   std::unordered_map<std::string, ThreadLocalSessionManager*>
       client_to_manager_;  // 直接存储管理器指针
+
+  // 消息内容缓存管理器
+  std::unique_ptr<MessageContentCache> message_cache_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;
@@ -265,6 +315,11 @@ class GlobalSessionManager
    * @brief 移除客户端索引（写操作，使用写锁）
    */
   void remove_client_index(const std::string& client_id);
+
+  /**
+   * @brief 批量转发消息到多个客户端（内部优化方法）
+   */
+  int batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedPublishContentPtr& content);
 };
 
 // 单例访问
