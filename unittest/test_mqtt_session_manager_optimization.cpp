@@ -6,8 +6,8 @@
 #include <thread>
 
 // 包含优化后的头文件
-#include "mqtt_message_queue.h"
-#include "mqtt_packet.h"
+#include "../src/mqtt_message_queue.h"
+#include "../src/mqtt_packet.h"
 
 using namespace mqtt;
 
