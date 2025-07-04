@@ -4,6 +4,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_memory_tags.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_session_manager_v2.h"
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
@@ -103,7 +104,8 @@ void MQTTServer::run()
 
   LOG_INFO("MQTT Server running on {}:{}", host_, port_);
 
-  co_eventloop(co_get_epoll_ct(), 0, 0);
+  // Use eventloop with callback for pending message processing
+  co_eventloop(co_get_epoll_ct(), eventloop_callback, this);
 
   if (MQ_NOT_NULL(accept_co_)) {
     co_release(accept_co_);
@@ -269,6 +271,10 @@ void MQTTServer::handle_client(ClientContext* ctx)
   // Initialize handler
   handler->init(ctx->client, ctx->client_ip, ctx->client_port);
 
+  // Set session manager reference
+  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+  handler->set_session_manager(&session_manager);
+
   // Process packets until client disconnects
   int ret = handler->process();
   if (ret != 0) {
@@ -278,4 +284,28 @@ void MQTTServer::handle_client(ClientContext* ctx)
   // Cleanup
   handler->~MQTTProtocolHandler();
   ctx->allocator->deallocate(handler, sizeof(MQTTProtocolHandler));
+}
+
+int MQTTServer::eventloop_callback(void* arg)
+{
+  MQTTServer* server = (MQTTServer*)arg;
+  
+  // Only process if server is still running
+  if (!server->running_) {
+    return 0;
+  }
+
+  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+  
+  // Get current thread's session manager
+  mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
+  if (local_manager) {
+    // Process pending messages without blocking (process up to 50 messages per callback)
+    int processed = local_manager->process_pending_messages_nowait(50);
+    if (processed > 0) {
+      LOG_DEBUG("Processed {} pending messages in eventloop callback", processed);
+    }
+  }
+
+  return 0; // Continue eventloop
 }

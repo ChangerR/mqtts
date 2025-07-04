@@ -19,6 +19,9 @@
 
 namespace mqtt {
 
+// 前向声明
+class GlobalSessionManager;
+
 class MQTTProtocolHandler
 {
  public:
@@ -30,6 +33,10 @@ class MQTTProtocolHandler
 
   // Main processing loop
   int process();
+
+  // Session manager integration
+  void set_session_manager(GlobalSessionManager* session_manager) { session_manager_ = session_manager; }
+  GlobalSessionManager* get_session_manager() const { return session_manager_; }
 
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
@@ -128,6 +135,15 @@ class MQTTProtocolHandler
   // 写入锁状态和条件变量，支持超时等待
   mutable std::atomic<bool> write_lock_acquired_;
   mutable CoroCondition write_lock_condition_;
+
+  // Session manager
+  GlobalSessionManager* session_manager_;
+
+  // Helper method to unregister from session manager
+  void cleanup_session_registration(const char* context = nullptr);
+
+  // Helper method to register with session manager
+  int register_session_with_manager();
 };
 
 }  // namespace mqtt

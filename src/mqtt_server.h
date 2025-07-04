@@ -47,6 +47,9 @@ class MQTTServer
   static void* client_routine(void* arg);
   static void handle_client(ClientContext* ctx);
 
+  // Event loop callback for pending message processing
+  static int eventloop_callback(void* arg);
+
  private:
   stCoRoutine_t* accept_co_;
   MQTTSocket* server_socket_;

@@ -54,6 +54,7 @@
 #define MQ_ERR_SESSION_NOT_CONNECTED -601
 #define MQ_ERR_SESSION_ALREADY_CONNECTED -602
 #define MQ_ERR_SESSION_EXPIRED -603
+#define MQ_ERR_SESSION_REGISTER -604
 
 // 通用错误
 #define MQ_ERR_INVALID_ARGS -700
@@ -76,7 +77,7 @@
 #define MQ_IS_ERR_PUBLISH(code) (code <= MQ_ERR_PUBLISH && code > MQ_ERR_PUBLISH_RETAIN)
 #define MQ_IS_ERR_SUBSCRIBE(code) \
   (code <= MQ_ERR_SUBSCRIBE && code > MQ_ERR_SUBSCRIBE_NOT_AUTHORIZED)
-#define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_EXPIRED)
+#define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_REGISTER)
 
 // Error code to string conversion
 static inline const char* mqtt_error_string(int error_code)
@@ -174,6 +175,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Already connected";
     case MQ_ERR_SESSION_EXPIRED:
       return "Session expired";
+    case MQ_ERR_SESSION_REGISTER:
+      return "Failed to register session";
 
     // 通用错误
     case MQ_ERR_INVALID_ARGS:
