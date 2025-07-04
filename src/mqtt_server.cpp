@@ -9,6 +9,7 @@ using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
     : accept_co_(NULL),
+      message_processor_co_(NULL),
       server_socket_(NULL),
       running_(false),
       host_(host),
@@ -25,6 +26,7 @@ MQTTServer::MQTTServer(const std::string& host, int port)
 
 MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config)
     : accept_co_(NULL),
+      message_processor_co_(NULL),
       server_socket_(NULL),
       running_(false),
       host_(config.bind_address),
@@ -102,6 +104,10 @@ void MQTTServer::run()
   co_create(&accept_co_, NULL, accept_routine, this);
   co_resume(accept_co_);
 
+  // Create message processor coroutine
+  co_create(&message_processor_co_, NULL, message_processor_routine, this);
+  co_resume(message_processor_co_);
+
   LOG_INFO("MQTT Server running on {}:{}", host_, port_);
 
   co_eventloop(co_get_epoll_ct(), 0, 0);
@@ -109,6 +115,11 @@ void MQTTServer::run()
   if (MQ_NOT_NULL(accept_co_)) {
     co_release(accept_co_);
     accept_co_ = NULL;
+  }
+
+  if (MQ_NOT_NULL(message_processor_co_)) {
+    co_release(message_processor_co_);
+    message_processor_co_ = NULL;
   }
 }
 
@@ -283,4 +294,33 @@ void MQTTServer::handle_client(ClientContext* ctx)
   // Cleanup
   handler->~MQTTProtocolHandler();
   ctx->allocator->deallocate(handler, sizeof(MQTTProtocolHandler));
+}
+
+void* MQTTServer::message_processor_routine(void* arg)
+{
+  MQTTServer* server = (MQTTServer*)arg;
+  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+
+  LOG_INFO("Message processor routine started");
+
+  while (server->running_) {
+    // Get current thread's session manager
+    mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
+    if (local_manager) {
+      // Process pending messages with a small timeout to avoid blocking too long
+      int processed = local_manager->process_pending_messages_nowait(100);  // Process up to 100 messages
+      if (processed > 0) {
+        LOG_DEBUG("Processed {} pending messages", processed);
+      }
+    }
+
+    // Sleep for a short time before checking again (协程友好的延时)
+    struct pollfd pf = {0};
+    pf.fd = -1;  // No file descriptor, just for timing
+    pf.events = 0;
+    co_poll(co_get_epoll_ct(), &pf, 1, 10);  // 10ms delay
+  }
+
+  LOG_INFO("Message processor routine stopped");
+  return NULL;
 }

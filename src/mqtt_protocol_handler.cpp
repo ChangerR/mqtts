@@ -468,18 +468,10 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
             client_port_, from_mqtt_string(client_id_));
 
   // Register this handler with the session manager
-  if (session_manager_) {
-    int ret = session_manager_->register_session(client_id_, this);
-    if (ret != 0) {
-      LOG_ERROR("Failed to register session for client {}, error: {}", 
-                from_mqtt_string(client_id_), ret);
-      connected_ = false;
-      return MQ_ERR_SESSION_REGISTER;
-    }
-    LOG_INFO("Client {} successfully registered with session manager", 
-             from_mqtt_string(client_id_));
-  } else {
-    LOG_WARN("Session manager not available for client {}", from_mqtt_string(client_id_));
+  int ret = register_session_with_manager();
+  if (ret != 0) {
+    connected_ = false;
+    return ret;
   }
 
   // Send CONNACK
@@ -1179,6 +1171,30 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
     }
     connected_ = false;
   }
+}
+
+int MQTTProtocolHandler::register_session_with_manager()
+{
+  if (!session_manager_) {
+    LOG_WARN("Session manager not available for client {}", from_mqtt_string(client_id_));
+    return MQ_SUCCESS; // Not an error, just no session manager
+  }
+
+  if (client_id_.empty()) {
+    LOG_ERROR("Cannot register session: client ID is empty");
+    return MQ_ERR_CONNECT_CLIENT_ID;
+  }
+
+  int ret = session_manager_->register_session(client_id_, this);
+  if (ret != 0) {
+    LOG_ERROR("Failed to register session for client {}, error: {}", 
+              from_mqtt_string(client_id_), ret);
+    return MQ_ERR_SESSION_REGISTER;
+  }
+
+  LOG_INFO("Client {} successfully registered with session manager", 
+           from_mqtt_string(client_id_));
+  return MQ_SUCCESS;
 }
 
 }  // namespace mqtt

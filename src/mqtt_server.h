@@ -47,8 +47,12 @@ class MQTTServer
   static void* client_routine(void* arg);
   static void handle_client(ClientContext* ctx);
 
+  // Pending message processing
+  static void* message_processor_routine(void* arg);
+
  private:
   stCoRoutine_t* accept_co_;
+  stCoRoutine_t* message_processor_co_;
   MQTTSocket* server_socket_;
   mutable bool running_;
   std::string host_;
