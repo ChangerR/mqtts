@@ -8,19 +8,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(test_connect test_connect.cpp)
 add_executable(test_mqtt_allocator test_mqtt_allocator.cpp)
 add_executable(test_mqtt_parser test_mqtt_parser.cpp)
+add_executable(test_mqtt_topic_tree test_mqtt_topic_tree.cpp)
 
 # 添加头文件搜索路径
 target_include_directories(test_connect PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(test_mqtt_allocator PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(test_mqtt_parser PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(test_mqtt_topic_tree PRIVATE ${CMAKE_SOURCE_DIR})
 
 # 链接必要的库
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal)
 target_link_libraries(test_mqtt_allocator PRIVATE mqtt_parser tcmalloc_minimal)
 target_link_libraries(test_mqtt_parser PRIVATE mqtt_parser tcmalloc_minimal)
+target_link_libraries(test_mqtt_topic_tree PRIVATE mqtt_parser tcmalloc_minimal pthread)
 
 # 启用测试
 enable_testing()
 add_test(NAME test_connect COMMAND test_connect)
 add_test(NAME test_mqtt_allocator COMMAND test_mqtt_allocator)
-add_test(NAME test_mqtt_parser COMMAND test_mqtt_parser) 
+add_test(NAME test_mqtt_parser COMMAND test_mqtt_parser)
+add_test(NAME test_mqtt_topic_tree COMMAND test_mqtt_topic_tree) 
