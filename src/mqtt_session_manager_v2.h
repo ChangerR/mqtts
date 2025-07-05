@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include "mqtt_allocator.h"
+#include "mqtt_session_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_message_queue.h"
 #include "mqtt_parser.h"
@@ -126,14 +127,56 @@ class ThreadLocalSessionManager
    */
   SendWorkerPool::Statistics get_worker_statistics() const;
 
+  /**
+   * @brief 获取当前线程管理器的内存使用情况
+   * @param memory_usage 输出参数，内存使用量（字节）
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int get_memory_usage(size_t& memory_usage) const;
+
+  /**
+   * @brief 检查内存使用是否超过限制
+   * @param limit_exceeded 输出参数，true表示超过限制
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int is_memory_limit_exceeded(bool& limit_exceeded) const;
+
+  /**
+   * @brief 设置内存限制
+   * @param limit 内存限制（字节），0表示无限制
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int set_memory_limit(size_t limit);
+
+  /**
+   * @brief 获取内存分配器统计信息
+   * @param stats 输出参数，包含各种分配器统计信息的结构
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  struct MemoryStats {
+    size_t total_usage;
+    size_t session_usage;
+    size_t queue_usage;
+    size_t worker_usage;
+    size_t limit;
+    bool limit_exceeded;
+  };
+  int get_memory_statistics(MemoryStats& stats) const;
+
  private:
   std::thread::id thread_id_;
   mutable CoroMutex sessions_mutex_;
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>> sessions_;
+  
+  // 使用Session分配器的容器
+  MQTTAllocator* session_allocator_;
+  MQTTAllocator* queue_allocator_;
+  MQTTAllocator* worker_allocator_;
+  
+  SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>> sessions_;
 
   // 消息队列需要支持多线程访问（其他线程会向此队列写入消息）
   mutable std::mutex queue_mutex_;
-  std::queue<PendingMessage> pending_messages_;
+  SessionQueue<PendingMessage> pending_messages_;
 
   CoroCondition new_message_cond_;
   std::atomic<bool> has_new_messages_;
@@ -144,6 +187,12 @@ class ThreadLocalSessionManager
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
   void safe_remove_session(const std::string& client_id, SessionInfo* info);
   int internal_process_messages(int max_process_count);
+  
+  // 内存管理相关方法
+  void initialize_allocators();
+  void cleanup_allocators();
+  size_t get_memory_usage() const;
+  bool check_memory_limit() const;
 };
 
 /**
@@ -315,6 +364,50 @@ class GlobalSessionManager
    */
   size_t get_message_cache_size() const;
 
+  /**
+   * @brief 获取全局内存使用统计
+   * @param memory_usage 输出参数，内存使用量（字节）
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int get_global_memory_usage(size_t& memory_usage) const;
+
+  /**
+   * @brief 获取所有客户端的内存使用情况
+   * @param client_usage 输出参数，客户端ID到内存使用量的映射
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int get_client_memory_usage(std::unordered_map<std::string, size_t>& client_usage) const;
+
+  /**
+   * @brief 设置客户端内存限制
+   * @param client_id 客户端ID
+   * @param limit 内存限制（字节），0表示无限制
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int set_client_memory_limit(const MQTTString& client_id, size_t limit);
+
+  /**
+   * @brief 检查客户端内存使用是否超过限制
+   * @param client_id 客户端ID
+   * @param limit_exceeded 输出参数，true表示超过限制
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int is_client_memory_limit_exceeded(const MQTTString& client_id, bool& limit_exceeded);
+
+  /**
+   * @brief 获取内存分配器层次结构信息
+   * @param hierarchy 输出参数，分配器层次结构的字符串表示
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int get_allocator_hierarchy(std::string& hierarchy) const;
+
+  /**
+   * @brief 清理所有过期的内存分配器
+   * @param cleaned_count 输出参数，清理的分配器数量
+   * @return 错误码，MQ_SUCCESS表示成功
+   */
+  int cleanup_expired_allocators(int& cleaned_count);
+
  private:
   // 运行状态
   enum class ManagerState {
@@ -343,6 +436,11 @@ class GlobalSessionManager
 
   // 线程本地缓存（避免重复查找）
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;
+
+  // 全局内存管理
+  MQTTAllocator* global_allocator_;
+  std::unordered_map<std::string, size_t> client_memory_limits_;
+  mutable std::mutex memory_limits_mutex_;
 
   /**
    * @brief 内部快速查找客户端管理器（无锁版本）

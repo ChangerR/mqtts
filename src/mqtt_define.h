@@ -56,12 +56,22 @@
 #define MQ_ERR_SESSION_EXPIRED -603
 #define MQ_ERR_SESSION_REGISTER -604
 
+// MQTT Allocator error codes (-700 to -799)
+#define MQ_ERR_ALLOCATOR -700
+#define MQ_ERR_ALLOCATOR_CREATE -701
+#define MQ_ERR_ALLOCATOR_NOT_FOUND -702
+#define MQ_ERR_ALLOCATOR_CLEANUP -703
+#define MQ_ERR_ALLOCATOR_LIMIT_EXCEEDED -704
+#define MQ_ERR_ALLOCATOR_INVALID_PARENT -705
+#define MQ_ERR_ALLOCATOR_INVALID_TAG -706
+#define MQ_ERR_ALLOCATOR_HIERARCHY -707
+
 // 通用错误
-#define MQ_ERR_INVALID_ARGS -700
-#define MQ_ERR_TIMEOUT -701
-#define MQ_ERR_INTERNAL -702
-#define MQ_ERR_PARAM_V2 -703
-#define MQ_ERR_NOT_FOUND_V2 -704
+#define MQ_ERR_INVALID_ARGS -800
+#define MQ_ERR_TIMEOUT -801
+#define MQ_ERR_INTERNAL -802
+#define MQ_ERR_PARAM_V2 -803
+#define MQ_ERR_NOT_FOUND_V2 -804
 
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
@@ -81,6 +91,7 @@
 #define MQ_IS_ERR_SUBSCRIBE(code) \
   (code <= MQ_ERR_SUBSCRIBE && code > MQ_ERR_SUBSCRIBE_NOT_AUTHORIZED)
 #define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_REGISTER)
+#define MQ_IS_ERR_ALLOCATOR(code) (code <= MQ_ERR_ALLOCATOR && code > MQ_ERR_ALLOCATOR_HIERARCHY)
 
 // Error code to string conversion
 static inline const char* mqtt_error_string(int error_code)
@@ -180,6 +191,24 @@ static inline const char* mqtt_error_string(int error_code)
       return "Session expired";
     case MQ_ERR_SESSION_REGISTER:
       return "Failed to register session";
+
+    // Allocator errors
+    case MQ_ERR_ALLOCATOR:
+      return "Allocator error";
+    case MQ_ERR_ALLOCATOR_CREATE:
+      return "Failed to create allocator";
+    case MQ_ERR_ALLOCATOR_NOT_FOUND:
+      return "Allocator not found";
+    case MQ_ERR_ALLOCATOR_CLEANUP:
+      return "Failed to cleanup allocator";
+    case MQ_ERR_ALLOCATOR_LIMIT_EXCEEDED:
+      return "Allocator limit exceeded";
+    case MQ_ERR_ALLOCATOR_INVALID_PARENT:
+      return "Invalid parent allocator";
+    case MQ_ERR_ALLOCATOR_INVALID_TAG:
+      return "Invalid memory tag";
+    case MQ_ERR_ALLOCATOR_HIERARCHY:
+      return "Allocator hierarchy error";
 
     // 通用错误
     case MQ_ERR_INVALID_ARGS:
