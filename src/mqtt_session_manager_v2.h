@@ -122,12 +122,7 @@ class ThreadLocalSessionManager
    */
   SendWorkerPool::Statistics get_worker_statistics() const;
 
-  /**
-   * @brief 为指定客户端生成新的packet_id
-   * @param client_id 客户端ID
-   * @return 新的packet_id，如果失败返回0
-   */
-  uint16_t generate_packet_id(const MQTTString& client_id);
+
 
  private:
   std::thread::id thread_id_;
@@ -144,14 +139,9 @@ class ThreadLocalSessionManager
   // 发送Worker池
   std::unique_ptr<SendWorkerPool> worker_pool_;
 
-  // Packet ID管理（每个客户端独立的ID空间）
-  mutable std::mutex packet_id_mutex_;
-  std::unordered_map<std::string, uint16_t> client_packet_ids_;
-
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
   void safe_remove_session(const std::string& client_id, SessionInfo* info);
   int internal_process_messages(int max_process_count);
-  uint16_t get_next_packet_id(const std::string& client_id);
 };
 
 /**

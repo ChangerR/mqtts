@@ -226,26 +226,7 @@ void ThreadLocalSessionManager::enqueue_shared_messages(const SharedMessageConte
             target_client_ids.size(), get_pending_message_count());
 }
 
-uint16_t ThreadLocalSessionManager::generate_packet_id(const MQTTString& client_id)
-{
-  std::string client_id_str = from_mqtt_string(client_id);
-  return get_next_packet_id(client_id_str);
-}
 
-uint16_t ThreadLocalSessionManager::get_next_packet_id(const std::string& client_id)
-{
-  std::lock_guard<std::mutex> lock(packet_id_mutex_);
-  
-  uint16_t& current_id = client_packet_ids_[client_id];
-  current_id++;
-  
-  // MQTT packet_id 不能为0，跳过0
-  if (current_id == 0) {
-    current_id = 1;
-  }
-  
-  return current_id;
-}
 
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
 {
@@ -394,7 +375,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
           CoroLockGuard handler_lock(&session_info->session_mutex);
 
           // TODO: 将消息信息传递给 MQTT handler 进行实际发送
-          // 这里只需要传递消息的基本信息，让 handler 自己生成 packet_id 和 PublishPacket
+          // handler负责packet_id管理和PublishPacket生成，这里只传递消息基本信息
           // safe_handler->send_message(message.get_topic(), message.get_payload(), 
           //                           message.get_qos(), message.get_retain(), 
           //                           message.is_dup(), message.get_properties());
