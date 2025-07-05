@@ -44,7 +44,7 @@ struct SharedMessageContent
         timestamp(std::chrono::steady_clock::now()),
         sender_client_id(sender)
   {
-    ref_count.store(1);
+    ref_count.store(0);  // 初始化为0，第一次被智能指针包装时会增加到1
   }
   
   // 增加引用计数
