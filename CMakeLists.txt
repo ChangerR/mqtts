@@ -67,6 +67,7 @@ add_library(mqtt_parser STATIC
     src/mqtt_config.cpp
     src/mqtt_session_manager_v2.cpp
 	src/mqtt_session_info.cpp
+    src/mqtt_topic_tree.cpp
 )
 
 # 查找yaml-cpp库的静态版本

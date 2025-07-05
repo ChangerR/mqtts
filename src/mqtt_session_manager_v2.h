@@ -18,6 +18,7 @@
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
 #include "mqtt_send_worker_pool.h"
+#include "mqtt_topic_tree.h"
 
 namespace mqtt {
 
@@ -241,9 +242,59 @@ class GlobalSessionManager
   bool is_topic_match(const MQTTString& topic, const MQTTString& topic_filter) const;
 
   /**
-   * @brief 获取订阅了指定主题的客户端列表
+   * @brief 获取订阅了指定主题的客户端列表（已弃用，使用主题匹配树代替）
    */
   std::vector<MQTTString> get_subscribers(const MQTTString& topic) const;
+
+  /**
+   * @brief 客户端订阅主题
+   * @param topic_filter 主题过滤器（支持通配符）
+   * @param client_id 客户端ID
+   * @param qos QoS级别
+   * @return 0成功，非0失败
+   */
+  int subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+
+  /**
+   * @brief 客户端取消订阅主题
+   * @param topic_filter 主题过滤器
+   * @param client_id 客户端ID
+   * @return 0成功，非0失败
+   */
+  int unsubscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id);
+
+  /**
+   * @brief 取消客户端的所有订阅
+   * @param client_id 客户端ID
+   * @return 取消的订阅数量
+   */
+  int unsubscribe_all_topics(const MQTTString& client_id);
+
+  /**
+   * @brief 获取客户端的所有订阅
+   * @param client_id 客户端ID
+   * @return 订阅的主题过滤器列表
+   */
+  std::vector<MQTTString> get_client_subscriptions(const MQTTString& client_id) const;
+
+  /**
+   * @brief 使用高性能主题匹配树查找订阅者
+   * @param topic 发布主题
+   * @return 匹配的订阅者列表
+   */
+  std::vector<SubscriberInfo> find_topic_subscribers(const MQTTString& topic) const;
+
+  /**
+   * @brief 获取主题匹配树统计信息
+   * @return 包含订阅者数量和节点数量的pair
+   */
+  std::pair<size_t, size_t> get_topic_tree_stats() const;
+
+  /**
+   * @brief 清理主题匹配树中的空节点
+   * @return 清理的节点数量
+   */
+  size_t cleanup_topic_tree() const;
 
   /**
    * @brief 清理所有无效的会话记录
@@ -282,6 +333,9 @@ class GlobalSessionManager
 
   // 消息内容缓存管理器
   std::unique_ptr<MessageContentCache> message_cache_;
+
+  // 高性能主题匹配树
+  std::unique_ptr<ConcurrentTopicTree> topic_tree_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;

@@ -514,7 +514,10 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
   // 初始化消息内容缓存管理器
   message_cache_.reset(new MessageContentCache());
   
-  LOG_INFO("GlobalSessionManager initialized with high-performance lock-free architecture");
+  // 初始化高性能主题匹配树
+  topic_tree_.reset(new ConcurrentTopicTree());
+  
+  LOG_INFO("GlobalSessionManager initialized with high-performance lock-free architecture and topic tree");
 }
 
 GlobalSessionManager::~GlobalSessionManager()
@@ -529,6 +532,9 @@ GlobalSessionManager::~GlobalSessionManager()
   
   // 清理消息缓存
   message_cache_.reset();
+  
+  // 清理主题匹配树
+  topic_tree_.reset();
 
   LOG_INFO("GlobalSessionManager destroyed, all managers cleared");
 }
@@ -804,16 +810,18 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
 {
-  std::vector<MQTTString> subscribers = get_subscribers(topic);
+  // 使用高性能主题匹配树查找订阅者
+  std::vector<SubscriberInfo> subscribers = find_topic_subscribers(topic);
   int forwarded_count = 0;
 
-  for (const MQTTString& subscriber : subscribers) {
+  std::string sender_id = from_mqtt_string(sender_client_id);
+  for (const SubscriberInfo& subscriber : subscribers) {
     // 避免回环
-    if (from_mqtt_string(subscriber) == from_mqtt_string(sender_client_id)) {
+    if (from_mqtt_string(subscriber.client_id) == sender_id) {
       continue;
     }
 
-    if (forward_publish(subscriber, packet, sender_client_id) == MQ_SUCCESS) {
+    if (forward_publish(subscriber.client_id, packet, sender_client_id) == MQ_SUCCESS) {
       forwarded_count++;
     }
   }
@@ -831,7 +839,8 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
     return MQ_ERR_PARAM_V2;
   }
 
-  std::vector<MQTTString> subscribers = get_subscribers(topic);
+  // 使用高性能主题匹配树查找订阅者
+  std::vector<SubscriberInfo> subscribers = find_topic_subscribers(topic);
   if (subscribers.empty()) {
     LOG_DEBUG("No subscribers found for topic: {}", from_mqtt_string(topic));
     return 0;
@@ -841,9 +850,9 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
   std::vector<MQTTString> filtered_subscribers;
   std::string sender_id = from_mqtt_string(content->sender_client_id);
   
-  for (const MQTTString& subscriber : subscribers) {
-    if (from_mqtt_string(subscriber) != sender_id) {
-      filtered_subscribers.push_back(subscriber);
+  for (const SubscriberInfo& subscriber : subscribers) {
+    if (from_mqtt_string(subscriber.client_id) != sender_id) {
+      filtered_subscribers.push_back(subscriber.client_id);
     }
   }
 
@@ -1053,6 +1062,107 @@ size_t GlobalSessionManager::get_message_cache_size() const
     return message_cache_->get_cache_size();
   }
   return 0;
+}
+
+// ============================================================================
+// 新的主题匹配树相关方法实现
+// ============================================================================
+
+int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos)
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return MQ_ERR_INTERNAL;
+  }
+  
+  int result = topic_tree_->subscribe(topic_filter, client_id, qos);
+  if (result == MQ_SUCCESS) {
+    LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", 
+              from_mqtt_string(client_id), from_mqtt_string(topic_filter), qos);
+  } else {
+    LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}", 
+              from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+  }
+  
+  return result;
+}
+
+int GlobalSessionManager::unsubscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id)
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return MQ_ERR_INTERNAL;
+  }
+  
+  int result = topic_tree_->unsubscribe(topic_filter, client_id);
+  if (result == MQ_SUCCESS) {
+    LOG_DEBUG("Client {} unsubscribed from topic filter {}", 
+              from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+  } else {
+    LOG_WARN("Failed to unsubscribe client {} from topic filter {}: error {}", 
+             from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+  }
+  
+  return result;
+}
+
+int GlobalSessionManager::unsubscribe_all_topics(const MQTTString& client_id)
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return 0;
+  }
+  
+  int unsubscribed_count = topic_tree_->unsubscribe_all(client_id);
+  LOG_INFO("Unsubscribed client {} from {} topics", 
+           from_mqtt_string(client_id), unsubscribed_count);
+  
+  return unsubscribed_count;
+}
+
+std::vector<MQTTString> GlobalSessionManager::get_client_subscriptions(const MQTTString& client_id) const
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return std::vector<MQTTString>();
+  }
+  
+  return topic_tree_->get_client_subscriptions(client_id);
+}
+
+std::vector<SubscriberInfo> GlobalSessionManager::find_topic_subscribers(const MQTTString& topic) const
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return std::vector<SubscriberInfo>();
+  }
+  
+  TopicMatchResult result = topic_tree_->find_subscribers(topic);
+  return result.subscribers;
+}
+
+std::pair<size_t, size_t> GlobalSessionManager::get_topic_tree_stats() const
+{
+  if (!topic_tree_) {
+    return std::make_pair(0, 0);
+  }
+  
+  return std::make_pair(topic_tree_->get_total_subscribers(), topic_tree_->get_total_nodes());
+}
+
+size_t GlobalSessionManager::cleanup_topic_tree() const
+{
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return 0;
+  }
+  
+  size_t cleaned_nodes = topic_tree_->cleanup_empty_nodes();
+  if (cleaned_nodes > 0) {
+    LOG_INFO("Cleaned up {} empty nodes from topic tree", cleaned_nodes);
+  }
+  
+  return cleaned_nodes;
 }
 
 }  // namespace mqtt
