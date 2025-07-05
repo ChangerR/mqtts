@@ -23,7 +23,7 @@ ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id)
 {
   LOG_INFO("ThreadLocalSessionManager created for thread: {}",
            std::hash<std::thread::id>{}(thread_id_));
-  
+
   // 创建默认的Worker池（4个Worker）
   worker_pool_.reset(new SendWorkerPool(4, 1000));
   worker_pool_->set_session_manager(this);
@@ -173,7 +173,8 @@ void ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
             from_mqtt_string(message.get_target_client_id()), get_pending_message_count());
 }
 
-void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContentPtr& content, const MQTTString& target_client_id)
+void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContentPtr& content,
+                                                       const MQTTString& target_client_id)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
@@ -182,7 +183,7 @@ void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageConten
 
   PendingMessageInfo message_info(content, target_client_id);
   PendingMessage message(message_info);
-  
+
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     pending_messages_.push(message);
@@ -196,7 +197,8 @@ void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageConten
             from_mqtt_string(target_client_id), get_pending_message_count());
 }
 
-void ThreadLocalSessionManager::enqueue_shared_messages(const SharedMessageContentPtr& content, const std::vector<MQTTString>& target_client_ids)
+void ThreadLocalSessionManager::enqueue_shared_messages(
+    const SharedMessageContentPtr& content, const std::vector<MQTTString>& target_client_ids)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
@@ -209,24 +211,22 @@ void ThreadLocalSessionManager::enqueue_shared_messages(const SharedMessageConte
 
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    
+
     for (const MQTTString& client_id : target_client_ids) {
       PendingMessageInfo message_info(content, client_id);
       PendingMessage message(message_info);
       pending_messages_.push(message);
     }
-    
+
     has_new_messages_.store(true);
   }
 
   // 通知等待的协程有新消息到达
   new_message_cond_.signal();
 
-  LOG_DEBUG("Shared messages enqueued for {} clients (queue size: {})",
-            target_client_ids.size(), get_pending_message_count());
+  LOG_DEBUG("Shared messages enqueued for {} clients (queue size: {})", target_client_ids.size(),
+            get_pending_message_count());
 }
-
-
 
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
 {
@@ -278,16 +278,16 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
 
     // 创建Worker任务并提交给Worker池
     WorkerSendTask task(message.packet, message.target_client_id, message.sender_client_id);
-    
+
     int submit_result = worker_pool_->submit_task(task);
     if (submit_result == MQ_SUCCESS) {
       dispatched_count++;
-      LOG_DEBUG("Message dispatched to worker pool for client: {}", 
+      LOG_DEBUG("Message dispatched to worker pool for client: {}",
                 from_mqtt_string(message.target_client_id));
     } else {
-      LOG_WARN("Failed to dispatch message to worker pool for client: {}, error: {}", 
+      LOG_WARN("Failed to dispatch message to worker pool for client: {}, error: {}",
                from_mqtt_string(message.target_client_id), submit_result);
-      
+
       // Worker池满了或出错，将消息放回队列头部
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -376,13 +376,13 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
 
           // TODO: 将消息信息传递给 MQTT handler 进行实际发送
           // handler负责packet_id管理和PublishPacket生成，这里只传递消息基本信息
-          // safe_handler->send_message(message.get_topic(), message.get_payload(), 
-          //                           message.get_qos(), message.get_retain(), 
+          // safe_handler->send_message(message.get_topic(), message.get_payload(),
+          //                           message.get_qos(), message.get_retain(),
           //                           message.is_dup(), message.get_properties());
           processed_count++;
 
-          LOG_DEBUG("Message processed for client: {} (topic: {}, payload size: {})", 
-                    client_id_str, from_mqtt_string(message.get_topic()), message.get_payload_size());
+          LOG_DEBUG("Message processed for client: {} (topic: {}, payload size: {})", client_id_str,
+                    from_mqtt_string(message.get_topic()), message.get_payload_size());
         }
       } else {
         LOG_WARN("Handler not found or invalid for client: {}",
@@ -471,19 +471,19 @@ int ThreadLocalSessionManager::configure_worker_pool(size_t worker_count, size_t
   if (worker_pool_ && worker_pool_->is_running()) {
     worker_pool_->stop();
   }
-  
+
   worker_pool_.reset(new SendWorkerPool(worker_count, max_queue_size));
   worker_pool_->set_session_manager(this);
-  
+
   int result = worker_pool_->start();
   if (result != MQ_SUCCESS) {
     LOG_ERROR("Failed to start worker pool: {}", result);
     worker_pool_.reset();
     return result;
   }
-  
-  LOG_INFO("Worker pool configured with {} workers, max queue size: {}", 
-           worker_count, max_queue_size);
+
+  LOG_INFO("Worker pool configured with {} workers, max queue size: {}", worker_count,
+           max_queue_size);
   return MQ_SUCCESS;
 }
 
@@ -492,7 +492,7 @@ SendWorkerPool::Statistics ThreadLocalSessionManager::get_worker_statistics() co
   if (worker_pool_) {
     return worker_pool_->get_statistics();
   }
-  
+
   SendWorkerPool::Statistics empty_stats = {};
   return empty_stats;
 }
@@ -533,7 +533,7 @@ GlobalSessionManager::~GlobalSessionManager()
   thread_managers_.clear();
   thread_manager_array_.clear();
   client_to_manager_.clear();
-  
+
   // 清理消息缓存
   message_cache_.reset();
   
@@ -741,7 +741,8 @@ int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
   return MQ_SUCCESS;
 }
 
-int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client_id, const SharedMessageContentPtr& content)
+int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client_id,
+                                                 const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
@@ -761,7 +762,8 @@ int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client
   return MQ_SUCCESS;
 }
 
-SharedMessageContentPtr GlobalSessionManager::get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id)
+SharedMessageContentPtr GlobalSessionManager::get_or_create_shared_content(
+    const PublishPacket& packet, const MQTTString& sender_client_id)
 {
   if (!message_cache_) {
     LOG_ERROR("Message cache not initialized");
@@ -771,7 +773,8 @@ SharedMessageContentPtr GlobalSessionManager::get_or_create_shared_content(const
   return message_cache_->get_or_create_content_from_packet(packet, sender_client_id);
 }
 
-int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedMessageContentPtr& content)
+int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& target_client_ids,
+                                                const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
@@ -784,7 +787,7 @@ int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& t
 
   // 将客户端按线程分组
   std::unordered_map<ThreadLocalSessionManager*, std::vector<MQTTString>> manager_groups;
-  
+
   for (const MQTTString& client_id : target_client_ids) {
     ThreadLocalSessionManager* thread_manager = find_client_manager(client_id);
     if (thread_manager) {
@@ -795,18 +798,18 @@ int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& t
   }
 
   int forwarded_count = 0;
-  
+
   // 批量转发到每个线程
   for (const auto& group : manager_groups) {
     ThreadLocalSessionManager* manager = group.first;
     const std::vector<MQTTString>& client_ids = group.second;
-    
+
     manager->enqueue_shared_messages(content, client_ids);
     forwarded_count += client_ids.size();
   }
 
-  LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", 
-            forwarded_count, manager_groups.size());
+  LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", forwarded_count,
+            manager_groups.size());
   return forwarded_count;
 }
 
@@ -836,7 +839,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   return forwarded_count;
 }
 
-int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic, const SharedMessageContentPtr& content)
+int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic,
+                                                          const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
@@ -861,7 +865,8 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
   }
 
   if (filtered_subscribers.empty()) {
-    LOG_DEBUG("No valid subscribers found for topic: {} (after filtering sender)", from_mqtt_string(topic));
+    LOG_DEBUG("No valid subscribers found for topic: {} (after filtering sender)",
+              from_mqtt_string(topic));
     return 0;
   }
 
@@ -1170,4 +1175,3 @@ size_t GlobalSessionManager::cleanup_topic_tree() const
 }
 
 }  // namespace mqtt
-

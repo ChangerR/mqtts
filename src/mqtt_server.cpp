@@ -289,14 +289,14 @@ void MQTTServer::handle_client(ClientContext* ctx)
 int MQTTServer::eventloop_callback(void* arg)
 {
   MQTTServer* server = (MQTTServer*)arg;
-  
+
   // Only process if server is still running
   if (!server->running_) {
     return 0;
   }
 
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
-  
+
   // Get current thread's session manager
   mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
   if (local_manager) {
@@ -307,5 +307,5 @@ int MQTTServer::eventloop_callback(void* arg)
     }
   }
 
-  return 0; // Continue eventloop
+  return 0;  // Continue eventloop
 }

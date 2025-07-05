@@ -2,11 +2,11 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include "../build/generated/version.h"
 #include "logger.h"
 #include "mqtt_config.h"
 #include "mqtt_server.h"
 #include "mqtt_session_manager_v2.h"
-#include "../build/generated/version.h"
 
 void run_mqtt_server(const mqtt::Config& config)
 {
@@ -14,12 +14,12 @@ void run_mqtt_server(const mqtt::Config& config)
 
   // 初始化全局会话管理器
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
-  
+
   // 预注册线程数量和预期客户端数量
   session_manager.pre_register_threads(config.server.thread_count, config.server.max_connections);
-  
-  LOG_INFO("Session manager initialized for {} threads, {} max clients", 
-           config.server.thread_count, config.server.max_connections);
+
+  LOG_INFO("Session manager initialized for {} threads, {} max clients", config.server.thread_count,
+           config.server.max_connections);
 
   MQTTServer server(config.server, config.memory);
 
@@ -36,44 +36,44 @@ void run_mqtt_server(const mqtt::Config& config)
       threads.push_back(std::thread([&] {
         // 每个工作线程启动时注册到会话管理器
         std::thread::id thread_id = std::this_thread::get_id();
-        mqtt::ThreadLocalSessionManager* local_manager = 
+        mqtt::ThreadLocalSessionManager* local_manager =
             session_manager.register_thread_manager(thread_id);
-        
+
         if (local_manager) {
-          LOG_INFO("MQTT server thread started, session manager registered for thread: {}", 
+          LOG_INFO("MQTT server thread started, session manager registered for thread: {}",
                    std::hash<std::thread::id>{}(thread_id));
         } else {
-          LOG_ERROR("Failed to register session manager for thread: {}", 
+          LOG_ERROR("Failed to register session manager for thread: {}",
                     std::hash<std::thread::id>{}(thread_id));
         }
-        
+
         server.run();
         LOG_INFO("MQTT server thread stopped");
       }));
     }
-    
+
     // 等待所有线程注册完成，然后切换到运行模式
-    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 给线程注册一些时间
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 给线程注册一些时间
     session_manager.finalize_thread_registration();
     LOG_INFO("All threads registered, session manager switched to running mode");
-    
+
   } else {
     // 单线程模式也需要注册
     std::thread::id thread_id = std::this_thread::get_id();
-    mqtt::ThreadLocalSessionManager* local_manager = 
+    mqtt::ThreadLocalSessionManager* local_manager =
         session_manager.register_thread_manager(thread_id);
-    
+
     if (local_manager) {
-      LOG_INFO("Single thread session manager registered for thread: {}", 
+      LOG_INFO("Single thread session manager registered for thread: {}",
                std::hash<std::thread::id>{}(thread_id));
     } else {
-      LOG_ERROR("Failed to register session manager for single thread: {}", 
+      LOG_ERROR("Failed to register session manager for single thread: {}",
                 std::hash<std::thread::id>{}(thread_id));
     }
-    
+
     session_manager.finalize_thread_registration();
     LOG_INFO("Single thread mode, session manager switched to running mode");
-    
+
     server.run();
   }
 

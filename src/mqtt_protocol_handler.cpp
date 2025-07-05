@@ -1,14 +1,14 @@
 #include "mqtt_protocol_handler.h"
 #include <arpa/inet.h>
-#include <cstring>
 #include <unistd.h>
+#include <cstring>
+#include "co_routine.h"
 #include "logger.h"
+#include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_memory_tags.h"
-#include "mqtt_session_manager_v2.h"
-#include "co_routine.h"
-#include "mqtt_allocator.h"
 #include "mqtt_parser.h"
+#include "mqtt_session_manager_v2.h"
 #include "mqtt_socket.h"
 namespace mqtt {
 
@@ -134,7 +134,8 @@ int MQTTProtocolHandler::process()
     }
   }
 
-  // Cleanup session registration when process() exits (for any reason: socket disconnect, error, etc.)
+  // Cleanup session registration when process() exits (for any reason: socket disconnect, error,
+  // etc.)
   cleanup_session_registration("on process exit");
 
   return ret;
@@ -767,48 +768,49 @@ int MQTTProtocolHandler::send_data_with_lock(const char* data, size_t size, int 
 
   // 尝试在超时时间内获取写入锁
   auto start_time = std::chrono::steady_clock::now();
-  
+
   while (true) {
     // 尝试获取锁
     bool expected = false;
     if (write_lock_acquired_.compare_exchange_weak(expected, true)) {
       // 成功获取锁，执行发送操作
       int result = socket_->send(reinterpret_cast<const uint8_t*>(data), static_cast<int>(size));
-      
+
       // 释放锁并通知等待的协程
       write_lock_acquired_.store(false);
       write_lock_condition_.broadcast();
-      
+
       if (result != 0) {
-        LOG_ERROR("Failed to send data to client {}:{}, error: {}", 
-                  client_ip_.c_str(), client_port_, result);
+        LOG_ERROR("Failed to send data to client {}:{}, error: {}", client_ip_.c_str(),
+                  client_port_, result);
       } else {
-        LOG_DEBUG("Successfully sent {} bytes to client {}:{}", 
-                  size, client_ip_.c_str(), client_port_);
+        LOG_DEBUG("Successfully sent {} bytes to client {}:{}", size, client_ip_.c_str(),
+                  client_port_);
       }
-      
+
       return result;
     }
-    
+
     // 锁被占用，检查是否超时
     if (timeout_ms > 0) {
       std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-      int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-      
+      int64_t elapsed =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+
       if (elapsed >= timeout_ms) {
-        LOG_WARN("Failed to acquire write lock within {}ms for client {}:{}", 
-                 timeout_ms, client_ip_.c_str(), client_port_);
+        LOG_WARN("Failed to acquire write lock within {}ms for client {}:{}", timeout_ms,
+                 client_ip_.c_str(), client_port_);
         return MQ_ERR_TIMEOUT;
       }
-      
+
       // 等待锁释放信号，剩余时间
       int remaining_time = timeout_ms - static_cast<int>(elapsed);
       if (remaining_time > 0) {
-        write_lock_condition_.wait(std::min(remaining_time, 100)); // 最多等待100ms
+        write_lock_condition_.wait(std::min(remaining_time, 100));  // 最多等待100ms
       }
     } else {
       // 无超时限制，等待锁释放信号
-      write_lock_condition_.wait(100); // 每100ms检查一次
+      write_lock_condition_.wait(100);  // 每100ms检查一次
     }
   }
 }
@@ -846,7 +848,8 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   if (ret != 0) {
     LOG_ERROR("Failed to send CONNACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -883,7 +886,8 @@ int MQTTProtocolHandler::send_pubrec(uint16_t packet_id, ReasonCode reason_code)
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubRecPacket));
   return ret;
 }
@@ -912,7 +916,8 @@ int MQTTProtocolHandler::send_pubrel(uint16_t packet_id, ReasonCode reason_code)
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubRelPacket));
   return ret;
 }
@@ -941,7 +946,8 @@ int MQTTProtocolHandler::send_pubcomp(uint16_t packet_id, ReasonCode reason_code
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PubCompPacket));
   return ret;
 }
@@ -976,7 +982,8 @@ int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   packet->~UnsubAckPacket();
   allocator_->deallocate(packet, sizeof(UnsubAckPacket));
   return ret;
@@ -1006,7 +1013,8 @@ int MQTTProtocolHandler::send_disconnect(ReasonCode reason_code)
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(DisconnectPacket));
   return ret;
 }
@@ -1034,7 +1042,8 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(AuthPacket));
   return ret;
 }
@@ -1079,7 +1088,8 @@ int MQTTProtocolHandler::send_suback(uint16_t packet_id,
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   packet->~SubAckPacket();
   allocator_->deallocate(packet, sizeof(SubAckPacket));
   return ret;
@@ -1118,7 +1128,8 @@ int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   if (ret != 0) {
     LOG_ERROR("Failed to send PUBACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -1153,7 +1164,8 @@ int MQTTProtocolHandler::send_pingresp()
   }
 
   // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()), serialize_buffer_->size());
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PingRespPacket));
   return ret;
 }
@@ -1163,11 +1175,11 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
   if (connected_ && session_manager_ && !client_id_.empty()) {
     int ret = session_manager_->unregister_session(client_id_);
     if (ret != 0) {
-      LOG_WARN("Failed to unregister session for client {} {}, error: {}", 
+      LOG_WARN("Failed to unregister session for client {} {}, error: {}",
                from_mqtt_string(client_id_), context ? context : "", ret);
     } else {
-      LOG_DEBUG("Client {} unregistered from session manager {}", 
-                from_mqtt_string(client_id_), context ? context : "");
+      LOG_DEBUG("Client {} unregistered from session manager {}", from_mqtt_string(client_id_),
+                context ? context : "");
     }
     connected_ = false;
   }
@@ -1177,7 +1189,7 @@ int MQTTProtocolHandler::register_session_with_manager()
 {
   if (!session_manager_) {
     LOG_WARN("Session manager not available for client {}", from_mqtt_string(client_id_));
-    return MQ_SUCCESS; // Not an error, just no session manager
+    return MQ_SUCCESS;  // Not an error, just no session manager
   }
 
   if (client_id_.empty()) {
@@ -1187,13 +1199,12 @@ int MQTTProtocolHandler::register_session_with_manager()
 
   int ret = session_manager_->register_session(client_id_, this);
   if (ret != 0) {
-    LOG_ERROR("Failed to register session for client {}, error: {}", 
-              from_mqtt_string(client_id_), ret);
+    LOG_ERROR("Failed to register session for client {}, error: {}", from_mqtt_string(client_id_),
+              ret);
     return MQ_ERR_SESSION_REGISTER;
   }
 
-  LOG_INFO("Client {} successfully registered with session manager", 
-           from_mqtt_string(client_id_));
+  LOG_INFO("Client {} successfully registered with session manager", from_mqtt_string(client_id_));
   return MQ_SUCCESS;
 }
 

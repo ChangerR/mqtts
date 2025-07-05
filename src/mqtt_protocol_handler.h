@@ -1,21 +1,21 @@
 #pragma once
 
 #include <poll.h>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <atomic>
-#include <chrono>
 #include "logger.h"
 #include "mqtt_allocator.h"
+#include "mqtt_coroutine_utils.h"
 #include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
 #include "mqtt_serialize_buffer.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
-#include "mqtt_coroutine_utils.h"
 
 namespace mqtt {
 
@@ -35,7 +35,10 @@ class MQTTProtocolHandler
   int process();
 
   // Session manager integration
-  void set_session_manager(GlobalSessionManager* session_manager) { session_manager_ = session_manager; }
+  void set_session_manager(GlobalSessionManager* session_manager)
+  {
+    session_manager_ = session_manager;
+  }
   GlobalSessionManager* get_session_manager() const { return session_manager_; }
 
   // Packet handlers
@@ -131,7 +134,7 @@ class MQTTProtocolHandler
   bool request_problem_information_;
 
   MQTTSerializeBuffer* serialize_buffer_;  // 复用的序列化缓冲区
-  
+
   // 写入锁状态和条件变量，支持超时等待
   mutable std::atomic<bool> write_lock_acquired_;
   mutable CoroCondition write_lock_condition_;
