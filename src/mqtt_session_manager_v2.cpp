@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <unordered_set>
 #include "logger.h"
 #include "mqtt_define.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_session_allocator.h"
 
 // 新增错误代码定义 (已在mqtt_define.h中定义，这里注释掉避免重复定义)
 // #define MQ_ERR_PARAM_V2 -800
@@ -19,10 +21,18 @@ namespace mqtt {
 //==============================================================================
 
 ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id)
-    : thread_id_(thread_id), has_new_messages_(false)
+    : thread_id_(thread_id), has_new_messages_(false),
+      session_allocator_(nullptr), queue_allocator_(nullptr), worker_allocator_(nullptr)
 {
   LOG_INFO("ThreadLocalSessionManager created for thread: {}",
            std::hash<std::thread::id>{}(thread_id_));
+
+  // 初始化分配器
+  initialize_allocators();
+  
+  // 使用分配器创建容器
+  sessions_ = make_session_unordered_map<std::string, std::unique_ptr<SessionInfo>>(session_allocator_);
+  pending_messages_ = make_session_queue<PendingMessage>(queue_allocator_);
 
   // 创建默认的Worker池（4个Worker）
   worker_pool_.reset(new SendWorkerPool(4, 1000));
@@ -63,6 +73,9 @@ ThreadLocalSessionManager::~ThreadLocalSessionManager()
   // 通知所有等待的协程退出
   new_message_cond_.broadcast();
 
+  // 清理分配器
+  cleanup_allocators();
+
   LOG_INFO("ThreadLocalSessionManager destroyed for thread: {}",
            std::hash<std::thread::id>{}(thread_id_));
 }
@@ -96,8 +109,8 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
     }
   }
 
-  // 创建新的SessionInfo
-  sessions_[client_id_str] = std::unique_ptr<SessionInfo>(new SessionInfo(handler));
+  // 创建新的SessionInfo使用session allocator
+  sessions_[client_id_str] = make_session_unique<SessionInfo>(session_allocator_, handler);
 
   LOG_INFO("Handler registered in thread: {} (total sessions: {})", client_id_str,
            sessions_.size());
@@ -497,6 +510,121 @@ SendWorkerPool::Statistics ThreadLocalSessionManager::get_worker_statistics() co
   return empty_stats;
 }
 
+void ThreadLocalSessionManager::initialize_allocators()
+{
+  // 为线程创建唯一的allocator标识
+  std::stringstream ss;
+  ss << "thread_" << std::hash<std::thread::id>{}(thread_id_);
+  std::string thread_id_str = ss.str();
+  
+  // 创建主会话分配器
+  session_allocator_ = SessionAllocatorManager::get_session_allocator(thread_id_str, 0);
+  if (!session_allocator_) {
+    LOG_ERROR("Failed to initialize session allocator for thread: {}", thread_id_str);
+    return;
+  }
+  
+  // 创建队列分配器
+  queue_allocator_ = SessionAllocatorManager::get_session_queue_allocator(thread_id_str);
+  if (!queue_allocator_) {
+    LOG_ERROR("Failed to initialize queue allocator for thread: {}", thread_id_str);
+    return;
+  }
+  
+  // 创建worker分配器
+  worker_allocator_ = SessionAllocatorManager::get_session_worker_allocator(thread_id_str);
+  if (!worker_allocator_) {
+    LOG_ERROR("Failed to initialize worker allocator for thread: {}", thread_id_str);
+    return;
+  }
+  
+  LOG_INFO("Initialized allocators for thread: {}", thread_id_str);
+}
+
+void ThreadLocalSessionManager::cleanup_allocators()
+{
+  // 清理线程相关的所有分配器
+  std::stringstream ss;
+  ss << "thread_" << std::hash<std::thread::id>{}(thread_id_);
+  std::string thread_id_str = ss.str();
+  
+  SessionAllocatorManager::cleanup_session_allocators(thread_id_str);
+  
+  session_allocator_ = nullptr;
+  queue_allocator_ = nullptr;
+  worker_allocator_ = nullptr;
+  
+  LOG_INFO("Cleaned up allocators for thread: {}", thread_id_str);
+}
+
+size_t ThreadLocalSessionManager::get_memory_usage() const
+{
+  size_t total_usage = 0;
+  
+  if (session_allocator_) {
+    total_usage += session_allocator_->get_total_memory_usage();
+  }
+  
+  if (queue_allocator_) {
+    total_usage += queue_allocator_->get_total_memory_usage();
+  }
+  
+  if (worker_allocator_) {
+    total_usage += worker_allocator_->get_total_memory_usage();
+  }
+  
+  return total_usage;
+}
+
+bool ThreadLocalSessionManager::is_memory_limit_exceeded() const
+{
+  // 检查主会话分配器是否超过限制
+  if (session_allocator_) {
+    size_t limit = session_allocator_->get_memory_limit();
+    if (limit > 0) {
+      return session_allocator_->get_total_memory_usage() > limit;
+    }
+  }
+  
+  return false;
+}
+
+int ThreadLocalSessionManager::set_memory_limit(size_t limit)
+{
+  // 注意：当前的MQTTAllocator不支持动态设置限制
+  // 这里只是记录警告，实际的限制需要在创建时设置
+  LOG_WARN("Dynamic memory limit setting not supported. Limit should be set during creation.");
+  return MQ_ERR_PARAM_V2;
+}
+
+ThreadLocalSessionManager::MemoryStats ThreadLocalSessionManager::get_memory_statistics() const
+{
+  MemoryStats stats = {};
+  
+  if (session_allocator_) {
+    stats.session_usage = session_allocator_->get_memory_usage();
+    stats.limit = session_allocator_->get_memory_limit();
+  }
+  
+  if (queue_allocator_) {
+    stats.queue_usage = queue_allocator_->get_memory_usage();
+  }
+  
+  if (worker_allocator_) {
+    stats.worker_usage = worker_allocator_->get_memory_usage();
+  }
+  
+  stats.total_usage = get_memory_usage();
+  stats.limit_exceeded = is_memory_limit_exceeded();
+  
+  return stats;
+}
+
+bool ThreadLocalSessionManager::check_memory_limit() const
+{
+  return is_memory_limit_exceeded();
+}
+
 bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) const
 {
   return handler && handler->is_connected();
@@ -511,12 +639,15 @@ thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_mana
 
 GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING)
 {
-  // 初始化消息内容缓存管理器
+  // 初始化全局分配器
+  global_allocator_ = MQTTMemoryManager::get_instance().get_root_allocator();
+  
+  // 初始化消息内容缓存管理器使用专用allocator
+  MQTTAllocator* cache_allocator = SessionAllocatorManager::get_message_cache_allocator();
   message_cache_.reset(new MessageContentCache());
   
   // 为主题匹配树创建专用的allocator
-  MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
-  MQTTAllocator* topic_tree_allocator = root_allocator->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+  MQTTAllocator* topic_tree_allocator = global_allocator_->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
   
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
@@ -656,6 +787,26 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
     return MQ_ERR_THREAD_MISMATCH;
   }
 
+  // 检查客户端是否有预设的内存限制
+  size_t memory_limit = 0;
+  {
+    std::lock_guard<std::mutex> lock(memory_limits_mutex_);
+    auto it = client_memory_limits_.find(client_id_str);
+    if (it != client_memory_limits_.end()) {
+      memory_limit = it->second;
+    }
+  }
+
+  // 为客户端创建专用的session allocator
+  if (memory_limit > 0) {
+    MQTTAllocator* client_allocator = SessionAllocatorManager::get_session_allocator(client_id_str, memory_limit);
+    if (!client_allocator) {
+      LOG_ERROR("Failed to create session allocator for client: {}", client_id_str);
+      return MQ_ERR_INTERNAL;
+    }
+    LOG_DEBUG("Created session allocator for client {} with limit: {} bytes", client_id_str, memory_limit);
+  }
+
   // 在线程管理器中注册handler
   int result = thread_manager->register_handler(client_id, handler);
   if (result != MQ_SUCCESS) {
@@ -686,6 +837,10 @@ int GlobalSessionManager::unregister_session(const MQTTString& client_id)
   // 只有注销成功才从客户端索引中移除
   if (result == MQ_SUCCESS) {
     remove_client_index(client_id_str);
+    
+    // 清理客户端的专用allocator
+    SessionAllocatorManager::cleanup_session_allocators(client_id_str);
+    
     LOG_INFO("Session unregistered globally: {}", client_id_str);
   }
 
@@ -1178,6 +1333,136 @@ size_t GlobalSessionManager::cleanup_topic_tree() const
   }
   
   return cleaned_nodes;
+}
+
+// ============================================================================
+// 新的内存管理方法实现
+// ============================================================================
+
+size_t GlobalSessionManager::get_global_memory_usage() const
+{
+  size_t total_usage = 0;
+  
+  // 获取所有线程管理器的内存使用情况
+  ReadLockGuard lock(managers_mutex_);
+  for (const ThreadLocalSessionManager* manager : thread_manager_array_) {
+    total_usage += manager->get_memory_usage();
+  }
+  
+  // 添加消息缓存的内存使用
+  if (message_cache_) {
+    // 假设每个缓存项平均占用1KB
+    total_usage += get_message_cache_size() * 1024;
+  }
+  
+  return total_usage;
+}
+
+std::unordered_map<std::string, size_t> GlobalSessionManager::get_client_memory_usage() const
+{
+  std::unordered_map<std::string, size_t> client_usage;
+  
+  // 获取所有客户端的内存使用情况
+  ReadLockGuard index_lock(client_index_mutex_);
+  for (const auto& pair : client_to_manager_) {
+    const std::string& client_id = pair.first;
+    size_t usage = SessionAllocatorManager::get_session_memory_usage(client_id);
+    if (usage > 0) {
+      client_usage[client_id] = usage;
+    }
+  }
+  
+  return client_usage;
+}
+
+int GlobalSessionManager::set_client_memory_limit(const MQTTString& client_id, size_t limit)
+{
+  std::string client_id_str = from_mqtt_string(client_id);
+  
+  std::lock_guard<std::mutex> lock(memory_limits_mutex_);
+  client_memory_limits_[client_id_str] = limit;
+  
+  // 注意：当前实现不支持动态设置现有allocator的限制
+  // 新的限制将在下次创建session时生效
+  LOG_INFO("Memory limit set for client {}: {} bytes (effective on next session creation)", 
+           client_id_str, limit);
+  
+  return MQ_SUCCESS;
+}
+
+bool GlobalSessionManager::is_client_memory_limit_exceeded(const MQTTString& client_id)
+{
+  std::string client_id_str = from_mqtt_string(client_id);
+  return SessionAllocatorManager::is_session_memory_limit_exceeded(client_id_str);
+}
+
+std::string GlobalSessionManager::get_allocator_hierarchy() const
+{
+  std::stringstream hierarchy;
+  hierarchy << "MQTT Allocator Hierarchy:\n";
+  
+  // 全局分配器信息
+  if (global_allocator_) {
+    hierarchy << "  Global Allocator: " << global_allocator_->get_id() 
+              << " (Usage: " << global_allocator_->get_total_memory_usage() << " bytes)\n";
+  }
+  
+  // 线程分配器信息
+  ReadLockGuard lock(managers_mutex_);
+  for (size_t i = 0; i < thread_manager_array_.size(); ++i) {
+    const ThreadLocalSessionManager* manager = thread_manager_array_[i];
+    auto stats = manager->get_memory_statistics();
+    hierarchy << "    Thread Manager " << i << ":\n";
+    hierarchy << "      Session Usage: " << stats.session_usage << " bytes\n";
+    hierarchy << "      Queue Usage: " << stats.queue_usage << " bytes\n";
+    hierarchy << "      Worker Usage: " << stats.worker_usage << " bytes\n";
+    hierarchy << "      Total Usage: " << stats.total_usage << " bytes\n";
+    hierarchy << "      Limit: " << (stats.limit > 0 ? std::to_string(stats.limit) : "unlimited") << " bytes\n";
+    hierarchy << "      Limit Exceeded: " << (stats.limit_exceeded ? "Yes" : "No") << "\n";
+  }
+  
+  // 客户端分配器信息
+  auto client_usage = get_client_memory_usage();
+  if (!client_usage.empty()) {
+    hierarchy << "  Client Allocators:\n";
+    for (const auto& pair : client_usage) {
+      hierarchy << "    " << pair.first << ": " << pair.second << " bytes\n";
+    }
+  }
+  
+  return hierarchy.str();
+}
+
+int GlobalSessionManager::cleanup_expired_allocators()
+{
+  int cleaned_count = 0;
+  
+  // 获取所有有效的客户端ID
+  std::unordered_set<std::string> valid_clients;
+  {
+    ReadLockGuard index_lock(client_index_mutex_);
+    for (const auto& pair : client_to_manager_) {
+      valid_clients.insert(pair.first);
+    }
+  }
+  
+  // 清理无效的客户端分配器
+  auto client_usage = get_client_memory_usage();
+  for (const auto& pair : client_usage) {
+    const std::string& client_id = pair.first;
+    if (valid_clients.find(client_id) == valid_clients.end()) {
+      // 客户端已经不存在，清理其分配器
+      SessionAllocatorManager::cleanup_session_allocators(client_id);
+      cleaned_count++;
+      LOG_DEBUG("Cleaned up allocator for expired client: {}", client_id);
+    }
+  }
+  
+  if (cleaned_count > 0) {
+    LOG_INFO("Cleaned up {} expired allocators", cleaned_count);
+  }
+  
+  return cleaned_count;
 }
 
 }  // namespace mqtt
