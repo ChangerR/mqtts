@@ -51,28 +51,26 @@ void test_shared_content_ref_count(TestFramework& test) {
     test.start_test("共享内容引用计数");
     
     // 创建测试数据
-    PublishPacket packet;
-    packet.type = PacketType::PUBLISH;
-    packet.topic_name = to_mqtt_string("test/topic", nullptr);
-    packet.payload = MQTTByteVector{'h', 'e', 'l', 'l', 'o'};
-    packet.qos = 1;
-    packet.retain = false;
-    packet.dup = false;
-    
+    MQTTString topic = to_mqtt_string("test/topic", nullptr);
+    MQTTByteVector payload{'h', 'e', 'l', 'l', 'o'};
+    uint8_t qos = 1;
+    bool retain = false;
+    bool dup = false;
+    Properties properties;
     MQTTString sender_id = to_mqtt_string("sender", nullptr);
     
     // 创建共享内容
-    SharedPublishContent* content = new SharedPublishContent(packet, sender_id);
+    SharedMessageContent* content = new SharedMessageContent(topic, payload, qos, retain, dup, properties, sender_id);
     
     // 测试初始引用计数
     bool initial_ref_count = (content->ref_count.load() == 1);
     
     // 创建智能指针
-    SharedPublishContentPtr ptr1(content);
+    SharedMessageContentPtr ptr1(content);
     bool ref_count_after_ptr1 = (content->ref_count.load() == 2);
     
     // 复制智能指针
-    SharedPublishContentPtr ptr2 = ptr1;
+    SharedMessageContentPtr ptr2 = ptr1;
     bool ref_count_after_copy = (content->ref_count.load() == 3);
     
     // 测试结果
@@ -80,39 +78,35 @@ void test_shared_content_ref_count(TestFramework& test) {
                     "引用计数管理不正确");
 }
 
-// 测试SessionPublishInfo的消息生成
-void test_session_publish_info(TestFramework& test) {
-    test.start_test("Session消息生成");
+// 测试PendingMessageInfo的消息信息访问
+void test_pending_message_info(TestFramework& test) {
+    test.start_test("PendingMessageInfo消息信息");
     
     // 创建测试数据
-    PublishPacket original_packet;
-    original_packet.type = PacketType::PUBLISH;
-    original_packet.topic_name = to_mqtt_string("test/topic", nullptr);
-    original_packet.payload = MQTTByteVector{'d', 'a', 't', 'a'};
-    original_packet.qos = 2;
-    original_packet.retain = true;
-    original_packet.dup = false;
-    
+    MQTTString topic = to_mqtt_string("test/topic", nullptr);
+    MQTTByteVector payload{'d', 'a', 't', 'a'};
+    uint8_t qos = 2;
+    bool retain = true;
+    bool dup = false;
+    Properties properties;
     MQTTString sender_id = to_mqtt_string("sender", nullptr);
     MQTTString target_id = to_mqtt_string("target", nullptr);
     
-    // 创建SessionPublishInfo
-    SessionPublishInfo session_info(original_packet, target_id, sender_id);
+    // 创建PendingMessageInfo
+    PendingMessageInfo message_info(topic, payload, qos, retain, dup, properties, sender_id, target_id);
     
-    // 生成带有session特定packet_id的消息
-    uint16_t session_packet_id = 12345;
-    PublishPacket generated_packet = session_info.generate_publish_packet(session_packet_id);
-    
-    // 验证生成的消息
-    bool topic_correct = (generated_packet.topic_name == original_packet.topic_name);
-    bool payload_correct = (generated_packet.payload == original_packet.payload);
-    bool qos_correct = (generated_packet.qos == original_packet.qos);
-    bool retain_correct = (generated_packet.retain == original_packet.retain);
-    bool packet_id_correct = (generated_packet.packet_id == session_packet_id);
+    // 验证消息信息访问
+    bool topic_correct = (message_info.get_topic() == topic);
+    bool payload_correct = (message_info.get_payload() == payload);
+    bool qos_correct = (message_info.get_qos() == qos);
+    bool retain_correct = (message_info.is_retain() == retain);
+    bool dup_correct = (message_info.is_dup() == dup);
+    bool sender_correct = (message_info.get_sender_client_id() == sender_id);
+    bool target_correct = (message_info.get_target_client_id() == target_id);
     
     test.assert_true(topic_correct && payload_correct && qos_correct && 
-                    retain_correct && packet_id_correct,
-                    "生成的消息不正确");
+                    retain_correct && dup_correct && sender_correct && target_correct,
+                    "消息信息访问不正确");
 }
 
 // 测试PendingMessage的兼容性接口
@@ -125,24 +119,25 @@ void test_pending_message_compatibility(TestFramework& test) {
     packet.topic_name = to_mqtt_string("test/topic", nullptr);
     packet.payload = MQTTByteVector{'t', 'e', 's', 't'};
     packet.qos = 1;
+    packet.retain = false;
+    packet.dup = false;
     
     MQTTString target_id = to_mqtt_string("target", nullptr);
     MQTTString sender_id = to_mqtt_string("sender", nullptr);
     
-    // 创建PendingMessage
+    // 创建PendingMessage（使用兼容性构造函数）
     PendingMessage message(packet, target_id, sender_id);
     
     // 测试兼容性接口
     bool target_correct = (message.get_target_client_id() == target_id);
     bool sender_correct = (message.get_sender_client_id() == sender_id);
     bool valid = message.is_valid();
+    bool topic_correct = (message.get_topic() == packet.topic_name);
+    bool payload_correct = (message.get_payload() == packet.payload);
+    bool qos_correct = (message.get_qos() == packet.qos);
     
-    // 测试消息生成
-    uint16_t test_packet_id = 999;
-    PublishPacket generated = message.generate_publish_packet(test_packet_id);
-    bool generated_correct = (generated.packet_id == test_packet_id);
-    
-    test.assert_true(target_correct && sender_correct && valid && generated_correct,
+    test.assert_true(target_correct && sender_correct && valid && 
+                    topic_correct && payload_correct && qos_correct,
                     "PendingMessage兼容性接口不正确");
 }
 
@@ -153,26 +148,22 @@ void test_message_content_cache(TestFramework& test) {
     MessageContentCache cache;
     
     // 创建测试数据
-    PublishPacket packet1;
-    packet1.type = PacketType::PUBLISH;
-    packet1.topic_name = to_mqtt_string("test/topic1", nullptr);
-    packet1.payload = MQTTByteVector{'d', 'a', 't', 'a', '1'};
-    packet1.qos = 1;
-    
-    PublishPacket packet2;
-    packet2.type = PacketType::PUBLISH;
-    packet2.topic_name = to_mqtt_string("test/topic2", nullptr);
-    packet2.payload = MQTTByteVector{'d', 'a', 't', 'a', '2'};
-    packet2.qos = 1;
-    
+    MQTTString topic1 = to_mqtt_string("test/topic1", nullptr);
+    MQTTByteVector payload1{'d', 'a', 't', 'a', '1'};
+    MQTTString topic2 = to_mqtt_string("test/topic2", nullptr);
+    MQTTByteVector payload2{'d', 'a', 't', 'a', '2'};
+    uint8_t qos = 1;
+    bool retain = false;
+    bool dup = false;
+    Properties properties;
     MQTTString sender_id = to_mqtt_string("sender", nullptr);
     
     // 获取共享内容
-    SharedPublishContentPtr content1 = cache.get_or_create_content(packet1, sender_id);
-    SharedPublishContentPtr content2 = cache.get_or_create_content(packet2, sender_id);
+    SharedMessageContentPtr content1 = cache.get_or_create_content(topic1, payload1, qos, retain, dup, properties, sender_id);
+    SharedMessageContentPtr content2 = cache.get_or_create_content(topic2, payload2, qos, retain, dup, properties, sender_id);
     
     // 再次获取相同的内容
-    SharedPublishContentPtr content1_again = cache.get_or_create_content(packet1, sender_id);
+    SharedMessageContentPtr content1_again = cache.get_or_create_content(topic1, payload1, qos, retain, dup, properties, sender_id);
     
     // 验证缓存行为
     bool cache_working = (content1.get() == content1_again.get());
@@ -215,8 +206,10 @@ void test_performance_comparison(TestFramework& test) {
     auto traditional_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
     
     // 测试优化方式的内存使用
-    SharedPublishContentPtr shared_content(new SharedPublishContent(large_packet, sender_id));
-    std::vector<SessionPublishInfo> optimized_messages;
+    SharedMessageContentPtr shared_content(new SharedMessageContent(large_packet.topic_name, large_packet.payload, 
+                                                                     large_packet.qos, large_packet.retain, 
+                                                                     large_packet.dup, large_packet.properties, sender_id));
+    std::vector<PendingMessageInfo> optimized_messages;
     
     start_time = std::chrono::high_resolution_clock::now();
     
@@ -230,8 +223,8 @@ void test_performance_comparison(TestFramework& test) {
     // 计算内存使用估算
     size_t traditional_memory = traditional_messages.size() * 
                                 (sizeof(PendingMessage) + large_packet.payload.size());
-    size_t optimized_memory = sizeof(SharedPublishContent) + large_packet.payload.size() +
-                              optimized_messages.size() * sizeof(SessionPublishInfo);
+    size_t optimized_memory = sizeof(SharedMessageContent) + large_packet.payload.size() +
+                              optimized_messages.size() * sizeof(PendingMessageInfo);
     
     double memory_savings = (double)(traditional_memory - optimized_memory) / traditional_memory * 100;
     
@@ -254,7 +247,7 @@ int main() {
     try {
         // 运行各项测试
         test_shared_content_ref_count(test);
-        test_session_publish_info(test);
+        test_pending_message_info(test);
         test_pending_message_compatibility(test);
         test_message_content_cache(test);
         test_performance_comparison(test);

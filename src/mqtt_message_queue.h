@@ -12,10 +12,10 @@
 namespace mqtt {
 
 /**
- * @brief 共享的PUBLISH消息内容（不包含session特定的packet_id）
- * 使用引用计数管理内存，支持多个session共享同一消息内容
+ * @brief 共享的消息内容（不包含session特定信息）
+ * 用于在多个session之间共享同一消息内容，减少内存占用
  */
-struct SharedPublishContent
+struct SharedMessageContent
 {
   MQTTString topic_name;                            // 主题名称
   MQTTByteVector payload;                           // 消息载荷
@@ -31,14 +31,16 @@ struct SharedPublishContent
   // 引用计数（用于内存管理）
   mutable std::atomic<int> ref_count{0};
   
-  // 构造函数
-  SharedPublishContent(const PublishPacket& packet, const MQTTString& sender)
-      : topic_name(packet.topic_name),
-        payload(packet.payload),
-        dup(packet.dup),
-        qos(packet.qos),
-        retain(packet.retain),
-        properties(packet.properties),
+  // 构造函数 - 从消息基本信息创建
+  SharedMessageContent(const MQTTString& topic, const MQTTByteVector& msg_payload, 
+                      uint8_t msg_qos, bool msg_retain, bool msg_dup,
+                      const Properties& props, const MQTTString& sender)
+      : topic_name(topic),
+        payload(msg_payload),
+        dup(msg_dup),
+        qos(msg_qos),
+        retain(msg_retain),
+        properties(props),
         timestamp(std::chrono::steady_clock::now()),
         sender_client_id(sender)
   {
@@ -63,15 +65,15 @@ struct SharedPublishContent
 /**
  * @brief 共享内容的智能指针包装
  */
-class SharedPublishContentPtr
+class SharedMessageContentPtr
 {
 private:
-  SharedPublishContent* content_;
+  SharedMessageContent* content_;
   
 public:
-  SharedPublishContentPtr() : content_(nullptr) {}
+  SharedMessageContentPtr() : content_(nullptr) {}
   
-  explicit SharedPublishContentPtr(SharedPublishContent* content) : content_(content)
+  explicit SharedMessageContentPtr(SharedMessageContent* content) : content_(content)
   {
     if (content_) {
       content_->add_ref();
@@ -79,7 +81,7 @@ public:
   }
   
   // 拷贝构造
-  SharedPublishContentPtr(const SharedPublishContentPtr& other) : content_(other.content_)
+  SharedMessageContentPtr(const SharedMessageContentPtr& other) : content_(other.content_)
   {
     if (content_) {
       content_->add_ref();
@@ -87,13 +89,13 @@ public:
   }
   
   // 移动构造
-  SharedPublishContentPtr(SharedPublishContentPtr&& other) noexcept : content_(other.content_)
+  SharedMessageContentPtr(SharedMessageContentPtr&& other) noexcept : content_(other.content_)
   {
     other.content_ = nullptr;
   }
   
   // 拷贝赋值
-  SharedPublishContentPtr& operator=(const SharedPublishContentPtr& other)
+  SharedMessageContentPtr& operator=(const SharedMessageContentPtr& other)
   {
     if (this != &other) {
       if (content_) {
@@ -108,7 +110,7 @@ public:
   }
   
   // 移动赋值
-  SharedPublishContentPtr& operator=(SharedPublishContentPtr&& other) noexcept
+  SharedMessageContentPtr& operator=(SharedMessageContentPtr&& other) noexcept
   {
     if (this != &other) {
       if (content_) {
@@ -121,7 +123,7 @@ public:
   }
   
   // 析构函数
-  ~SharedPublishContentPtr()
+  ~SharedMessageContentPtr()
   {
     if (content_) {
       content_->release();
@@ -129,9 +131,9 @@ public:
   }
   
   // 访问操作
-  SharedPublishContent* operator->() const { return content_; }
-  SharedPublishContent& operator*() const { return *content_; }
-  SharedPublishContent* get() const { return content_; }
+  SharedMessageContent* operator->() const { return content_; }
+  SharedMessageContent& operator*() const { return *content_; }
+  SharedMessageContent* get() const { return content_; }
   bool is_valid() const { return content_ != nullptr; }
   
   // 重置
@@ -145,99 +147,70 @@ public:
 };
 
 /**
- * @brief Session特定的PUBLISH消息信息
- * 只包含session特定的数据，共享消息内容通过智能指针管理
+ * @brief 待发送的消息信息
+ * 包含共享的消息内容和目标客户端信息
  */
-struct SessionPublishInfo
+struct PendingMessageInfo
 {
-  SharedPublishContentPtr content;                  // 共享的消息内容
+  SharedMessageContentPtr content;                  // 共享的消息内容
   MQTTString target_client_id;                      // 目标客户端ID
-  uint16_t packet_id;                               // session特定的packet_id（0表示需要生成）
+  std::chrono::steady_clock::time_point enqueue_time;  // 入队时间戳
   
-  // 构造函数 - 从原始PublishPacket创建
-  SessionPublishInfo(const PublishPacket& packet, const MQTTString& target, const MQTTString& sender)
-      : content(new SharedPublishContent(packet, sender)),
-        target_client_id(target),
-        packet_id(0)  // 初始为0，表示需要session自己生成
+  // 构造函数 - 从消息基本信息创建
+  PendingMessageInfo(const MQTTString& topic, const MQTTByteVector& payload, 
+                    uint8_t qos, bool retain, bool dup,
+                    const Properties& properties, const MQTTString& sender_id,
+                    const MQTTString& target_id)
+      : content(new SharedMessageContent(topic, payload, qos, retain, dup, properties, sender_id)),
+        target_client_id(target_id),
+        enqueue_time(std::chrono::steady_clock::now())
   {
   }
   
   // 构造函数 - 从共享内容创建
-  SessionPublishInfo(const SharedPublishContentPtr& shared_content, const MQTTString& target)
+  PendingMessageInfo(const SharedMessageContentPtr& shared_content, const MQTTString& target_id)
       : content(shared_content),
-        target_client_id(target),
-        packet_id(0)  // 初始为0，表示需要session自己生成
+        target_client_id(target_id),
+        enqueue_time(std::chrono::steady_clock::now())
   {
   }
   
-  // 生成完整的PublishPacket（由session调用，传入session特定的packet_id）
-  PublishPacket generate_publish_packet(uint16_t session_packet_id) const
-  {
-    if (!content.is_valid()) {
-      return PublishPacket();  // 返回空包
-    }
-    
-    PublishPacket packet;
-    packet.type = PacketType::PUBLISH;
-    packet.dup = content->dup;
-    packet.qos = content->qos;
-    packet.retain = content->retain;
-    packet.topic_name = content->topic_name;
-    packet.packet_id = session_packet_id;  // 使用session特定的packet_id
-    packet.payload = content->payload;
-    packet.properties = content->properties;
-    
-    return packet;
-  }
-  
-  // 获取消息基本信息（用于日志等）
+  // 获取基本信息
+  const MQTTString& get_target_client_id() const { return target_client_id; }
   const MQTTString& get_topic() const { return content->topic_name; }
-  const MQTTString& get_sender() const { return content->sender_client_id; }
-  size_t get_payload_size() const { return content->payload.size(); }
+  const MQTTString& get_sender_client_id() const { return content->sender_client_id; }
+  const MQTTByteVector& get_payload() const { return content->payload; }
   uint8_t get_qos() const { return content->qos; }
   bool is_retain() const { return content->retain; }
+  bool is_dup() const { return content->dup; }
+  const Properties& get_properties() const { return content->properties; }
+  size_t get_payload_size() const { return content->payload.size(); }
   
   // 检查消息是否有效
   bool is_valid() const { return content.is_valid(); }
 };
 
 /**
- * @brief 待发送的消息结构（重构后的版本）
- * 使用SessionPublishInfo替代原来的PublishPacket，实现内存共享和延迟packet_id生成
+ * @brief 兼容性结构 - 保持向后兼容
+ * 重定向到新的 PendingMessageInfo
  */
-struct PendingMessage
+struct PendingMessage : public PendingMessageInfo
 {
-  SessionPublishInfo session_info;                  // Session特定的消息信息
-  std::chrono::steady_clock::time_point enqueue_time;  // 入队时间戳
-  
-  // 构造函数 - 从原始PublishPacket创建
+  // 兼容性构造函数 - 从PublishPacket创建（用于渐进式迁移）
   PendingMessage(const PublishPacket& packet, const MQTTString& target, const MQTTString& sender)
-      : session_info(packet, target, sender),
-        enqueue_time(std::chrono::steady_clock::now())
+      : PendingMessageInfo(packet.topic_name, packet.payload, packet.qos, 
+                          packet.retain, packet.dup, packet.properties, sender, target)
   {
   }
   
-  // 构造函数 - 从SessionPublishInfo创建
-  PendingMessage(const SessionPublishInfo& info)
-      : session_info(info),
-        enqueue_time(std::chrono::steady_clock::now())
+  // 从PendingMessageInfo创建
+  PendingMessage(const PendingMessageInfo& info)
+      : PendingMessageInfo(info)
   {
   }
   
-  // 兼容性接口 - 获取目标客户端ID
-  const MQTTString& get_target_client_id() const { return session_info.target_client_id; }
-  
-  // 兼容性接口 - 获取发送者客户端ID
-  const MQTTString& get_sender_client_id() const { return session_info.get_sender(); }
-  
-  // 生成完整的PublishPacket（由session调用）
-  PublishPacket generate_publish_packet(uint16_t session_packet_id) const
-  {
-    return session_info.generate_publish_packet(session_packet_id);
-  }
-  
-  // 检查消息是否有效
-  bool is_valid() const { return session_info.is_valid(); }
+  // 兼容性接口 - 这些方法现在委托给基类
+  const MQTTString& get_sender_client_id() const { return PendingMessageInfo::get_sender_client_id(); }
 };
 
 /**
@@ -248,26 +221,27 @@ class MessageContentCache
 {
 private:
   mutable std::mutex cache_mutex_;
-  std::unordered_map<std::string, SharedPublishContentPtr> content_cache_;
+  std::unordered_map<std::string, SharedMessageContentPtr> content_cache_;
   
   // 生成缓存键
-  std::string generate_cache_key(const PublishPacket& packet, const MQTTString& sender) const
+  std::string generate_cache_key(const MQTTString& topic, const MQTTString& sender, 
+                                size_t payload_size, uint8_t qos) const
   {
-    // 使用主题+发送者+时间戳的组合作为键
-    return from_mqtt_string(packet.topic_name) + "|" + from_mqtt_string(sender) + "|" + 
-           std::to_string(packet.payload.size());
+    return from_mqtt_string(topic) + "|" + from_mqtt_string(sender) + "|" + 
+           std::to_string(payload_size) + "|" + std::to_string(qos);
   }
   
 public:
   /**
    * @brief 获取或创建共享消息内容
-   * @param packet 原始PublishPacket
-   * @param sender 发送者客户端ID
-   * @return 共享的消息内容指针
    */
-  SharedPublishContentPtr get_or_create_content(const PublishPacket& packet, const MQTTString& sender)
+  SharedMessageContentPtr get_or_create_content(const MQTTString& topic, 
+                                               const MQTTByteVector& payload,
+                                               uint8_t qos, bool retain, bool dup,
+                                               const Properties& properties,
+                                               const MQTTString& sender_id)
   {
-    std::string cache_key = generate_cache_key(packet, sender);
+    std::string cache_key = generate_cache_key(topic, sender_id, payload.size(), qos);
     
     std::lock_guard<std::mutex> lock(cache_mutex_);
     
@@ -278,10 +252,19 @@ public:
     }
     
     // 创建新内容
-    SharedPublishContentPtr new_content(new SharedPublishContent(packet, sender));
+    SharedMessageContentPtr new_content(new SharedMessageContent(topic, payload, qos, retain, dup, properties, sender_id));
     content_cache_[cache_key] = new_content;
     
     return new_content;
+  }
+  
+  /**
+   * @brief 兼容性接口 - 从PublishPacket创建或获取共享内容
+   */
+  SharedMessageContentPtr get_or_create_content_from_packet(const PublishPacket& packet, const MQTTString& sender_id)
+  {
+    return get_or_create_content(packet.topic_name, packet.payload, packet.qos, 
+                                packet.retain, packet.dup, packet.properties, sender_id);
   }
   
   /**
@@ -313,6 +296,15 @@ public:
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     return content_cache_.size();
+  }
+  
+  /**
+   * @brief 清空所有缓存
+   */
+  void clear_cache()
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    content_cache_.clear();
   }
 };
 

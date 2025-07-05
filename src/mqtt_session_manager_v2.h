@@ -62,12 +62,12 @@ class ThreadLocalSessionManager
   /**
    * @brief 将共享消息内容加入待发送队列（优化版本）
    */
-  void enqueue_shared_message(const SharedPublishContentPtr& content, const MQTTString& target_client_id);
+  void enqueue_shared_message(const SharedMessageContentPtr& content, const MQTTString& target_client_id);
 
   /**
    * @brief 批量将共享消息内容加入待发送队列（批量优化版本）
    */
-  void enqueue_shared_messages(const SharedPublishContentPtr& content, const std::vector<MQTTString>& target_client_ids);
+  void enqueue_shared_messages(const SharedMessageContentPtr& content, const std::vector<MQTTString>& target_client_ids);
 
   /**
    * @brief 处理待发送队列中的消息（协程友好的阻塞等待）
@@ -217,7 +217,7 @@ class GlobalSessionManager
   /**
    * @brief 转发PUBLISH消息到指定客户端（使用共享内容，内存优化版本）
    */
-  int forward_publish_shared(const MQTTString& target_client_id, const SharedPublishContentPtr& content);
+  int forward_publish_shared(const MQTTString& target_client_id, const SharedMessageContentPtr& content);
 
   /**
    * @brief 转发PUBLISH消息到订阅指定主题的所有客户端
@@ -228,12 +228,12 @@ class GlobalSessionManager
   /**
    * @brief 转发PUBLISH消息到订阅指定主题的所有客户端（使用共享内容，内存优化版本）
    */
-  int forward_publish_by_topic_shared(const MQTTString& topic, const SharedPublishContentPtr& content);
+  int forward_publish_by_topic_shared(const MQTTString& topic, const SharedMessageContentPtr& content);
 
   /**
    * @brief 获取或创建共享消息内容
    */
-  SharedPublishContentPtr get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id);
+  SharedMessageContentPtr get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id);
 
   /**
    * @brief 获取所有活跃会话的数量
@@ -319,7 +319,7 @@ class GlobalSessionManager
   /**
    * @brief 批量转发消息到多个客户端（内部优化方法）
    */
-  int batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedPublishContentPtr& content);
+  int batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedMessageContentPtr& content);
 };
 
 // 单例访问

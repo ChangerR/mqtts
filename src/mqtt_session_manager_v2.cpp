@@ -173,15 +173,15 @@ void ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
             from_mqtt_string(message.get_target_client_id()), get_pending_message_count());
 }
 
-void ThreadLocalSessionManager::enqueue_shared_message(const SharedPublishContentPtr& content, const MQTTString& target_client_id)
+void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContentPtr& content, const MQTTString& target_client_id)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
     return;
   }
 
-  SessionPublishInfo session_info(content, target_client_id);
-  PendingMessage message(session_info);
+  PendingMessageInfo message_info(content, target_client_id);
+  PendingMessage message(message_info);
   
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -196,7 +196,7 @@ void ThreadLocalSessionManager::enqueue_shared_message(const SharedPublishConten
             from_mqtt_string(target_client_id), get_pending_message_count());
 }
 
-void ThreadLocalSessionManager::enqueue_shared_messages(const SharedPublishContentPtr& content, const std::vector<MQTTString>& target_client_ids)
+void ThreadLocalSessionManager::enqueue_shared_messages(const SharedMessageContentPtr& content, const std::vector<MQTTString>& target_client_ids)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
@@ -211,8 +211,8 @@ void ThreadLocalSessionManager::enqueue_shared_messages(const SharedPublishConte
     std::lock_guard<std::mutex> lock(queue_mutex_);
     
     for (const MQTTString& client_id : target_client_ids) {
-      SessionPublishInfo session_info(content, client_id);
-      PendingMessage message(session_info);
+      PendingMessageInfo message_info(content, client_id);
+      PendingMessage message(message_info);
       pending_messages_.push(message);
     }
     
@@ -393,19 +393,15 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
           // 使用session专属锁，避免阻塞其他session的处理
           CoroLockGuard handler_lock(&session_info->session_mutex);
 
-          // 生成session特定的packet_id并发送消息
-          uint16_t session_packet_id = get_next_packet_id(client_id_str);
-          PublishPacket packet_to_send = message.generate_publish_packet(session_packet_id);
-          
-          if (packet_to_send.type == PacketType::PUBLISH) {
-            // TODO: 实现实际的消息发送逻辑
-            // safe_handler->send_publish_message(packet_to_send);
-            processed_count++;
+          // TODO: 将消息信息传递给 MQTT handler 进行实际发送
+          // 这里只需要传递消息的基本信息，让 handler 自己生成 packet_id 和 PublishPacket
+          // safe_handler->send_message(message.get_topic(), message.get_payload(), 
+          //                           message.get_qos(), message.get_retain(), 
+          //                           message.is_dup(), message.get_properties());
+          processed_count++;
 
-            LOG_DEBUG("Message processed for client: {} with packet_id: {}", client_id_str, session_packet_id);
-          } else {
-            LOG_ERROR("Failed to generate publish packet for client: {}", client_id_str);
-          }
+          LOG_DEBUG("Message processed for client: {} (topic: {}, payload size: {})", 
+                    client_id_str, from_mqtt_string(message.get_topic()), message.get_payload_size());
         }
       } else {
         LOG_WARN("Handler not found or invalid for client: {}",
@@ -754,7 +750,7 @@ int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
   return MQ_SUCCESS;
 }
 
-int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client_id, const SharedPublishContentPtr& content)
+int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client_id, const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
@@ -774,17 +770,17 @@ int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client
   return MQ_SUCCESS;
 }
 
-SharedPublishContentPtr GlobalSessionManager::get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id)
+SharedMessageContentPtr GlobalSessionManager::get_or_create_shared_content(const PublishPacket& packet, const MQTTString& sender_client_id)
 {
   if (!message_cache_) {
     LOG_ERROR("Message cache not initialized");
-    return SharedPublishContentPtr();
+    return SharedMessageContentPtr();
   }
 
-  return message_cache_->get_or_create_content(packet, sender_client_id);
+  return message_cache_->get_or_create_content_from_packet(packet, sender_client_id);
 }
 
-int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedPublishContentPtr& content)
+int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& target_client_ids, const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
@@ -847,7 +843,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   return forwarded_count;
 }
 
-int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic, const SharedPublishContentPtr& content)
+int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic, const SharedMessageContentPtr& content)
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
