@@ -11,6 +11,7 @@
 #include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_message_queue.h"
 
 namespace mqtt {
 
@@ -19,23 +20,49 @@ class ThreadLocalSessionManager;
 
 /**
  * @brief Worker发送任务结构
+ * 使用共享消息内容，提高内存效率和转发性能
  */
 struct WorkerSendTask
 {
-  PublishPacket packet;
+  // 共享的消息内容（包含topic, payload, qos, retain, dup, properties, sender_client_id等）
+  SharedMessageContentPtr shared_content;
+  
+  // 目标客户端信息
   MQTTString target_client_id;
-  MQTTString sender_client_id;
+  
+  // 任务时间戳
   std::chrono::steady_clock::time_point enqueue_time;
 
   WorkerSendTask() : enqueue_time(std::chrono::steady_clock::now()) {}
 
-  WorkerSendTask(const PublishPacket& p, const MQTTString& target, const MQTTString& sender)
-      : packet(p),
+  // 从共享内容创建任务
+  WorkerSendTask(const SharedMessageContentPtr& content, const MQTTString& target)
+      : shared_content(content),
         target_client_id(target),
-        sender_client_id(sender),
         enqueue_time(std::chrono::steady_clock::now())
   {
   }
+
+  // 从PendingMessage创建的便利构造函数（推荐使用）
+  WorkerSendTask(const PendingMessage& pending_msg)
+      : shared_content(pending_msg.content),
+        target_client_id(pending_msg.get_target_client_id()),
+        enqueue_time(std::chrono::steady_clock::now())
+  {
+  }
+
+  // 便利访问方法
+  const MQTTString& get_topic() const { return shared_content->topic_name; }
+  const MQTTByteVector& get_payload() const { return shared_content->payload; }
+  uint8_t get_qos() const { return shared_content->qos; }
+  bool is_retain() const { return shared_content->retain; }
+  bool is_dup() const { return shared_content->dup; }
+  const Properties& get_properties() const { return shared_content->properties; }
+  const MQTTString& get_sender_client_id() const { return shared_content->sender_client_id; }
+  const MQTTString& get_target_client_id() const { return target_client_id; }
+  
+  // 检查任务是否有效
+  bool is_valid() const { return shared_content.is_valid(); }
 };
 
 /**

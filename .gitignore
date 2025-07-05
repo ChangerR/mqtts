@@ -3,3 +3,4 @@ release/
 .vscode/
 .cursor/
 .ccls-cache/
+logs/

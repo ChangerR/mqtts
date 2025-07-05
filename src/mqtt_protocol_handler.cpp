@@ -1208,4 +1208,69 @@ int MQTTProtocolHandler::register_session_with_manager()
   return MQ_SUCCESS;
 }
 
+int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos,
+                                      bool retain, bool dup, const Properties& properties)
+{
+  LOG_DEBUG("Sending PUBLISH to client {}:{} (topic: {}, qos: {}, retain: {}, dup: {})",
+            client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos, retain, dup);
+
+  if (!socket_) {
+    LOG_ERROR("Cannot send PUBLISH: socket is null for client {}:{}", client_ip_.c_str(),
+              client_port_);
+    return MQ_ERR_SOCKET;
+  }
+
+  // 创建PUBLISH包
+  PublishPacket* packet = new (allocator_->allocate(sizeof(PublishPacket))) PublishPacket();
+  if (!packet) {
+    LOG_ERROR("Failed to allocate PUBLISH packet for client {}:{}", client_ip_.c_str(),
+              client_port_);
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+
+  packet->type = PacketType::PUBLISH;
+  packet->topic_name = topic;
+  packet->payload = payload;
+  packet->qos = qos;
+  packet->retain = retain;
+  packet->dup = dup;
+  packet->properties = properties;
+  
+  // 如果QoS > 0，需要分配packet_id
+  if (qos > 0) {
+    packet->packet_id = get_next_packet_id();
+  } else {
+    packet->packet_id = 0;
+  }
+
+  // 序列化包
+  int ret = parser_->serialize_publish(packet, *serialize_buffer_);
+  if (ret != 0) {
+    LOG_ERROR("Failed to serialize PUBLISH packet for client {}:{}, error: {}", client_ip_.c_str(),
+              client_port_, ret);
+    allocator_->deallocate(packet, sizeof(PublishPacket));
+    return ret;
+  }
+
+  // 使用统一的带锁写入函数
+  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
+  if (ret != 0) {
+    LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
+              client_port_, ret);
+  } else {
+    LOG_DEBUG("Successfully sent PUBLISH packet to client {}:{} (size: {}, packet_id: {})", 
+              client_ip_.c_str(), client_port_, serialize_buffer_->size(), packet->packet_id);
+  }
+
+  allocator_->deallocate(packet, sizeof(PublishPacket));
+  return ret;
+}
+
+int MQTTProtocolHandler::send_publish(const PublishPacket& packet)
+{
+  return send_publish(packet.topic_name, packet.payload, packet.qos, 
+                      packet.retain, packet.dup, packet.properties);
+}
+
 }  // namespace mqtt

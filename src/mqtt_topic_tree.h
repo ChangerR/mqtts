@@ -119,10 +119,6 @@ using TopicTreeSet = std::unordered_set<Value, std::hash<Value>, std::equal_to<V
 template<typename Value>
 using TopicTreeVector = std::vector<Value, TopicTreeAllocator<Value>>;
 
-// 专门用于SubscriberInfo的集合类型
-using SubscriberSet = std::unordered_set<SubscriberInfo, SubscriberInfoHash, std::equal_to<SubscriberInfo>, 
-                                        TopicTreeAllocator<SubscriberInfo>>;
-
 /**
  * @brief 订阅者信息
  */
@@ -146,6 +142,10 @@ struct SubscriberInfoHash {
         return std::hash<std::string>{}(from_mqtt_string(info.client_id));
     }
 };
+
+// 专门用于SubscriberInfo的集合类型
+using SubscriberSet = std::unordered_set<SubscriberInfo, SubscriberInfoHash, std::equal_to<SubscriberInfo>, 
+                                        TopicTreeAllocator<SubscriberInfo>>;
 
 /**
  * @brief 主题树节点
@@ -262,6 +262,7 @@ public:
     std::shared_ptr<TopicTreeNode> get_child(const std::string& level) const;
     const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>& get_children() const { return children_; }
     const SubscriberSet& get_subscribers() const { return subscribers_; }
+    MQTTAllocator* get_allocator() const { return allocator_; }
     
 private:
     // MQTT分配器

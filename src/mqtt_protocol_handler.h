@@ -70,6 +70,11 @@ class MQTTProtocolHandler
   int send_disconnect(ReasonCode reason_code);
   int send_auth(ReasonCode reason_code);
 
+  // Publish message sender
+  int send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos = 0,
+                   bool retain = false, bool dup = false, const Properties& properties = Properties());
+  int send_publish(const PublishPacket& packet);
+
   // Session management
   bool is_connected() const { return connected_; }
   void set_client_id(const MQTTString& client_id) { client_id_ = client_id; }

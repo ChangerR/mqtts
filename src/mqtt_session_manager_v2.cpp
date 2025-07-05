@@ -6,9 +6,9 @@
 #include "mqtt_define.h"
 #include "mqtt_protocol_handler.h"
 
-// 新增错误代码定义
-#define MQ_ERR_PARAM_V2 -800
-#define MQ_ERR_NOT_FOUND_V2 -801
+// 新增错误代码定义 (已在mqtt_define.h中定义，这里注释掉避免重复定义)
+// #define MQ_ERR_PARAM_V2 -800
+// #define MQ_ERR_NOT_FOUND_V2 -801
 #define MQ_ERR_TIMEOUT_V2 -802
 #define MQ_ERR_THREAD_MISMATCH -803
 
@@ -276,8 +276,8 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
       break;  // 队列为空
     }
 
-    // 创建Worker任务并提交给Worker池
-    WorkerSendTask task(message.packet, message.target_client_id, message.sender_client_id);
+    // 直接从PendingMessage创建Worker任务
+    WorkerSendTask task(message);
 
     int submit_result = worker_pool_->submit_task(task);
     if (submit_result == MQ_SUCCESS) {
@@ -1147,7 +1147,13 @@ std::vector<SubscriberInfo> GlobalSessionManager::find_topic_subscribers(const M
   }
   
   TopicMatchResult result = topic_tree_->find_subscribers(topic);
-  return result.subscribers;
+  // 转换分配器类型
+  std::vector<SubscriberInfo> converted_subscribers;
+  converted_subscribers.reserve(result.subscribers.size());
+  for (const auto& subscriber : result.subscribers) {
+    converted_subscribers.push_back(subscriber);
+  }
+  return converted_subscribers;
 }
 
 std::pair<size_t, size_t> GlobalSessionManager::get_topic_tree_stats() const

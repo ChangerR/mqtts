@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "mqtt_session_info.h"
 #include "mqtt_session_manager_v2.h"
+#include "mqtt_protocol_handler.h"
 
 namespace mqtt {
 
@@ -220,10 +221,10 @@ bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker
   }
 
   try {
-    SafeHandlerRef safe_handler = session_manager_->get_safe_handler(task.target_client_id);
+    SafeHandlerRef safe_handler = session_manager_->get_safe_handler(task.get_target_client_id());
     if (!safe_handler.is_valid()) {
       LOG_WARN("Worker {}: handler not found for client: {}", worker_id,
-               from_mqtt_string(task.target_client_id));
+               from_mqtt_string(task.get_target_client_id()));
       return false;
     }
 
@@ -234,22 +235,37 @@ bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker
 
     if (queue_time.count() > 5000) {  // 5秒超时
       LOG_WARN("Worker {}: task expired (waited {}ms) for client: {}", worker_id,
-               queue_time.count(), from_mqtt_string(task.target_client_id));
+               queue_time.count(), from_mqtt_string(task.get_target_client_id()));
       return false;
     }
 
-    // TODO: 实现实际的PUBLISH消息发送
-    // MQTTProtocolHandler* handler = safe_handler.get();
-    // int result = handler->send_publish(task.packet);
+    // 检查任务是否有效
+    if (!task.is_valid()) {
+      LOG_ERROR("Worker {}: invalid task for client: {}", worker_id,
+                from_mqtt_string(task.target_client_id));
+      return false;
+    }
 
-    LOG_DEBUG("Worker {}: processed task for client: {} (queue time: {}ms)", worker_id,
-              from_mqtt_string(task.target_client_id), queue_time.count());
+    // 实际发送PUBLISH消息（使用共享内容）
+    MQTTProtocolHandler* handler = safe_handler.get();
+    int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(), 
+                                       task.is_retain(), task.is_dup(), task.get_properties());
 
-    return true;  // 暂时返回成功
+    if (result == MQ_SUCCESS) {
+      LOG_DEBUG("Worker {}: successfully sent shared message to client: {} (topic: {}, queue time: {}ms)", 
+                worker_id, from_mqtt_string(task.get_target_client_id()), 
+                from_mqtt_string(task.get_topic()), queue_time.count());
+      return true;
+    } else {
+      LOG_ERROR("Worker {}: failed to send shared message to client: {}, error: {} (topic: {}, queue time: {}ms)", 
+                worker_id, from_mqtt_string(task.get_target_client_id()), result,
+                from_mqtt_string(task.get_topic()), queue_time.count());
+      return false;
+    }
 
   } catch (const std::exception& e) {
     LOG_ERROR("Worker {}: exception processing task for client {}: {}", worker_id,
-              from_mqtt_string(task.target_client_id), e.what());
+              from_mqtt_string(task.get_target_client_id()), e.what());
     return false;
   }
 }

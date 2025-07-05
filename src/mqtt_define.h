@@ -59,6 +59,9 @@
 // 通用错误
 #define MQ_ERR_INVALID_ARGS -700
 #define MQ_ERR_TIMEOUT -701
+#define MQ_ERR_INTERNAL -702
+#define MQ_ERR_PARAM_V2 -703
+#define MQ_ERR_NOT_FOUND_V2 -704
 
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
