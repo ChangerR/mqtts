@@ -54,26 +54,40 @@ Enhanced with global memory management:
 ```cpp
 // Set memory limit for a specific client
 MQTTString client_id = to_mqtt_string("client123", nullptr);
-global_session_manager->set_client_memory_limit(client_id, 1024 * 1024); // 1MB limit
+int ret = global_session_manager->set_client_memory_limit(client_id, 1024 * 1024); // 1MB limit
+if (ret != MQ_SUCCESS) {
+    LOG_ERROR("Failed to set memory limit: {}", mqtt_error_string(ret));
+}
 ```
 
 ### Monitoring Memory Usage
 ```cpp
 // Get global memory usage
-size_t total_usage = global_session_manager->get_global_memory_usage();
+size_t total_usage = 0;
+int ret = global_session_manager->get_global_memory_usage(total_usage);
+if (ret == MQ_SUCCESS) {
+    LOG_INFO("Total memory usage: {} bytes", total_usage);
+}
 
 // Get per-client memory usage
-auto client_usage = global_session_manager->get_client_memory_usage();
-for (const auto& pair : client_usage) {
-    LOG_INFO("Client {}: {} bytes", pair.first, pair.second);
+std::unordered_map<std::string, size_t> client_usage;
+ret = global_session_manager->get_client_memory_usage(client_usage);
+if (ret == MQ_SUCCESS) {
+    for (const auto& pair : client_usage) {
+        LOG_INFO("Client {}: {} bytes", pair.first, pair.second);
+    }
 }
 ```
 
 ### Checking Memory Limits
 ```cpp
 // Check if client exceeded memory limit
-if (global_session_manager->is_client_memory_limit_exceeded(client_id)) {
+bool limit_exceeded = false;
+int ret = global_session_manager->is_client_memory_limit_exceeded(client_id, limit_exceeded);
+if (ret == MQ_SUCCESS && limit_exceeded) {
     LOG_WARN("Client {} exceeded memory limit", from_mqtt_string(client_id));
+} else if (ret != MQ_SUCCESS) {
+    LOG_ERROR("Failed to check memory limit: {}", mqtt_error_string(ret));
 }
 ```
 
@@ -81,10 +95,15 @@ if (global_session_manager->is_client_memory_limit_exceeded(client_id)) {
 ```cpp
 // Get detailed memory statistics
 ThreadLocalSessionManager* thread_manager = global_session_manager->get_thread_manager();
-auto stats = thread_manager->get_memory_statistics();
-LOG_INFO("Session Usage: {} bytes", stats.session_usage);
-LOG_INFO("Queue Usage: {} bytes", stats.queue_usage);
-LOG_INFO("Worker Usage: {} bytes", stats.worker_usage);
+ThreadLocalSessionManager::MemoryStats stats;
+int ret = thread_manager->get_memory_statistics(stats);
+if (ret == MQ_SUCCESS) {
+    LOG_INFO("Session Usage: {} bytes", stats.session_usage);
+    LOG_INFO("Queue Usage: {} bytes", stats.queue_usage);
+    LOG_INFO("Worker Usage: {} bytes", stats.worker_usage);
+} else {
+    LOG_ERROR("Failed to get memory statistics: {}", mqtt_error_string(ret));
+}
 ```
 
 ## Benefits
@@ -127,17 +146,53 @@ Memory limits can be configured via:
 ### Manual Cleanup
 ```cpp
 // Clean up expired allocators
-int cleaned = global_session_manager->cleanup_expired_allocators();
-LOG_INFO("Cleaned up {} expired allocators", cleaned);
+int cleaned_count = 0;
+int ret = global_session_manager->cleanup_expired_allocators(cleaned_count);
+if (ret == MQ_SUCCESS) {
+    LOG_INFO("Cleaned up {} expired allocators", cleaned_count);
+} else {
+    LOG_ERROR("Failed to cleanup expired allocators: {}", mqtt_error_string(ret));
+}
+```
+
+## Error Code Design
+
+All allocator management functions follow a consistent error code pattern:
+- **Return Value**: Always an `int` error code (`MQ_SUCCESS` for success)
+- **Output Parameters**: Actual return values passed by reference
+- **Error Codes**: Specific allocator error codes in the -700 to -799 range
+
+### Allocator Error Codes
+- `MQ_ERR_ALLOCATOR`: General allocator error
+- `MQ_ERR_ALLOCATOR_CREATE`: Failed to create allocator
+- `MQ_ERR_ALLOCATOR_NOT_FOUND`: Allocator not found
+- `MQ_ERR_ALLOCATOR_CLEANUP`: Failed to cleanup allocator
+- `MQ_ERR_ALLOCATOR_LIMIT_EXCEEDED`: Allocator limit exceeded
+- `MQ_ERR_ALLOCATOR_INVALID_PARENT`: Invalid parent allocator
+- `MQ_ERR_ALLOCATOR_INVALID_TAG`: Invalid memory tag
+- `MQ_ERR_ALLOCATOR_HIERARCHY`: Allocator hierarchy error
+
+### Error Handling Pattern
+```cpp
+// Standard pattern for all allocator functions
+MQTTAllocator* allocator = nullptr;
+int ret = SessionAllocatorManager::get_session_allocator(client_id, limit, allocator);
+if (ret == MQ_SUCCESS) {
+    // Use allocator
+} else {
+    LOG_ERROR("Allocator operation failed: {}", mqtt_error_string(ret));
+    // Handle error
+}
 ```
 
 ## Error Handling
 
 The system provides comprehensive error handling:
 - Graceful fallback to standard allocators if custom allocators fail
-- Detailed logging of allocation failures
+- Detailed logging of allocation failures with specific error codes
 - Memory limit violation warnings
 - Automatic cleanup on errors
+- Consistent error reporting through `mqtt_error_string()`
 
 ## Integration Status
 
@@ -154,9 +209,15 @@ The system provides comprehensive error handling:
 - Component-specific categorization
 
 ✅ **API Extensions:**
-- Memory management APIs
-- Statistics reporting
-- Limit configuration
+- Memory management APIs with error code returns
+- Statistics reporting with error handling
+- Limit configuration with validation
+
+✅ **Error Code System:**
+- Dedicated allocator error codes (-700 to -799)
+- Consistent error code return pattern
+- Reference parameter pattern for return values
+- Comprehensive error message translation
 
 ## Future Enhancements
 

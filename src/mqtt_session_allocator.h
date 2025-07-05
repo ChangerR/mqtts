@@ -22,49 +22,56 @@ public:
      * @brief 获取或创建session专用allocator
      * @param client_id 客户端ID
      * @param memory_limit 内存限制（字节），0表示无限制
-     * @return session专用allocator
+     * @param allocator 输出参数，session专用allocator
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static MQTTAllocator* get_session_allocator(const std::string& client_id, size_t memory_limit = 0);
+    static int get_session_allocator(const std::string& client_id, size_t memory_limit, MQTTAllocator*& allocator);
     
     /**
      * @brief 获取或创建session队列专用allocator
      * @param client_id 客户端ID
-     * @return session队列专用allocator
+     * @param allocator 输出参数，session队列专用allocator
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static MQTTAllocator* get_session_queue_allocator(const std::string& client_id);
+    static int get_session_queue_allocator(const std::string& client_id, MQTTAllocator*& allocator);
     
     /**
      * @brief 获取或创建session worker专用allocator
      * @param client_id 客户端ID
-     * @return session worker专用allocator
+     * @param allocator 输出参数，session worker专用allocator
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static MQTTAllocator* get_session_worker_allocator(const std::string& client_id);
+    static int get_session_worker_allocator(const std::string& client_id, MQTTAllocator*& allocator);
     
     /**
      * @brief 获取全局消息缓存allocator
-     * @return 消息缓存allocator
+     * @param allocator 输出参数，消息缓存allocator
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static MQTTAllocator* get_message_cache_allocator();
+    static int get_message_cache_allocator(MQTTAllocator*& allocator);
     
     /**
      * @brief 清理session相关的所有allocator
      * @param client_id 客户端ID
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static void cleanup_session_allocators(const std::string& client_id);
+    static int cleanup_session_allocators(const std::string& client_id);
     
     /**
      * @brief 获取session内存使用统计
      * @param client_id 客户端ID
-     * @return 内存使用量（字节）
+     * @param memory_usage 输出参数，内存使用量（字节）
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static size_t get_session_memory_usage(const std::string& client_id);
+    static int get_session_memory_usage(const std::string& client_id, size_t& memory_usage);
     
     /**
      * @brief 检查session是否超过内存限制
      * @param client_id 客户端ID
-     * @return true表示超过限制
+     * @param limit_exceeded 输出参数，true表示超过限制
+     * @return 错误码，MQ_SUCCESS表示成功
      */
-    static bool is_session_memory_limit_exceeded(const std::string& client_id);
+    static int is_session_memory_limit_exceeded(const std::string& client_id, bool& limit_exceeded);
 
 private:
     // 防止实例化

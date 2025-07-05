@@ -129,26 +129,29 @@ class ThreadLocalSessionManager
 
   /**
    * @brief 获取当前线程管理器的内存使用情况
-   * @return 内存使用量（字节）
+   * @param memory_usage 输出参数，内存使用量（字节）
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  size_t get_memory_usage() const;
+  int get_memory_usage(size_t& memory_usage) const;
 
   /**
    * @brief 检查内存使用是否超过限制
-   * @return true表示超过限制
+   * @param limit_exceeded 输出参数，true表示超过限制
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  bool is_memory_limit_exceeded() const;
+  int is_memory_limit_exceeded(bool& limit_exceeded) const;
 
   /**
    * @brief 设置内存限制
    * @param limit 内存限制（字节），0表示无限制
-   * @return 0成功，非0失败
+   * @return 错误码，MQ_SUCCESS表示成功
    */
   int set_memory_limit(size_t limit);
 
   /**
    * @brief 获取内存分配器统计信息
-   * @return 包含各种分配器统计信息的结构
+   * @param stats 输出参数，包含各种分配器统计信息的结构
+   * @return 错误码，MQ_SUCCESS表示成功
    */
   struct MemoryStats {
     size_t total_usage;
@@ -158,7 +161,7 @@ class ThreadLocalSessionManager
     size_t limit;
     bool limit_exceeded;
   };
-  MemoryStats get_memory_statistics() const;
+  int get_memory_statistics(MemoryStats& stats) const;
 
  private:
   std::thread::id thread_id_;
@@ -363,42 +366,47 @@ class GlobalSessionManager
 
   /**
    * @brief 获取全局内存使用统计
-   * @return 内存使用量（字节）
+   * @param memory_usage 输出参数，内存使用量（字节）
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  size_t get_global_memory_usage() const;
+  int get_global_memory_usage(size_t& memory_usage) const;
 
   /**
    * @brief 获取所有客户端的内存使用情况
-   * @return 客户端ID到内存使用量的映射
+   * @param client_usage 输出参数，客户端ID到内存使用量的映射
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  std::unordered_map<std::string, size_t> get_client_memory_usage() const;
+  int get_client_memory_usage(std::unordered_map<std::string, size_t>& client_usage) const;
 
   /**
    * @brief 设置客户端内存限制
    * @param client_id 客户端ID
    * @param limit 内存限制（字节），0表示无限制
-   * @return 0成功，非0失败
+   * @return 错误码，MQ_SUCCESS表示成功
    */
   int set_client_memory_limit(const MQTTString& client_id, size_t limit);
 
   /**
    * @brief 检查客户端内存使用是否超过限制
    * @param client_id 客户端ID
-   * @return true表示超过限制
+   * @param limit_exceeded 输出参数，true表示超过限制
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  bool is_client_memory_limit_exceeded(const MQTTString& client_id);
+  int is_client_memory_limit_exceeded(const MQTTString& client_id, bool& limit_exceeded);
 
   /**
    * @brief 获取内存分配器层次结构信息
-   * @return 分配器层次结构的字符串表示
+   * @param hierarchy 输出参数，分配器层次结构的字符串表示
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  std::string get_allocator_hierarchy() const;
+  int get_allocator_hierarchy(std::string& hierarchy) const;
 
   /**
    * @brief 清理所有过期的内存分配器
-   * @return 清理的分配器数量
+   * @param cleaned_count 输出参数，清理的分配器数量
+   * @return 错误码，MQ_SUCCESS表示成功
    */
-  int cleanup_expired_allocators();
+  int cleanup_expired_allocators(int& cleaned_count);
 
  private:
   // 运行状态
