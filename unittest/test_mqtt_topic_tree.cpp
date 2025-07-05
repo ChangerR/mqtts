@@ -10,8 +10,15 @@
 #include <string>
 #include "src/mqtt_topic_tree.h"
 #include "src/mqtt_define.h"
+#include "src/mqtt_allocator.h"
 
 using namespace mqtt;
+
+// 创建测试用的分配器
+MQTTAllocator* create_test_allocator() {
+    static MQTTAllocator allocator("test_topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+    return &allocator;
+}
 
 // 辅助函数：创建MQTTString
 MQTTString create_mqtt_string(const std::string& str) {
@@ -86,7 +93,7 @@ void test_exact_topic_match() {
 void test_topic_no_match() {
     std::cout << "\n测试主题不匹配..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString topic_filter = create_mqtt_string("sensor/temperature");
     MQTTString client_id = create_mqtt_string("client1");
     
@@ -147,7 +154,7 @@ void test_single_level_wildcard() {
 void test_multi_level_wildcard() {
     std::cout << "\n测试多级通配符 (#)..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString topic_filter = create_mqtt_string("sensor/#");
     MQTTString client_id = create_mqtt_string("client1");
     
@@ -188,7 +195,7 @@ void test_multi_level_wildcard() {
 void test_root_level_multi_wildcard() {
     std::cout << "\n测试根级别多级通配符..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString topic_filter = create_mqtt_string("#");
     MQTTString client_id = create_mqtt_string("client1");
     
@@ -216,7 +223,7 @@ void test_root_level_multi_wildcard() {
 void test_multiple_subscribers_to_same_topic() {
     std::cout << "\n测试多客户端订阅相同主题..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString topic = create_mqtt_string("sensor/temperature");
     
     std::vector<std::string> client_ids = {"client1", "client2", "client3"};
@@ -251,7 +258,7 @@ void test_multiple_subscribers_to_same_topic() {
 void test_qos_update() {
     std::cout << "\n测试QoS更新..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString topic = create_mqtt_string("sensor/temperature");
     MQTTString client_id = create_mqtt_string("client1");
     
@@ -278,7 +285,7 @@ void test_qos_update() {
 void test_get_client_subscriptions() {
     std::cout << "\n测试获取客户端订阅列表..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString client_id = create_mqtt_string("client1");
     
     std::vector<std::string> topics = {
@@ -313,7 +320,7 @@ void test_get_client_subscriptions() {
 void test_unsubscribe_all() {
     std::cout << "\n测试取消所有订阅..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString client_id = create_mqtt_string("client1");
     
     std::vector<std::string> topics = {
@@ -346,7 +353,7 @@ void test_unsubscribe_all() {
 void test_parameter_validation() {
     std::cout << "\n测试参数验证..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     MQTTString empty_topic = create_mqtt_string("");
     MQTTString empty_client = create_mqtt_string("");
     MQTTString valid_topic = create_mqtt_string("sensor/temperature");
@@ -377,7 +384,7 @@ void test_parameter_validation() {
 void test_concurrent_subscriptions() {
     std::cout << "\n测试并发订阅..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     const int num_threads = 10;
     const int subscriptions_per_thread = 100;
     
@@ -425,7 +432,7 @@ void test_concurrent_subscriptions() {
 void test_concurrent_find_subscribers() {
     std::cout << "\n测试并发查找订阅者..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     const int num_clients = 100;
     
     // 先创建一些订阅
@@ -480,7 +487,7 @@ void test_concurrent_find_subscribers() {
 void test_performance_benchmark() {
     std::cout << "\n执行性能基准测试..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    ConcurrentTopicTree tree(create_test_allocator());
     const int num_subscriptions = 10000;
     const int num_searches = 1000;
     
