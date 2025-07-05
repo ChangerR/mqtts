@@ -10,6 +10,7 @@
 #include <functional>
 #include "mqtt_define.h"
 #include "mqtt_parser.h"
+#include "mqtt_allocator.h"
 
 namespace mqtt {
 
@@ -18,6 +19,109 @@ namespace mqtt {
  */
 class TopicTreeNode;
 class IntermediateNode;
+
+/**
+ * @brief 主题树专用的自定义分配器
+ */
+template<typename T>
+class TopicTreeAllocator {
+public:
+    typedef T value_type;
+    typedef T* pointer;
+    typedef const T* const_pointer;
+    typedef T& reference;
+    typedef const T& const_reference;
+    typedef size_t size_type;
+    typedef ptrdiff_t difference_type;
+
+    template<typename U>
+    struct rebind {
+        typedef TopicTreeAllocator<U> other;
+    };
+
+    TopicTreeAllocator() : mqtt_allocator_(nullptr) {}
+    
+    explicit TopicTreeAllocator(MQTTAllocator* mqtt_allocator) : mqtt_allocator_(mqtt_allocator) {}
+    
+    template<typename U>
+    TopicTreeAllocator(const TopicTreeAllocator<U>& other) : mqtt_allocator_(other.get_mqtt_allocator()) {}
+    
+    TopicTreeAllocator(const TopicTreeAllocator& other) : mqtt_allocator_(other.mqtt_allocator_) {}
+    
+    TopicTreeAllocator& operator=(const TopicTreeAllocator& other) {
+        if (this != &other) {
+            mqtt_allocator_ = other.mqtt_allocator_;
+        }
+        return *this;
+    }
+
+    pointer allocate(size_type n, const void* = 0) {
+        if (mqtt_allocator_) {
+            pointer result = static_cast<pointer>(mqtt_allocator_->allocate(n * sizeof(T)));
+            if (!result) {
+                throw std::bad_alloc();
+            }
+            return result;
+        } else {
+            // Fallback to standard new if no MQTT allocator
+            return static_cast<pointer>(::operator new(n * sizeof(T)));
+        }
+    }
+
+    void deallocate(pointer p, size_type n) {
+        if (mqtt_allocator_ && p) {
+            mqtt_allocator_->deallocate(p, n * sizeof(T));
+        } else if (p) {
+            // Fallback to standard delete
+            ::operator delete(p);
+        }
+    }
+
+    template<typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        new(p) U(std::forward<Args>(args)...);
+    }
+
+    template<typename U>
+    void destroy(U* p) {
+        p->~U();
+    }
+
+    size_type max_size() const {
+        return size_t(-1) / sizeof(T);
+    }
+
+    MQTTAllocator* get_mqtt_allocator() const { return mqtt_allocator_; }
+
+    bool operator==(const TopicTreeAllocator& other) const {
+        return mqtt_allocator_ == other.mqtt_allocator_;
+    }
+
+    bool operator!=(const TopicTreeAllocator& other) const {
+        return !(*this == other);
+    }
+
+private:
+    MQTTAllocator* mqtt_allocator_;
+};
+
+/**
+ * @brief 使用自定义分配器的容器类型定义
+ */
+template<typename Key, typename Value>
+using TopicTreeMap = std::unordered_map<Key, Value, std::hash<Key>, std::equal_to<Key>, 
+                                       TopicTreeAllocator<std::pair<const Key, Value>>>;
+
+template<typename Value>
+using TopicTreeSet = std::unordered_set<Value, std::hash<Value>, std::equal_to<Value>, 
+                                       TopicTreeAllocator<Value>>;
+
+template<typename Value>
+using TopicTreeVector = std::vector<Value, TopicTreeAllocator<Value>>;
+
+// 专门用于SubscriberInfo的集合类型
+using SubscriberSet = std::unordered_set<SubscriberInfo, SubscriberInfoHash, std::equal_to<SubscriberInfo>, 
+                                        TopicTreeAllocator<SubscriberInfo>>;
 
 /**
  * @brief 订阅者信息
@@ -49,7 +153,7 @@ struct SubscriberInfoHash {
  */
 class TopicTreeNode {
 public:
-    TopicTreeNode();
+    explicit TopicTreeNode(MQTTAllocator* allocator);
     ~TopicTreeNode();
     
     // 禁止拷贝和赋值
@@ -67,13 +171,13 @@ public:
      * @brief 获取所有子节点
      * @return 子节点映射的副本
      */
-    std::unordered_map<std::string, std::shared_ptr<TopicTreeNode>> get_children() const;
+    TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> get_children() const;
     
     /**
      * @brief 获取当前节点的订阅者
      * @return 订阅者集合的副本
      */
-    std::unordered_set<SubscriberInfo, SubscriberInfoHash> get_subscribers() const;
+    SubscriberSet get_subscribers() const;
     
     /**
      * @brief 检查是否有订阅者
@@ -87,9 +191,18 @@ public:
      */
     bool has_children() const;
     
+    /**
+     * @brief 获取节点使用的分配器
+     * @return MQTT分配器指针
+     */
+    MQTTAllocator* get_allocator() const { return allocator_; }
+    
 private:
     friend class ConcurrentTopicTree;
     friend class IntermediateNode;
+    
+    // MQTT分配器
+    MQTTAllocator* allocator_;
     
     // 使用原子指针指向中间节点，实现无锁操作
     std::atomic<IntermediateNode*> intermediate_node_;
@@ -107,7 +220,7 @@ private:
  */
 class IntermediateNode {
 public:
-    IntermediateNode();
+    explicit IntermediateNode(MQTTAllocator* allocator);
     ~IntermediateNode();
     
     // 禁止拷贝和赋值
@@ -147,15 +260,18 @@ public:
     
     // 数据访问接口
     std::shared_ptr<TopicTreeNode> get_child(const std::string& level) const;
-    const std::unordered_map<std::string, std::shared_ptr<TopicTreeNode>>& get_children() const { return children_; }
-    const std::unordered_set<SubscriberInfo, SubscriberInfoHash>& get_subscribers() const { return subscribers_; }
+    const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>& get_children() const { return children_; }
+    const SubscriberSet& get_subscribers() const { return subscribers_; }
     
 private:
-    // 子节点映射
-    std::unordered_map<std::string, std::shared_ptr<TopicTreeNode>> children_;
+    // MQTT分配器
+    MQTTAllocator* allocator_;
     
-    // 订阅者集合
-    std::unordered_set<SubscriberInfo, SubscriberInfoHash> subscribers_;
+    // 子节点映射（使用自定义分配器）
+    TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> children_;
+    
+    // 订阅者集合（使用自定义分配器）
+    SubscriberSet subscribers_;
     
     // 引用计数，用于安全回收
     std::atomic<int> ref_count_;
@@ -174,10 +290,14 @@ void intrusive_ptr_release(IntermediateNode* node);
  * @brief 主题匹配结果
  */
 struct TopicMatchResult {
-    std::vector<SubscriberInfo> subscribers;
+    TopicTreeVector<SubscriberInfo> subscribers;
     size_t total_count;
     
-    TopicMatchResult() : total_count(0) {}
+    explicit TopicMatchResult(MQTTAllocator* allocator) 
+        : subscribers(TopicTreeAllocator<SubscriberInfo>(allocator)), total_count(0) {}
+        
+    // 默认构造函数（使用标准allocator作为fallback）
+    TopicMatchResult() : subscribers(), total_count(0) {}
 };
 
 /**
@@ -186,7 +306,7 @@ struct TopicMatchResult {
  */
 class ConcurrentTopicTree {
 public:
-    ConcurrentTopicTree();
+    explicit ConcurrentTopicTree(MQTTAllocator* allocator);
     ~ConcurrentTopicTree();
     
     // 禁止拷贝和赋值
@@ -249,7 +369,22 @@ public:
      */
     std::vector<MQTTString> get_client_subscriptions(const MQTTString& client_id) const;
     
+    /**
+     * @brief 获取使用的分配器
+     * @return MQTT分配器指针
+     */
+    MQTTAllocator* get_allocator() const { return allocator_; }
+    
+    /**
+     * @brief 获取分配器的内存使用统计
+     * @return 内存使用字节数
+     */
+    size_t get_memory_usage() const;
+
 private:
+    // MQTT分配器
+    MQTTAllocator* allocator_;
+    
     // 根节点
     std::shared_ptr<TopicTreeNode> root_;
     

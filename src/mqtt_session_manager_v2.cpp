@@ -514,10 +514,14 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
   // 初始化消息内容缓存管理器
   message_cache_.reset(new MessageContentCache());
   
-  // 初始化高性能主题匹配树
-  topic_tree_.reset(new ConcurrentTopicTree());
+  // 为主题匹配树创建专用的allocator
+  MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+  MQTTAllocator* topic_tree_allocator = root_allocator->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
   
-  LOG_INFO("GlobalSessionManager initialized with high-performance lock-free architecture and topic tree");
+  // 初始化高性能主题匹配树
+  topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
+  
+  LOG_INFO("GlobalSessionManager initialized with high-performance lock-free architecture and topic tree using allocator");
 }
 
 GlobalSessionManager::~GlobalSessionManager()

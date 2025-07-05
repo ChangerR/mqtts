@@ -18,18 +18,25 @@ MQTTString create_mqtt_string(const std::string& str) {
     return to_mqtt_string(str, nullptr);
 }
 
+// 辅助函数：创建测试用的主题树
+ConcurrentTopicTree* create_test_tree(const std::string& test_name) {
+    MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+    MQTTAllocator* tree_allocator = root_allocator->create_child(test_name, MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+    return new ConcurrentTopicTree(tree_allocator);
+}
+
 // 基础订阅测试
 void test_basic_subscribe() {
     std::cout << "测试基本订阅功能..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    std::unique_ptr<ConcurrentTopicTree> tree(create_test_tree("test_basic_subscribe"));
     MQTTString topic = create_mqtt_string("sensor/temperature");
     MQTTString client_id = create_mqtt_string("client1");
     
-    int result = tree.subscribe(topic, client_id, 1);
+    int result = tree->subscribe(topic, client_id, 1);
     assert(result == MQ_SUCCESS);
-    assert(tree.get_total_subscribers() == 1);
-    assert(tree.get_total_nodes() > 1);
+    assert(tree->get_total_subscribers() == 1);
+    assert(tree->get_total_nodes() > 1);
     
     std::cout << "基本订阅测试通过" << std::endl;
 }
@@ -38,17 +45,17 @@ void test_basic_subscribe() {
 void test_basic_unsubscribe() {
     std::cout << "\n测试基本取消订阅功能..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    std::unique_ptr<ConcurrentTopicTree> tree(create_test_tree("test_basic_unsubscribe"));
     MQTTString topic = create_mqtt_string("sensor/temperature");
     MQTTString client_id = create_mqtt_string("client1");
     
     // 先订阅
-    assert(tree.subscribe(topic, client_id, 1) == MQ_SUCCESS);
-    assert(tree.get_total_subscribers() == 1);
+    assert(tree->subscribe(topic, client_id, 1) == MQ_SUCCESS);
+    assert(tree->get_total_subscribers() == 1);
     
     // 再取消订阅
-    assert(tree.unsubscribe(topic, client_id) == MQ_SUCCESS);
-    assert(tree.get_total_subscribers() == 0);
+    assert(tree->unsubscribe(topic, client_id) == MQ_SUCCESS);
+    assert(tree->get_total_subscribers() == 0);
     
     std::cout << "基本取消订阅测试通过" << std::endl;
 }
@@ -57,15 +64,15 @@ void test_basic_unsubscribe() {
 void test_exact_topic_match() {
     std::cout << "\n测试精确主题匹配..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    std::unique_ptr<ConcurrentTopicTree> tree(create_test_tree("test_exact_topic_match"));
     MQTTString topic_filter = create_mqtt_string("sensor/temperature");
     MQTTString client_id = create_mqtt_string("client1");
     
-    tree.subscribe(topic_filter, client_id, 1);
+    tree->subscribe(topic_filter, client_id, 1);
     
     // 精确匹配
     MQTTString publish_topic = create_mqtt_string("sensor/temperature");
-    TopicMatchResult result = tree.find_subscribers(publish_topic);
+    TopicMatchResult result = tree->find_subscribers(publish_topic);
     
     assert(result.total_count == 1);
     assert(result.subscribers.size() == 1);
@@ -99,11 +106,11 @@ void test_topic_no_match() {
 void test_single_level_wildcard() {
     std::cout << "\n测试单级通配符 (+)..." << std::endl;
     
-    ConcurrentTopicTree tree;
+    std::unique_ptr<ConcurrentTopicTree> tree(create_test_tree("test_single_level_wildcard"));
     MQTTString topic_filter = create_mqtt_string("sensor/+/data");
     MQTTString client_id = create_mqtt_string("client1");
     
-    tree.subscribe(topic_filter, client_id, 1);
+    tree->subscribe(topic_filter, client_id, 1);
     
     // 应该匹配的主题
     std::vector<std::string> matching_topics = {
@@ -114,7 +121,7 @@ void test_single_level_wildcard() {
     
     for (const std::string& topic_str : matching_topics) {
         MQTTString topic = create_mqtt_string(topic_str);
-        TopicMatchResult result = tree.find_subscribers(topic);
+        TopicMatchResult result = tree->find_subscribers(topic);
         assert(result.total_count == 1);
         std::cout << "  匹配主题: " << topic_str << " ✓" << std::endl;
     }
@@ -128,7 +135,7 @@ void test_single_level_wildcard() {
     
     for (const std::string& topic_str : non_matching_topics) {
         MQTTString topic = create_mqtt_string(topic_str);
-        TopicMatchResult result = tree.find_subscribers(topic);
+        TopicMatchResult result = tree->find_subscribers(topic);
         assert(result.total_count == 0);
         std::cout << "  不匹配主题: " << topic_str << " ✓" << std::endl;
     }

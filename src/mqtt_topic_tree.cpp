@@ -10,14 +10,24 @@ namespace mqtt {
 // IntermediateNode 实现
 // ============================================================================
 
-IntermediateNode::IntermediateNode() : ref_count_(1) {
+IntermediateNode::IntermediateNode(MQTTAllocator* allocator) 
+    : allocator_(allocator)
+    , children_(TopicTreeAllocator<std::pair<const std::string, std::shared_ptr<TopicTreeNode>>>(allocator))
+    , subscribers_(TopicTreeAllocator<SubscriberInfo>(allocator))
+    , ref_count_(1) {
 }
 
 IntermediateNode::~IntermediateNode() {
 }
 
 IntermediateNode* IntermediateNode::clone() const {
-    IntermediateNode* new_node = new IntermediateNode();
+    // 使用allocator分配新的IntermediateNode
+    void* memory = allocator_->allocate(sizeof(IntermediateNode));
+    if (!memory) {
+        throw std::bad_alloc();
+    }
+    
+    IntermediateNode* new_node = new(memory) IntermediateNode(allocator_);
     new_node->children_ = children_;
     new_node->subscribers_ = subscribers_;
     return new_node;
@@ -60,7 +70,9 @@ void intrusive_ptr_add_ref(IntermediateNode* node) {
 
 void intrusive_ptr_release(IntermediateNode* node) {
     if (node && node->ref_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        delete node;
+        MQTTAllocator* allocator = node->allocator_;
+        node->~IntermediateNode();
+        allocator->deallocate(node, sizeof(IntermediateNode));
     }
 }
 
@@ -68,7 +80,14 @@ void intrusive_ptr_release(IntermediateNode* node) {
 // TopicTreeNode 实现
 // ============================================================================
 
-TopicTreeNode::TopicTreeNode() : intermediate_node_(new IntermediateNode()) {
+TopicTreeNode::TopicTreeNode(MQTTAllocator* allocator) 
+    : allocator_(allocator) {
+    // 使用allocator分配IntermediateNode
+    void* memory = allocator_->allocate(sizeof(IntermediateNode));
+    if (!memory) {
+        throw std::bad_alloc();
+    }
+    intermediate_node_.store(new(memory) IntermediateNode(allocator_));
 }
 
 TopicTreeNode::~TopicTreeNode() {
@@ -102,16 +121,16 @@ std::shared_ptr<TopicTreeNode> TopicTreeNode::get_child(const std::string& level
     return result;
 }
 
-std::unordered_map<std::string, std::shared_ptr<TopicTreeNode>> TopicTreeNode::get_children() const {
+TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> TopicTreeNode::get_children() const {
     IntermediateNode* node = get_intermediate_node();
-    std::unordered_map<std::string, std::shared_ptr<TopicTreeNode>> result = node->get_children();
+    TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> result = node->get_children();
     intrusive_ptr_release(node);
     return result;
 }
 
-std::unordered_set<SubscriberInfo, SubscriberInfoHash> TopicTreeNode::get_subscribers() const {
+SubscriberSet TopicTreeNode::get_subscribers() const {
     IntermediateNode* node = get_intermediate_node();
-    std::unordered_set<SubscriberInfo, SubscriberInfoHash> result = node->get_subscribers();
+    SubscriberSet result = node->get_subscribers();
     intrusive_ptr_release(node);
     return result;
 }
@@ -134,8 +153,9 @@ bool TopicTreeNode::has_children() const {
 // ConcurrentTopicTree 实现
 // ============================================================================
 
-ConcurrentTopicTree::ConcurrentTopicTree() 
-    : root_(std::make_shared<TopicTreeNode>())
+ConcurrentTopicTree::ConcurrentTopicTree(MQTTAllocator* allocator) 
+    : allocator_(allocator)
+    , root_(std::make_shared<TopicTreeNode>(allocator))
     , total_subscribers_(0)
     , total_nodes_(1) {
 }
@@ -183,7 +203,7 @@ std::shared_ptr<TopicTreeNode> ConcurrentTopicTree::get_or_create_node(
             }
             
             // 创建新子节点
-            child = std::make_shared<TopicTreeNode>();
+            child = std::make_shared<TopicTreeNode>(allocator_);
             
             // 无锁添加子节点
             while (true) {
@@ -404,7 +424,7 @@ void ConcurrentTopicTree::find_subscribers_recursive(
 }
 
 TopicMatchResult ConcurrentTopicTree::find_subscribers(const MQTTString& topic) const {
-    TopicMatchResult result;
+    TopicMatchResult result(allocator_);
     
     if (topic.empty()) {
         LOG_WARN("Empty topic for subscriber search");
@@ -545,6 +565,13 @@ size_t ConcurrentTopicTree::cleanup_empty_nodes() {
     }
     
     return cleaned_count;
+}
+
+size_t ConcurrentTopicTree::get_memory_usage() const {
+    if (allocator_) {
+        return allocator_->get_memory_usage();
+    }
+    return 0;
 }
 
 }  // namespace mqtt
