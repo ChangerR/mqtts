@@ -217,7 +217,10 @@ std::shared_ptr<TopicTreeNode> ConcurrentTopicTree::get_or_create_node(
                     break;
                 } else {
                     intrusive_ptr_release(old_node);
-                    delete new_node;
+                    // Properly deallocate the new_node using the allocator
+                    MQTTAllocator* allocator = new_node->allocator_;
+                    new_node->~IntermediateNode();
+                    allocator->deallocate(new_node, sizeof(IntermediateNode));
                     // 重试：可能其他线程已经创建了节点
                     child = current->get_child(level);
                     if (child) {
@@ -255,7 +258,10 @@ bool ConcurrentTopicTree::add_subscriber_to_node(
             return true;
         } else {
             intrusive_ptr_release(old_node);
-            delete new_node;
+            // Properly deallocate the new_node using the allocator
+            MQTTAllocator* allocator = new_node->allocator_;
+            new_node->~IntermediateNode();
+            allocator->deallocate(new_node, sizeof(IntermediateNode));
             // 重试
         }
     }
@@ -290,7 +296,10 @@ bool ConcurrentTopicTree::remove_subscriber_from_node(
             return true;
         } else {
             intrusive_ptr_release(old_node);
-            delete new_node;
+            // Properly deallocate the new_node using the allocator
+            MQTTAllocator* allocator = new_node->allocator_;
+            new_node->~IntermediateNode();
+            allocator->deallocate(new_node, sizeof(IntermediateNode));
             // 重试
         }
     }
@@ -544,7 +553,10 @@ bool ConcurrentTopicTree::cleanup_empty_nodes_recursive(std::shared_ptr<TopicTre
                 break;
             } else {
                 intrusive_ptr_release(old_node);
-                delete new_node;
+                // Properly deallocate the new_node using the allocator
+                MQTTAllocator* allocator = new_node->allocator_;
+                new_node->~IntermediateNode();
+                allocator->deallocate(new_node, sizeof(IntermediateNode));
                 // 重试
             }
         }
