@@ -408,33 +408,56 @@ int MQTTParser::parse_connack(const uint8_t* buffer, size_t length, ConnAckPacke
 
 int MQTTParser::parse_puback(const uint8_t* buffer, size_t length, PubAckPacket** packet)
 {
-  if (length < 2) {
+  if (length < 5) {  // Minimum: 1 byte header + 1 byte remaining length + 2 bytes packet ID + 1 byte reason code
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubAckPacket* puback = new (allocator_->allocate(sizeof(PubAckPacket))) PubAckPacket();
+  PubAckPacket* puback = new (allocator_->allocate(sizeof(PubAckPacket))) PubAckPacket(allocator_);
   puback->type = PacketType::PUBACK;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+
+  // 跳过header (1字节)
+  pos++;
+
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    puback->~PubAckPacket();
+    allocator_->deallocate(puback, sizeof(PubAckPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
 
   // 解析包ID
-  puback->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  if (pos + 2 > length) {
+    puback->~PubAckPacket();
+    allocator_->deallocate(puback, sizeof(PubAckPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  puback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
 
   // 解析原因码
-  if (bytes_read < length) {
-    puback->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  if (pos < length) {
+    puback->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    pos++;
 
     // 解析属性
-    if (bytes_read < length) {
-      int ret = parse_properties(buffer + bytes_read, length - bytes_read, puback->properties,
-                                 bytes_read);
+    if (pos < length) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, length - pos, puback->properties, properties_bytes_read);
       if (ret != 0) {
+        puback->~PubAckPacket();
         allocator_->deallocate(puback, sizeof(PubAckPacket));
         return ret;
       }
     }
+  } else {
+    // 默认原因码
+    puback->reason_code = ReasonCode::Success;
   }
 
   *packet = puback;
@@ -443,33 +466,56 @@ int MQTTParser::parse_puback(const uint8_t* buffer, size_t length, PubAckPacket*
 
 int MQTTParser::parse_pubrec(const uint8_t* buffer, size_t length, PubRecPacket** packet)
 {
-  if (length < 2) {
+  if (length < 5) {  // Minimum: 1 byte header + 1 byte remaining length + 2 bytes packet ID + 1 byte reason code
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubRecPacket* pubrec = new (allocator_->allocate(sizeof(PubRecPacket))) PubRecPacket();
+  PubRecPacket* pubrec = new (allocator_->allocate(sizeof(PubRecPacket))) PubRecPacket(allocator_);
   pubrec->type = PacketType::PUBREC;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+
+  // 跳过header (1字节)
+  pos++;
+
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    pubrec->~PubRecPacket();
+    allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
 
   // 解析包ID
-  pubrec->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  if (pos + 2 > length) {
+    pubrec->~PubRecPacket();
+    allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pubrec->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
 
   // 解析原因码
-  if (bytes_read < length) {
-    pubrec->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  if (pos < length) {
+    pubrec->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    pos++;
 
     // 解析属性
-    if (bytes_read < length) {
-      int ret = parse_properties(buffer + bytes_read, length - bytes_read, pubrec->properties,
-                                 bytes_read);
+    if (pos < length) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, length - pos, pubrec->properties, properties_bytes_read);
       if (ret != 0) {
+        pubrec->~PubRecPacket();
         allocator_->deallocate(pubrec, sizeof(PubRecPacket));
         return ret;
       }
     }
+  } else {
+    // 默认原因码
+    pubrec->reason_code = ReasonCode::Success;
   }
 
   *packet = pubrec;
@@ -1200,26 +1246,26 @@ int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTSerializeBuff
 {
   buffer.clear();  // 重置buffer以便复用
 
-  // Calculate total length
+  // First, serialize properties to calculate their actual size
+  MQTTSerializeBuffer temp_properties_buffer(allocator_);
+  int ret = serialize_properties(packet->properties, temp_properties_buffer);
+  if (ret != 0)
+    return ret;
+
+  // Calculate total length (properties buffer already includes length encoding)
   size_t total_length = 0;
   total_length += 2 + packet->topic_name.length();  // Topic name
   if (packet->qos > 0) {
     total_length += 2;  // Packet ID
   }
-
-  // Properties length
-  total_length += 1;  // Properties length byte
-  for (size_t i = 0; i < packet->properties.user_properties.size(); ++i) {
-    const MQTTStringPair& prop = packet->properties.user_properties[i];
-    total_length += 1;                         // Property type
-    total_length += 2 + prop.first.length();   // Property key
-    total_length += 2 + prop.second.length();  // Property value
-  }
-
+  
+  // Properties: complete properties buffer (already includes length encoding)
+  total_length += temp_properties_buffer.size();
+  
   total_length += packet->payload.size();  // Payload
 
   // Reserve buffer space
-  int ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
+  ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
   if (ret != 0)
     return ret;
 
@@ -1252,16 +1298,10 @@ int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTSerializeBuff
       return ret;
   }
 
-  // Properties
-  ret = buffer.push_back(0);  // Properties length placeholder
+  // Properties - directly append the complete properties buffer (includes length encoding)
+  ret = buffer.append(temp_properties_buffer.data(), temp_properties_buffer.size());
   if (ret != 0)
     return ret;
-  size_t properties_start = buffer.size();
-  ret = serialize_properties(packet->properties, buffer);
-  if (ret != 0)
-    return ret;
-  buffer[properties_start - 1] =
-      static_cast<uint8_t>(buffer.size() - properties_start);  // Update properties length
 
   // Payload
   ret = buffer.append(packet->payload.data(), packet->payload.size());

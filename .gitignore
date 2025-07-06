@@ -1,6 +1,43 @@
 build/
 release/
+releases/
 .vscode/
 .cursor/
 .ccls-cache/
 logs/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+
+# Generated files
+generated/
+version.h
+
+# Build artifacts
+*.a
+*.o
+*.so
+*.dylib
+*.exe
+libmqtt_parser.a
+mqtts
+
+# Test executables
+unittest/test_*
+!unittest/test_*.cpp
+!unittest/test_*.h
+
+# Log files
+*.log
+server.log
+
+# Temporary test files
+test_mqtts.yaml
+
+# Object files and dependencies
+*.o.d

@@ -14,6 +14,22 @@ add_executable(test_mqtt_allocator test_mqtt_allocator.cpp)
 add_executable(test_mqtt_parser test_mqtt_parser.cpp)
 add_executable(test_mqtt_topic_tree test_mqtt_topic_tree.cpp)
 add_executable(test_mqttv5_protocol test_mqttv5_protocol.cpp)
+add_executable(test_publish_serialization test_publish_serialization.cpp)
+add_executable(test_debug_serialization test_debug_serialization.cpp)
+add_executable(test_mqttv5_client test_mqttv5_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+add_executable(test_send_publish test_send_publish.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+add_executable(test_qos_reply test_qos_reply.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+add_executable(test_debug_properties test_debug_properties.cpp)
 
 # 添加头文件搜索路径
 target_include_directories(test_connect PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
@@ -21,6 +37,12 @@ target_include_directories(test_mqtt_allocator PRIVATE ${CMAKE_SOURCE_DIR} ${GTE
 target_include_directories(test_mqtt_parser PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 target_include_directories(test_mqtt_topic_tree PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 target_include_directories(test_mqttv5_protocol PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_publish_serialization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_debug_serialization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_mqttv5_client PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_send_publish PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_qos_reply PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_debug_properties PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 
 # 链接必要的库（包括Google Test）
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
@@ -28,6 +50,12 @@ target_link_libraries(test_mqtt_allocator PRIVATE mqtt_parser tcmalloc_minimal g
 target_link_libraries(test_mqtt_parser PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqtt_topic_tree PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqttv5_protocol PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_publish_serialization PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_debug_serialization PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqttv5_client PRIVATE colib_static mqtt_parser tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+target_link_libraries(test_send_publish PRIVATE colib_static mqtt_parser tcmalloc_minimal gtest pthread dl)
+target_link_libraries(test_qos_reply PRIVATE colib_static mqtt_parser tcmalloc_minimal gtest pthread dl)
+target_link_libraries(test_debug_properties PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 
 # 启用测试
 enable_testing()
@@ -35,4 +63,8 @@ add_test(NAME test_connect COMMAND test_connect)
 add_test(NAME test_mqtt_allocator COMMAND test_mqtt_allocator)
 add_test(NAME test_mqtt_parser COMMAND test_mqtt_parser)
 add_test(NAME test_mqtt_topic_tree COMMAND test_mqtt_topic_tree)
-add_test(NAME test_mqttv5_protocol COMMAND test_mqttv5_protocol) 
+add_test(NAME test_mqttv5_protocol COMMAND test_mqttv5_protocol)
+add_test(NAME test_publish_serialization COMMAND test_publish_serialization)
+add_test(NAME test_mqttv5_client COMMAND test_mqttv5_client)
+add_test(NAME test_send_publish COMMAND test_send_publish)
+add_test(NAME test_qos_reply COMMAND test_qos_reply) 

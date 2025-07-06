@@ -105,5 +105,8 @@ target_link_libraries(mqtts
     dl
 )
 
+# 启用测试
+enable_testing()
+
 # 添加测试目录
 add_subdirectory(unittest)

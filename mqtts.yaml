@@ -1,8 +1,8 @@
 # MQTT服务器配置文件
 # 服务器配置
 server:
-  bind_address: "0.0.0.0"  # 绑定地址
-  port: 1883  # 监听端口
+  bind_address: "127.0.0.1"  # 绑定地址
+  port: 1884  # 监听端口
   max_connections: 10000  # 最大连接数
   backlog: 128  # socket backlog
   thread_count: 2  # 线程数
@@ -26,7 +26,7 @@ memory:
 
 # 日志配置
 log:
-  level: "info"  # 日志级别: trace, debug, info, warn, error, critical
+  level: "debug"  # 日志级别: trace, debug, info, warn, error, critical
   file_path: "logs/mqtt.log"  # 日志文件路径，空字符串输出到控制台
   max_file_size: 10485760  # 日志文件最大大小(字节)
   max_files: 10  # 最大日志文件数量

@@ -551,9 +551,29 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
             client_ip_.c_str(), client_port_, packet->payload.size());
 
+  // 转发消息给订阅者
+  if (session_manager_) {
+    int ret = session_manager_->forward_publish_by_topic(packet->topic_name, *packet, client_id_);
+    if (ret != MQ_SUCCESS) {
+      LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}", 
+               from_mqtt_string(packet->topic_name), ret);
+    } else {
+      LOG_DEBUG("Successfully forwarded PUBLISH message to subscribers for topic: {}", 
+                from_mqtt_string(packet->topic_name));
+    }
+  } else {
+    LOG_WARN("Session manager not available, cannot forward PUBLISH message for topic: {}", 
+             from_mqtt_string(packet->topic_name));
+  }
+
   // Send PUBACK for QoS 1
   if (packet->qos == 1) {
     return send_puback(packet->packet_id, ReasonCode::Success);
+  }
+  
+  // Send PUBREC for QoS 2
+  if (packet->qos == 2) {
+    return send_pubrec(packet->packet_id, ReasonCode::Success);
   }
 
   return MQ_SUCCESS;
@@ -767,8 +787,21 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
       continue;
     }
 
-    // 添加订阅
+    // 添加订阅到本地存储
     add_subscription(topic);
+    
+    // 注册到全局session manager的topic tree
+    if (session_manager_) {
+      int ret = session_manager_->subscribe_topic(topic, client_id_, qos);
+      if (ret != MQ_SUCCESS) {
+        LOG_WARN("Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(topic), ret);
+      } else {
+        LOG_DEBUG("Successfully registered subscription with session manager for client {}:{}, topic: {}", 
+                  client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+      }
+    }
+    
     reason_codes.push_back(static_cast<ReasonCode>(qos));
     LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}", client_ip_.c_str(),
               client_port_, from_mqtt_string(topic), qos);

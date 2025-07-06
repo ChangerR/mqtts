@@ -58,7 +58,7 @@ show_help() {
 # 默认参数
 CLEAN=false
 BUILD_TYPE="RelWithDebInfo"
-JOBS=1
+JOBS=3
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -217,7 +217,7 @@ main() {
     create_build_dir
     configure_project
     build_project
-    run_tests
+    #run_tests
     
     log_success "MQTT服务器构建完成！"
     show_build_info

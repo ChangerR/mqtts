@@ -898,7 +898,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   LOG_DEBUG("Forwarded PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
 
-  return forwarded_count;
+  return ret;
 }
 
 int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic,

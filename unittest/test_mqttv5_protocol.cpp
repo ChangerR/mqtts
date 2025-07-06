@@ -18,22 +18,35 @@ class MQTTv5ProtocolTest : public ::testing::Test
   {
     // Initialize memory allocator
     MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+    ASSERT_NE(root_allocator, nullptr) << "Root allocator is null";
+    
+    // Generate unique child name for each test
+    std::string child_name = "mqttv5_protocol_test_" + std::to_string(reinterpret_cast<uintptr_t>(this));
     test_allocator =
-        root_allocator->create_child("mqttv5_protocol_test", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+        root_allocator->create_child(child_name, MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    ASSERT_NE(test_allocator, nullptr) << "Failed to create child allocator";
 
     // Initialize parser
     parser = std::make_unique<MQTTParser>(test_allocator);
 
     // Initialize topic tree
     topic_tree = std::make_unique<ConcurrentTopicTree>(test_allocator);
-    ASSERT_TRUE(topic_tree->is_initialized());
+    ASSERT_TRUE(topic_tree->is_initialized()) << "Topic tree initialization failed";
   }
 
   void TearDown() override
   {
     parser.reset();
     topic_tree.reset();
-    test_allocator = nullptr;
+    
+    if (test_allocator) {
+      // Remove the child allocator from parent
+      MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+      if (root_allocator) {
+        root_allocator->remove_child(test_allocator->get_id());
+      }
+      test_allocator = nullptr;
+    }
   }
 
   // Helper function to create test payload
