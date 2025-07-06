@@ -38,8 +38,8 @@ class MQTTServer
 
   // 连接管理
   bool can_accept_connection() const;
-  void add_connection();
-  void remove_connection();
+  int add_connection();
+  int remove_connection();
   int get_connection_count() const { return current_connections_.load(); }
 
  private:

@@ -16,10 +16,9 @@
 #include "mqtt_parser.h"
 #include "mqtt_send_worker_pool.h"
 #include "mqtt_session_info.h"
+#include "mqtt_topic_tree.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
-#include "mqtt_send_worker_pool.h"
-#include "mqtt_topic_tree.h"
 
 namespace mqtt {
 
@@ -58,20 +57,28 @@ class ThreadLocalSessionManager
 
   /**
    * @brief 将消息加入待发送队列（协程友好）
+   * @param message 待发送消息
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void enqueue_message(const PendingMessage& message);
+  int enqueue_message(const PendingMessage& message);
 
   /**
    * @brief 将共享消息内容加入待发送队列（优化版本）
+   * @param content 共享消息内容
+   * @param target_client_id 目标客户端ID
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void enqueue_shared_message(const SharedMessageContentPtr& content,
-                              const MQTTString& target_client_id);
+  int enqueue_shared_message(const SharedMessageContentPtr& content,
+                             const MQTTString& target_client_id);
 
   /**
    * @brief 批量将共享消息内容加入待发送队列（批量优化版本）
+   * @param content 共享消息内容
+   * @param target_client_ids 目标客户端ID列表
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void enqueue_shared_messages(const SharedMessageContentPtr& content,
-                               const std::vector<MQTTString>& target_client_ids);
+  int enqueue_shared_messages(const SharedMessageContentPtr& content,
+                              const std::vector<MQTTString>& target_client_ids);
 
   /**
    * @brief 处理待发送队列中的消息（协程友好的阻塞等待）
@@ -85,8 +92,11 @@ class ThreadLocalSessionManager
 
   /**
    * @brief 等待新消息到达（协程友好的阻塞等待）
+   * @param timeout_ms 超时时间（毫秒），-1表示无限等待
+   * @param has_message 输出参数：是否有新消息
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  bool wait_for_new_message(int timeout_ms = -1);
+  int wait_for_new_message(int timeout_ms, bool& has_message);
 
   /**
    * @brief 获取当前线程ID
@@ -164,8 +174,9 @@ class GlobalSessionManager
    * @brief 预注册线程管理器（启动阶段调用）
    * @param thread_count 预期的线程数量
    * @param reserve_client_count 预期的客户端数量（用于预分配）
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void pre_register_threads(size_t thread_count, size_t reserve_client_count = 10000);
+  int pre_register_threads(size_t thread_count, size_t reserve_client_count = 10000);
 
   /**
    * @brief 注册线程管理器（每个工作线程启动时调用一次）
@@ -176,8 +187,9 @@ class GlobalSessionManager
 
   /**
    * @brief 完成线程注册，切换到运行模式（所有线程注册完毕后调用）
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void finalize_thread_registration();
+  int finalize_thread_registration();
 
   /**
    * @brief 获取当前线程的SessionManager（运行时调用，无锁）
@@ -277,28 +289,35 @@ class GlobalSessionManager
   /**
    * @brief 获取客户端的所有订阅
    * @param client_id 客户端ID
-   * @return 订阅的主题过滤器列表
+   * @param subscriptions 输出参数：订阅的主题过滤器列表
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  std::vector<MQTTString> get_client_subscriptions(const MQTTString& client_id) const;
+  int get_client_subscriptions(const MQTTString& client_id,
+                               std::vector<MQTTString>& subscriptions) const;
 
   /**
    * @brief 使用高性能主题匹配树查找订阅者
    * @param topic 发布主题
-   * @return 匹配的订阅者列表
+   * @param subscribers 输出参数：匹配的订阅者列表
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  std::vector<SubscriberInfo> find_topic_subscribers(const MQTTString& topic) const;
+  int find_topic_subscribers(const MQTTString& topic,
+                             std::vector<SubscriberInfo>& subscribers) const;
 
   /**
    * @brief 获取主题匹配树统计信息
-   * @return 包含订阅者数量和节点数量的pair
+   * @param subscriber_count 输出参数：订阅者数量
+   * @param node_count 输出参数：节点数量
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  std::pair<size_t, size_t> get_topic_tree_stats() const;
+  int get_topic_tree_stats(size_t& subscriber_count, size_t& node_count) const;
 
   /**
    * @brief 清理主题匹配树中的空节点
-   * @return 清理的节点数量
+   * @param cleaned_count 输出参数：清理的节点数量
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  size_t cleanup_topic_tree() const;
+  int cleanup_topic_tree(size_t& cleaned_count) const;
 
   /**
    * @brief 清理所有无效的会话记录
@@ -307,13 +326,17 @@ class GlobalSessionManager
 
   /**
    * @brief 清理过期的消息内容缓存
+   * @param max_age_seconds 最大年龄（秒）
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  void cleanup_message_cache(int max_age_seconds = 300);
+  int cleanup_message_cache(int max_age_seconds = 300);
 
   /**
    * @brief 获取消息缓存统计信息
+   * @param cache_size 输出参数：缓存大小
+   * @return MQ_SUCCESS成功，其他值失败
    */
-  size_t get_message_cache_size() const;
+  int get_message_cache_size(size_t& cache_size) const;
 
  private:
   // 运行状态

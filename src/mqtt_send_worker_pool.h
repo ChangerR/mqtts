@@ -9,9 +9,9 @@
 
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_define.h"
+#include "mqtt_message_queue.h"
 #include "mqtt_packet.h"
 #include "mqtt_stl_allocator.h"
-#include "mqtt_message_queue.h"
 
 namespace mqtt {
 
@@ -26,10 +26,10 @@ struct WorkerSendTask
 {
   // 共享的消息内容（包含topic, payload, qos, retain, dup, properties, sender_client_id等）
   SharedMessageContentPtr shared_content;
-  
+
   // 目标客户端信息
   MQTTString target_client_id;
-  
+
   // 任务时间戳
   std::chrono::steady_clock::time_point enqueue_time;
 
@@ -60,7 +60,7 @@ struct WorkerSendTask
   const Properties& get_properties() const { return shared_content->properties; }
   const MQTTString& get_sender_client_id() const { return shared_content->sender_client_id; }
   const MQTTString& get_target_client_id() const { return target_client_id; }
-  
+
   // 检查任务是否有效
   bool is_valid() const { return shared_content.is_valid(); }
 };

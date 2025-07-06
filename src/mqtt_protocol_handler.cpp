@@ -78,11 +78,31 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
   }
 }
 
-void MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, int client_port)
+int MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, int client_port)
 {
-  socket_ = socket;
-  client_ip_ = to_mqtt_string(client_ip, allocator_);
-  client_port_ = client_port;
+  int ret = MQ_SUCCESS;
+
+  if (MQ_ISNULL(socket)) {
+    LOG_ERROR("Socket cannot be null");
+    ret = MQ_ERR_PARAM_V2;
+  } else if (client_ip.empty()) {
+    LOG_ERROR("Client IP cannot be empty");
+    ret = MQ_ERR_PARAM_V2;
+  } else if (client_port <= 0 || client_port > 65535) {
+    LOG_ERROR("Client port {} is invalid", client_port);
+    ret = MQ_ERR_PARAM_V2;
+  } else {
+    try {
+      socket_ = socket;
+      client_ip_ = to_mqtt_string(client_ip, allocator_);
+      client_port_ = client_port;
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to initialize protocol handler: {}", e.what());
+      ret = MQ_ERR_INTERNAL;
+    }
+  }
+
+  return ret;
 }
 
 int MQTTProtocolHandler::process()
@@ -1048,15 +1068,69 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
   return ret;
 }
 
-void MQTTProtocolHandler::add_subscription(const MQTTString& topic)
+int MQTTProtocolHandler::add_subscription(const MQTTString& topic)
 {
-  subscriptions_.push_back(topic);
+  int ret = MQ_SUCCESS;
+
+  if (from_mqtt_string(topic).empty()) {
+    LOG_ERROR("Topic cannot be empty for subscription");
+    ret = MQ_ERR_SUBSCRIBE_TOPIC;
+  } else {
+    try {
+      subscriptions_.push_back(topic);
+      LOG_DEBUG("Added subscription for topic: {}", from_mqtt_string(topic));
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to add subscription for topic {}: {}", from_mqtt_string(topic), e.what());
+      ret = MQ_ERR_MEMORY_ALLOC;
+    }
+  }
+
+  return ret;
 }
 
-void MQTTProtocolHandler::remove_subscription(const MQTTString& topic)
+int MQTTProtocolHandler::remove_subscription(const MQTTString& topic)
 {
-  subscriptions_.erase(std::remove(subscriptions_.begin(), subscriptions_.end(), topic),
-                       subscriptions_.end());
+  int ret = MQ_SUCCESS;
+
+  if (from_mqtt_string(topic).empty()) {
+    LOG_ERROR("Topic cannot be empty for unsubscription");
+    ret = MQ_ERR_SUBSCRIBE_TOPIC;
+  } else {
+    try {
+      auto initial_size = subscriptions_.size();
+      subscriptions_.erase(std::remove(subscriptions_.begin(), subscriptions_.end(), topic),
+                           subscriptions_.end());
+      auto final_size = subscriptions_.size();
+
+      if (initial_size == final_size) {
+        LOG_DEBUG("Topic '{}' was not found in subscriptions", from_mqtt_string(topic));
+        ret = MQ_ERR_NOT_FOUND_V2;
+      } else {
+        LOG_DEBUG("Removed {} subscription(s) for topic: {}", initial_size - final_size,
+                  from_mqtt_string(topic));
+      }
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to remove subscription for topic {}: {}", from_mqtt_string(topic),
+                e.what());
+      ret = MQ_ERR_INTERNAL;
+    }
+  }
+
+  return ret;
+}
+
+int MQTTProtocolHandler::get_subscriptions(MQTTVector<MQTTString>& subscriptions) const
+{
+  int ret = MQ_SUCCESS;
+
+  try {
+    subscriptions = subscriptions_;
+  } catch (const std::exception& e) {
+    LOG_ERROR("Failed to copy subscriptions: {}", e.what());
+    ret = MQ_ERR_MEMORY_ALLOC;
+  }
+
+  return ret;
 }
 
 int MQTTProtocolHandler::send_suback(uint16_t packet_id,
@@ -1208,8 +1282,9 @@ int MQTTProtocolHandler::register_session_with_manager()
   return MQ_SUCCESS;
 }
 
-int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos,
-                                      bool retain, bool dup, const Properties& properties)
+int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVector& payload,
+                                      uint8_t qos, bool retain, bool dup,
+                                      const Properties& properties)
 {
   LOG_DEBUG("Sending PUBLISH to client {}:{} (topic: {}, qos: {}, retain: {}, dup: {})",
             client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos, retain, dup);
@@ -1235,7 +1310,7 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
   packet->retain = retain;
   packet->dup = dup;
   packet->properties = properties;
-  
+
   // 如果QoS > 0，需要分配packet_id
   if (qos > 0) {
     packet->packet_id = get_next_packet_id();
@@ -1259,7 +1334,7 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
     LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
   } else {
-    LOG_DEBUG("Successfully sent PUBLISH packet to client {}:{} (size: {}, packet_id: {})", 
+    LOG_DEBUG("Successfully sent PUBLISH packet to client {}:{} (size: {}, packet_id: {})",
               client_ip_.c_str(), client_port_, serialize_buffer_->size(), packet->packet_id);
   }
 
@@ -1269,8 +1344,8 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
 
 int MQTTProtocolHandler::send_publish(const PublishPacket& packet)
 {
-  return send_publish(packet.topic_name, packet.payload, packet.qos, 
-                      packet.retain, packet.dup, packet.properties);
+  return send_publish(packet.topic_name, packet.payload, packet.qos, packet.retain, packet.dup,
+                      packet.properties);
 }
 
 }  // namespace mqtt

@@ -45,18 +45,37 @@ bool MQTTServer::can_accept_connection() const
   return current_connections_.load() < server_config_.max_connections;
 }
 
-void MQTTServer::add_connection()
+int MQTTServer::add_connection()
 {
-  current_connections_.fetch_add(1);
-  LOG_DEBUG("新连接建立，当前连接数: {}/{}", current_connections_.load(),
-            server_config_.max_connections);
+  int ret = MQ_SUCCESS;
+
+  if (current_connections_.load() >= server_config_.max_connections) {
+    LOG_WARN("Cannot add connection: maximum connections ({}) reached",
+             server_config_.max_connections);
+    ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+  } else {
+    current_connections_.fetch_add(1);
+    LOG_DEBUG("新连接建立，当前连接数: {}/{}", current_connections_.load(),
+              server_config_.max_connections);
+  }
+
+  return ret;
 }
 
-void MQTTServer::remove_connection()
+int MQTTServer::remove_connection()
 {
-  current_connections_.fetch_sub(1);
-  LOG_DEBUG("连接断开，当前连接数: {}/{}", current_connections_.load(),
-            server_config_.max_connections);
+  int ret = MQ_SUCCESS;
+
+  if (current_connections_.load() <= 0) {
+    LOG_WARN("Cannot remove connection: connection count is already 0");
+    ret = MQ_ERR_INTERNAL;
+  } else {
+    current_connections_.fetch_sub(1);
+    LOG_DEBUG("连接断开，当前连接数: {}/{}", current_connections_.load(),
+              server_config_.max_connections);
+  }
+
+  return ret;
 }
 
 int MQTTServer::start()

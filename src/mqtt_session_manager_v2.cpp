@@ -6,11 +6,7 @@
 #include "mqtt_define.h"
 #include "mqtt_protocol_handler.h"
 
-// 新增错误代码定义 (已在mqtt_define.h中定义，这里注释掉避免重复定义)
-// #define MQ_ERR_PARAM_V2 -800
-// #define MQ_ERR_NOT_FOUND_V2 -801
-#define MQ_ERR_TIMEOUT_V2 -802
-#define MQ_ERR_THREAD_MISMATCH -803
+// 错误代码已在mqtt_define.h中统一定义
 
 namespace mqtt {
 
@@ -158,82 +154,127 @@ SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& cli
   return SafeHandlerRef();  // 返回空引用
 }
 
-void ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
+int ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
 {
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    pending_messages_.push(message);
-    has_new_messages_.store(true);
+  int ret = MQ_SUCCESS;
+
+  if (from_mqtt_string(message.get_target_client_id()).empty()) {
+    LOG_ERROR("Target client ID cannot be empty");
+    ret = MQ_ERR_PARAM_V2;
+  } else {
+    // Pre-check queue capacity to avoid potential allocation failures
+    if (get_pending_message_count() >= 10000) {  // Reasonable queue limit
+      LOG_ERROR("Message queue is full, cannot enqueue more messages");
+      ret = MQ_ERR_QUEUE_FULL;
+    } else {
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        pending_messages_.push(message);
+        has_new_messages_.store(true);
+      }
+
+      // 通知等待的协程有新消息到达
+      new_message_cond_.signal();
+
+      LOG_DEBUG("Message enqueued for client: {} (queue size: {})",
+                from_mqtt_string(message.get_target_client_id()), get_pending_message_count());
+    }
   }
 
-  // 通知等待的协程有新消息到达
-  new_message_cond_.signal();
-
-  LOG_DEBUG("Message enqueued for client: {} (queue size: {})",
-            from_mqtt_string(message.get_target_client_id()), get_pending_message_count());
+  return ret;
 }
 
-void ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContentPtr& content,
-                                                       const MQTTString& target_client_id)
+int ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContentPtr& content,
+                                                      const MQTTString& target_client_id)
 {
+  int ret = MQ_SUCCESS;
+
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
-    return;
+    ret = MQ_ERR_PARAM_V2;
+  } else if (from_mqtt_string(target_client_id).empty()) {
+    LOG_ERROR("Target client ID cannot be empty");
+    ret = MQ_ERR_PARAM_V2;
+  } else {
+    // Pre-check queue capacity
+    if (get_pending_message_count() >= 10000) {
+      LOG_ERROR("Message queue is full, cannot enqueue shared message");
+      ret = MQ_ERR_QUEUE_FULL;
+    } else {
+      PendingMessageInfo message_info(content, target_client_id);
+      PendingMessage message(message_info);
+
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        pending_messages_.push(message);
+        has_new_messages_.store(true);
+      }
+
+      // 通知等待的协程有新消息到达
+      new_message_cond_.signal();
+
+      LOG_DEBUG("Shared message enqueued for client: {} (queue size: {})",
+                from_mqtt_string(target_client_id), get_pending_message_count());
+    }
   }
 
-  PendingMessageInfo message_info(content, target_client_id);
-  PendingMessage message(message_info);
-
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    pending_messages_.push(message);
-    has_new_messages_.store(true);
-  }
-
-  // 通知等待的协程有新消息到达
-  new_message_cond_.signal();
-
-  LOG_DEBUG("Shared message enqueued for client: {} (queue size: {})",
-            from_mqtt_string(target_client_id), get_pending_message_count());
+  return ret;
 }
 
-void ThreadLocalSessionManager::enqueue_shared_messages(
+int ThreadLocalSessionManager::enqueue_shared_messages(
     const SharedMessageContentPtr& content, const std::vector<MQTTString>& target_client_ids)
 {
+  int ret = MQ_SUCCESS;
+
   if (!content.is_valid()) {
     LOG_ERROR("Cannot enqueue invalid shared message content");
-    return;
-  }
+    ret = MQ_ERR_PARAM_V2;
+  } else if (target_client_ids.empty()) {
+    LOG_DEBUG("Target client IDs list is empty, nothing to enqueue");
+    // 空列表不是错误，但也不需要处理
+  } else {
+    // Pre-check queue capacity for batch operation
+    size_t current_queue_size = get_pending_message_count();
+    if (current_queue_size + target_client_ids.size() >= 10000) {
+      LOG_ERROR("Message queue would exceed capacity with batch enqueue");
+      ret = MQ_ERR_QUEUE_FULL;
+    } else {
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
 
-  if (target_client_ids.empty()) {
-    return;
-  }
+        for (const MQTTString& client_id : target_client_ids) {
+          if (from_mqtt_string(client_id).empty()) {
+            LOG_WARN("Skipping empty client ID in batch enqueue");
+            continue;
+          }
 
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
+          PendingMessageInfo message_info(content, client_id);
+          PendingMessage message(message_info);
+          pending_messages_.push(message);
+        }
 
-    for (const MQTTString& client_id : target_client_ids) {
-      PendingMessageInfo message_info(content, client_id);
-      PendingMessage message(message_info);
-      pending_messages_.push(message);
+        has_new_messages_.store(true);
+      }
+
+      // 通知等待的协程有新消息到达
+      new_message_cond_.signal();
+
+      LOG_DEBUG("Shared messages enqueued for {} clients (queue size: {})",
+                target_client_ids.size(), get_pending_message_count());
     }
-
-    has_new_messages_.store(true);
   }
 
-  // 通知等待的协程有新消息到达
-  new_message_cond_.signal();
-
-  LOG_DEBUG("Shared messages enqueued for {} clients (queue size: {})", target_client_ids.size(),
-            get_pending_message_count());
+  return ret;
 }
 
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
 {
   // 如果队列为空，等待新消息
   if (get_pending_message_count() == 0) {
-    if (!wait_for_new_message(timeout_ms)) {
-      return -1;  // 超时
+    bool has_message = false;
+    int ret = wait_for_new_message(timeout_ms, has_message);
+    if (MQ_FAIL(ret) || !has_message) {
+      return -1;  // 超时或错误
     }
   }
 
@@ -311,15 +352,27 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
   return dispatched_count;
 }
 
-bool ThreadLocalSessionManager::wait_for_new_message(int timeout_ms)
+int ThreadLocalSessionManager::wait_for_new_message(int timeout_ms, bool& has_message)
 {
+  int ret = MQ_SUCCESS;
+
   if (has_new_messages_.load()) {
-    return true;  // 已经有新消息
+    has_message = true;  // 已经有新消息
+  } else {
+    // 使用协程信号量等待新消息
+    int result = new_message_cond_.wait(timeout_ms);
+    if (result == 0) {
+      has_message = has_new_messages_.load();
+    } else if (result == -1) {
+      has_message = false;
+      ret = MQ_ERR_TIMEOUT_V2;
+    } else {
+      has_message = false;
+      ret = MQ_ERR_INTERNAL;
+    }
   }
 
-  // 使用协程信号量等待新消息
-  int result = new_message_cond_.wait(timeout_ms);
-  return (result == 0 && has_new_messages_.load());
+  return ret;
 }
 
 int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
@@ -354,43 +407,39 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
     }
 
     // 安全处理消息 - 使用SafeHandlerRef避免Use-After-Free
-    try {
-      SafeHandlerRef safe_handler = get_safe_handler(message.target_client_id);
-      if (safe_handler.is_valid() && is_handler_valid(safe_handler.get())) {
-        // 获取session专属锁，实现细粒度并发控制
-        std::string client_id_str = from_mqtt_string(message.target_client_id);
-        SessionInfo* session_info = nullptr;
+    SafeHandlerRef safe_handler = get_safe_handler(message.target_client_id);
+    if (safe_handler.is_valid() && is_handler_valid(safe_handler.get())) {
+      // 获取session专属锁，实现细粒度并发控制
+      std::string client_id_str = from_mqtt_string(message.target_client_id);
+      SessionInfo* session_info = nullptr;
 
-        {
-          CoroLockGuard session_lookup_lock(&sessions_mutex_);
-          std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
-              sessions_.find(client_id_str);
-          if (it != sessions_.end() && it->second->is_valid.load()) {
-            session_info = it->second.get();
-          }
+      {
+        CoroLockGuard session_lookup_lock(&sessions_mutex_);
+        auto it = sessions_.find(client_id_str);
+        if (it != sessions_.end() && it->second && it->second->is_valid.load()) {
+          session_info = it->second.get();
         }
-
-        if (session_info) {
-          // 使用session专属锁，避免阻塞其他session的处理
-          CoroLockGuard handler_lock(&session_info->session_mutex);
-
-          // TODO: 将消息信息传递给 MQTT handler 进行实际发送
-          // handler负责packet_id管理和PublishPacket生成，这里只传递消息基本信息
-          // safe_handler->send_message(message.get_topic(), message.get_payload(),
-          //                           message.get_qos(), message.get_retain(),
-          //                           message.is_dup(), message.get_properties());
-          processed_count++;
-
-          LOG_DEBUG("Message processed for client: {} (topic: {}, payload size: {})", client_id_str,
-                    from_mqtt_string(message.get_topic()), message.get_payload_size());
-        }
-      } else {
-        LOG_WARN("Handler not found or invalid for client: {}",
-                 from_mqtt_string(message.target_client_id));
       }
-    } catch (const std::exception& e) {
-      LOG_ERROR("Exception processing message for client {}: {}",
-                from_mqtt_string(message.target_client_id), e.what());
+
+      if (session_info) {
+        // 使用session专属锁，避免阻塞其他session的处理
+        CoroLockGuard handler_lock(&session_info->session_mutex);
+
+        // TODO: 将消息信息传递给 MQTT handler 进行实际发送
+        // handler负责packet_id管理和PublishPacket生成，这里只传递消息基本信息
+        // safe_handler->send_message(message.get_topic(), message.get_payload(),
+        //                           message.get_qos(), message.get_retain(),
+        //                           message.is_dup(), message.get_properties());
+        processed_count++;
+
+        LOG_DEBUG("Message processed for client: {} (topic: {}, payload size: {})", client_id_str,
+                  from_mqtt_string(message.get_topic()), message.get_payload_size());
+      } else {
+        LOG_WARN("Session not found or invalid for client: {}", client_id_str);
+      }
+    } else {
+      LOG_WARN("Handler not found or invalid for client: {}",
+               from_mqtt_string(message.target_client_id));
     }
     // SafeHandlerRef析构时自动释放引用计数
   }
@@ -513,15 +562,18 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
 {
   // 初始化消息内容缓存管理器
   message_cache_.reset(new MessageContentCache());
-  
+
   // 为主题匹配树创建专用的allocator
   MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
-  MQTTAllocator* topic_tree_allocator = root_allocator->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
-  
+  MQTTAllocator* topic_tree_allocator =
+      root_allocator->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
-  
-  LOG_INFO("GlobalSessionManager initialized with high-performance lock-free architecture and topic tree using allocator");
+
+  LOG_INFO(
+      "GlobalSessionManager initialized with high-performance lock-free architecture and topic "
+      "tree using allocator");
 }
 
 GlobalSessionManager::~GlobalSessionManager()
@@ -536,18 +588,18 @@ GlobalSessionManager::~GlobalSessionManager()
 
   // 清理消息缓存
   message_cache_.reset();
-  
+
   // 清理主题匹配树
   topic_tree_.reset();
 
   LOG_INFO("GlobalSessionManager destroyed, all managers cleared");
 }
 
-void GlobalSessionManager::pre_register_threads(size_t thread_count, size_t reserve_client_count)
+int GlobalSessionManager::pre_register_threads(size_t thread_count, size_t reserve_client_count)
 {
   if (state_.load() != ManagerState::INITIALIZING) {
     LOG_ERROR("pre_register_threads can only be called in INITIALIZING state");
-    return;
+    return MQ_ERR_INVALID_STATE;
   }
 
   WriteLockGuard managers_lock(managers_mutex_);
@@ -562,6 +614,8 @@ void GlobalSessionManager::pre_register_threads(size_t thread_count, size_t rese
 
   LOG_INFO("Pre-registered capacity for {} threads and {} clients", thread_count,
            reserve_client_count);
+
+  return MQ_SUCCESS;
 }
 
 ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::thread::id thread_id)
@@ -598,17 +652,19 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
   return manager_ptr;
 }
 
-void GlobalSessionManager::finalize_thread_registration()
+int GlobalSessionManager::finalize_thread_registration()
 {
   if (state_.load() != ManagerState::REGISTERING) {
     LOG_ERROR("finalize_thread_registration can only be called in REGISTERING state");
-    return;
+    return MQ_ERR_INVALID_STATE;
   }
 
   state_.store(ManagerState::RUNNING);
 
   LOG_INFO("Thread registration finalized, switched to RUNNING mode with {} threads",
            thread_managers_.size());
+
+  return MQ_SUCCESS;
 }
 
 ThreadLocalSessionManager* GlobalSessionManager::get_thread_manager()
@@ -653,7 +709,7 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
 
   if (!thread_manager) {
     LOG_ERROR("No thread manager available for session registration");
-    return MQ_ERR_THREAD_MISMATCH;
+    return MQ_ERR_SESSION_THREAD_MISMATCH;
   }
 
   // 在线程管理器中注册handler
@@ -677,7 +733,7 @@ int GlobalSessionManager::unregister_session(const MQTTString& client_id)
   ThreadLocalSessionManager* thread_manager = get_thread_manager();
   if (!thread_manager) {
     LOG_ERROR("No thread manager available for session unregistration");
-    return MQ_ERR_THREAD_MISMATCH;
+    return MQ_ERR_SESSION_THREAD_MISMATCH;
   }
 
   // 从线程管理器中注销
@@ -818,7 +874,13 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const MQTTString& sender_client_id)
 {
   // 使用高性能主题匹配树查找订阅者
-  std::vector<SubscriberInfo> subscribers = find_topic_subscribers(topic);
+  std::vector<SubscriberInfo> subscribers;
+  int ret = find_topic_subscribers(topic, subscribers);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
+    return 0;
+  }
+
   int forwarded_count = 0;
 
   std::string sender_id = from_mqtt_string(sender_client_id);
@@ -848,7 +910,13 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
   }
 
   // 使用高性能主题匹配树查找订阅者
-  std::vector<SubscriberInfo> subscribers = find_topic_subscribers(topic);
+  std::vector<SubscriberInfo> subscribers;
+  int ret = find_topic_subscribers(topic, subscribers);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
+    return 0;
+  }
+
   if (subscribers.empty()) {
     LOG_DEBUG("No subscribers found for topic: {}", from_mqtt_string(topic));
     return 0;
@@ -857,7 +925,7 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
   // 过滤掉发送者自己（避免回环）
   std::vector<MQTTString> filtered_subscribers;
   std::string sender_id = from_mqtt_string(content->sender_client_id);
-  
+
   for (const SubscriberInfo& subscriber : subscribers) {
     if (from_mqtt_string(subscriber.client_id) != sender_id) {
       filtered_subscribers.push_back(subscriber.client_id);
@@ -920,20 +988,24 @@ std::vector<MQTTString> GlobalSessionManager::get_subscribers(const MQTTString& 
     std::vector<MQTTString> thread_clients = manager->get_all_client_ids();
 
     for (const MQTTString& client_id : thread_clients) {
-      try {
-        SafeHandlerRef safe_handler = manager->get_safe_handler(client_id);
-        if (safe_handler.is_valid()) {
-          MQTTProtocolHandler* handler = safe_handler.get();
-          const MQTTVector<MQTTString>& subscriptions = handler->get_subscriptions();
-          for (const MQTTString& subscription : subscriptions) {
-            if (is_topic_match(topic, subscription)) {
-              subscribers.push_back(client_id);
-              break;
+      SafeHandlerRef safe_handler = manager->get_safe_handler(client_id);
+      if (safe_handler.is_valid()) {
+        MQTTProtocolHandler* handler = safe_handler.get();
+        if (handler) {
+          MQTTVector<MQTTString> subscriptions;
+          int result = handler->get_subscriptions(subscriptions);
+          if (result == MQ_SUCCESS) {
+            for (const MQTTString& subscription : subscriptions) {
+              if (is_topic_match(topic, subscription)) {
+                subscribers.push_back(client_id);
+                break;
+              }
             }
+          } else {
+            LOG_WARN("Failed to get subscriptions for client {}: {}", from_mqtt_string(client_id),
+                     result);
           }
         }
-      } catch (...) {
-        // 忽略异常，继续处理其他客户端
       }
     }
   }
@@ -1057,61 +1129,73 @@ bool GlobalSessionManager::match_topic_filter(const MQTTString& topic,
   return topic_idx == topic_levels.size();
 }
 
-void GlobalSessionManager::cleanup_message_cache(int max_age_seconds)
+int GlobalSessionManager::cleanup_message_cache(int max_age_seconds)
 {
-  if (message_cache_) {
-    message_cache_->cleanup_expired_content(max_age_seconds);
-    LOG_DEBUG("Message cache cleanup completed, max age: {} seconds", max_age_seconds);
+  if (!message_cache_) {
+    LOG_ERROR("Message cache not initialized");
+    return MQ_ERR_INTERNAL;
   }
+
+  message_cache_->cleanup_expired_content(max_age_seconds);
+  LOG_DEBUG("Message cache cleanup completed, max age: {} seconds", max_age_seconds);
+
+  return MQ_SUCCESS;
 }
 
-size_t GlobalSessionManager::get_message_cache_size() const
+int GlobalSessionManager::get_message_cache_size(size_t& cache_size) const
 {
-  if (message_cache_) {
-    return message_cache_->get_cache_size();
+  cache_size = 0;
+
+  if (!message_cache_) {
+    LOG_ERROR("Message cache not initialized");
+    return MQ_ERR_INTERNAL;
   }
-  return 0;
+
+  cache_size = message_cache_->get_cache_size();
+  return MQ_SUCCESS;
 }
 
 // ============================================================================
 // 新的主题匹配树相关方法实现
 // ============================================================================
 
-int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos)
+int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter,
+                                          const MQTTString& client_id, uint8_t qos)
 {
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
     return MQ_ERR_INTERNAL;
   }
-  
+
   int result = topic_tree_->subscribe(topic_filter, client_id, qos);
   if (result == MQ_SUCCESS) {
-    LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", 
-              from_mqtt_string(client_id), from_mqtt_string(topic_filter), qos);
+    LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", from_mqtt_string(client_id),
+              from_mqtt_string(topic_filter), qos);
   } else {
-    LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}", 
+    LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}",
               from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
   }
-  
+
   return result;
 }
 
-int GlobalSessionManager::unsubscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id)
+int GlobalSessionManager::unsubscribe_topic(const MQTTString& topic_filter,
+                                            const MQTTString& client_id)
 {
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
     return MQ_ERR_INTERNAL;
   }
-  
+
   int result = topic_tree_->unsubscribe(topic_filter, client_id);
   if (result == MQ_SUCCESS) {
-    LOG_DEBUG("Client {} unsubscribed from topic filter {}", 
-              from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+    LOG_DEBUG("Client {} unsubscribed from topic filter {}", from_mqtt_string(client_id),
+              from_mqtt_string(topic_filter));
   } else {
-    LOG_WARN("Failed to unsubscribe client {} from topic filter {}: error {}", 
+    LOG_WARN("Failed to unsubscribe client {} from topic filter {}: error {}",
              from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
   }
-  
+
   return result;
 }
 
@@ -1121,63 +1205,104 @@ int GlobalSessionManager::unsubscribe_all_topics(const MQTTString& client_id)
     LOG_ERROR("Topic tree not initialized");
     return 0;
   }
-  
+
   int unsubscribed_count = topic_tree_->unsubscribe_all(client_id);
-  LOG_INFO("Unsubscribed client {} from {} topics", 
-           from_mqtt_string(client_id), unsubscribed_count);
-  
+  LOG_INFO("Unsubscribed client {} from {} topics", from_mqtt_string(client_id),
+           unsubscribed_count);
+
   return unsubscribed_count;
 }
 
-std::vector<MQTTString> GlobalSessionManager::get_client_subscriptions(const MQTTString& client_id) const
+int GlobalSessionManager::get_client_subscriptions(const MQTTString& client_id,
+                                                   std::vector<MQTTString>& subscriptions) const
 {
+  subscriptions.clear();
+
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return std::vector<MQTTString>();
+    return MQ_ERR_INTERNAL;
   }
-  
-  return topic_tree_->get_client_subscriptions(client_id);
+
+  int ret = topic_tree_->get_client_subscriptions(client_id, subscriptions);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to get client subscriptions: {}", ret);
+    return ret;
+  }
+
+  return MQ_SUCCESS;
 }
 
-std::vector<SubscriberInfo> GlobalSessionManager::find_topic_subscribers(const MQTTString& topic) const
+int GlobalSessionManager::find_topic_subscribers(const MQTTString& topic,
+                                                 std::vector<SubscriberInfo>& subscribers) const
 {
+  subscribers.clear();
+
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return std::vector<SubscriberInfo>();
+    return MQ_ERR_INTERNAL;
   }
-  
-  TopicMatchResult result = topic_tree_->find_subscribers(topic);
+
+  TopicMatchResult result(nullptr);
+  int ret = topic_tree_->find_subscribers(topic, result);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to find topic subscribers: {}", ret);
+    return ret;
+  }
+
   // 转换分配器类型
-  std::vector<SubscriberInfo> converted_subscribers;
-  converted_subscribers.reserve(result.subscribers.size());
+  subscribers.reserve(result.subscribers.size());
   for (const auto& subscriber : result.subscribers) {
-    converted_subscribers.push_back(subscriber);
+    subscribers.push_back(subscriber);
   }
-  return converted_subscribers;
+
+  return MQ_SUCCESS;
 }
 
-std::pair<size_t, size_t> GlobalSessionManager::get_topic_tree_stats() const
+int GlobalSessionManager::get_topic_tree_stats(size_t& subscriber_count, size_t& node_count) const
 {
-  if (!topic_tree_) {
-    return std::make_pair(0, 0);
-  }
-  
-  return std::make_pair(topic_tree_->get_total_subscribers(), topic_tree_->get_total_nodes());
-}
+  subscriber_count = 0;
+  node_count = 0;
 
-size_t GlobalSessionManager::cleanup_topic_tree() const
-{
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return 0;
+    return MQ_ERR_INTERNAL;
   }
-  
-  size_t cleaned_nodes = topic_tree_->cleanup_empty_nodes();
-  if (cleaned_nodes > 0) {
-    LOG_INFO("Cleaned up {} empty nodes from topic tree", cleaned_nodes);
+
+  int ret = topic_tree_->get_total_subscribers(subscriber_count);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to get subscriber count: {}", ret);
+    return ret;
   }
-  
-  return cleaned_nodes;
+
+  ret = topic_tree_->get_total_nodes(node_count);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to get node count: {}", ret);
+    return ret;
+  }
+
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::cleanup_topic_tree(size_t& cleaned_count) const
+{
+  cleaned_count = 0;
+
+  if (!topic_tree_) {
+    LOG_ERROR("Topic tree not initialized");
+    return MQ_ERR_INTERNAL;
+  }
+
+  int ret = topic_tree_->cleanup_empty_nodes(cleaned_count);
+  if (MQ_FAIL(ret)) {
+    LOG_ERROR("Failed to cleanup topic tree: {}", ret);
+    return ret;
+  }
+
+  if (cleaned_count > 0) {
+    LOG_INFO("Cleaned up {} empty nodes from topic tree", cleaned_count);
+  }
+
+  return MQ_SUCCESS;
 }
 
 }  // namespace mqtt

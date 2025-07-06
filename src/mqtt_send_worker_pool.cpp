@@ -1,9 +1,9 @@
 #include "mqtt_send_worker_pool.h"
 #include <algorithm>
 #include "logger.h"
+#include "mqtt_protocol_handler.h"
 #include "mqtt_session_info.h"
 #include "mqtt_session_manager_v2.h"
-#include "mqtt_protocol_handler.h"
 
 namespace mqtt {
 
@@ -248,18 +248,21 @@ bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker
 
     // 实际发送PUBLISH消息（使用共享内容）
     MQTTProtocolHandler* handler = safe_handler.get();
-    int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(), 
+    int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(),
                                        task.is_retain(), task.is_dup(), task.get_properties());
 
     if (result == MQ_SUCCESS) {
-      LOG_DEBUG("Worker {}: successfully sent shared message to client: {} (topic: {}, queue time: {}ms)", 
-                worker_id, from_mqtt_string(task.get_target_client_id()), 
-                from_mqtt_string(task.get_topic()), queue_time.count());
+      LOG_DEBUG(
+          "Worker {}: successfully sent shared message to client: {} (topic: {}, queue time: {}ms)",
+          worker_id, from_mqtt_string(task.get_target_client_id()),
+          from_mqtt_string(task.get_topic()), queue_time.count());
       return true;
     } else {
-      LOG_ERROR("Worker {}: failed to send shared message to client: {}, error: {} (topic: {}, queue time: {}ms)", 
-                worker_id, from_mqtt_string(task.get_target_client_id()), result,
-                from_mqtt_string(task.get_topic()), queue_time.count());
+      LOG_ERROR(
+          "Worker {}: failed to send shared message to client: {}, error: {} (topic: {}, queue "
+          "time: {}ms)",
+          worker_id, from_mqtt_string(task.get_target_client_id()), result,
+          from_mqtt_string(task.get_topic()), queue_time.count());
       return false;
     }
 

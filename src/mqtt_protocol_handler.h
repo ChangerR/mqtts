@@ -29,7 +29,7 @@ class MQTTProtocolHandler
   ~MQTTProtocolHandler();
 
   // Initialize handler with socket
-  void init(MQTTSocket* socket, const std::string& client_ip, int client_port);
+  int init(MQTTSocket* socket, const std::string& client_ip, int client_port);
 
   // Main processing loop
   int process();
@@ -72,7 +72,8 @@ class MQTTProtocolHandler
 
   // Publish message sender
   int send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos = 0,
-                   bool retain = false, bool dup = false, const Properties& properties = Properties());
+                   bool retain = false, bool dup = false,
+                   const Properties& properties = Properties());
   int send_publish(const PublishPacket& packet);
 
   // Session management
@@ -82,9 +83,9 @@ class MQTTProtocolHandler
   uint16_t get_next_packet_id() { return next_packet_id_++; }
 
   // Topic subscription management
-  void add_subscription(const MQTTString& topic);
-  void remove_subscription(const MQTTString& topic);
-  const MQTTVector<MQTTString>& get_subscriptions() const { return subscriptions_; }
+  int add_subscription(const MQTTString& topic);
+  int remove_subscription(const MQTTString& topic);
+  int get_subscriptions(MQTTVector<MQTTString>& subscriptions) const;
 
  private:
   // Buffer management

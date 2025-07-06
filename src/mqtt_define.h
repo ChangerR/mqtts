@@ -55,6 +55,10 @@
 #define MQ_ERR_SESSION_ALREADY_CONNECTED -602
 #define MQ_ERR_SESSION_EXPIRED -603
 #define MQ_ERR_SESSION_REGISTER -604
+#define MQ_ERR_SESSION_UNREGISTER -605
+#define MQ_ERR_SESSION_INVALID_HANDLER -606
+#define MQ_ERR_SESSION_THREAD_MISMATCH -607
+#define MQ_ERR_SESSION_MANAGER_NOT_READY -608
 
 // 通用错误
 #define MQ_ERR_INVALID_ARGS -700
@@ -62,6 +66,19 @@
 #define MQ_ERR_INTERNAL -702
 #define MQ_ERR_PARAM_V2 -703
 #define MQ_ERR_NOT_FOUND_V2 -704
+#define MQ_ERR_TIMEOUT_V2 -705
+#define MQ_ERR_QUEUE_FULL -706
+#define MQ_ERR_INVALID_STATE -707
+
+// Topic Tree error codes (-800 to -899)
+#define MQ_ERR_TOPIC_TREE -800
+#define MQ_ERR_TOPIC_TREE_INVALID_TOPIC -801
+#define MQ_ERR_TOPIC_TREE_INVALID_CLIENT -802
+#define MQ_ERR_TOPIC_TREE_NODE_CREATE -803
+#define MQ_ERR_TOPIC_TREE_MEMORY_ALLOC -804
+#define MQ_ERR_TOPIC_TREE_CONCURRENT_MODIFY -805
+#define MQ_ERR_TOPIC_TREE_SUBSCRIBER_EXISTS -806
+#define MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND -807
 
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
@@ -80,7 +97,9 @@
 #define MQ_IS_ERR_PUBLISH(code) (code <= MQ_ERR_PUBLISH && code > MQ_ERR_PUBLISH_RETAIN)
 #define MQ_IS_ERR_SUBSCRIBE(code) \
   (code <= MQ_ERR_SUBSCRIBE && code > MQ_ERR_SUBSCRIBE_NOT_AUTHORIZED)
-#define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_REGISTER)
+#define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_MANAGER_NOT_READY)
+#define MQ_IS_ERR_TOPIC_TREE(code) \
+  (code <= MQ_ERR_TOPIC_TREE && code > MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND)
 
 // Error code to string conversion
 static inline const char* mqtt_error_string(int error_code)
@@ -180,12 +199,44 @@ static inline const char* mqtt_error_string(int error_code)
       return "Session expired";
     case MQ_ERR_SESSION_REGISTER:
       return "Failed to register session";
+    case MQ_ERR_SESSION_UNREGISTER:
+      return "Failed to unregister session";
+    case MQ_ERR_SESSION_INVALID_HANDLER:
+      return "Invalid session handler";
+    case MQ_ERR_SESSION_THREAD_MISMATCH:
+      return "Session thread mismatch";
+    case MQ_ERR_SESSION_MANAGER_NOT_READY:
+      return "Session manager not ready";
 
     // 通用错误
     case MQ_ERR_INVALID_ARGS:
       return "Invalid arguments";
     case MQ_ERR_TIMEOUT:
       return "Operation timeout";
+    case MQ_ERR_PARAM_V2:
+      return "Invalid parameter";
+    case MQ_ERR_NOT_FOUND_V2:
+      return "Resource not found";
+    case MQ_ERR_TIMEOUT_V2:
+      return "Operation timeout";
+
+    // Topic tree errors
+    case MQ_ERR_TOPIC_TREE:
+      return "Topic tree error";
+    case MQ_ERR_TOPIC_TREE_INVALID_TOPIC:
+      return "Invalid topic format";
+    case MQ_ERR_TOPIC_TREE_INVALID_CLIENT:
+      return "Invalid client ID";
+    case MQ_ERR_TOPIC_TREE_NODE_CREATE:
+      return "Failed to create topic tree node";
+    case MQ_ERR_TOPIC_TREE_MEMORY_ALLOC:
+      return "Topic tree memory allocation failed";
+    case MQ_ERR_TOPIC_TREE_CONCURRENT_MODIFY:
+      return "Concurrent modification conflict";
+    case MQ_ERR_TOPIC_TREE_SUBSCRIBER_EXISTS:
+      return "Subscriber already exists";
+    case MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND:
+      return "Subscriber not found";
 
     default:
       return "Unknown error";
