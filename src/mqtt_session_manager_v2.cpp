@@ -9,8 +9,8 @@
 #include "mqtt_session_allocator.h"
 
 // 新增错误代码定义 (已在mqtt_define.h中定义，这里注释掉避免重复定义)
-// #define MQ_ERR_PARAM_V2 -800
-// #define MQ_ERR_NOT_FOUND_V2 -801
+// #define MQ_ERR_INVALID_ARGS -800
+// #define MQ_ERR_TIMEOUT -801
 #define MQ_ERR_TIMEOUT_V2 -802
 #define MQ_ERR_THREAD_MISMATCH -803
 
@@ -85,7 +85,7 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
 {
   if (!handler) {
     LOG_ERROR("Cannot register handler: handler is null");
-    return MQ_ERR_PARAM_V2;
+    return MQ_ERR_INVALID_ARGS;
   }
 
   CoroLockGuard lock(&sessions_mutex_);
@@ -93,7 +93,7 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
   std::string client_id_str = from_mqtt_string(client_id);
 
   // 检查是否已存在相同的client_id
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator existing =
+  SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>>::iterator existing =
       sessions_.find(client_id_str);
   if (existing != sessions_.end()) {
     LOG_WARN("Client ID already exists in thread, replacing: {}", client_id_str);
@@ -124,12 +124,12 @@ int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
 
   CoroLockGuard lock(&sessions_mutex_);
 
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
+  SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>>::iterator it =
       sessions_.find(client_id_str);
 
   if (it == sessions_.end()) {
     LOG_WARN("Attempt to unregister non-existent handler: {}", client_id_str);
-    return MQ_ERR_NOT_FOUND_V2;
+    return MQ_ERR_ALLOCATOR_NOT_FOUND;
   }
 
   // 安全移除session
@@ -161,7 +161,7 @@ SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& cli
   CoroLockGuard lock(&sessions_mutex_);
 
   std::string client_id_str = from_mqtt_string(client_id);
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
+  SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>>::iterator it =
       sessions_.find(client_id_str);
 
   if (it != sessions_.end() && it->second->is_valid.load() && !it->second->pending_removal.load()) {
@@ -304,7 +304,7 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
       // Worker池满了或出错，将消息放回队列头部
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        std::queue<PendingMessage> temp_queue;
+        SessionQueue<PendingMessage> temp_queue = make_session_queue<PendingMessage>(queue_allocator_);
         temp_queue.push(message);
         while (!pending_messages_.empty()) {
           temp_queue.push(pending_messages_.front());
@@ -376,7 +376,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
 
         {
           CoroLockGuard session_lookup_lock(&sessions_mutex_);
-          std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
+          SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>>::iterator it =
               sessions_.find(client_id_str);
           if (it != sessions_.end() && it->second->is_valid.load()) {
             session_info = it->second.get();
@@ -456,7 +456,7 @@ int ThreadLocalSessionManager::cleanup_invalid_handlers()
   CoroLockGuard lock(&sessions_mutex_);
 
   int cleaned_count = 0;
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it = sessions_.begin();
+  SessionUnorderedMap<std::string, std::unique_ptr<SessionInfo>>::iterator it = sessions_.begin();
 
   while (it != sessions_.end()) {
     if (!is_handler_valid(it->second->handler)) {
@@ -632,16 +632,7 @@ int ThreadLocalSessionManager::get_memory_statistics(MemoryStats& stats) const
   return MQ_SUCCESS;
 }
 
-bool ThreadLocalSessionManager::check_memory_limit() const
-{
-  bool limit_exceeded = false;
-  int ret = is_memory_limit_exceeded(limit_exceeded);
-  if (ret != MQ_SUCCESS) {
-    LOG_WARN("Failed to check memory limit: {}", mqtt_error_string(ret));
-    return false;
-  }
-  return limit_exceeded;
-}
+
 
 bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) const
 {
@@ -798,7 +789,7 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
 {
   if (!handler) {
     LOG_ERROR("Cannot register session: handler is null");
-    return MQ_ERR_PARAM_V2;
+    return MQ_ERR_INVALID_ARGS;
   }
 
   std::string client_id_str = from_mqtt_string(client_id);
@@ -911,7 +902,7 @@ int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
   ThreadLocalSessionManager* thread_manager = find_client_manager(target_client_id);
   if (!thread_manager) {
     LOG_WARN("Target client not found: {}", from_mqtt_string(target_client_id));
-    return MQ_ERR_NOT_FOUND_V2;
+    return MQ_ERR_ALLOCATOR_NOT_FOUND;
   }
 
   // 将消息加入目标线程的队列
@@ -927,13 +918,13 @@ int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
-    return MQ_ERR_PARAM_V2;
+    return MQ_ERR_INVALID_ARGS;
   }
 
   ThreadLocalSessionManager* thread_manager = find_client_manager(target_client_id);
   if (!thread_manager) {
     LOG_WARN("Target client not found: {}", from_mqtt_string(target_client_id));
-    return MQ_ERR_NOT_FOUND_V2;
+    return MQ_ERR_ALLOCATOR_NOT_FOUND;
   }
 
   // 使用共享内容加入目标线程的队列
@@ -959,7 +950,7 @@ int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& t
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
-    return MQ_ERR_PARAM_V2;
+    return MQ_ERR_INVALID_ARGS;
   }
 
   if (target_client_ids.empty()) {
@@ -1025,7 +1016,7 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
 {
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
-    return MQ_ERR_PARAM_V2;
+    return MQ_ERR_INVALID_ARGS;
   }
 
   // 使用高性能主题匹配树查找订阅者

@@ -191,8 +191,6 @@ class ThreadLocalSessionManager
   // 内存管理相关方法
   void initialize_allocators();
   void cleanup_allocators();
-  size_t get_memory_usage() const;
-  bool check_memory_limit() const;
 };
 
 /**
