@@ -463,9 +463,9 @@ int MQTTProtocolHandler::parse_packet()
 
 int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 {
-  LOG_DEBUG("Processing CONNECT from client {}:{} (protocol: v{}, client_id: {})",
+  LOG_DEBUG("Processing CONNECT from client {}:{} (protocol: v{}, client_id: {}, clean_start: {})",
             client_ip_.c_str(), client_port_, packet->protocol_version,
-            from_mqtt_string(packet->client_id));
+            from_mqtt_string(packet->client_id), packet->flags.clean_start);
 
   // Check protocol version
   if (packet->protocol_version != 5) {
@@ -495,8 +495,26 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     return ret;
   }
 
+  // Determine session_present based on MQTT v5.0 specification:
+  // - If Clean Start is 1, Session Present must be 0
+  // - If Clean Start is 0, Session Present indicates whether a session existed before
+  bool session_present = false;
+  if (packet->flags.clean_start == 0) {
+    // Clean Start is 0, check if a session existed
+    // For now, we assume no persistent session exists (simple implementation)
+    // In a full implementation, this would check if session state was preserved
+    session_present = false;
+    LOG_DEBUG("Clean Start is 0, but no persistent session found for client {}:{}", 
+              client_ip_.c_str(), client_port_);
+  } else {
+    // Clean Start is 1, Session Present must be 0
+    session_present = false;
+    LOG_DEBUG("Clean Start is 1, setting session_present to false for client {}:{}", 
+              client_ip_.c_str(), client_port_);
+  }
+
   // Send CONNACK
-  return send_connack(ReasonCode::Success, true);
+  return send_connack(ReasonCode::Success, session_present);
 }
 
 int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)

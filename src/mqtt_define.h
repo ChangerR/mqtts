@@ -79,6 +79,7 @@
 #define MQ_ERR_TOPIC_TREE_CONCURRENT_MODIFY -805
 #define MQ_ERR_TOPIC_TREE_SUBSCRIBER_EXISTS -806
 #define MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND -807
+#define MQ_ERR_TOPIC_TREE_CONCURRENT -808
 
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)

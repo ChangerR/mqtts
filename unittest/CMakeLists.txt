@@ -30,6 +30,10 @@ add_executable(test_qos_reply test_qos_reply.cpp
     ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
     ${CMAKE_SOURCE_DIR}/src/logger.cpp)
 add_executable(test_debug_properties test_debug_properties.cpp)
+add_executable(test_mqtt_protocol_comprehensive test_mqtt_protocol_comprehensive.cpp)
+add_executable(test_mqtt_serialization_comprehensive test_mqtt_serialization_comprehensive.cpp)
+add_executable(test_mqtt_edge_cases test_mqtt_edge_cases.cpp)
+add_executable(test_mqtt_session_manager_optimization test_mqtt_session_manager_optimization.cpp)
 
 # 添加头文件搜索路径
 target_include_directories(test_connect PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
@@ -43,6 +47,10 @@ target_include_directories(test_mqttv5_client PRIVATE ${CMAKE_SOURCE_DIR} ${GTES
 target_include_directories(test_send_publish PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 target_include_directories(test_qos_reply PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 target_include_directories(test_debug_properties PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_mqtt_protocol_comprehensive PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_mqtt_serialization_comprehensive PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_mqtt_edge_cases PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_mqtt_session_manager_optimization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 
 # 链接必要的库（包括Google Test）
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
@@ -56,6 +64,10 @@ target_link_libraries(test_mqttv5_client PRIVATE colib_static mqtt_parser tcmall
 target_link_libraries(test_send_publish PRIVATE colib_static mqtt_parser tcmalloc_minimal gtest pthread dl)
 target_link_libraries(test_qos_reply PRIVATE colib_static mqtt_parser tcmalloc_minimal gtest pthread dl)
 target_link_libraries(test_debug_properties PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_protocol_comprehensive PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_serialization_comprehensive PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_edge_cases PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_session_manager_optimization PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 
 # 启用测试
 enable_testing()
@@ -67,4 +79,8 @@ add_test(NAME test_mqttv5_protocol COMMAND test_mqttv5_protocol)
 add_test(NAME test_publish_serialization COMMAND test_publish_serialization)
 add_test(NAME test_mqttv5_client COMMAND test_mqttv5_client)
 add_test(NAME test_send_publish COMMAND test_send_publish)
-add_test(NAME test_qos_reply COMMAND test_qos_reply) 
+add_test(NAME test_qos_reply COMMAND test_qos_reply)
+add_test(NAME test_mqtt_protocol_comprehensive COMMAND test_mqtt_protocol_comprehensive)
+add_test(NAME test_mqtt_serialization_comprehensive COMMAND test_mqtt_serialization_comprehensive)
+add_test(NAME test_mqtt_edge_cases COMMAND test_mqtt_edge_cases)
+add_test(NAME test_mqtt_session_manager_optimization COMMAND test_mqtt_session_manager_optimization) 

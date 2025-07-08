@@ -32,34 +32,104 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
 
   switch (type) {
     case PacketType::CONNECT:
+      // CONNECT packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid CONNECT packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_connect(buffer, length, reinterpret_cast<ConnectPacket**>(packet));
     case PacketType::PUBLISH:
       return parse_publish(buffer, length, reinterpret_cast<PublishPacket**>(packet));
     case PacketType::SUBSCRIBE:
+      // SUBSCRIBE packets must have bit 1 set in the fixed header
+      if ((buffer[0] & 0x0F) != 0x02) {
+        LOG_ERROR("Invalid SUBSCRIBE packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_subscribe(buffer, length, reinterpret_cast<SubscribePacket**>(packet));
     case PacketType::UNSUBSCRIBE:
+      // UNSUBSCRIBE packets must have bit 1 set in the fixed header
+      if ((buffer[0] & 0x0F) != 0x02) {
+        LOG_ERROR("Invalid UNSUBSCRIBE packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_unsubscribe(buffer, length, reinterpret_cast<UnsubscribePacket**>(packet));
     case PacketType::CONNACK:
+      // CONNACK packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid CONNACK packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_connack(buffer, length, reinterpret_cast<ConnAckPacket**>(packet));
     case PacketType::PUBACK:
+      // PUBACK packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid PUBACK packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_puback(buffer, length, reinterpret_cast<PubAckPacket**>(packet));
     case PacketType::PUBREC:
+      // PUBREC packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid PUBREC packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_pubrec(buffer, length, reinterpret_cast<PubRecPacket**>(packet));
     case PacketType::PUBREL:
+      // PUBREL packets must have bit 1 set in the fixed header
+      if ((buffer[0] & 0x0F) != 0x02) {
+        LOG_ERROR("Invalid PUBREL packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_pubrel(buffer, length, reinterpret_cast<PubRelPacket**>(packet));
     case PacketType::PUBCOMP:
+      // PUBCOMP packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid PUBCOMP packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_pubcomp(buffer, length, reinterpret_cast<PubCompPacket**>(packet));
     case PacketType::SUBACK:
+      // SUBACK packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid SUBACK packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_suback(buffer, length, reinterpret_cast<SubAckPacket**>(packet));
     case PacketType::UNSUBACK:
+      // UNSUBACK packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid UNSUBACK packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_unsuback(buffer, length, reinterpret_cast<UnsubAckPacket**>(packet));
     case PacketType::PINGREQ:
+      // PINGREQ packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid PINGREQ packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_pingreq(buffer, length, reinterpret_cast<PingReqPacket**>(packet));
     case PacketType::PINGRESP:
+      // PINGRESP packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid PINGRESP packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_pingresp(buffer, length, reinterpret_cast<PingRespPacket**>(packet));
     case PacketType::DISCONNECT:
+      // DISCONNECT packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid DISCONNECT packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_disconnect(buffer, length, reinterpret_cast<DisconnectPacket**>(packet));
     case PacketType::AUTH:
+      // AUTH packets must have exact flags 0x00
+      if ((buffer[0] & 0x0F) != 0x00) {
+        LOG_ERROR("Invalid AUTH packet fixed header flags");
+        return MQ_ERR_PACKET_TYPE;
+      }
       return parse_auth(buffer, length, reinterpret_cast<AuthPacket**>(packet));
     default:
       LOG_ERROR("Unsupported packet type: 0x{:02x}", static_cast<uint8_t>(type));
@@ -101,13 +171,15 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   pos += remaining_length_bytes;
 
   // Parse protocol name
-  ret = parse_mqtt_string(buffer + pos, length - pos, connect->protocol_name, pos);
+  size_t string_bytes_read = 0;
+  ret = parse_mqtt_string(buffer + pos, length - pos, connect->protocol_name, string_bytes_read);
   if (ret != 0) {
     LOG_ERROR("Failed to parse protocol name");
     connect->~ConnectPacket();
     allocator_->deallocate(connect, sizeof(ConnectPacket));
     return MQ_ERR_PACKET_INVALID;
   }
+  pos += string_bytes_read;
 
   // Parse protocol version
   if (pos + 1 > length) {
@@ -155,47 +227,69 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   pos += properties_bytes_read;
 
   // Parse client ID
-  ret = parse_mqtt_string(buffer + pos, length - pos, connect->client_id, pos);
+  string_bytes_read = 0;
+  ret = parse_mqtt_string(buffer + pos, length - pos, connect->client_id, string_bytes_read);
   if (ret != 0) {
     LOG_ERROR("Failed to parse client ID");
     connect->~ConnectPacket();
     allocator_->deallocate(connect, sizeof(ConnectPacket));
     return MQ_ERR_CONNECT_CLIENT_ID;
   }
+  pos += string_bytes_read;
 
   // Parse will topic and payload if will flag is set
   if (connect->flags.will_flag) {
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_topic, pos);
+    // Parse will properties first (MQTT v5)
+    size_t will_properties_bytes_read = 0;
+    ret = parse_properties(buffer + pos, length - pos, connect->will_properties, will_properties_bytes_read);
+    if (ret != 0) {
+      LOG_ERROR("Failed to parse will properties");
+      connect->~ConnectPacket();
+      allocator_->deallocate(connect, sizeof(ConnectPacket));
+      return MQ_ERR_PACKET_INVALID;
+    }
+    pos += will_properties_bytes_read;
+
+    // Parse will topic
+    string_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_topic, string_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse will topic");
       connect->~ConnectPacket();
       allocator_->deallocate(connect, sizeof(ConnectPacket));
       return MQ_ERR_PACKET_INVALID;
     }
+    pos += string_bytes_read;
 
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_payload, pos);
+    // Parse will payload
+    string_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_payload, string_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse will payload");
       connect->~ConnectPacket();
       allocator_->deallocate(connect, sizeof(ConnectPacket));
       return MQ_ERR_PACKET_INVALID;
     }
+    pos += string_bytes_read;
   }
 
   // Parse username if username flag is set
   if (connect->flags.username_flag) {
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->username, pos);
+    string_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, length - pos, connect->username, string_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse username");
       connect->~ConnectPacket();
       allocator_->deallocate(connect, sizeof(ConnectPacket));
       return MQ_ERR_PACKET_INVALID;
     }
+    pos += string_bytes_read;
   }
 
   // Parse password if password flag is set
   if (connect->flags.password_flag) {
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->password, pos);
+    string_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, length - pos, connect->password, string_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse password");
       connect->~ConnectPacket();
@@ -228,6 +322,10 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   // Parse flags
   publish->dup = (buffer[0] >> 3) & 0x01;
   publish->qos = (buffer[0] >> 1) & 0x03;
+  // Normalize invalid QoS levels to valid ones
+  if (publish->qos > 2) {
+    publish->qos = 2;  // Clamp to maximum valid QoS
+  }
   publish->retain = buffer[0] & 0x01;
   pos++;
 
@@ -249,13 +347,15 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   size_t payload_end = header_size + remaining_length;
 
   // Parse topic name
-  ret = parse_mqtt_string(buffer + pos, length - pos, publish->topic_name, pos);
+  size_t topic_bytes_read = 0;
+  ret = parse_mqtt_string(buffer + pos, length - pos, publish->topic_name, topic_bytes_read);
   if (ret != 0) {
     LOG_ERROR("Failed to parse topic name");
     publish->~PublishPacket();
     allocator_->deallocate(publish, sizeof(PublishPacket));
     return MQ_ERR_PUBLISH_TOPIC;
   }
+  pos += topic_bytes_read;
 
   // Parse packet ID if QoS > 0
   if (publish->qos > 0) {
@@ -282,8 +382,9 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
 
   // Parse payload
   size_t payload_length = remaining_length - (pos - header_size);  // Subtract header length
-  parse_mqtt_binary_data(buffer + pos, payload_length, publish->payload, pos);
-  pos = header_size + remaining_length;  // 直接设置到包的末尾
+  size_t payload_bytes_read = 0;
+  parse_mqtt_binary_data(buffer + pos, payload_length, publish->payload, payload_bytes_read);
+  pos += payload_bytes_read;
 
   *packet = publish;
   return MQ_SUCCESS;
@@ -350,13 +451,15 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
   // Parse subscriptions
   while (pos < payload_end) {
     MQTTString topic_filter{MQTTStrAllocator(allocator_)};
-    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, pos);
+    size_t topic_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, topic_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse topic filter");
       subscribe->~SubscribePacket();
       allocator_->deallocate(subscribe, sizeof(SubscribePacket));
       return MQ_ERR_SUBSCRIBE_TOPIC;
     }
+    pos += topic_bytes_read;
 
     if (pos + 1 > payload_end) {
       LOG_ERROR("Packet too short for QoS");
@@ -376,29 +479,65 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
 
 int MQTTParser::parse_connack(const uint8_t* buffer, size_t length, ConnAckPacket** packet)
 {
-  if (length < 2) {
+  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  ConnAckPacket* connack = new (allocator_->allocate(sizeof(ConnAckPacket))) ConnAckPacket();
+  ConnAckPacket* connack = new (allocator_->allocate(sizeof(ConnAckPacket))) ConnAckPacket(allocator_);
   connack->type = PacketType::CONNACK;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+
+  // 跳过header (1字节)
+  pos++;
+
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    connack->~ConnAckPacket();
+    allocator_->deallocate(connack, sizeof(ConnAckPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
+
+  // 验证数据长度
+  if (pos + remaining_length > length) {
+    connack->~ConnAckPacket();
+    allocator_->deallocate(connack, sizeof(ConnAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
 
   // 解析会话存在标志和原因码
-  connack->session_present = (buffer[bytes_read] & 0x01) != 0;
-  bytes_read++;
+  if (pos + 2 > length) {
+    connack->~ConnAckPacket();
+    allocator_->deallocate(connack, sizeof(ConnAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
 
-  connack->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-  bytes_read++;
+  connack->session_present = (buffer[pos] & 0x01) != 0;
+  pos++;
+
+  connack->reason_code = static_cast<ReasonCode>(buffer[pos]);
+  pos++;
+
+  // 计算剩余的属性数据长度
+  size_t properties_length = remaining_length - 2; // 减去会话标志和原因码的2字节
 
   // 解析属性
-  if (bytes_read < length) {
-    int ret =
-        parse_properties(buffer + bytes_read, length - bytes_read, connack->properties, bytes_read);
+  if (properties_length > 0) {
+    size_t properties_bytes_read = 0;
+    ret = parse_properties(buffer + pos, properties_length, connack->properties, properties_bytes_read);
     if (ret != 0) {
+      connack->~ConnAckPacket();
       allocator_->deallocate(connack, sizeof(ConnAckPacket));
       return ret;
+    }
+    if (properties_bytes_read != properties_length) {
+      connack->~ConnAckPacket();
+      allocator_->deallocate(connack, sizeof(ConnAckPacket));
+      return MQ_ERR_PACKET_INVALID;
     }
   }
 
@@ -524,33 +663,66 @@ int MQTTParser::parse_pubrec(const uint8_t* buffer, size_t length, PubRecPacket*
 
 int MQTTParser::parse_pubrel(const uint8_t* buffer, size_t length, PubRelPacket** packet)
 {
-  if (length < 2) {
+  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubRelPacket* pubrel = new (allocator_->allocate(sizeof(PubRelPacket))) PubRelPacket();
+  PubRelPacket* pubrel = new (allocator_->allocate(sizeof(PubRelPacket))) PubRelPacket(allocator_);
   pubrel->type = PacketType::PUBREL;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+
+  // 跳过header (1字节)
+  pos++;
+
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    pubrel->~PubRelPacket();
+    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
+
+  // 验证数据长度
+  if (pos + remaining_length > length) {
+    pubrel->~PubRelPacket();
+    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
 
   // 解析包ID
-  pubrel->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  if (pos + 2 > length) {
+    pubrel->~PubRelPacket();
+    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+  pubrel->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
 
-  // 解析原因码
-  if (bytes_read < length) {
-    pubrel->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  // 计算剩余的数据长度
+  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
 
-    // 解析属性
-    if (bytes_read < length) {
-      int ret = parse_properties(buffer + bytes_read, length - bytes_read, pubrel->properties,
-                                 bytes_read);
+  // 解析原因码（如果存在）
+  if (pos < payload_end) {
+    pubrel->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    pos++;
+
+    // 解析属性（如果存在）
+    if (pos < payload_end) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, payload_end - pos, pubrel->properties, properties_bytes_read);
       if (ret != 0) {
+        pubrel->~PubRelPacket();
         allocator_->deallocate(pubrel, sizeof(PubRelPacket));
         return ret;
       }
     }
+  } else {
+    // 默认原因码
+    pubrel->reason_code = ReasonCode::Success;
   }
 
   *packet = pubrel;
@@ -559,33 +731,66 @@ int MQTTParser::parse_pubrel(const uint8_t* buffer, size_t length, PubRelPacket*
 
 int MQTTParser::parse_pubcomp(const uint8_t* buffer, size_t length, PubCompPacket** packet)
 {
-  if (length < 2) {
+  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubCompPacket* pubcomp = new (allocator_->allocate(sizeof(PubCompPacket))) PubCompPacket();
+  PubCompPacket* pubcomp = new (allocator_->allocate(sizeof(PubCompPacket))) PubCompPacket(allocator_);
   pubcomp->type = PacketType::PUBCOMP;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
+
+  // 跳过header (1字节)
+  pos++;
+
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    pubcomp->~PubCompPacket();
+    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
+
+  // 验证数据长度
+  if (pos + remaining_length > length) {
+    pubcomp->~PubCompPacket();
+    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
 
   // 解析包ID
-  pubcomp->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  if (pos + 2 > length) {
+    pubcomp->~PubCompPacket();
+    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+  pubcomp->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
 
-  // 解析原因码
-  if (bytes_read < length) {
-    pubcomp->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  // 计算剩余的数据长度
+  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
 
-    // 解析属性
-    if (bytes_read < length) {
-      int ret = parse_properties(buffer + bytes_read, length - bytes_read, pubcomp->properties,
-                                 bytes_read);
+  // 解析原因码（如果存在）
+  if (pos < payload_end) {
+    pubcomp->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    pos++;
+
+    // 解析属性（如果存在）
+    if (pos < payload_end) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, payload_end - pos, pubcomp->properties, properties_bytes_read);
       if (ret != 0) {
+        pubcomp->~PubCompPacket();
         allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
         return ret;
       }
     }
+  } else {
+    // 默认原因码
+    pubcomp->reason_code = ReasonCode::Success;
   }
 
   *packet = pubcomp;
@@ -594,60 +799,64 @@ int MQTTParser::parse_pubcomp(const uint8_t* buffer, size_t length, PubCompPacke
 
 int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket** packet)
 {
-  if (length < 4) {  // 至少需要包ID(2字节) + 属性长度(1字节) + 至少1个原因码(1字节)
+  if (length < 6) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 4 bytes)
     return MQ_ERR_PACKET_INVALID;
   }
 
   SubAckPacket* suback = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket(allocator_);
   suback->type = PacketType::SUBACK;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
 
-  // 解析包ID
-  suback->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  // 跳过header (1字节)
+  pos++;
 
-  // 解析属性长度
-  uint32_t properties_length;
-  size_t properties_length_bytes;
-  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, properties_length,
-                                   properties_length_bytes);
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
   if (ret != 0) {
     suback->~SubAckPacket();
     allocator_->deallocate(suback, sizeof(SubAckPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
-  bytes_read += properties_length_bytes;
+  pos += remaining_length_bytes;
 
-  // 检查数据完整性
-  if (bytes_read + properties_length > length) {
+  // 验证数据长度
+  if (pos + remaining_length > length) {
     suback->~SubAckPacket();
     allocator_->deallocate(suback, sizeof(SubAckPacket));
     return MQ_ERR_PACKET_INCOMPLETE;
   }
 
+  // 解析包ID
+  if (pos + 2 > length) {
+    suback->~SubAckPacket();
+    allocator_->deallocate(suback, sizeof(SubAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+  suback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
+
+  // 计算剩余的数据长度，用于属性和原因码
+  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
+
   // 解析属性
-  if (properties_length > 0) {
+  if (pos < payload_end) {
     size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + bytes_read, properties_length, suback->properties,
-                           properties_bytes_read);
+    ret = parse_properties(buffer + pos, payload_end - pos, suback->properties, properties_bytes_read);
     if (ret != 0) {
       suback->~SubAckPacket();
       allocator_->deallocate(suback, sizeof(SubAckPacket));
       return ret;
     }
-    if (properties_bytes_read != properties_length) {
-      suback->~SubAckPacket();
-      allocator_->deallocate(suback, sizeof(SubAckPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
+    pos += properties_bytes_read;
   }
-  bytes_read += properties_length;
 
   // 解析原因码列表
-  while (bytes_read < length) {
-    suback->reason_codes.push_back(static_cast<ReasonCode>(buffer[bytes_read]));
-    bytes_read++;
+  while (pos < length) {
+    suback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
+    pos++;
   }
 
   // 验证至少有一个原因码
@@ -663,61 +872,64 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
 
 int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPacket** packet)
 {
-  if (length < 4) {  // 至少需要包ID(2字节) + 属性长度(1字节) + 至少1个原因码(1字节)
+  if (length < 6) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 4 bytes)
     return MQ_ERR_PACKET_INVALID;
   }
 
-  UnsubAckPacket* unsuback =
-      new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
+  UnsubAckPacket* unsuback = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
   unsuback->type = PacketType::UNSUBACK;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
 
-  // 解析包ID
-  unsuback->packet_id = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-  bytes_read += 2;
+  // 跳过header (1字节)
+  pos++;
 
-  // 解析属性长度
-  uint32_t properties_length;
-  size_t properties_length_bytes;
-  int ret = parse_remaining_length(buffer + bytes_read, length - bytes_read, properties_length,
-                                   properties_length_bytes);
+  // 跳过remaining length字段
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
   if (ret != 0) {
     unsuback->~UnsubAckPacket();
     allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-    return ret;
+    return MQ_ERR_PACKET_INVALID;
   }
-  bytes_read += properties_length_bytes;
+  pos += remaining_length_bytes;
 
-  // 检查数据完整性
-  if (bytes_read + properties_length > length) {
+  // 验证数据长度
+  if (pos + remaining_length > length) {
     unsuback->~UnsubAckPacket();
     allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
     return MQ_ERR_PACKET_INCOMPLETE;
   }
 
+  // 解析包ID
+  if (pos + 2 > length) {
+    unsuback->~UnsubAckPacket();
+    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+  unsuback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+  pos += 2;
+
+  // 计算剩余的数据长度，用于属性和原因码
+  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
+
   // 解析属性
-  if (properties_length > 0) {
+  if (pos < payload_end) {
     size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + bytes_read, properties_length, unsuback->properties,
-                           properties_bytes_read);
+    ret = parse_properties(buffer + pos, payload_end - pos, unsuback->properties, properties_bytes_read);
     if (ret != 0) {
       unsuback->~UnsubAckPacket();
       allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
       return ret;
     }
-    if (properties_bytes_read != properties_length) {
-      unsuback->~UnsubAckPacket();
-      allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
+    pos += properties_bytes_read;
   }
-  bytes_read += properties_length;
 
   // 解析原因码列表
-  while (bytes_read < length) {
-    unsuback->reason_codes.push_back(static_cast<ReasonCode>(buffer[bytes_read]));
-    bytes_read++;
+  while (pos < length) {
+    unsuback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
+    pos++;
   }
 
   // 验证至少有一个原因码
@@ -812,25 +1024,57 @@ int MQTTParser::parse_disconnect(const uint8_t* buffer, size_t length, Disconnec
 
 int MQTTParser::parse_auth(const uint8_t* buffer, size_t length, AuthPacket** packet)
 {
-  AuthPacket* auth = new (allocator_->allocate(sizeof(AuthPacket))) AuthPacket();
+  if (length < 2) {
+    LOG_ERROR("AUTH packet too short");
+    return MQ_ERR_PACKET_INCOMPLETE;
+  }
+
+  AuthPacket* auth = new (allocator_->allocate(sizeof(AuthPacket))) AuthPacket(allocator_);
+  if (!auth) {
+    LOG_ERROR("Failed to allocate AUTH packet");
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+
   auth->type = PacketType::AUTH;
 
-  size_t bytes_read = 0;
+  size_t pos = 0;
 
-  // 解析原因码
-  if (length > 0) {
-    auth->reason_code = static_cast<ReasonCode>(buffer[bytes_read]);
-    bytes_read++;
+  // Skip fixed header (packet type + remaining length)
+  pos++; // Skip packet type byte
 
-    // 解析属性
-    if (bytes_read < length) {
-      int ret =
-          parse_properties(buffer + bytes_read, length - bytes_read, auth->properties, bytes_read);
+  // Skip remaining length bytes
+  uint32_t remaining_length;
+  size_t remaining_length_bytes;
+  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
+  if (ret != 0) {
+    LOG_ERROR("Failed to parse remaining length");
+    auth->~AuthPacket();
+    allocator_->deallocate(auth, sizeof(AuthPacket));
+    return MQ_ERR_PACKET_INVALID;
+  }
+  pos += remaining_length_bytes;
+
+  size_t payload_end = pos + remaining_length;
+
+  // Parse reason code if present
+  if (pos < payload_end) {
+    auth->reason_code = static_cast<ReasonCode>(buffer[pos++]);
+
+    // Parse properties if present
+    if (pos < payload_end) {
+      size_t properties_bytes_read = 0;
+      ret = parse_properties(buffer + pos, payload_end - pos, auth->properties, properties_bytes_read);
       if (ret != 0) {
+        LOG_ERROR("Failed to parse properties");
+        auth->~AuthPacket();
         allocator_->deallocate(auth, sizeof(AuthPacket));
         return ret;
       }
+      pos += properties_bytes_read;
     }
+  } else {
+    // Default reason code for AUTH packet
+    auth->reason_code = ReasonCode::Success;
   }
 
   *packet = auth;
@@ -842,16 +1086,33 @@ int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
 {
   remaining_length = 0;
   bytes_read = 0;
-  uint8_t multiplier = 1;
+  uint32_t multiplier = 1;
 
   do {
     if (bytes_read >= length) {
       LOG_ERROR("Packet too short for remaining length");
       return MQ_ERR_PACKET_INCOMPLETE;
     }
-    remaining_length += (buffer[bytes_read] & 0x7F) * multiplier;
+
+    if (bytes_read >= 4) {
+      LOG_ERROR("Remaining length encoding too long (max 4 bytes)");
+      return MQ_ERR_PACKET_INVALID;
+    }
+
+    uint8_t byte = buffer[bytes_read++];
+    remaining_length += (byte & 0x7F) * multiplier;
+    
+    if (multiplier > 128 * 128 * 128) {
+      LOG_ERROR("Remaining length exceeds maximum value");
+      return MQ_ERR_PACKET_INVALID;
+    }
+    
     multiplier *= 128;
-  } while ((buffer[bytes_read++] & 0x80) != 0);
+    
+    if ((byte & 0x80) == 0) {
+      break;
+    }
+  } while (true);
 
   return MQ_SUCCESS;
 }
@@ -871,7 +1132,7 @@ int MQTTParser::parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTStri
   }
 
   str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
-  bytes_read += 2 + str_length;
+  bytes_read = 2 + str_length;  // Fix: should set, not add to bytes_read
   return MQ_SUCCESS;
 }
 
@@ -890,7 +1151,7 @@ int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& 
   }
 
   str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
-  bytes_read += 2 + str_length;
+  bytes_read = 2 + str_length;  // Fix: should set, not add to bytes_read
   return MQ_SUCCESS;
 }
 
@@ -909,7 +1170,7 @@ int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vec
   }
 
   data.assign(buffer + 2, buffer + 2 + data_length);
-  bytes_read += 2 + data_length;
+  bytes_read = 2 + data_length;  // Fix: should set, not add to bytes_read
   return MQ_SUCCESS;
 }
 
@@ -934,8 +1195,15 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
   }
 
   size_t properties_end = bytes_read + properties_length;
+  
   while (bytes_read < properties_end) {
+    if (bytes_read >= length) {
+      LOG_ERROR("Properties parsing: buffer overflow, bytes_read={}, length={}", bytes_read, length);
+      return MQ_ERR_PACKET_INVALID;
+    }
+    
     PropertyType type = static_cast<PropertyType>(buffer[bytes_read++]);
+    
     switch (type) {
       case PropertyType::PayloadFormatIndicator:
         properties.payload_format_indicator = buffer[bytes_read++];
@@ -1113,6 +1381,10 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         properties.shared_subscription_available = buffer[bytes_read++] != 0;
         break;
       default:
+        // According to MQTT v5.0 specification, unknown properties should be ignored
+        // However, we cannot safely skip them without knowing their length
+        // For now, we'll log a warning and fail gracefully
+        LOG_WARN("Unknown property type: 0x{:02x}, failing packet parsing", static_cast<uint8_t>(type));
         return MQ_ERR_PACKET_INVALID;
     }
   }
@@ -1145,13 +1417,11 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuff
     total_length += 2 + packet->password.length();  // Password
   }
 
-  // Properties length
-  total_length += 1;  // Properties length byte
-  for (size_t i = 0; i < packet->properties.user_properties.size(); ++i) {
-    const MQTTStringPair& prop = packet->properties.user_properties[i];
-    total_length += 1;                         // Property type
-    total_length += 2 + prop.first.length();   // Property key
-    total_length += 2 + prop.second.length();  // Property value
+  // Calculate properties length (using a temporary buffer)
+  MQTTSerializeBuffer temp_props_buffer(allocator_);
+  int props_ret = serialize_properties(packet->properties, temp_props_buffer);
+  if (props_ret == 0) {
+    total_length += temp_props_buffer.size();  // Properties with their variable-length header
   }
 
   // Reserve buffer space
@@ -1200,23 +1470,22 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuff
     return ret;
 
   // Properties
-  ret = buffer.push_back(0);  // Properties length placeholder
-  if (ret != 0)
-    return ret;
-  size_t properties_start = buffer.size();
   ret = serialize_properties(packet->properties, buffer);
   if (ret != 0)
     return ret;
-  buffer[properties_start - 1] =
-      static_cast<uint8_t>(buffer.size() - properties_start);  // Update properties length
 
   // Client ID
   ret = serialize_mqtt_string(packet->client_id, buffer);
   if (ret != 0)
     return ret;
 
-  // Will topic and payload
+  // Will properties, topic and payload
   if (packet->flags.will_flag) {
+    // Will properties (MQTT v5)
+    ret = serialize_properties(packet->will_properties, buffer);
+    if (ret != 0)
+      return ret;
+    
     ret = serialize_mqtt_string(packet->will_topic, buffer);
     if (ret != 0)
       return ret;
@@ -1318,15 +1587,15 @@ int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTSerializeBuff
   if (ret != 0)
     return ret;
 
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 会话存在标志 + 原因码
-
   // 序列化属性
   MQTTSerializeBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
   }
+
+  // 计算剩余长度
+  uint32_t remaining_length = 2;  // 会话存在标志 + 原因码
   remaining_length += properties_buffer.size();
 
   // 序列化剩余长度
@@ -1729,34 +1998,30 @@ int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTSerializeBuffer& bu
 
 int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTSerializeBuffer& buffer)
 {
+  buffer.clear();
+  
+  // Packet type
+  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBSCRIBE) | 0x02);  // Set reserved bits
+  if (ret != 0)
+    return ret;
+
+  // Serialize properties
+  MQTTSerializeBuffer properties_buffer(allocator_);
+  ret = serialize_properties(packet->properties, properties_buffer);
+  if (ret != 0) {
+    return ret;
+  }
+
   // Calculate total length
   size_t total_length = 0;
   total_length += 2;  // Packet ID
-
-  // Properties length
-  total_length += 1;  // Properties length byte
-  for (size_t i = 0; i < packet->properties.user_properties.size(); ++i) {
-    const MQTTStringPair& prop = packet->properties.user_properties[i];
-    total_length += 1;                         // Property type
-    total_length += 2 + prop.first.length();   // Property key
-    total_length += 2 + prop.second.length();  // Property value
-  }
+  total_length += properties_buffer.size();  // Properties
 
   // Subscriptions
   for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
     total_length += 2 + packet->subscriptions[i].first.length();  // Topic filter
     total_length += 1;                                            // QoS
   }
-
-  // Reserve buffer space
-  int ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
-  if (ret != 0)
-    return ret;
-
-  // Packet type
-  ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBSCRIBE) | 0x02);  // Set reserved bits
-  if (ret != 0)
-    return ret;
 
   // Remaining length
   ret = serialize_remaining_length(total_length, buffer);
@@ -1772,15 +2037,9 @@ int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTSerialize
     return ret;
 
   // Properties
-  ret = buffer.push_back(0);  // Properties length placeholder
+  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
   if (ret != 0)
     return ret;
-  size_t properties_start = buffer.size();
-  ret = serialize_properties(packet->properties, buffer);
-  if (ret != 0)
-    return ret;
-  buffer[properties_start - 1] =
-      static_cast<uint8_t>(buffer.size() - properties_start);  // Update properties length
 
   // Subscriptions
   for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
@@ -2304,36 +2563,29 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
 
 int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSerializeBuffer& buffer)
 {
-  buffer.clear();  // 重置buffer以便复用
+  buffer.clear();
+  
+  // Packet type
+  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBSCRIBE) | 0x02);  // Set reserved bits
+  if (ret != 0)
+    return ret;
+
+  // Serialize properties
+  MQTTSerializeBuffer properties_buffer(allocator_);
+  ret = serialize_properties(packet->properties, properties_buffer);
+  if (ret != 0) {
+    return ret;
+  }
 
   // Calculate total length
   size_t total_length = 0;
   total_length += 2;  // Packet ID
-
-  // Properties length
-  total_length += 1;  // Properties length byte
-  for (size_t i = 0; i < packet->properties.user_properties.size(); ++i) {
-    const MQTTStringPair& prop = packet->properties.user_properties[i];
-    total_length += 1;                         // Property type
-    total_length += 2 + prop.first.length();   // Property key
-    total_length += 2 + prop.second.length();  // Property value
-  }
+  total_length += properties_buffer.size();  // Properties
 
   // Topic filters
   for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
     total_length += 2 + packet->topic_filters[i].length();  // Topic filter
   }
-
-  // Reserve buffer space
-  int ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
-  if (ret != 0)
-    return ret;
-
-  // Packet type
-  ret =
-      buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBSCRIBE) | 0x02);  // Set reserved bits
-  if (ret != 0)
-    return ret;
 
   // Remaining length
   ret = serialize_remaining_length(total_length, buffer);
@@ -2349,15 +2601,9 @@ int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSeria
     return ret;
 
   // Properties
-  ret = buffer.push_back(0);  // Properties length placeholder
+  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
   if (ret != 0)
     return ret;
-  size_t properties_start = buffer.size();
-  ret = serialize_properties(packet->properties, buffer);
-  if (ret != 0)
-    return ret;
-  buffer[properties_start - 1] =
-      static_cast<uint8_t>(buffer.size() - properties_start);  // Update properties length
 
   // Topic filters
   for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
@@ -2431,13 +2677,15 @@ int MQTTParser::parse_unsubscribe(const uint8_t* buffer, size_t length, Unsubscr
   // Parse topic filters
   while (pos < payload_end) {
     MQTTString topic_filter{MQTTStrAllocator(allocator_)};
-    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, pos);
+    size_t topic_bytes_read = 0;
+    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, topic_bytes_read);
     if (ret != 0) {
       LOG_ERROR("Failed to parse topic filter");
       unsubscribe->~UnsubscribePacket();
       allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
       return MQ_ERR_PACKET_INVALID;
     }
+    pos += topic_bytes_read;
 
     // 直接添加到topic_filters
     unsubscribe->topic_filters.push_back(std::move(topic_filter));

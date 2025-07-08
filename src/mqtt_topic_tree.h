@@ -4,6 +4,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -470,6 +471,9 @@ class ConcurrentTopicTree
   // 统计信息
   mutable std::atomic<size_t> total_subscribers_;
   mutable std::atomic<size_t> total_nodes_;
+  
+  // Mutex for node creation to prevent race conditions
+  mutable std::mutex node_creation_mutex_;
 
   /**
    * @brief 分割主题为级别
