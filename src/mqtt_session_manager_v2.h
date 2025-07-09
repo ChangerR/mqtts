@@ -357,6 +357,26 @@ class GlobalSessionManager
    */
   int get_message_cache_size(size_t& cache_size) const;
 
+  /**
+   * @brief 获取线程数量
+   * @return 线程数量
+   */
+  size_t get_thread_count() const;
+
+  /**
+   * @brief 获取总的Handler数量
+   * @param total_count 输出参数：总Handler数量
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int get_total_handler_count(size_t& total_count) const;
+
+  /**
+   * @brief 获取总的待处理消息数量
+   * @param total_count 输出参数：总待处理消息数量
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int get_total_pending_message_count(size_t& total_count) const;
+
  private:
   // 运行状态
   enum class ManagerState {

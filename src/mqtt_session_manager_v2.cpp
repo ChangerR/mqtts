@@ -1361,4 +1361,34 @@ int GlobalSessionManager::cleanup_topic_tree(size_t& cleaned_count) const
   return MQ_SUCCESS;
 }
 
+size_t GlobalSessionManager::get_thread_count() const
+{
+  ReadLockGuard lock(managers_mutex_);
+  return thread_manager_array_.size();
+}
+
+int GlobalSessionManager::get_total_handler_count(size_t& total_count) const
+{
+  ReadLockGuard lock(managers_mutex_);
+  
+  total_count = 0;
+  for (const ThreadLocalSessionManager* manager : thread_manager_array_) {
+    total_count += manager->get_handler_count();
+  }
+  
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::get_total_pending_message_count(size_t& total_count) const
+{
+  ReadLockGuard lock(managers_mutex_);
+  
+  total_count = 0;
+  for (const ThreadLocalSessionManager* manager : thread_manager_array_) {
+    total_count += manager->get_pending_message_count();
+  }
+  
+  return MQ_SUCCESS;
+}
+
 }  // namespace mqtt

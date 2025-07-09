@@ -85,6 +85,7 @@ class MQTTMemoryManager
   void add_tag_usage(MQTTMemoryTag tag, size_t size);
   void sub_tag_usage(MQTTMemoryTag tag, size_t size);
   size_t get_tag_usage(MQTTMemoryTag tag);
+  size_t get_tag_memory_usage(MQTTMemoryTag tag);
   size_t get_total_memory_usage();
 
  private:

@@ -7,6 +7,7 @@
 #include "mqtt_config.h"
 #include "mqtt_server.h"
 #include "mqtt_session_manager_v2.h"
+#include "mqtt_process_monitor.h"
 
 void run_mqtt_server(const mqtt::Config& config)
 {
@@ -73,7 +74,19 @@ void run_mqtt_server(const mqtt::Config& config)
 
     session_manager.finalize_thread_registration();
     LOG_INFO("Single thread mode, session manager switched to running mode");
+  }
 
+  // 启动进程监控器
+  mqtt::ProcessMonitor process_monitor(&session_manager, 5);  // 每5秒打印一次状态
+  process_monitor.set_verbose_output(true);  // 启用详细输出
+  int monitor_result = process_monitor.start();
+  if (monitor_result == MQ_SUCCESS) {
+    LOG_INFO("Process monitor started successfully");
+  } else {
+    LOG_ERROR("Failed to start process monitor: {}", monitor_result);
+  }
+
+  if (config.server.thread_count == 1) {
     server.run();
   }
 
