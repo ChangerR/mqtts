@@ -41,7 +41,7 @@ ThreadLocalSessionManager::~ThreadLocalSessionManager()
     worker_pool_.reset();
   }
 
-  SafeCoroLockGuard sessions_lock(&sessions_mutex_);
+  CoroLockGuard sessions_lock(&sessions_mutex_);
   std::lock_guard<std::mutex> queue_lock(queue_mutex_);
 
   // 标记所有session为无效，等待引用计数归零
@@ -78,7 +78,7 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
     return MQ_ERR_PARAM_V2;
   }
 
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   std::string client_id_str = from_mqtt_string(client_id);
 
@@ -112,7 +112,7 @@ int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
 {
   std::string client_id_str = from_mqtt_string(client_id);
 
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   auto it = sessions_.find(client_id_str);
 
@@ -147,7 +147,7 @@ void ThreadLocalSessionManager::safe_remove_session(const std::string& client_id
 
 SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& client_id)
 {
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   std::string client_id_str = from_mqtt_string(client_id);
   auto it = sessions_.find(client_id_str);
@@ -419,7 +419,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
       SessionInfo* session_info = nullptr;
 
       {
-        SafeCoroLockGuard session_lookup_lock(&sessions_mutex_);
+        CoroLockGuard session_lookup_lock(&sessions_mutex_);
         auto it = sessions_.find(client_id_str);
         if (it != sessions_.end() && it->second && it->second->is_valid.load()) {
           session_info = it->second.get();
@@ -428,7 +428,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
 
       if (session_info) {
         // 使用session专属锁，避免阻塞其他session的处理
-        SafeCoroLockGuard handler_lock(&session_info->session_mutex);
+        CoroLockGuard handler_lock(&session_info->session_mutex);
 
         // TODO: 将消息信息传递给 MQTT handler 进行实际发送
         // handler负责packet_id管理和PublishPacket生成，这里只传递消息基本信息
@@ -458,7 +458,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
 
 size_t ThreadLocalSessionManager::get_handler_count() const
 {
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   // 只计算有效的session
   size_t count = 0;
@@ -478,7 +478,7 @@ size_t ThreadLocalSessionManager::get_pending_message_count() const
 
 std::vector<MQTTString> ThreadLocalSessionManager::get_all_client_ids() const
 {
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   std::vector<MQTTString> client_ids;
   client_ids.reserve(sessions_.size());
@@ -494,7 +494,7 @@ std::vector<MQTTString> ThreadLocalSessionManager::get_all_client_ids() const
 
 int ThreadLocalSessionManager::cleanup_invalid_handlers()
 {
-  SafeCoroLockGuard lock(&sessions_mutex_);
+  CoroLockGuard lock(&sessions_mutex_);
 
   int cleaned_count = 0;
   auto it = sessions_.begin();
