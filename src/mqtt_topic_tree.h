@@ -12,6 +12,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_define.h"
 #include "mqtt_parser.h"
+#include "mqtt_stl_allocator.h"
 
 namespace mqtt {
 
@@ -21,10 +22,14 @@ namespace mqtt {
 class TopicTreeNode;
 class IntermediateNode;
 
-/**
- * @brief 主题树专用的自定义分配器
- */
+// 使用统一的MQTT STL分配器，避免重复代码
 template <typename T>
+using TopicTreeAllocator = MQTTSTLAllocator<T>;
+
+/**
+ * @brief 主题树专用的自定义分配器（已废弃，使用MQTTSTLAllocator）
+ */
+/*template <typename T>
 class TopicTreeAllocator
 {
  public:
@@ -111,7 +116,7 @@ class TopicTreeAllocator
 
  private:
   MQTTAllocator* mqtt_allocator_;
-};
+};*/
 
 /**
  * @brief 使用自定义分配器的容器类型定义
@@ -126,6 +131,10 @@ using TopicTreeSet =
 
 template <typename Value>
 using TopicTreeVector = std::vector<Value, TopicTreeAllocator<Value>>;
+
+// 专门为主题树定义的类型，统一使用 MQTTString
+using TopicTreeChildrenMap = TopicTreeMap<MQTTString, std::shared_ptr<TopicTreeNode>>;
+using TopicTreeLevelVector = TopicTreeVector<MQTTString>;
 
 /**
  * @brief 订阅者信息
@@ -186,14 +195,14 @@ class TopicTreeNode
    * @param child 输出参数：子节点指针
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_child(const std::string& level, std::shared_ptr<TopicTreeNode>& child) const;
+  int get_child(const MQTTString& level, std::shared_ptr<TopicTreeNode>& child) const;
 
   /**
    * @brief 获取所有子节点
    * @param children 输出参数：子节点映射的副本
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_children(TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>& children) const;
+  int get_children(TopicTreeChildrenMap& children) const;
 
   /**
    * @brief 获取当前节点的订阅者
@@ -266,14 +275,14 @@ class IntermediateNode
    * @param child 子节点
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int add_child(const std::string& level, std::shared_ptr<TopicTreeNode> child);
+  int add_child(const MQTTString& level, std::shared_ptr<TopicTreeNode> child);
 
   /**
    * @brief 移除子节点
    * @param level 主题级别
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int remove_child(const std::string& level);
+  int remove_child(const MQTTString& level);
 
   /**
    * @brief 添加订阅者
@@ -287,7 +296,7 @@ class IntermediateNode
    * @param client_id 客户端ID
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int remove_subscriber(const std::string& client_id);
+  int remove_subscriber(const MQTTString& client_id);
 
   // 数据访问接口
   /**
@@ -296,15 +305,14 @@ class IntermediateNode
    * @param child 输出参数：子节点指针
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_child(const std::string& level, std::shared_ptr<TopicTreeNode>& child) const;
+  int get_child(const MQTTString& level, std::shared_ptr<TopicTreeNode>& child) const;
 
   /**
    * @brief 获取所有子节点的引用
    * @param children 输出参数：子节点映射的引用
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_children(
-      const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>*& children) const;
+  int get_children(const TopicTreeChildrenMap*& children) const;
 
   /**
    * @brief 获取订阅者集合的引用
@@ -330,8 +338,8 @@ class IntermediateNode
   // MQTT分配器
   MQTTAllocator* allocator_;
 
-  // 子节点映射（使用自定义分配器）
-  TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> children_;
+  // 子节点映射（使用自定义分配器和MQTTString）
+  TopicTreeChildrenMap children_;
 
   // 订阅者集合（使用自定义分配器）
   SubscriberSet subscribers_;
@@ -481,7 +489,7 @@ class ConcurrentTopicTree
    * @param levels 输出参数：级别向量
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int split_topic_levels(const MQTTString& topic, std::vector<std::string>& levels) const;
+  int split_topic_levels(const MQTTString& topic, TopicTreeLevelVector& levels) const;
 
   /**
    * @brief 获取或创建节点
@@ -490,7 +498,7 @@ class ConcurrentTopicTree
    * @param node 输出参数：节点指针
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_or_create_node(const std::vector<std::string>& levels, bool create_if_not_exists,
+  int get_or_create_node(const TopicTreeLevelVector& levels, bool create_if_not_exists,
                          std::shared_ptr<TopicTreeNode>& node);
 
   /**
@@ -502,7 +510,7 @@ class ConcurrentTopicTree
    * @return MQ_SUCCESS成功，其他值失败
    */
   int find_subscribers_recursive(const std::shared_ptr<TopicTreeNode>& node,
-                                 const std::vector<std::string>& topic_levels, size_t level_index,
+                                 const TopicTreeLevelVector& topic_levels, size_t level_index,
                                  TopicMatchResult& result) const;
 
   /**
@@ -520,7 +528,7 @@ class ConcurrentTopicTree
    * @return MQ_SUCCESS成功，其他值失败
    */
   int remove_subscriber_from_node(std::shared_ptr<TopicTreeNode> node,
-                                  const std::string& client_id);
+                                  const MQTTString& client_id);
 
   /**
    * @brief 递归收集客户端订阅
@@ -531,7 +539,7 @@ class ConcurrentTopicTree
    * @return MQ_SUCCESS成功，其他值失败
    */
   int collect_client_subscriptions(const std::shared_ptr<TopicTreeNode>& node,
-                                   const std::string& current_path, const std::string& client_id,
+                                   const MQTTString& current_path, const MQTTString& client_id,
                                    std::vector<MQTTString>& result) const;
 
   /**
@@ -541,7 +549,7 @@ class ConcurrentTopicTree
    * @param should_delete 输出参数：是否应该删除此节点
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int cleanup_empty_nodes_recursive(std::shared_ptr<TopicTreeNode> node, const std::string& path,
+  int cleanup_empty_nodes_recursive(std::shared_ptr<TopicTreeNode> node, const MQTTString& path,
                                     bool& should_delete);
 };
 
