@@ -1117,61 +1117,65 @@ int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
   return MQ_SUCCESS;
 }
 
+int MQTTParser::map_string_util_error(int string_util_error) const
+{
+  switch (string_util_error) {
+    case mqtt::MQ_STRING_SUCCESS:
+      return MQ_SUCCESS;
+    case mqtt::MQ_STRING_ERR_BUFFER_TOO_SHORT:
+      return MQ_ERR_PACKET_INCOMPLETE;
+    case mqtt::MQ_STRING_ERR_INVALID_UTF8:
+    case mqtt::MQ_STRING_ERR_INVALID_CONTROL_CHARS:
+    case mqtt::MQ_STRING_ERR_STRING_TOO_LONG:
+      return MQ_ERR_PACKET_INVALID;
+    default:
+      return MQ_ERR_PACKET_INVALID;
+  }
+}
+
 int MQTTParser::parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTString& str,
                                   size_t& bytes_read)
 {
-  if (length < 2) {
-    LOG_ERROR("Packet too short for string length");
-    return MQ_ERR_PACKET_INCOMPLETE;
+  int ret = mqtt::parse_mqtt_string(buffer, length, str, bytes_read);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
+    LOG_ERROR("Packet too short for string");
+  } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("String parsing failed with error: %d", ret);
   }
-
-  uint16_t str_length = (buffer[0] << 8) | buffer[1];
-  if (length < 2 + str_length) {
-    LOG_ERROR("Packet too short for string content");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
-  bytes_read = 2 + str_length;  // Fix: should set, not add to bytes_read
-  return MQ_SUCCESS;
+  
+  return mapped_error;
 }
 
 int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& str,
                              size_t& bytes_read)
 {
-  if (length < 2) {
-    LOG_ERROR("Packet too short for string length");
-    return MQ_ERR_PACKET_INCOMPLETE;
+  int ret = mqtt::parse_string(buffer, length, str, bytes_read);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
+    LOG_ERROR("Packet too short for string");
+  } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("String parsing failed with error: %d", ret);
   }
-
-  uint16_t str_length = (buffer[0] << 8) | buffer[1];
-  if (length < 2 + str_length) {
-    LOG_ERROR("Packet too short for string content");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  str.assign(reinterpret_cast<const char*>(buffer + 2), str_length);
-  bytes_read = 2 + str_length;  // Fix: should set, not add to bytes_read
-  return MQ_SUCCESS;
+  
+  return mapped_error;
 }
 
 int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vector<uint8_t>& data,
                                   size_t& bytes_read)
 {
-  if (length < 2) {
-    LOG_ERROR("Packet too short for binary data length");
-    return MQ_ERR_PACKET_INCOMPLETE;
+  int ret = mqtt::parse_binary_data(buffer, length, data, bytes_read);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
+    LOG_ERROR("Packet too short for binary data");
+  } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("Binary data parsing failed with error: %d", ret);
   }
-
-  uint16_t data_length = (buffer[0] << 8) | buffer[1];
-  if (length < 2 + data_length) {
-    LOG_ERROR("Packet too short for binary data content");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  data.assign(buffer + 2, buffer + 2 + data_length);
-  bytes_read = 2 + data_length;  // Fix: should set, not add to bytes_read
-  return MQ_SUCCESS;
+  
+  return mapped_error;
 }
 
 int MQTTParser::parse_mqtt_binary_data(const uint8_t* buffer, size_t length, MQTTByteVector& data,
@@ -2072,58 +2076,50 @@ int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTSerial
 
 int MQTTParser::serialize_string(const std::string& str, MQTTSerializeBuffer& buffer)
 {
-  int ret = buffer.push_back((str.length() >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(str.length() & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.append(str.data(), str.length());
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  int ret = mqtt::serialize_string(str, buffer);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("String serialization failed with error: %d", ret);
+  }
+  
+  return mapped_error;
 }
 
 int MQTTParser::serialize_mqtt_string(const MQTTString& str, MQTTSerializeBuffer& buffer)
 {
-  int ret = buffer.push_back((str.length() >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(str.length() & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.append(str.data(), str.length());
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  int ret = mqtt::serialize_mqtt_string(str, buffer);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("String serialization failed with error: %d", ret);
+  }
+  
+  return mapped_error;
 }
 
 int MQTTParser::serialize_binary_data(const std::vector<uint8_t>& data, MQTTSerializeBuffer& buffer)
 {
-  int ret = buffer.push_back((data.size() >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(data.size() & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.append(data.data(), data.size());
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  int ret = mqtt::serialize_binary_data(data, buffer);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("Binary data serialization failed with error: %d", ret);
+  }
+  
+  return mapped_error;
 }
 
 int MQTTParser::serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTSerializeBuffer& buffer)
 {
-  int ret = buffer.push_back((data.size() >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(data.size() & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.append(data.data(), data.size());
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  int ret = mqtt::serialize_mqtt_binary_data(data, buffer);
+  int mapped_error = map_string_util_error(ret);
+  
+  if (mapped_error == MQ_ERR_PACKET_INVALID) {
+    LOG_ERROR("Binary data serialization failed with error: %d", ret);
+  }
+  
+  return mapped_error;
 }
 
 int MQTTParser::serialize_properties(const Properties& properties, MQTTSerializeBuffer& buffer)

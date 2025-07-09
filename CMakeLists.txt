@@ -64,6 +64,7 @@ add_library(mqtt_parser STATIC
     src/mqtt_parser.cpp
     src/mqtt_allocator.cpp
     src/mqtt_serialize_buffer.cpp
+    src/mqtt_string_utils.cpp
     src/mqtt_config.cpp
     src/mqtt_session_manager_v2.cpp
 	src/mqtt_session_info.cpp
