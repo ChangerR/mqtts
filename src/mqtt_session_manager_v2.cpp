@@ -15,22 +15,45 @@ namespace mqtt {
 //==============================================================================
 
 ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id, MQTTAllocator* allocator)
-    : thread_id_(thread_id), has_new_messages_(false)
+    : thread_id_(thread_id), allocator_(allocator), initialized_(false), has_new_messages_(false)
 {
-  // Initialize allocator
-  if (allocator) {
-    allocator_ = allocator;
-  } else {
-    std::string child_name = "session_manager_" + std::to_string(std::hash<std::thread::id>{}(thread_id));
-    allocator_ = MQTTMemoryManager::get_instance().get_root_allocator()->create_child(child_name, MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+  // 构造函数只做简单的成员变量初始化
+  // 复杂的初始化逻辑移到init()方法中
+}
+
+int ThreadLocalSessionManager::init()
+{
+  if (initialized_) {
+    return MQ_SUCCESS;  // 已经初始化过了
   }
-  LOG_INFO("ThreadLocalSessionManager created for thread: {} with allocator: {}",
+
+  // Initialize allocator if not provided
+  if (!allocator_) {
+    std::string child_name = "session_manager_" + std::to_string(std::hash<std::thread::id>{}(thread_id_));
+    allocator_ = MQTTMemoryManager::get_instance().get_root_allocator()->create_child(
+        child_name, MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+    if (!allocator_) {
+      LOG_ERROR("Failed to create allocator for ThreadLocalSessionManager");
+      return MQ_ERR_SESSION_MANAGER_NOT_READY;
+    }
+  }
+
+  LOG_INFO("ThreadLocalSessionManager initialized for thread: {} with allocator: {}",
            std::hash<std::thread::id>{}(thread_id_), allocator_->get_id());
 
-  // TODO: 暂时禁用Worker池以排查段错误问题
-  // worker_pool_.reset(new SendWorkerPool(4, 1000));
-  // worker_pool_->set_session_manager(this);
-  // worker_pool_->start();
+  // Initialize worker pool
+  try {
+    worker_pool_.reset(new SendWorkerPool(4, 1000));
+    worker_pool_->set_session_manager(this);
+    worker_pool_->start();
+    LOG_DEBUG("SendWorkerPool initialized for thread: {}", std::hash<std::thread::id>{}(thread_id_));
+  } catch (const std::exception& e) {
+    LOG_ERROR("Failed to initialize SendWorkerPool: {}", e.what());
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+
+  initialized_ = true;
+  return MQ_SUCCESS;
 }
 
 ThreadLocalSessionManager::~ThreadLocalSessionManager()
@@ -73,6 +96,11 @@ ThreadLocalSessionManager::~ThreadLocalSessionManager()
 int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
                                                 MQTTProtocolHandler* handler)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  
   if (!handler) {
     LOG_ERROR("Cannot register handler: handler is null");
     return MQ_ERR_PARAM_V2;
@@ -147,6 +175,11 @@ void ThreadLocalSessionManager::safe_remove_session(const std::string& client_id
 
 SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& client_id)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return SafeHandlerRef();  // 返回空引用
+  }
+  
   CoroLockGuard lock(&sessions_mutex_);
 
   std::string client_id_str = from_mqtt_string(client_id);
@@ -161,6 +194,11 @@ SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& cli
 
 int ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  
   int ret = MQ_SUCCESS;
 
   if (from_mqtt_string(message.get_target_client_id()).empty()) {
@@ -652,6 +690,14 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
   // 创建新的线程管理器
   std::unique_ptr<ThreadLocalSessionManager> manager(new ThreadLocalSessionManager(thread_id, thread_allocator));
   ThreadLocalSessionManager* manager_ptr = manager.get();
+  
+  // 初始化线程管理器
+  int init_result = manager_ptr->init();
+  if (init_result != MQ_SUCCESS) {
+    LOG_ERROR("Failed to initialize ThreadLocalSessionManager for thread: {}", 
+              std::hash<std::thread::id>{}(thread_id));
+    return nullptr;
+  }
 
   thread_managers_[thread_id] = std::move(manager);
   thread_manager_array_.push_back(manager_ptr);

@@ -42,6 +42,12 @@ class ThreadLocalSessionManager
   ThreadLocalSessionManager& operator=(const ThreadLocalSessionManager&) = delete;
 
   /**
+   * @brief 初始化线程本地会话管理器
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int init();
+
+  /**
    * @brief 注册Handler到当前线程的SessionManager
    */
   int register_handler(const MQTTString& client_id, MQTTProtocolHandler* handler);
@@ -145,6 +151,7 @@ class ThreadLocalSessionManager
  private:
   std::thread::id thread_id_;
   MQTTAllocator* allocator_;
+  bool initialized_;
   mutable CoroMutex sessions_mutex_;
   std::unordered_map<std::string, std::unique_ptr<SessionInfo>> sessions_;
 
