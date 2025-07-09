@@ -11,16 +11,16 @@
 namespace mqtt {
 
 // MQTT string length limits according to MQTT v5.0 specification
-static constexpr uint16_t MQTT_MAX_STRING_LENGTH = 65535;
-static constexpr uint16_t MQTT_MAX_BINARY_LENGTH = 65535;
+const uint16_t MQTT_MAX_STRING_LENGTH = 65535;
+const uint16_t MQTT_MAX_BINARY_LENGTH = 65535;
 
 // Error codes for string operations
-static constexpr int MQ_STRING_SUCCESS = 0;
-static constexpr int MQ_STRING_ERR_INVALID_LENGTH = -1;
-static constexpr int MQ_STRING_ERR_INVALID_UTF8 = -2;
-static constexpr int MQ_STRING_ERR_BUFFER_TOO_SHORT = -3;
-static constexpr int MQ_STRING_ERR_STRING_TOO_LONG = -4;
-static constexpr int MQ_STRING_ERR_INVALID_CONTROL_CHARS = -5;
+const int MQ_STRING_SUCCESS = 0;
+const int MQ_STRING_ERR_INVALID_LENGTH = -1;
+const int MQ_STRING_ERR_INVALID_UTF8 = -2;
+const int MQ_STRING_ERR_BUFFER_TOO_SHORT = -3;
+const int MQ_STRING_ERR_STRING_TOO_LONG = -4;
+const int MQ_STRING_ERR_INVALID_CONTROL_CHARS = -5;
 
 // UTF-8 validation function
 bool is_valid_utf8(const uint8_t* data, size_t length);

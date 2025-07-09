@@ -1,5 +1,4 @@
 #include "mqtt_string_utils.h"
-#include <cassert>
 
 namespace mqtt {
 
