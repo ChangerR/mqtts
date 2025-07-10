@@ -7,6 +7,8 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <new>
+#include <stdexcept>
 #include "mqtt_allocator.h"
 
 namespace mqtt {
@@ -43,22 +45,43 @@ class MQTTSTLAllocator
 
   pointer allocate(size_type n)
   {
+    if (n == 0) {
+      return nullptr;
+    }
+    
     MQTTAllocator* alloc = allocator_;
     if (!alloc) {
       // 使用root allocator作为默认分配器
       alloc = MQTTMemoryManager::get_instance().get_root_allocator();
     }
-    return static_cast<pointer>(alloc->allocate(n * sizeof(T)));
+    
+    if (!alloc) {
+      throw std::bad_alloc();
+    }
+    
+    void* ptr = alloc->allocate(n * sizeof(T));
+    if (!ptr) {
+      throw std::bad_alloc();
+    }
+    
+    return static_cast<pointer>(ptr);
   }
 
   void deallocate(pointer p, size_type n)
   {
+    if (!p || n == 0) {
+      return;
+    }
+    
     MQTTAllocator* alloc = allocator_;
     if (!alloc) {
       // 使用root allocator作为默认分配器
       alloc = MQTTMemoryManager::get_instance().get_root_allocator();
     }
-    alloc->deallocate(p, n * sizeof(T));
+    
+    if (alloc) {
+      alloc->deallocate(p, n * sizeof(T));
+    }
   }
 
   template <typename U, typename... Args>
@@ -87,7 +110,8 @@ class MQTTSTLAllocator
   template <typename U>
   bool operator==(const MQTTSTLAllocator<U>& other) const
   {
-    return allocator_ == other.get_allocator();
+    // For stateless allocators, always return true if both use the same effective allocator
+    return get_effective_allocator() == other.get_effective_allocator();
   }
 
   template <typename U>

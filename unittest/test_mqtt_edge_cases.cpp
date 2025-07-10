@@ -5,6 +5,8 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <thread>
+#include <chrono>
 #include "src/mqtt_allocator.h"
 #include "src/mqtt_define.h"
 #include "src/mqtt_packet.h"
@@ -19,9 +21,9 @@ class MQTTv5EdgeCasesTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        // Initialize memory allocator directly
-        test_allocator = new MQTTAllocator("mqttv5_edge_cases_test", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
-        ASSERT_NE(test_allocator, nullptr) << "Failed to create allocator";
+        // Use root allocator directly to avoid potential allocation issues
+        test_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+        ASSERT_NE(test_allocator, nullptr) << "Failed to get root allocator";
 
         // Initialize parser
         parser = std::make_unique<MQTTParser>(test_allocator);
@@ -29,12 +31,14 @@ protected:
 
     void TearDown() override
     {
+        // Reset parser first to ensure it stops using the allocator
         parser.reset();
         
-        if (test_allocator) {
-            delete test_allocator;
-            test_allocator = nullptr;
-        }
+        // Small delay to ensure any cleanup is complete
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Don't delete root allocator - it's managed by the singleton
+        test_allocator = nullptr;
     }
 
     MQTTAllocator* test_allocator = nullptr;

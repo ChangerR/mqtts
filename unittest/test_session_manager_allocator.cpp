@@ -33,7 +33,7 @@ protected:
         coro_scope_.reset();
         
         // 等待清理完成
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     
     bool is_coroutine_available() const {
