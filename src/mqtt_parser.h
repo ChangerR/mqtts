@@ -6,6 +6,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_packet.h"
 #include "mqtt_serialize_buffer.h"
+#include "mqtt_string_utils.h"
 
 namespace mqtt {
 
@@ -80,6 +81,9 @@ class MQTTParser
   int serialize_properties(const Properties& properties, MQTTSerializeBuffer& buffer);
   int serialize_reason_codes(const std::vector<ReasonCode>& reason_codes,
                              MQTTSerializeBuffer& buffer);
+
+  // Helper function to map string util error codes to parser error codes
+  int map_string_util_error(int string_util_error) const;
 
   MQTTAllocator* allocator_;
 };

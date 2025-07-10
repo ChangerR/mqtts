@@ -20,7 +20,7 @@ namespace mqtt {
 
 IntermediateNode::IntermediateNode(MQTTAllocator* allocator)
     : allocator_(allocator),
-      children_(TopicTreeAllocator<std::pair<const std::string, std::shared_ptr<TopicTreeNode>>>(
+      children_(TopicTreeAllocator<std::pair<const MQTTString, std::shared_ptr<TopicTreeNode>>>(
           allocator)),
       subscribers_(TopicTreeAllocator<SubscriberInfo>(allocator)),
       ref_count_(1)
@@ -102,7 +102,7 @@ int IntermediateNode::clone(IntermediateNode*& cloned_node) const
   return ret;
 }
 
-int IntermediateNode::add_child(const std::string& level, std::shared_ptr<TopicTreeNode> child)
+int IntermediateNode::add_child(const MQTTString& level, std::shared_ptr<TopicTreeNode> child)
 {
   int ret = MQ_SUCCESS;
 
@@ -123,7 +123,7 @@ int IntermediateNode::add_child(const std::string& level, std::shared_ptr<TopicT
   return ret;
 }
 
-int IntermediateNode::remove_child(const std::string& level)
+int IntermediateNode::remove_child(const MQTTString& level)
 {
   int ret = MQ_SUCCESS;
 
@@ -171,7 +171,7 @@ int IntermediateNode::add_subscriber(const SubscriberInfo& subscriber)
   return ret;
 }
 
-int IntermediateNode::remove_subscriber(const std::string& client_id)
+int IntermediateNode::remove_subscriber(const MQTTString& client_id)
 {
   int ret = MQ_SUCCESS;
 
@@ -183,7 +183,7 @@ int IntermediateNode::remove_subscriber(const std::string& client_id)
     ret = MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND;
   } else {
     SubscriberInfo temp_info;
-    temp_info.client_id = to_mqtt_string(client_id, nullptr);
+    temp_info.client_id = client_id;
     auto it = subscribers_.find(temp_info);
     if (it != subscribers_.end()) {
       subscribers_.erase(it);
@@ -196,7 +196,7 @@ int IntermediateNode::remove_subscriber(const std::string& client_id)
   return ret;
 }
 
-int IntermediateNode::get_child(const std::string& level,
+int IntermediateNode::get_child(const MQTTString& level,
                                 std::shared_ptr<TopicTreeNode>& child) const
 {
   int ret = MQ_SUCCESS;
@@ -214,8 +214,7 @@ int IntermediateNode::get_child(const std::string& level,
   return ret;
 }
 
-int IntermediateNode::get_children(
-    const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>*& children) const
+int IntermediateNode::get_children(const TopicTreeChildrenMap*& children) const
 {
   children = &children_;
   return MQ_SUCCESS;
@@ -310,7 +309,7 @@ bool TopicTreeNode::compare_and_swap_intermediate_node(IntermediateNode* expecte
   return success;
 }
 
-int TopicTreeNode::get_child(const std::string& level, std::shared_ptr<TopicTreeNode>& child) const
+int TopicTreeNode::get_child(const MQTTString& level, std::shared_ptr<TopicTreeNode>& child) const
 {
   int ret = MQ_SUCCESS;
   IntermediateNode* node = nullptr;
@@ -333,12 +332,11 @@ int TopicTreeNode::get_child(const std::string& level, std::shared_ptr<TopicTree
   return ret;
 }
 
-int TopicTreeNode::get_children(
-    TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>& children) const
+int TopicTreeNode::get_children(TopicTreeChildrenMap& children) const
 {
   int ret = MQ_SUCCESS;
   IntermediateNode* node = nullptr;
-  const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>* children_ptr = nullptr;
+  const TopicTreeChildrenMap* children_ptr = nullptr;
 
   node = get_intermediate_node();
   if (MQ_ISNULL(node)) {
@@ -465,7 +463,7 @@ int TopicTreeNode::has_children(bool& has_childs) const
 {
   int ret = MQ_SUCCESS;
   IntermediateNode* node = nullptr;
-  const TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>>* children_ptr = nullptr;
+  const TopicTreeChildrenMap* children_ptr = nullptr;
 
   node = get_intermediate_node();
   if (MQ_ISNULL(node)) {
@@ -513,7 +511,7 @@ ConcurrentTopicTree::ConcurrentTopicTree(MQTTAllocator* allocator)
 ConcurrentTopicTree::~ConcurrentTopicTree() {}
 
 int ConcurrentTopicTree::split_topic_levels(const MQTTString& topic,
-                                            std::vector<std::string>& levels) const
+                                            TopicTreeLevelVector& levels) const
 {
   int ret = MQ_SUCCESS;
 
@@ -542,14 +540,14 @@ int ConcurrentTopicTree::split_topic_levels(const MQTTString& topic,
         if (pos < topic_str.length()) {  // Only check bounds, don't skip empty levels
           // Safe substring operation
           if (start <= topic_str.length() && pos <= topic_str.length()) {
-            levels.emplace_back(topic_str.substr(start, pos - start));
+            levels.emplace_back(to_mqtt_string(topic_str.substr(start, pos - start), allocator_));
           }
         }
         start = pos + 1;
       }
 
       if (start < topic_str.size()) {
-        levels.emplace_back(topic_str.substr(start));
+        levels.emplace_back(to_mqtt_string(topic_str.substr(start), allocator_));
       }
     }
   }
@@ -557,14 +555,14 @@ int ConcurrentTopicTree::split_topic_levels(const MQTTString& topic,
   return ret;
 }
 
-int ConcurrentTopicTree::get_or_create_node(const std::vector<std::string>& levels,
+int ConcurrentTopicTree::get_or_create_node(const TopicTreeLevelVector& levels,
                                             bool create_if_not_exists,
                                             std::shared_ptr<TopicTreeNode>& node)
 {
   int ret = MQ_SUCCESS;
   std::shared_ptr<TopicTreeNode> current = root_;
 
-  for (const std::string& level : levels) {
+  for (const MQTTString& level : levels) {
     std::shared_ptr<TopicTreeNode> child;
     ret = current->get_child(level, child);
 
@@ -718,11 +716,13 @@ int ConcurrentTopicTree::add_subscriber_to_node(std::shared_ptr<TopicTreeNode> n
 }
 
 int ConcurrentTopicTree::remove_subscriber_from_node(std::shared_ptr<TopicTreeNode> node,
-                                                     const std::string& client_id)
+                                                     const MQTTString& client_id)
 {
   int ret = MQ_SUCCESS;
+  int retry_count = 0;
+  const int max_retries = 100; // Prevent infinite loops
 
-  while (true) {
+  while (retry_count < max_retries) {
     IntermediateNode* old_node = node->get_intermediate_node();
     if (MQ_ISNULL(old_node)) {
       LOG_ERROR("Failed to get intermediate node");
@@ -731,7 +731,7 @@ int ConcurrentTopicTree::remove_subscriber_from_node(std::shared_ptr<TopicTreeNo
 
     // Check if exists
     SubscriberInfo temp_info;
-    temp_info.client_id = to_mqtt_string(client_id, nullptr);
+    temp_info.client_id = client_id;
     const SubscriberSet* existing_subscribers = nullptr;
     ret = old_node->get_subscribers(existing_subscribers);
     if (MQ_FAIL(ret)) {
@@ -772,11 +772,17 @@ int ConcurrentTopicTree::remove_subscriber_from_node(std::shared_ptr<TopicTreeNo
       MQTTAllocator* allocator = new_node->get_allocator();
       new_node->~IntermediateNode();
       allocator->deallocate(new_node, sizeof(IntermediateNode));
-      // Retry
+      
+      retry_count++;
+      // Small delay to reduce contention
+      if (retry_count > 10) {
+        std::this_thread::yield();
+      }
     }
   }
 
-  return MQ_ERR_INTERNAL;
+  LOG_ERROR("Failed to remove subscriber after {} retries", max_retries);
+  return MQ_ERR_TOPIC_TREE_CONCURRENT;
 }
 
 int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
@@ -792,7 +798,7 @@ int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTStr
     return MQ_ERR_PARAM_V2;
   }
 
-  std::vector<std::string> levels;
+  TopicTreeLevelVector levels;
   int ret = split_topic_levels(topic_filter, levels);
   if (MQ_FAIL(ret)) {
     return ret;
@@ -848,7 +854,7 @@ int ConcurrentTopicTree::unsubscribe(const MQTTString& topic_filter, const MQTTS
     return MQ_ERR_PARAM_V2;
   }
 
-  std::vector<std::string> levels;
+  TopicTreeLevelVector levels;
   int ret = split_topic_levels(topic_filter, levels);
   if (MQ_FAIL(ret)) {
     return ret;
@@ -866,21 +872,20 @@ int ConcurrentTopicTree::unsubscribe(const MQTTString& topic_filter, const MQTTS
     return ret;
   }
 
-  std::string client_id_str = from_mqtt_string(client_id);
-  ret = remove_subscriber_from_node(target_node, client_id_str);
+  ret = remove_subscriber_from_node(target_node, client_id);
   if (MQ_FAIL(ret)) {
-    LOG_WARN("Subscriber not found for unsubscription: {} from {}", client_id_str,
+    LOG_WARN("Subscriber not found for unsubscription: {} from {}", from_mqtt_string(client_id),
              from_mqtt_string(topic_filter));
     return ret;
   }
 
-  LOG_DEBUG("Unsubscribed client {} from topic filter {}", client_id_str,
+  LOG_DEBUG("Unsubscribed client {} from topic filter {}", from_mqtt_string(client_id),
             from_mqtt_string(topic_filter));
   return MQ_SUCCESS;
 }
 
 int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicTreeNode>& node,
-                                                    const std::vector<std::string>& topic_levels,
+                                                    const TopicTreeLevelVector& topic_levels,
                                                     size_t level_index,
                                                     TopicMatchResult& result) const
 {
@@ -904,7 +909,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicT
 
     // 检查多级通配符
     std::shared_ptr<TopicTreeNode> wildcard_node;
-    ret = node->get_child("#", wildcard_node);
+    ret = node->get_child(to_mqtt_string("#", allocator_), wildcard_node);
     if (ret == MQ_SUCCESS && wildcard_node) {
       SubscriberSet wildcard_subscribers;
       ret = wildcard_node->get_subscribers(wildcard_subscribers);
@@ -918,7 +923,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicT
     return MQ_SUCCESS;
   }
 
-  const std::string& current_level = topic_levels[level_index];
+  const MQTTString& current_level = topic_levels[level_index];
 
   // 1. 精确匹配
   std::shared_ptr<TopicTreeNode> exact_child;
@@ -932,7 +937,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicT
 
   // 2. 单级通配符 '+'
   std::shared_ptr<TopicTreeNode> single_wildcard_child;
-  ret = node->get_child("+", single_wildcard_child);
+  ret = node->get_child(to_mqtt_string("+", allocator_), single_wildcard_child);
   if (ret == MQ_SUCCESS && single_wildcard_child) {
     ret = find_subscribers_recursive(single_wildcard_child, topic_levels, level_index + 1, result);
     if (MQ_FAIL(ret)) {
@@ -942,7 +947,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicT
 
   // 3. 多级通配符 '#' (匹配当前级别及之后的所有级别)
   std::shared_ptr<TopicTreeNode> multi_wildcard_child;
-  ret = node->get_child("#", multi_wildcard_child);
+  ret = node->get_child(to_mqtt_string("#", allocator_), multi_wildcard_child);
   if (ret == MQ_SUCCESS && multi_wildcard_child) {
     SubscriberSet multi_wildcard_subscribers;
     ret = multi_wildcard_child->get_subscribers(multi_wildcard_subscribers);
@@ -969,7 +974,7 @@ int ConcurrentTopicTree::find_subscribers(const MQTTString& topic, TopicMatchRes
     return MQ_ERR_PARAM_V2;
   }
 
-  std::vector<std::string> levels;
+  TopicTreeLevelVector levels;
   int ret = split_topic_levels(topic, levels);
   if (MQ_FAIL(ret)) {
     return ret;
@@ -1026,8 +1031,8 @@ int ConcurrentTopicTree::unsubscribe_all(const MQTTString& client_id)
 }
 
 int ConcurrentTopicTree::collect_client_subscriptions(const std::shared_ptr<TopicTreeNode>& node,
-                                                      const std::string& current_path,
-                                                      const std::string& client_id,
+                                                      const MQTTString& current_path,
+                                                      const MQTTString& client_id,
                                                       std::vector<MQTTString>& result) const
 {
   if (!node) {
@@ -1044,22 +1049,22 @@ int ConcurrentTopicTree::collect_client_subscriptions(const std::shared_ptr<Topi
   }
 
   SubscriberInfo target_info;
-  target_info.client_id = to_mqtt_string(client_id, nullptr);
+  target_info.client_id = client_id;
 
   if (subscribers.find(target_info) != subscribers.end()) {
-    result.push_back(to_mqtt_string(current_path, nullptr));
+    result.push_back(current_path);
   }
 
   // 递归检查子节点
-  TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> children;
+  TopicTreeChildrenMap children;
   ret = node->get_children(children);
   if (MQ_FAIL(ret)) {
     return ret;
   }
 
   for (const auto& child_pair : children) {
-    std::string child_path =
-        current_path.empty() ? child_pair.first : (current_path + "/" + child_pair.first);
+    MQTTString child_path = current_path.empty() ? child_pair.first : 
+        to_mqtt_string(from_mqtt_string(current_path) + "/" + from_mqtt_string(child_pair.first), allocator_);
     ret = collect_client_subscriptions(child_pair.second, child_path, client_id, result);
     if (MQ_FAIL(ret)) {
       return ret;
@@ -1079,8 +1084,8 @@ int ConcurrentTopicTree::get_client_subscriptions(const MQTTString& client_id,
     return MQ_ERR_TOPIC_TREE;
   }
 
-  std::string client_id_str = from_mqtt_string(client_id);
-  return collect_client_subscriptions(root_, "", client_id_str, subscriptions);
+  MQTTString empty_path = to_mqtt_string("", allocator_);
+  return collect_client_subscriptions(root_, empty_path, client_id, subscriptions);
 }
 
 int ConcurrentTopicTree::get_total_subscribers(size_t& total_count) const
@@ -1096,7 +1101,7 @@ int ConcurrentTopicTree::get_total_nodes(size_t& total_count) const
 }
 
 int ConcurrentTopicTree::cleanup_empty_nodes_recursive(std::shared_ptr<TopicTreeNode> node,
-                                                       const std::string& path, bool& should_delete)
+                                                       const MQTTString& path, bool& should_delete)
 {
   should_delete = false;
 
@@ -1106,16 +1111,17 @@ int ConcurrentTopicTree::cleanup_empty_nodes_recursive(std::shared_ptr<TopicTree
   }
 
   int ret = MQ_SUCCESS;
-  TopicTreeMap<std::string, std::shared_ptr<TopicTreeNode>> children;
+  TopicTreeChildrenMap children;
   ret = node->get_children(children);
   if (MQ_FAIL(ret)) {
     return ret;
   }
 
   // 递归清理子节点
-  std::vector<std::string> children_to_remove;
+  TopicTreeLevelVector children_to_remove;
   for (const auto& child_pair : children) {
-    std::string child_path = path.empty() ? child_pair.first : (path + "/" + child_pair.first);
+    MQTTString child_path = path.empty() ? child_pair.first : 
+        to_mqtt_string(from_mqtt_string(path) + "/" + from_mqtt_string(child_pair.first), allocator_);
     bool child_should_delete = false;
     ret = cleanup_empty_nodes_recursive(child_pair.second, child_path, child_should_delete);
     if (MQ_FAIL(ret)) {
@@ -1127,7 +1133,7 @@ int ConcurrentTopicTree::cleanup_empty_nodes_recursive(std::shared_ptr<TopicTree
   }
 
   // 移除空的子节点
-  for (const std::string& child_level : children_to_remove) {
+  for (const MQTTString& child_level : children_to_remove) {
     while (true) {
       IntermediateNode* old_node = node->get_intermediate_node();
       if (MQ_ISNULL(old_node)) {
@@ -1185,7 +1191,8 @@ int ConcurrentTopicTree::cleanup_empty_nodes(size_t& cleaned_count)
 {
   size_t original_count = total_nodes_.load(std::memory_order_relaxed);
   bool should_delete = false;
-  int ret = cleanup_empty_nodes_recursive(root_, "", should_delete);
+  MQTTString empty_path = to_mqtt_string("", allocator_);
+  int ret = cleanup_empty_nodes_recursive(root_, empty_path, should_delete);
   if (MQ_FAIL(ret)) {
     return ret;
   }

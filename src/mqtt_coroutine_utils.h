@@ -2,6 +2,7 @@
 #define MQTT_COROUTINE_UTILS_H
 
 #include <stdexcept>
+#include <memory>
 #include "../3rd/libco/co_comm.h"
 #include "../3rd/libco/co_routine.h"
 
@@ -16,6 +17,7 @@ using CoroMutex = clsCoMutex;
  * @brief 协程锁的RAII包装器，直接使用libco的clsSmartLock
  */
 using CoroLockGuard = clsSmartLock;
+
 
 /**
  * @brief 协程信号量的RAII包装器

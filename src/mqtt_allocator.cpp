@@ -148,6 +148,11 @@ MQTTMemoryManager::MQTTMemoryManager()
 
 MQTTMemoryManager::~MQTTMemoryManager() {}
 
+size_t MQTTMemoryManager::get_tag_memory_usage(MQTTMemoryTag tag)
+{
+  return get_tag_usage(tag);
+}
+
 size_t MQTTMemoryManager::get_total_memory_usage()
 {
   size_t total = 0;

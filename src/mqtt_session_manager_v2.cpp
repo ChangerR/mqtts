@@ -14,16 +14,46 @@ namespace mqtt {
 // ThreadLocalSessionManager实现
 //==============================================================================
 
-ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id)
-    : thread_id_(thread_id), has_new_messages_(false)
+ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id, MQTTAllocator* allocator)
+    : thread_id_(thread_id), allocator_(allocator), initialized_(false), has_new_messages_(false)
 {
-  LOG_INFO("ThreadLocalSessionManager created for thread: {}",
-           std::hash<std::thread::id>{}(thread_id_));
+  // 构造函数只做简单的成员变量初始化
+  // 复杂的初始化逻辑移到init()方法中
+}
 
-  // 创建默认的Worker池（4个Worker）
-  worker_pool_.reset(new SendWorkerPool(4, 1000));
-  worker_pool_->set_session_manager(this);
-  worker_pool_->start();
+int ThreadLocalSessionManager::init()
+{
+  if (initialized_) {
+    return MQ_SUCCESS;  // 已经初始化过了
+  }
+
+  // Initialize allocator if not provided
+  if (!allocator_) {
+    std::string child_name = "session_manager_" + std::to_string(std::hash<std::thread::id>{}(thread_id_));
+    allocator_ = MQTTMemoryManager::get_instance().get_root_allocator()->create_child(
+        child_name, MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+    if (!allocator_) {
+      LOG_ERROR("Failed to create allocator for ThreadLocalSessionManager");
+      return MQ_ERR_SESSION_MANAGER_NOT_READY;
+    }
+  }
+
+  LOG_INFO("ThreadLocalSessionManager initialized for thread: {} with allocator: {}",
+           std::hash<std::thread::id>{}(thread_id_), allocator_->get_id());
+
+  // Initialize worker pool
+  try {
+    worker_pool_.reset(new SendWorkerPool(4, 1000));
+    worker_pool_->set_session_manager(this);
+    worker_pool_->start();
+    LOG_DEBUG("SendWorkerPool initialized for thread: {}", std::hash<std::thread::id>{}(thread_id_));
+  } catch (const std::exception& e) {
+    LOG_ERROR("Failed to initialize SendWorkerPool: {}", e.what());
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+
+  initialized_ = true;
+  return MQ_SUCCESS;
 }
 
 ThreadLocalSessionManager::~ThreadLocalSessionManager()
@@ -66,6 +96,11 @@ ThreadLocalSessionManager::~ThreadLocalSessionManager()
 int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
                                                 MQTTProtocolHandler* handler)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  
   if (!handler) {
     LOG_ERROR("Cannot register handler: handler is null");
     return MQ_ERR_PARAM_V2;
@@ -107,8 +142,7 @@ int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
 
   CoroLockGuard lock(&sessions_mutex_);
 
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
-      sessions_.find(client_id_str);
+  auto it = sessions_.find(client_id_str);
 
   if (it == sessions_.end()) {
     LOG_WARN("Attempt to unregister non-existent handler: {}", client_id_str);
@@ -141,11 +175,15 @@ void ThreadLocalSessionManager::safe_remove_session(const std::string& client_id
 
 SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& client_id)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return SafeHandlerRef();  // 返回空引用
+  }
+  
   CoroLockGuard lock(&sessions_mutex_);
 
   std::string client_id_str = from_mqtt_string(client_id);
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it =
-      sessions_.find(client_id_str);
+  auto it = sessions_.find(client_id_str);
 
   if (it != sessions_.end() && it->second->is_valid.load() && !it->second->pending_removal.load()) {
     return SafeHandlerRef(it->second.get());
@@ -156,6 +194,11 @@ SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& cli
 
 int ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
 {
+  if (!initialized_) {
+    LOG_ERROR("ThreadLocalSessionManager not initialized");
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  
   int ret = MQ_SUCCESS;
 
   if (from_mqtt_string(message.get_target_client_id()).empty()) {
@@ -492,7 +535,7 @@ int ThreadLocalSessionManager::cleanup_invalid_handlers()
   CoroLockGuard lock(&sessions_mutex_);
 
   int cleaned_count = 0;
-  std::unordered_map<std::string, std::unique_ptr<SessionInfo>>::iterator it = sessions_.begin();
+  auto it = sessions_.begin();
 
   while (it != sessions_.end()) {
     if (!is_handler_valid(it->second->handler)) {
@@ -560,20 +603,26 @@ thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_mana
 
 GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING)
 {
+  // 初始化全局分配器
+  MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+  global_allocator_ = root_allocator->create_child("global_session_manager", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+
+  // TODO: 简化容器初始化，去除复杂的STL分配器
+  // 容器使用默认分配器，后期可以优化
+
   // 初始化消息内容缓存管理器
   message_cache_.reset(new MessageContentCache());
 
   // 为主题匹配树创建专用的allocator
-  MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
   MQTTAllocator* topic_tree_allocator =
-      root_allocator->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+      global_allocator_->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
 
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
 
   LOG_INFO(
       "GlobalSessionManager initialized with high-performance lock-free architecture and topic "
-      "tree using allocator");
+      "tree using allocator: {}", global_allocator_->get_id());
 }
 
 GlobalSessionManager::~GlobalSessionManager()
@@ -628,17 +677,27 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
   WriteLockGuard lock(managers_mutex_);
 
   // 检查是否已经注册
-  std::unordered_map<std::thread::id, std::unique_ptr<ThreadLocalSessionManager>>::iterator it =
-      thread_managers_.find(thread_id);
+  auto it = thread_managers_.find(thread_id);
   if (it != thread_managers_.end()) {
     LOG_WARN("Thread manager already registered for thread: {}",
              std::hash<std::thread::id>{}(thread_id));
     return it->second.get();
   }
 
+  // 为每个线程创建专用的allocator
+  MQTTAllocator* thread_allocator = global_allocator_->create_child("thread_" + std::to_string(std::hash<std::thread::id>{}(thread_id)), MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+
   // 创建新的线程管理器
-  std::unique_ptr<ThreadLocalSessionManager> manager(new ThreadLocalSessionManager(thread_id));
+  std::unique_ptr<ThreadLocalSessionManager> manager(new ThreadLocalSessionManager(thread_id, thread_allocator));
   ThreadLocalSessionManager* manager_ptr = manager.get();
+  
+  // 初始化线程管理器
+  int init_result = manager_ptr->init();
+  if (init_result != MQ_SUCCESS) {
+    LOG_ERROR("Failed to initialize ThreadLocalSessionManager for thread: {}", 
+              std::hash<std::thread::id>{}(thread_id));
+    return nullptr;
+  }
 
   thread_managers_[thread_id] = std::move(manager);
   thread_manager_array_.push_back(manager_ptr);
@@ -680,8 +739,7 @@ ThreadLocalSessionManager* GlobalSessionManager::get_thread_manager()
   if (state_.load() == ManagerState::RUNNING) {
     // 运行时使用读锁，并发性能更好
     ReadLockGuard lock(managers_mutex_);
-    std::unordered_map<std::thread::id, std::unique_ptr<ThreadLocalSessionManager>>::iterator it =
-        thread_managers_.find(current_thread_id);
+    auto it = thread_managers_.find(current_thread_id);
     if (it != thread_managers_.end()) {
       cached_thread_manager_ = it->second.get();
       return cached_thread_manager_;
@@ -760,8 +818,7 @@ ThreadLocalSessionManager* GlobalSessionManager::fast_find_client_manager(
   // 使用读锁进行快速查找，支持高并发
   ReadLockGuard lock(client_index_mutex_);
 
-  std::unordered_map<std::string, ThreadLocalSessionManager*>::const_iterator it =
-      client_to_manager_.find(client_id_str);
+  auto it = client_to_manager_.find(client_id_str);
 
   return (it != client_to_manager_.end()) ? it->second : nullptr;
 }
@@ -1019,7 +1076,7 @@ int GlobalSessionManager::cleanup_all_invalid_sessions()
   std::vector<ThreadLocalSessionManager*> managers_to_clean;
   {
     ReadLockGuard lock(managers_mutex_);
-    managers_to_clean = thread_manager_array_;
+    managers_to_clean.assign(thread_manager_array_.begin(), thread_manager_array_.end());
   }
 
   int total_cleaned = 0;
@@ -1031,8 +1088,7 @@ int GlobalSessionManager::cleanup_all_invalid_sessions()
   {
     WriteLockGuard client_lock(client_index_mutex_);
 
-    std::unordered_map<std::string, ThreadLocalSessionManager*>::iterator it =
-        client_to_manager_.begin();
+    auto it = client_to_manager_.begin();
     while (it != client_to_manager_.end()) {
       // 检查对应的handler是否有效
       SafeHandlerRef safe_handler =
@@ -1302,6 +1358,36 @@ int GlobalSessionManager::cleanup_topic_tree(size_t& cleaned_count) const
     LOG_INFO("Cleaned up {} empty nodes from topic tree", cleaned_count);
   }
 
+  return MQ_SUCCESS;
+}
+
+size_t GlobalSessionManager::get_thread_count() const
+{
+  ReadLockGuard lock(managers_mutex_);
+  return thread_manager_array_.size();
+}
+
+int GlobalSessionManager::get_total_handler_count(size_t& total_count) const
+{
+  ReadLockGuard lock(managers_mutex_);
+  
+  total_count = 0;
+  for (const ThreadLocalSessionManager* manager : thread_manager_array_) {
+    total_count += manager->get_handler_count();
+  }
+  
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::get_total_pending_message_count(size_t& total_count) const
+{
+  ReadLockGuard lock(managers_mutex_);
+  
+  total_count = 0;
+  for (const ThreadLocalSessionManager* manager : thread_manager_array_) {
+    total_count += manager->get_pending_message_count();
+  }
+  
   return MQ_SUCCESS;
 }
 

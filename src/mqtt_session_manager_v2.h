@@ -16,6 +16,7 @@
 #include "mqtt_parser.h"
 #include "mqtt_send_worker_pool.h"
 #include "mqtt_session_info.h"
+#include "mqtt_stl_allocator.h"
 #include "mqtt_topic_tree.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
@@ -33,12 +34,18 @@ class SafeHandlerRef;
 class ThreadLocalSessionManager
 {
  public:
-  explicit ThreadLocalSessionManager(std::thread::id thread_id);
+  explicit ThreadLocalSessionManager(std::thread::id thread_id, MQTTAllocator* allocator = nullptr);
   ~ThreadLocalSessionManager();
 
   // 禁止拷贝和赋值
   ThreadLocalSessionManager(const ThreadLocalSessionManager&) = delete;
   ThreadLocalSessionManager& operator=(const ThreadLocalSessionManager&) = delete;
+
+  /**
+   * @brief 初始化线程本地会话管理器
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int init();
 
   /**
    * @brief 注册Handler到当前线程的SessionManager
@@ -136,8 +143,15 @@ class ThreadLocalSessionManager
    */
   SendWorkerPool::Statistics get_worker_statistics() const;
 
+  /**
+   * @brief 获取分配器
+   */
+  MQTTAllocator* get_allocator() const { return allocator_; }
+
  private:
   std::thread::id thread_id_;
+  MQTTAllocator* allocator_;
+  bool initialized_;
   mutable CoroMutex sessions_mutex_;
   std::unordered_map<std::string, std::unique_ptr<SessionInfo>> sessions_;
 
@@ -320,6 +334,11 @@ class GlobalSessionManager
   int cleanup_topic_tree(size_t& cleaned_count) const;
 
   /**
+   * @brief 获取全局分配器
+   */
+  MQTTAllocator* get_allocator() const { return global_allocator_; }
+
+  /**
    * @brief 清理所有无效的会话记录
    */
   int cleanup_all_invalid_sessions();
@@ -338,6 +357,26 @@ class GlobalSessionManager
    */
   int get_message_cache_size(size_t& cache_size) const;
 
+  /**
+   * @brief 获取线程数量
+   * @return 线程数量
+   */
+  size_t get_thread_count() const;
+
+  /**
+   * @brief 获取总的Handler数量
+   * @param total_count 输出参数：总Handler数量
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int get_total_handler_count(size_t& total_count) const;
+
+  /**
+   * @brief 获取总的待处理消息数量
+   * @param total_count 输出参数：总待处理消息数量
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int get_total_pending_message_count(size_t& total_count) const;
+
  private:
   // 运行状态
   enum class ManagerState {
@@ -349,6 +388,7 @@ class GlobalSessionManager
   std::atomic<ManagerState> state_;
 
   // 线程管理器存储（启动后不再变更，支持无锁访问）
+  MQTTAllocator* global_allocator_;
   mutable RWMutex managers_mutex_;  // 读写锁，读多写少
   std::unordered_map<std::thread::id, std::unique_ptr<ThreadLocalSessionManager>> thread_managers_;
   std::vector<ThreadLocalSessionManager*> thread_manager_array_;  // 预分配数组，支持快速遍历

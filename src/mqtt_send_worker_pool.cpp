@@ -7,9 +7,6 @@
 
 namespace mqtt {
 
-// 新增错误代码定义
-#define MQ_ERR_TIMEOUT_V2 -802
-
 SendWorkerPool::SendWorkerPool(size_t worker_count, size_t max_queue_size)
     : worker_count_(worker_count),
       max_queue_size_(max_queue_size),

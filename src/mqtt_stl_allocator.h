@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "mqtt_allocator.h"
 
@@ -135,5 +136,16 @@ inline std::vector<uint8_t> from_mqtt_bytes(const MQTTByteVector& vec)
 }
 
 }  // namespace mqtt
+
+// 为MQTTString提供std::hash特化，支持在std::unordered_map中使用
+namespace std {
+template <>
+struct hash<mqtt::MQTTString> {
+    size_t operator()(const mqtt::MQTTString& str) const {
+        // 直接对原始数据进行hash，避免字符串转换
+        return std::hash<std::string>{}(std::string(str.data(), str.length()));
+    }
+};
+}
 
 #endif  // MQTT_STL_ALLOCATOR_H
