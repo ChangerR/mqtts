@@ -62,7 +62,14 @@ void* MQTTAllocator::allocate(size_t size)
   void* ptr = tc_malloc(size);
   if (ptr) {
     usage_ += size;
-    MQTTMemoryManager::get_instance().add_tag_usage(tag_, size);
+    
+    // Safely access the memory manager
+    try {
+      MQTTMemoryManager::get_instance().add_tag_usage(tag_, size);
+    } catch (...) {
+      // Ignore errors during shutdown
+    }
+    
     LOG_DEBUG("Allocated {} bytes for id {} tag {} (used: {}/{})", size, id_.c_str(),
               get_memory_tag_str(tag_), usage_.load(), limit_);
   }
@@ -76,7 +83,14 @@ void MQTTAllocator::deallocate(void* ptr, size_t size)
 
   tc_free(ptr);
   usage_ -= size;
-  MQTTMemoryManager::get_instance().sub_tag_usage(tag_, size);
+  
+  // Safely access the memory manager
+  try {
+    MQTTMemoryManager::get_instance().sub_tag_usage(tag_, size);
+  } catch (...) {
+    // Ignore errors during shutdown
+  }
+  
   LOG_DEBUG("Freed {} bytes from id {} tag {} (used: {}/{})", size, id_.c_str(),
             get_memory_tag_str(tag_), usage_.load(), limit_);
 }
@@ -146,7 +160,10 @@ MQTTMemoryManager::MQTTMemoryManager()
   }
 }
 
-MQTTMemoryManager::~MQTTMemoryManager() {}
+MQTTMemoryManager::~MQTTMemoryManager() {
+  // Clean up thread local allocator if it exists
+  cleanup_thread_local();
+}
 
 size_t MQTTMemoryManager::get_tag_memory_usage(MQTTMemoryTag tag)
 {

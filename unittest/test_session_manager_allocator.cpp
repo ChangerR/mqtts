@@ -32,6 +32,9 @@ protected:
         // Clean up coroutine environment
         coro_scope_.reset();
         
+        // Clean up thread local allocator
+        MQTTMemoryManager::cleanup_thread_local();
+        
         // 等待清理完成
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }

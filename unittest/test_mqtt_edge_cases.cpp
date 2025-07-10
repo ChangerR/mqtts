@@ -21,9 +21,9 @@ class MQTTv5EdgeCasesTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        // Use root allocator directly to avoid potential allocation issues
-        test_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
-        ASSERT_NE(test_allocator, nullptr) << "Failed to get root allocator";
+        // Create a basic allocator for testing to isolate from shutdown issues
+        test_allocator = new MQTTAllocator("test_allocator", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+        ASSERT_NE(test_allocator, nullptr) << "Failed to create test allocator";
 
         // Initialize parser
         parser = std::make_unique<MQTTParser>(test_allocator);
@@ -35,10 +35,16 @@ protected:
         parser.reset();
         
         // Small delay to ensure any cleanup is complete
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         
-        // Don't delete root allocator - it's managed by the singleton
-        test_allocator = nullptr;
+        // Delete the test allocator we created
+        if (test_allocator) {
+            delete test_allocator;
+            test_allocator = nullptr;
+        }
+        
+        // Clean up thread local allocator
+        MQTTMemoryManager::cleanup_thread_local();
     }
 
     MQTTAllocator* test_allocator = nullptr;

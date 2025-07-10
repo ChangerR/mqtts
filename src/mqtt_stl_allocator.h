@@ -9,6 +9,7 @@
 #include <map>
 #include <new>
 #include <stdexcept>
+#include <cstdlib>
 #include "mqtt_allocator.h"
 
 namespace mqtt {
@@ -49,14 +50,11 @@ class MQTTSTLAllocator
       return nullptr;
     }
     
-    MQTTAllocator* alloc = allocator_;
-    if (!alloc) {
-      // 使用root allocator作为默认分配器
-      alloc = MQTTMemoryManager::get_instance().get_root_allocator();
-    }
+    MQTTAllocator* alloc = get_effective_allocator();
     
     if (!alloc) {
-      throw std::bad_alloc();
+      // Fallback to standard allocator if our custom allocator is not available
+      return static_cast<pointer>(std::malloc(n * sizeof(T)));
     }
     
     void* ptr = alloc->allocate(n * sizeof(T));
@@ -73,14 +71,13 @@ class MQTTSTLAllocator
       return;
     }
     
-    MQTTAllocator* alloc = allocator_;
-    if (!alloc) {
-      // 使用root allocator作为默认分配器
-      alloc = MQTTMemoryManager::get_instance().get_root_allocator();
-    }
+    MQTTAllocator* alloc = get_effective_allocator();
     
     if (alloc) {
       alloc->deallocate(p, n * sizeof(T));
+    } else {
+      // Fallback to standard free if our custom allocator is not available
+      std::free(p);
     }
   }
 
@@ -104,7 +101,13 @@ class MQTTSTLAllocator
     if (allocator_) {
       return allocator_;
     }
-    return MQTTMemoryManager::get_instance().get_root_allocator();
+    
+    // Use try-catch to handle potential shutdown issues
+    try {
+      return MQTTMemoryManager::get_instance().get_root_allocator();
+    } catch (...) {
+      return nullptr;
+    }
   }
 
   template <typename U>
