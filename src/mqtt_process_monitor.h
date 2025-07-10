@@ -41,6 +41,11 @@ struct ProcessStats {
     size_t messages_received = 0;
     size_t bytes_sent = 0;
     size_t bytes_received = 0;
+    
+    // 事件转发统计
+    size_t events_forwarded = 0;
+    size_t events_dropped = 0;
+    size_t forwarding_queue_size = 0;
 };
 
 /**

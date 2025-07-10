@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
+#include <map>
 #include "mqtt_allocator.h"
 
 namespace mqtt {
@@ -105,6 +107,13 @@ using MQTTByteVector = std::vector<uint8_t, MQTTSTLAllocator<uint8_t>>;
 
 template <typename T>
 using MQTTVector = std::vector<T, MQTTSTLAllocator<T>>;
+
+template <typename Key, typename Value>
+using MQTTMap = std::unordered_map<Key, Value, std::hash<Key>, std::equal_to<Key>, MQTTSTLAllocator<std::pair<const Key, Value>>>;
+
+// For compatibility with existing code
+template<typename T>
+using mqtt_stl_allocator = MQTTSTLAllocator<T>;
 
 using MQTTStringPair = std::pair<MQTTString, MQTTString>;
 using MQTTUserProperties = MQTTVector<MQTTStringPair>;

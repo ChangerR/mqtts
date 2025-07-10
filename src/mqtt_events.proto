@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package mqtt.events;
+
+// Timestamp message
+message Timestamp {
+    int64 seconds = 1;
+    int32 nanos = 2;
+}
+
+// Common event metadata
+message EventMetadata {
+    string event_id = 1;
+    Timestamp timestamp = 2;
+    string server_id = 3;
+    string client_id = 4;
+    string client_ip = 5;
+    int32 client_port = 6;
+}
+
+// Login event
+message LoginEvent {
+    EventMetadata metadata = 1;
+    string username = 2;
+    string protocol_version = 3;
+    int32 keep_alive = 4;
+    bool clean_session = 5;
+    map<string, string> properties = 6;
+}
+
+// Logout event
+message LogoutEvent {
+    EventMetadata metadata = 1;
+    string reason = 2;
+    int32 session_duration_seconds = 3;
+    int64 bytes_sent = 4;
+    int64 bytes_received = 5;
+    int32 messages_sent = 6;
+    int32 messages_received = 7;
+    map<string, string> properties = 8;
+}
+
+// Publish event
+message PublishEvent {
+    EventMetadata metadata = 1;
+    string topic = 2;
+    int32 qos = 3;
+    bool retain = 4;
+    bool duplicate = 5;
+    int32 payload_size = 6;
+    bytes payload = 7;  // Optional, can be empty to save bandwidth
+    map<string, string> properties = 8;
+}
+
+// Event container
+message MQTTEvent {
+    oneof event {
+        LoginEvent login = 1;
+        LogoutEvent logout = 2;
+        PublishEvent publish = 3;
+    }
+}
+
+// Batch of events for efficient transmission
+message EventBatch {
+    repeated MQTTEvent events = 1;
+    int32 batch_size = 2;
+    Timestamp batch_timestamp = 3;
+}
+
+// RPC Request/Response messages
+message ForwardEventsRequest {
+    EventBatch batch = 1;
+}
+
+message ForwardEventsResponse {
+    bool success = 1;
+    string error_message = 2;
+    int32 processed_count = 3;
+}
+
+// RPC Service definition
+service EventForwardingService {
+    rpc ForwardEvents(ForwardEventsRequest) returns (ForwardEventsResponse);
+}

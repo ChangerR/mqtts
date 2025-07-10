@@ -30,6 +30,10 @@ int ConfigManager::load_from_file(const std::string& config_file)
       parse_log_config(root["log"]);
     }
 
+    if (root["event_forwarding"]) {
+      parse_event_forwarding_config(root["event_forwarding"]);
+    }
+
     // 验证配置
     int ret = validate();
     if (ret != 0) {
@@ -181,6 +185,73 @@ void ConfigManager::parse_log_config(const YAML::Node& node)
 
   if (node["flush_immediately"]) {
     config_.log.flush_immediately = node["flush_immediately"].as<bool>();
+  }
+}
+
+void ConfigManager::parse_event_forwarding_config(const YAML::Node& node)
+{
+  if (node["enabled"]) {
+    config_.event_forwarding.enabled = node["enabled"].as<bool>();
+  }
+
+  if (node["server_host"]) {
+    config_.event_forwarding.server_host = node["server_host"].as<std::string>();
+  }
+
+  if (node["server_port"]) {
+    config_.event_forwarding.server_port = node["server_port"].as<int>();
+  }
+
+  if (node["worker_thread_count"]) {
+    config_.event_forwarding.worker_thread_count = node["worker_thread_count"].as<int>();
+  }
+
+  if (node["coroutines_per_thread"]) {
+    config_.event_forwarding.coroutines_per_thread = node["coroutines_per_thread"].as<int>();
+  }
+
+  if (node["connection_timeout_ms"]) {
+    config_.event_forwarding.connection_timeout_ms = node["connection_timeout_ms"].as<int>();
+  }
+
+  if (node["request_timeout_ms"]) {
+    config_.event_forwarding.request_timeout_ms = node["request_timeout_ms"].as<int>();
+  }
+
+  if (node["max_batch_size"]) {
+    config_.event_forwarding.max_batch_size = node["max_batch_size"].as<int>();
+  }
+
+  if (node["batch_timeout_ms"]) {
+    config_.event_forwarding.batch_timeout_ms = node["batch_timeout_ms"].as<int>();
+  }
+
+  if (node["max_queue_size"]) {
+    config_.event_forwarding.max_queue_size = node["max_queue_size"].as<size_t>();
+  }
+
+  if (node["queue_drop_policy"]) {
+    config_.event_forwarding.queue_drop_policy = node["queue_drop_policy"].as<int>();
+  }
+
+  if (node["forward_login_events"]) {
+    config_.event_forwarding.forward_login_events = node["forward_login_events"].as<bool>();
+  }
+
+  if (node["forward_logout_events"]) {
+    config_.event_forwarding.forward_logout_events = node["forward_logout_events"].as<bool>();
+  }
+
+  if (node["forward_publish_events"]) {
+    config_.event_forwarding.forward_publish_events = node["forward_publish_events"].as<bool>();
+  }
+
+  if (node["include_payload"]) {
+    config_.event_forwarding.include_payload = node["include_payload"].as<bool>();
+  }
+
+  if (node["max_payload_size"]) {
+    config_.event_forwarding.max_payload_size = node["max_payload_size"].as<size_t>();
   }
 }
 

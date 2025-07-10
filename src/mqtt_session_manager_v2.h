@@ -20,6 +20,7 @@
 #include "mqtt_topic_tree.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
+#include "mqtt_event_forwarding_service.h"
 
 namespace mqtt {
 
@@ -377,6 +378,74 @@ class GlobalSessionManager
    */
   int get_total_pending_message_count(size_t& total_count) const;
 
+  /**
+   * @brief 设置事件转发服务
+   * @param forwarding_service 事件转发服务指针
+   */
+  void set_event_forwarding_service(events::EventForwardingService* forwarding_service);
+
+  /**
+   * @brief 触发登录事件
+   * @param client_id 客户端ID
+   * @param username 用户名
+   * @param protocol_version 协议版本
+   * @param keep_alive 保活时间
+   * @param clean_session 清理会话标志
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_login_event(const MQTTString& client_id,
+                          const MQTTString& username,
+                          const MQTTString& protocol_version,
+                          int keep_alive,
+                          bool clean_session,
+                          const MQTTString& client_ip = MQTTString(),
+                          int client_port = 0);
+
+  /**
+   * @brief 触发登出事件
+   * @param client_id 客户端ID
+   * @param reason 登出原因
+   * @param session_duration_seconds 会话持续时间（秒）
+   * @param bytes_sent 发送字节数
+   * @param bytes_received 接收字节数
+   * @param messages_sent 发送消息数
+   * @param messages_received 接收消息数
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_logout_event(const MQTTString& client_id,
+                           const MQTTString& reason,
+                           int session_duration_seconds,
+                           int64_t bytes_sent,
+                           int64_t bytes_received,
+                           int messages_sent,
+                           int messages_received,
+                           const MQTTString& client_ip = MQTTString(),
+                           int client_port = 0);
+
+  /**
+   * @brief 触发发布事件
+   * @param client_id 客户端ID
+   * @param topic 主题
+   * @param qos QoS级别
+   * @param retain 保留标志
+   * @param duplicate 重复标志
+   * @param payload_size 载荷大小
+   * @param payload 载荷数据（可选）
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_publish_event(const MQTTString& client_id,
+                            const MQTTString& topic,
+                            int qos,
+                            bool retain,
+                            bool duplicate,
+                            int payload_size,
+                            const MQTTVector<uint8_t>& payload = MQTTVector<uint8_t>(),
+                            const MQTTString& client_ip = MQTTString(),
+                            int client_port = 0);
+
  private:
   // 运行状态
   enum class ManagerState {
@@ -403,6 +472,9 @@ class GlobalSessionManager
 
   // 高性能主题匹配树
   std::unique_ptr<ConcurrentTopicTree> topic_tree_;
+
+  // 事件转发服务
+  events::EventForwardingService* event_forwarding_service_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;

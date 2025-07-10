@@ -601,7 +601,7 @@ bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) c
 // 线程本地缓存定义
 thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_manager_ = nullptr;
 
-GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING)
+GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING), event_forwarding_service_(nullptr)
 {
   // 初始化全局分配器
   MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
@@ -1389,6 +1389,118 @@ int GlobalSessionManager::get_total_pending_message_count(size_t& total_count) c
   }
   
   return MQ_SUCCESS;
+}
+
+void GlobalSessionManager::set_event_forwarding_service(events::EventForwardingService* forwarding_service)
+{
+  event_forwarding_service_ = forwarding_service;
+  LOG_INFO("Event forwarding service set: {}", (forwarding_service ? "enabled" : "disabled"));
+}
+
+void GlobalSessionManager::trigger_login_event(const MQTTString& client_id,
+                                               const MQTTString& username,
+                                               const MQTTString& protocol_version,
+                                               int keep_alive,
+                                               bool clean_session,
+                                               const MQTTString& client_ip,
+                                               int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create login event data
+  events::LoginEventData login_data;
+  login_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  login_data.username = username;
+  login_data.protocol_version = protocol_version;
+  login_data.keep_alive = keep_alive;
+  login_data.clean_session = clean_session;
+  
+  // Create and forward event
+  auto event = events::createLoginEvent(login_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward login event for client: {}", from_mqtt_string(client_id));
+  }
+}
+
+void GlobalSessionManager::trigger_logout_event(const MQTTString& client_id,
+                                                const MQTTString& reason,
+                                                int session_duration_seconds,
+                                                int64_t bytes_sent,
+                                                int64_t bytes_received,
+                                                int messages_sent,
+                                                int messages_received,
+                                                const MQTTString& client_ip,
+                                                int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create logout event data
+  events::LogoutEventData logout_data;
+  logout_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  logout_data.reason = reason;
+  logout_data.session_duration_seconds = session_duration_seconds;
+  logout_data.bytes_sent = bytes_sent;
+  logout_data.bytes_received = bytes_received;
+  logout_data.messages_sent = messages_sent;
+  logout_data.messages_received = messages_received;
+  
+  // Create and forward event
+  auto event = events::createLogoutEvent(logout_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward logout event for client: {}", from_mqtt_string(client_id));
+  }
+}
+
+void GlobalSessionManager::trigger_publish_event(const MQTTString& client_id,
+                                                 const MQTTString& topic,
+                                                 int qos,
+                                                 bool retain,
+                                                 bool duplicate,
+                                                 int payload_size,
+                                                 const MQTTVector<uint8_t>& payload,
+                                                 const MQTTString& client_ip,
+                                                 int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create publish event data
+  events::PublishEventData publish_data;
+  publish_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  publish_data.topic = topic;
+  publish_data.qos = qos;
+  publish_data.retain = retain;
+  publish_data.duplicate = duplicate;
+  publish_data.payload_size = payload_size;
+  
+  // Only include payload if it's small (to save bandwidth)
+  if (payload.size() <= 1024) {  // 1KB limit
+    publish_data.payload = payload;
+  }
+  
+  // Create and forward event
+  auto event = events::createPublishEvent(publish_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward publish event for client: {}, topic: {}", 
+              from_mqtt_string(client_id), from_mqtt_string(topic));
+  }
 }
 
 }  // namespace mqtt

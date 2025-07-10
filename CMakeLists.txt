@@ -71,6 +71,10 @@ add_library(mqtt_parser STATIC
     src/mqtt_topic_tree.cpp
 	src/mqtt_send_worker_pool.cpp
 	src/mqtt_process_monitor.cpp
+	src/mqtt_event_types.cpp
+	src/mqtt_event_forwarding_queue.cpp
+	src/mqtt_event_rpc_client.cpp
+	src/mqtt_event_forwarding_service.cpp
 )
 
 # 查找yaml-cpp库的静态版本
