@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <memory>
 #include "../build/generated/version.h"
 #include "logger.h"
 #include "mqtt_config.h"
@@ -77,13 +78,27 @@ void run_mqtt_server(const mqtt::Config& config)
   }
 
   // 启动进程监控器
-  mqtt::ProcessMonitor process_monitor(&session_manager, 5);  // 每5秒打印一次状态
-  process_monitor.set_verbose_output(true);  // 启用详细输出
-  int monitor_result = process_monitor.start();
-  if (monitor_result == MQ_SUCCESS) {
-    LOG_INFO("Process monitor started successfully");
+  std::unique_ptr<mqtt::ProcessMonitor> process_monitor;
+  if (config.monitoring.enabled) {
+    process_monitor.reset(new mqtt::ProcessMonitor(&session_manager, config.monitoring.interval_seconds));
+    process_monitor->set_verbose_output(config.monitoring.verbose_output);
+    
+    // 如果配置了JSON输出文件，则设置
+    if (!config.monitoring.json_output_file.empty()) {
+      process_monitor->set_json_output_file(config.monitoring.json_output_file);
+    }
+    
+    int monitor_result = process_monitor->start();
+    if (monitor_result == MQ_SUCCESS) {
+      LOG_INFO("Process monitor started successfully with {}s interval", config.monitoring.interval_seconds);
+      if (!config.monitoring.json_output_file.empty()) {
+        LOG_INFO("JSON status output enabled to file: {}", config.monitoring.json_output_file);
+      }
+    } else {
+      LOG_ERROR("Failed to start process monitor: {}", monitor_result);
+    }
   } else {
-    LOG_ERROR("Failed to start process monitor: {}", monitor_result);
+    LOG_INFO("Process monitor disabled by configuration");
   }
 
   if (config.server.thread_count == 1) {

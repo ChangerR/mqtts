@@ -84,6 +84,17 @@ struct EventForwardingConfig
 };
 
 /**
+ * @brief 监控配置
+ */
+struct MonitoringConfig
+{
+  bool enabled = true;                     // 是否启用进程监控
+  int interval_seconds = 5;                // 监控间隔（秒）
+  bool verbose_output = true;              // 是否启用详细输出
+  std::string json_output_file = "";       // JSON状态输出文件路径，空字符串表示不输出
+};
+
+/**
  * @brief 主配置结构
  */
 struct Config
@@ -93,6 +104,7 @@ struct Config
   MemoryConfig memory;
   LogConfig log;
   EventForwardingConfig event_forwarding;
+  MonitoringConfig monitoring;
 };
 
 /**
@@ -142,6 +154,7 @@ class ConfigManager
   void parse_memory_config(const YAML::Node& node);
   void parse_log_config(const YAML::Node& node);
   void parse_event_forwarding_config(const YAML::Node& node);
+  void parse_monitoring_config(const YAML::Node& node);
 };
 
 }  // namespace mqtt

@@ -106,6 +106,12 @@ public:
     void set_verbose_output(bool enabled);
     
     /**
+     * @brief 设置JSON状态文件路径
+     * @param json_file_path JSON文件路径
+     */
+    void set_json_output_file(const std::string& json_file_path);
+    
+    /**
      * @brief 增加消息发送统计
      * @param message_count 消息数量
      * @param bytes 字节数
@@ -123,6 +129,7 @@ private:
     GlobalSessionManager* session_manager_;
     int interval_seconds_;
     bool verbose_output_;
+    std::string json_output_file_;
     
     std::atomic<bool> running_;
     std::unique_ptr<std::thread> monitor_thread_;
@@ -162,6 +169,19 @@ private:
      * @param stats 进程统计信息
      */
     void print_process_stats(const ProcessStats& stats);
+    
+    /**
+     * @brief 生成JSON格式的状态信息
+     * @param stats 进程统计信息
+     * @return JSON字符串
+     */
+    std::string generate_json_stats(const ProcessStats& stats);
+    
+    /**
+     * @brief 写状态到JSON文件
+     * @param stats 进程统计信息
+     */
+    void write_json_stats_to_file(const ProcessStats& stats);
     
     /**
      * @brief 格式化字节数

@@ -205,14 +205,18 @@ int MQTTProtocolHandler::read_packet()
 
   pf.fd = socket_->get_fd();
   pf.events = (POLLIN | POLLERR | POLLHUP);
-  co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 100ms timeout
+  co_poll(co_get_epoll_ct(), &pf, 1, 100);   // 100ms timeout
 
   // Try to receive data
   int len = bytes_needed_;
   int ret = socket_->recv(buffer_ + bytes_read_, len);
   if (MQ_FAIL(ret)) {
-    LOG_WARN("Client {}:{} disconnected unexpectedly", client_ip_.c_str(), client_port_);
-    return MQ_ERR_SOCKET_RECV;
+    if (ret == MQ_ERR_SOCKET_RECV) {
+      LOG_WARN("Client {}:{} recv error, closing connection", client_ip_.c_str(), client_port_);
+    } else {
+      LOG_WARN("Client {}:{} disconnected unexpectedly", client_ip_.c_str(), client_port_);
+    }
+    return ret;
   }
 
   // Check if connection closed
@@ -513,6 +517,24 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
               client_ip_.c_str(), client_port_);
   }
 
+  // 通知路由器客户端连接
+  if (session_manager_) {
+    MQTTString username{MQTTStrAllocator(allocator_)};
+    if (!packet->username.empty()) {
+      username = packet->username;
+    }
+    
+    int router_ret = session_manager_->notify_router_client_connect(
+        client_id_, username, packet->protocol_version, packet->keep_alive, packet->flags.clean_start);
+    if (router_ret != MQ_SUCCESS) {
+      LOG_DEBUG("Failed to notify router about client connect: {}, error: {}", 
+                from_mqtt_string(client_id_), router_ret);
+    } else {
+      LOG_DEBUG("Successfully notified router about client connect: {}", 
+                from_mqtt_string(client_id_));
+    }
+  }
+
   // Send CONNACK
   return send_connack(ReasonCode::Success, session_present);
 }
@@ -569,15 +591,15 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
             client_ip_.c_str(), client_port_, packet->payload.size());
 
-  // 转发消息给订阅者
+  // 转发消息给订阅者（包括路由到远程订阅者）
   if (session_manager_) {
-    int ret = session_manager_->forward_publish_by_topic(packet->topic_name, *packet, client_id_);
-    if (ret != MQ_SUCCESS) {
+    int ret = session_manager_->forward_publish_via_router(packet->topic_name, *packet, client_id_);
+    if (ret >= 0) {
+      LOG_DEBUG("Successfully forwarded PUBLISH message to {} subscribers for topic: {}", 
+                ret, from_mqtt_string(packet->topic_name));
+    } else {
       LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}", 
                from_mqtt_string(packet->topic_name), ret);
-    } else {
-      LOG_DEBUG("Successfully forwarded PUBLISH message to subscribers for topic: {}", 
-                from_mqtt_string(packet->topic_name));
     }
   } else {
     LOG_WARN("Session manager not available, cannot forward PUBLISH message for topic: {}", 
@@ -687,8 +709,24 @@ int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
   // 处理取消订阅
   std::vector<ReasonCode> reason_codes;
   for (const MQTTString& topic : packet->topic_filters) {
+    // 从本地存储中移除订阅
     remove_subscription(topic);
+    
+    // 从全局session manager的topic tree中移除订阅（包括路由器）
+    if (session_manager_) {
+      int ret = session_manager_->unsubscribe_topic_with_router(topic, client_id_);
+      if (ret != MQ_SUCCESS) {
+        LOG_WARN("Failed to unregister subscription with session manager for client {}:{}, topic: {}, error: {}", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(topic), ret);
+      } else {
+        LOG_DEBUG("Successfully unregistered subscription with session manager for client {}:{}, topic: {}", 
+                  client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+      }
+    }
+    
     reason_codes.push_back(ReasonCode::Success);
+    LOG_DEBUG("Successfully unsubscribed client {}:{} from topic: {}", client_ip_.c_str(),
+              client_port_, from_mqtt_string(topic));
   }
 
   // 发送UNSUBACK
@@ -808,9 +846,9 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     // 添加订阅到本地存储
     add_subscription(topic);
     
-    // 注册到全局session manager的topic tree
+    // 注册到全局session manager的topic tree（包括路由器）
     if (session_manager_) {
-      int ret = session_manager_->subscribe_topic(topic, client_id_, qos);
+      int ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
       if (ret != MQ_SUCCESS) {
         LOG_WARN("Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(topic), ret);
@@ -1298,6 +1336,17 @@ int MQTTProtocolHandler::send_pingresp()
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)
 {
   if (connected_ && session_manager_ && !client_id_.empty()) {
+    // 通知路由器客户端断开连接
+    MQTTString disconnect_reason(context ? context : "normal disconnect", MQTTStrAllocator(allocator_));
+    int router_ret = session_manager_->notify_router_client_disconnect(client_id_, disconnect_reason);
+    if (router_ret != MQ_SUCCESS) {
+      LOG_DEBUG("Failed to notify router about client disconnect: {}, error: {}", 
+                from_mqtt_string(client_id_), router_ret);
+    } else {
+      LOG_DEBUG("Successfully notified router about client disconnect: {}", 
+                from_mqtt_string(client_id_));
+    }
+    
     int ret = session_manager_->unregister_session(client_id_);
     if (ret != 0) {
       LOG_WARN("Failed to unregister session for client {} {}, error: {}",

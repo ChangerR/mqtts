@@ -4,6 +4,7 @@
 #include <ctime>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <fstream>
 #include "logger.h"
 #include "mqtt_memory_tags.h"
 
@@ -13,6 +14,7 @@ ProcessMonitor::ProcessMonitor(GlobalSessionManager* session_manager, int interv
     : session_manager_(session_manager), 
       interval_seconds_(interval_seconds),
       verbose_output_(false),
+      json_output_file_(""),
       running_(false),
       start_time_(std::chrono::steady_clock::now()),
       messages_sent_(0),
@@ -185,6 +187,11 @@ void ProcessMonitor::print_status_once()
     }
     
     print_process_stats(stats);
+    
+    // 如果配置了JSON输出文件，同时写入JSON格式
+    if (!json_output_file_.empty()) {
+        write_json_stats_to_file(stats);
+    }
 }
 
 void ProcessMonitor::print_process_stats(const ProcessStats& stats)
@@ -256,7 +263,7 @@ void ProcessMonitor::print_process_stats(const ProcessStats& stats)
     ss << std::string(80, '=') << "\n";
     
     // 输出到日志
-    LOG_INFO("{}", ss.str());
+    // LOG_INFO("{}", ss.str());
 }
 
 std::string ProcessMonitor::format_bytes(size_t bytes)
@@ -313,6 +320,115 @@ void ProcessMonitor::add_received_stats(size_t message_count, size_t bytes)
 {
     messages_received_.fetch_add(message_count);
     bytes_received_.fetch_add(bytes);
+}
+
+void ProcessMonitor::set_json_output_file(const std::string& json_file_path)
+{
+    json_output_file_ = json_file_path;
+    LOG_INFO("Process monitor JSON output file set to: {}", json_file_path);
+}
+
+std::string ProcessMonitor::generate_json_stats(const ProcessStats& stats)
+{
+    std::stringstream json;
+    
+    // 获取当前时间戳
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    
+    json << "{\n";
+    json << "  \"timestamp\": " << timestamp_ms << ",\n";
+    json << "  \"timestamp_iso\": \"" << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ") << "\",\n";
+    json << "  \"uptime_seconds\": " << stats.uptime.count() << ",\n";
+    
+    // 连接统计
+    json << "  \"connections\": {\n";
+    json << "    \"total\": " << stats.total_connections << ",\n";
+    json << "    \"active\": " << stats.active_connections << ",\n";
+    json << "    \"threads\": " << stats.total_threads << ",\n";
+    json << "    \"pending_messages\": " << stats.pending_messages << "\n";
+    json << "  },\n";
+    
+    // Topic统计
+    json << "  \"topics\": {\n";
+    json << "    \"subscribers\": " << stats.total_subscribers << ",\n";
+    json << "    \"nodes\": " << stats.total_topic_nodes << "\n";
+    json << "  },\n";
+    
+    // 内存统计
+    json << "  \"memory\": {\n";
+    json << "    \"total_bytes\": " << stats.total_memory_used << ",\n";
+    json << "    \"by_tag\": {\n";
+    bool first_tag = true;
+    for (const auto& pair : stats.memory_by_tag) {
+        if (!first_tag) json << ",\n";
+        json << "      \"" << pair.first << "\": " << pair.second;
+        first_tag = false;
+    }
+    json << "\n    }\n";
+    json << "  },\n";
+    
+    // 吞吐量统计
+    json << "  \"throughput\": {\n";
+    json << "    \"messages_sent\": " << stats.messages_sent << ",\n";
+    json << "    \"messages_received\": " << stats.messages_received << ",\n";
+    json << "    \"bytes_sent\": " << stats.bytes_sent << ",\n";
+    json << "    \"bytes_received\": " << stats.bytes_received;
+    
+    // 计算平均吞吐量
+    if (stats.uptime.count() > 0) {
+        double msg_per_sec = static_cast<double>(stats.messages_sent + stats.messages_received) / stats.uptime.count();
+        double bytes_per_sec = static_cast<double>(stats.bytes_sent + stats.bytes_received) / stats.uptime.count();
+        json << ",\n";
+        json << "    \"avg_messages_per_sec\": " << std::fixed << std::setprecision(2) << msg_per_sec << ",\n";
+        json << "    \"avg_bytes_per_sec\": " << std::fixed << std::setprecision(2) << bytes_per_sec;
+    }
+    json << "\n  },\n";
+    
+    // 事件转发统计
+    json << "  \"event_forwarding\": {\n";
+    json << "    \"forwarded\": " << stats.events_forwarded << ",\n";
+    json << "    \"dropped\": " << stats.events_dropped << ",\n";
+    json << "    \"queue_size\": " << stats.forwarding_queue_size << "\n";
+    json << "  },\n";
+    
+    // 系统资源统计
+    struct rusage usage;
+    json << "  \"system_resources\": {\n";
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        json << "    \"max_rss_bytes\": " << (usage.ru_maxrss * 1024) << ",\n";
+        json << "    \"user_cpu_time_seconds\": " << (usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0) << ",\n";
+        json << "    \"system_cpu_time_seconds\": " << (usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0) << "\n";
+    } else {
+        json << "    \"error\": \"Unable to get resource usage\"\n";
+    }
+    json << "  }\n";
+    
+    json << "}";
+    
+    return json.str();
+}
+
+void ProcessMonitor::write_json_stats_to_file(const ProcessStats& stats)
+{
+    try {
+        std::string json_content = generate_json_stats(stats);
+        
+        std::ofstream file(json_output_file_);
+        if (!file.is_open()) {
+            LOG_ERROR("Failed to open JSON output file: {}", json_output_file_);
+            return;
+        }
+        
+        file << json_content << std::endl;
+        file.close();
+        
+        LOG_DEBUG("JSON stats written to file: {}", json_output_file_);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Error writing JSON stats to file {}: {}", json_output_file_, e.what());
+    }
 }
 
 } // namespace mqtt

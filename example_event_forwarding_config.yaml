@@ -1,0 +1,52 @@
+# MQTT服务器配置文件示例 - 包含事件转发RPC配置
+# 服务器配置
+server:
+  bind_address: "127.0.0.1"  
+  port: 1884  
+  max_connections: 10000  
+  backlog: 128  
+  thread_count: 2  
+
+# MQTT协议配置
+mqtt:
+  max_packet_size: 1048576  
+  keep_alive_default: 60  
+  keep_alive_max: 3600  
+  max_qos: 2  
+  retain_available: true  
+  wildcard_subscription_available: true  
+  subscription_identifier_available: true  
+  shared_subscription_available: false  
+  topic_alias_maximum: 65535  
+  receive_maximum: 65535  
+
+# 内存配置
+memory:
+  client_max_size: 1048576  
+
+# 日志配置
+log:
+  level: "debug"  
+  file_path: "logs/mqtt.log"  
+  max_file_size: 10485760  
+  max_files: 10  
+  flush_immediately: false
+
+# 事件转发RPC系统配置
+event_forwarding:
+  enabled: true                          # 启用事件转发
+  server_host: "192.168.1.100"           # 目标RPC服务器地址
+  server_port: 8080                      # 目标RPC服务器端口
+  worker_thread_count: 4                 # 工作线程数量
+  coroutines_per_thread: 8               # 每个线程的协程数量
+  connection_timeout_ms: 5000            # 连接超时时间（毫秒）
+  request_timeout_ms: 10000              # 请求超时时间（毫秒）
+  max_batch_size: 100                    # 最大批次大小
+  batch_timeout_ms: 1000                 # 批次超时时间（毫秒）
+  max_queue_size: 50000                  # 最大队列大小
+  queue_drop_policy: 0                   # 队列丢弃策略：0=丢弃最旧，1=丢弃最新
+  forward_login_events: true             # 转发登录事件
+  forward_logout_events: true            # 转发登出事件
+  forward_publish_events: true           # 转发发布事件
+  include_payload: false                 # 是否包含载荷数据（节省带宽）
+  max_payload_size: 1024                 # 最大载荷大小（超过则不包含）

@@ -77,6 +77,18 @@ add_library(mqtt_parser STATIC
 	src/mqtt_event_forwarding_service.cpp
 )
 
+# 添加mqtt_router库
+add_library(mqtt_router STATIC
+    src/mqtt_router_service.cpp
+    src/mqtt_router_rpc_client.cpp
+    src/mqtt_allocator.cpp
+    src/mqtt_string_utils.cpp
+    src/mqtt_topic_tree.cpp
+)
+
+# mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
+target_link_libraries(mqtt_router colib_static)
+
 # 查找yaml-cpp库的静态版本
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
@@ -106,9 +118,49 @@ add_executable(mqtts
 target_link_libraries(mqtts 
     colib_static 
     mqtt_parser
+    mqtt_router
     tcmalloc_minimal
     pthread 
     dl
+)
+
+# 添加路由器服务可执行文件
+add_executable(mqtt_router_service src/mqtt_router_main.cpp)
+
+# 为mqtt_router可执行文件添加依赖配置
+target_include_directories(mqtt_router_service PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(mqtt_router_service 
+    colib_static
+    mqtt_router
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
+)
+
+# 添加性能分析工具
+add_executable(performance_analyzer tools/performance_analyzer.cpp)
+
+target_include_directories(performance_analyzer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(performance_analyzer 
+    mqtt_router
+    colib_static
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
 )
 
 # 启用测试

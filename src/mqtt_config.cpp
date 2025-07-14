@@ -34,6 +34,10 @@ int ConfigManager::load_from_file(const std::string& config_file)
       parse_event_forwarding_config(root["event_forwarding"]);
     }
 
+    if (root["monitoring"]) {
+      parse_monitoring_config(root["monitoring"]);
+    }
+
     // 验证配置
     int ret = validate();
     if (ret != 0) {
@@ -252,6 +256,25 @@ void ConfigManager::parse_event_forwarding_config(const YAML::Node& node)
 
   if (node["max_payload_size"]) {
     config_.event_forwarding.max_payload_size = node["max_payload_size"].as<size_t>();
+  }
+}
+
+void ConfigManager::parse_monitoring_config(const YAML::Node& node)
+{
+  if (node["enabled"]) {
+    config_.monitoring.enabled = node["enabled"].as<bool>();
+  }
+
+  if (node["interval_seconds"]) {
+    config_.monitoring.interval_seconds = node["interval_seconds"].as<int>();
+  }
+
+  if (node["verbose_output"]) {
+    config_.monitoring.verbose_output = node["verbose_output"].as<bool>();
+  }
+
+  if (node["json_output_file"]) {
+    config_.monitoring.json_output_file = node["json_output_file"].as<std::string>();
   }
 }
 

@@ -1,0 +1,22 @@
+server:
+  bind_address: "127.0.0.1"
+  port: 1883
+  max_connections: 100
+  thread_count: 1
+
+mqtt:
+  max_packet_size: 1048576
+  keep_alive_default: 60
+
+memory:
+  client_max_size: 1048576
+
+log:
+  level: "info"
+  flush_immediately: true
+
+monitoring:
+  enabled: true
+  interval_seconds: 3
+  verbose_output: true
+  json_output_file: "/tmp/mqtt_status.json"

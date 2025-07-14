@@ -1,0 +1,210 @@
+# MQTT Server with Router Configuration
+# 这是支持路由功能的MQTT服务器配置文件
+
+server:
+  # 基本服务器配置
+  bind_address: "0.0.0.0"
+  port: 1883
+  max_connections: 10000
+  worker_threads: 8
+  
+  # 服务器标识
+  server_id: "mqtt_server_1"
+  
+  # SSL/TLS配置（可选）
+  ssl:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+
+# MQTT协议配置
+mqtt:
+  protocol_version: 5
+  max_packet_size: 268435456  # 256MB
+  keep_alive_default: 60
+  session_expiry_interval: 3600
+  
+  # 主题配置
+  topic:
+    max_levels: 32
+    max_length: 65536
+    wildcard_enabled: true
+
+# 路由器配置
+router:
+  # 启用路由功能
+  enabled: true
+  
+  # 路由服务器连接配置
+  host: "127.0.0.1"
+  port: 9090
+  
+  # 连接参数
+  connect_timeout_ms: 5000
+  request_timeout_ms: 10000
+  max_retry_count: 3
+  retry_delay_ms: 1000
+  
+  # 心跳配置
+  enable_heartbeat: true
+  heartbeat_interval_ms: 30000
+  
+  # 性能配置
+  max_pending_requests: 1000
+  
+  # 自动注册配置
+  auto_register: true
+  
+  # 故障恢复配置
+  failover:
+    enabled: true
+    max_offline_time_ms: 60000
+    reconnect_interval_ms: 5000
+
+# 内存管理配置
+memory:
+  # 全局内存限制
+  max_global_memory: 2147483648  # 2GB
+  
+  # 每客户端内存限制
+  max_per_client_memory: 10485760  # 10MB
+  
+  # 分配器配置
+  allocator:
+    use_tcmalloc: true
+    enable_debugging: false
+    memory_tagging: true
+
+# 日志配置
+logging:
+  level: "info"
+  file: "./logs/mqtts.log"
+  max_file_size: "100MB"
+  max_files: 10
+  console_output: true
+  
+  # 组件特定的日志级别
+  components:
+    router: "debug"
+    session_manager: "info"
+    topic_tree: "info"
+    memory: "warn"
+
+# 性能监控配置
+monitoring:
+  enabled: true
+  
+  # 统计收集
+  statistics:
+    enabled: true
+    collection_interval_seconds: 60
+    
+  # 性能指标
+  metrics:
+    enabled: true
+    export_interval_seconds: 30
+    
+  # 健康检查
+  health_check:
+    enabled: true
+    check_interval_seconds: 10
+
+# 事件转发配置
+event_forwarding:
+  enabled: true
+  server_host: "127.0.0.1"
+  server_port: 8080
+  worker_thread_count: 2
+  coroutines_per_thread: 4
+  max_batch_size: 50
+  batch_timeout_ms: 1000
+  max_queue_size: 10000
+  
+  # 事件过滤配置
+  events:
+    login: true
+    logout: true
+    publish: true
+    subscribe: false
+    unsubscribe: false
+  
+  # 载荷配置
+  include_payload: true
+  max_payload_size: 1024
+
+# 主题树配置
+topic_tree:
+  # 性能配置
+  initial_size: 1000
+  max_subscribers_per_topic: 10000
+  
+  # 清理配置
+  cleanup_interval_seconds: 300
+  empty_node_cleanup_threshold: 100
+  
+  # 内存优化
+  enable_copy_on_write: true
+  max_reference_count: 1000
+
+# 会话管理配置
+session_manager:
+  # 线程配置
+  pre_allocated_threads: 8
+  reserve_client_count: 10000
+  
+  # 消息队列配置
+  max_pending_messages: 1000
+  message_timeout_ms: 30000
+  
+  # Worker池配置
+  worker_pool:
+    worker_count: 4
+    max_queue_size: 1000
+    
+  # 缓存配置
+  message_cache:
+    enabled: true
+    max_size: 1000
+    ttl_seconds: 300
+
+# 网络配置
+network:
+  # TCP配置
+  tcp:
+    nodelay: true
+    keepalive: true
+    keepalive_idle: 600
+    keepalive_interval: 60
+    keepalive_count: 3
+    
+  # 缓冲区配置
+  buffer:
+    read_buffer_size: 65536
+    write_buffer_size: 65536
+    initial_buffer_size: 4096
+
+# 安全配置
+security:
+  # 认证配置
+  authentication:
+    enabled: false
+    provider: "file"  # file, ldap, database
+    config_file: "./auth.yaml"
+    
+  # 授权配置
+  authorization:
+    enabled: false
+    provider: "acl"   # acl, database
+    config_file: "./acl.yaml"
+    
+  # 访问控制
+  access_control:
+    max_connections_per_ip: 100
+    connection_rate_limit: 10  # per second
+    
+  # 主题访问控制
+  topic_access:
+    enabled: false
+    allow_anonymous_subscribe: true
+    allow_anonymous_publish: false
