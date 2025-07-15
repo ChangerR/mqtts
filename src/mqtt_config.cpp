@@ -38,6 +38,10 @@ int ConfigManager::load_from_file(const std::string& config_file)
       parse_monitoring_config(root["monitoring"]);
     }
 
+    if (root["auth"]) {
+      parse_auth_config(root["auth"]);
+    }
+
     // 验证配置
     int ret = validate();
     if (ret != 0) {
@@ -275,6 +279,149 @@ void ConfigManager::parse_monitoring_config(const YAML::Node& node)
 
   if (node["json_output_file"]) {
     config_.monitoring.json_output_file = node["json_output_file"].as<std::string>();
+  }
+}
+
+void ConfigManager::parse_auth_config(const YAML::Node& node)
+{
+  if (node["enabled"]) {
+    config_.auth.enabled = node["enabled"].as<bool>();
+  }
+
+  if (node["allow_anonymous"]) {
+    config_.auth.allow_anonymous = node["allow_anonymous"].as<bool>();
+  }
+
+  if (node["cache_enabled"]) {
+    config_.auth.cache_enabled = node["cache_enabled"].as<bool>();
+  }
+
+  if (node["cache_ttl_seconds"]) {
+    config_.auth.cache_ttl_seconds = node["cache_ttl_seconds"].as<int>();
+  }
+
+  // 解析认证提供者列表
+  if (node["providers"]) {
+    for (const auto& provider_node : node["providers"]) {
+      AuthProviderConfig provider_config;
+      
+      if (provider_node["type"]) {
+        provider_config.type = provider_node["type"].as<std::string>();
+      }
+      
+      if (provider_node["priority"]) {
+        provider_config.priority = provider_node["priority"].as<int>();
+      }
+      
+      if (provider_node["enabled"]) {
+        provider_config.enabled = provider_node["enabled"].as<bool>();
+      }
+      
+      // 解析提供者特定设置
+      if (provider_node["settings"]) {
+        for (auto it = provider_node["settings"].begin(); it != provider_node["settings"].end(); ++it) {
+          provider_config.settings[it->first.as<std::string>()] = it->second.as<std::string>();
+        }
+      }
+      
+      config_.auth.providers.push_back(provider_config);
+    }
+  }
+
+  // 解析SQLite认证配置
+  if (node["sqlite"]) {
+    parse_sqlite_auth_config(node["sqlite"]);
+  }
+
+  // 解析Redis认证配置
+  if (node["redis"]) {
+    parse_redis_auth_config(node["redis"]);
+  }
+}
+
+void ConfigManager::parse_sqlite_auth_config(const YAML::Node& node)
+{
+  if (node["db_path"]) {
+    config_.auth.sqlite.db_path = node["db_path"].as<std::string>();
+  }
+
+  if (node["connection_pool_size"]) {
+    config_.auth.sqlite.connection_pool_size = node["connection_pool_size"].as<int>();
+  }
+
+  if (node["max_retry_count"]) {
+    config_.auth.sqlite.max_retry_count = node["max_retry_count"].as<int>();
+  }
+
+  if (node["retry_delay_ms"]) {
+    config_.auth.sqlite.retry_delay_ms = node["retry_delay_ms"].as<int>();
+  }
+
+  if (node["query_timeout_ms"]) {
+    config_.auth.sqlite.query_timeout_ms = node["query_timeout_ms"].as<int>();
+  }
+
+  if (node["enable_wal_mode"]) {
+    config_.auth.sqlite.enable_wal_mode = node["enable_wal_mode"].as<bool>();
+  }
+
+  if (node["enable_foreign_keys"]) {
+    config_.auth.sqlite.enable_foreign_keys = node["enable_foreign_keys"].as<bool>();
+  }
+
+  if (node["cache_size_kb"]) {
+    config_.auth.sqlite.cache_size_kb = node["cache_size_kb"].as<int>();
+  }
+}
+
+void ConfigManager::parse_redis_auth_config(const YAML::Node& node)
+{
+  if (node["host"]) {
+    config_.auth.redis.host = node["host"].as<std::string>();
+  }
+
+  if (node["port"]) {
+    config_.auth.redis.port = node["port"].as<int>();
+  }
+
+  if (node["password"]) {
+    config_.auth.redis.password = node["password"].as<std::string>();
+  }
+
+  if (node["database"]) {
+    config_.auth.redis.database = node["database"].as<int>();
+  }
+
+  if (node["connection_pool_size"]) {
+    config_.auth.redis.connection_pool_size = node["connection_pool_size"].as<int>();
+  }
+
+  if (node["max_retry_count"]) {
+    config_.auth.redis.max_retry_count = node["max_retry_count"].as<int>();
+  }
+
+  if (node["retry_delay_ms"]) {
+    config_.auth.redis.retry_delay_ms = node["retry_delay_ms"].as<int>();
+  }
+
+  if (node["connect_timeout_ms"]) {
+    config_.auth.redis.connect_timeout_ms = node["connect_timeout_ms"].as<int>();
+  }
+
+  if (node["command_timeout_ms"]) {
+    config_.auth.redis.command_timeout_ms = node["command_timeout_ms"].as<int>();
+  }
+
+  if (node["keepalive_interval_s"]) {
+    config_.auth.redis.keepalive_interval_s = node["keepalive_interval_s"].as<int>();
+  }
+
+  if (node["key_prefix"]) {
+    config_.auth.redis.key_prefix = node["key_prefix"].as<std::string>();
+  }
+
+  if (node["cache_ttl_seconds"]) {
+    config_.auth.redis.cache_ttl_seconds = node["cache_ttl_seconds"].as<int>();
   }
 }
 

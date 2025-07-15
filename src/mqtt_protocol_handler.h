@@ -16,6 +16,7 @@
 #include "mqtt_serialize_buffer.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_auth_interface.h"
 
 namespace mqtt {
 
@@ -40,6 +41,13 @@ class MQTTProtocolHandler
     session_manager_ = session_manager;
   }
   GlobalSessionManager* get_session_manager() const { return session_manager_; }
+
+  // Authentication manager integration
+  void set_auth_manager(auth::AuthManager* auth_manager)
+  {
+    auth_manager_ = auth_manager;
+  }
+  auth::AuthManager* get_auth_manager() const { return auth_manager_; }
 
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
@@ -147,6 +155,12 @@ class MQTTProtocolHandler
 
   // Session manager
   GlobalSessionManager* session_manager_;
+
+  // Authentication manager
+  auth::AuthManager* auth_manager_;
+
+  // Current authenticated user info
+  auth::UserInfo* current_user_info_;
 
   // Helper method to unregister from session manager
   void cleanup_session_registration(const char* context = nullptr);

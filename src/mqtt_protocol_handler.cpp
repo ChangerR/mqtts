@@ -42,7 +42,9 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       serialize_buffer_(nullptr),
       write_lock_acquired_(false),
       write_lock_condition_(),
-      session_manager_(nullptr)
+      session_manager_(nullptr),
+      auth_manager_(nullptr),
+      current_user_info_(nullptr)
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -75,6 +77,10 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
   if (serialize_buffer_) {
     serialize_buffer_->~MQTTSerializeBuffer();
     allocator_->deallocate(serialize_buffer_, sizeof(MQTTSerializeBuffer));
+  }
+  if (current_user_info_) {
+    current_user_info_->~UserInfo();
+    allocator_->deallocate(current_user_info_, sizeof(auth::UserInfo));
   }
 }
 
@@ -484,6 +490,59 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     return MQ_ERR_CONNECT_CLIENT_ID;
   }
 
+  // Perform authentication if auth manager is available
+  if (auth_manager_) {
+    // Allocate user info if not already allocated
+    if (!current_user_info_) {
+      current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
+      if (!current_user_info_) {
+        LOG_ERROR("Failed to allocate memory for user info");
+        return send_connack(ReasonCode::ServerUnavailable, false);
+      }
+      new (current_user_info_) auth::UserInfo(allocator_);
+    }
+
+    // Extract authentication credentials
+    MQTTString username = packet->username.empty() ? 
+        MQTTString("", MQTTStrAllocator(allocator_)) : packet->username;
+    MQTTString password = packet->password.empty() ? 
+        MQTTString("", MQTTStrAllocator(allocator_)) : packet->password;
+
+    // Perform authentication
+    auth::AuthResult auth_result = auth_manager_->authenticate_user(
+        username, password, packet->client_id, client_ip_, client_port_, *current_user_info_);
+
+    switch (auth_result) {
+      case auth::AuthResult::SUCCESS:
+        LOG_INFO("Client {}:{} authenticated successfully as user '{}'", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(current_user_info_->username));
+        break;
+      case auth::AuthResult::INVALID_CREDENTIALS:
+        LOG_WARN("Client {}:{} authentication failed: invalid credentials for user '{}'", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        return send_connack(ReasonCode::BadUserNameOrPassword, false);
+      case auth::AuthResult::USER_NOT_FOUND:
+        LOG_WARN("Client {}:{} authentication failed: user '{}' not found", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        return send_connack(ReasonCode::BadUserNameOrPassword, false);
+      case auth::AuthResult::ACCESS_DENIED:
+        LOG_WARN("Client {}:{} authentication failed: access denied for user '{}'", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        return send_connack(ReasonCode::NotAuthorized, false);
+      case auth::AuthResult::RATE_LIMITED:
+        LOG_WARN("Client {}:{} authentication failed: rate limited for user '{}'", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        return send_connack(ReasonCode::ConnectionRateExceeded, false);
+      default:
+        LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'", 
+                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        return send_connack(ReasonCode::ServerUnavailable, false);
+    }
+  } else {
+    LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}", 
+             client_ip_.c_str(), client_port_);
+  }
+
   // Update session state - 使用拷贝构造
   client_id_ =
       MQTTString(packet->client_id.begin(), packet->client_id.end(), MQTTStrAllocator(allocator_));
@@ -579,6 +638,28 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   if (packet->topic_name.empty()) {
     LOG_ERROR("Empty topic name from client {}:{}", client_ip_.c_str(), client_port_);
     return MQ_ERR_PUBLISH_TOPIC;
+  }
+
+  // Check topic publish permission
+  if (auth_manager_ && current_user_info_) {
+    auth::AuthResult auth_result = auth_manager_->check_topic_access(
+        *current_user_info_, packet->topic_name, auth::Permission::WRITE);
+    
+    if (auth_result != auth::AuthResult::SUCCESS) {
+      LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions", 
+               client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
+      
+      // For QoS > 0, we should send a PUBACK/PUBREC with Not Authorized reason code
+      if (packet->qos == 1) {
+        return send_puback(packet->packet_id, ReasonCode::NotAuthorized);
+      } else if (packet->qos == 2) {
+        return send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
+      }
+      // For QoS 0, we just drop the message silently
+      return MQ_SUCCESS;
+    }
+    LOG_DEBUG("Client {}:{} authorized to publish to topic: {}", 
+              client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
   }
 
   // Check QoS level
@@ -834,6 +915,21 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
     LOG_DEBUG("Client {}:{} subscribing to topic: {} with QoS: {}", client_ip_.c_str(),
               client_port_, from_mqtt_string(topic), qos);
+
+    // Check topic subscription permission
+    if (auth_manager_ && current_user_info_) {
+      auth::AuthResult auth_result = auth_manager_->check_topic_access(
+          *current_user_info_, topic, auth::Permission::READ);
+      
+      if (auth_result != auth::AuthResult::SUCCESS) {
+        LOG_WARN("Client {}:{} denied subscription to topic '{}': insufficient permissions", 
+                 client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+        reason_codes.push_back(ReasonCode::NotAuthorized);
+        continue;
+      }
+      LOG_DEBUG("Client {}:{} authorized to subscribe to topic: {}", 
+                client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+    }
 
     // 验证QoS级别
     if (qos > 2) {

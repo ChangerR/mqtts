@@ -1,0 +1,82 @@
+# MQTT服务器认证系统配置示例
+
+# 服务器基础配置
+server:
+  bind_address: "0.0.0.0"
+  port: 1883
+  thread_count: 4
+  max_connections: 1000
+  keepalive_timeout: 300
+
+# MQTT协议配置
+mqtt:
+  max_packet_size: 268435455  # 256MB
+  max_client_id_length: 23
+  max_topic_length: 256
+  max_payload_size: 1048576   # 1MB
+
+# 内存管理配置
+memory:
+  max_memory_per_client: 10485760  # 10MB
+  enable_memory_tracking: true
+  
+# 日志配置
+log:
+  level: "info"
+  file: "logs/mqtts.log"
+  max_size: 104857600    # 100MB
+  max_files: 10
+  console_output: true
+
+# 认证配置
+auth:
+  enabled: true
+  allow_anonymous: false
+  cache_enabled: true
+  cache_ttl_seconds: 300
+  
+  # 认证提供者列表（按优先级顺序）
+  providers:
+    - type: "sqlite"
+      priority: 10
+      enabled: true
+    - type: "redis"
+      priority: 20
+      enabled: false
+      
+  # SQLite认证配置
+  sqlite:
+    db_path: "auth.db"
+    connection_pool_size: 10
+    max_retry_count: 3
+    retry_delay_ms: 100
+    query_timeout_ms: 5000
+    enable_wal_mode: true
+    enable_foreign_keys: true
+    cache_size_kb: 2048
+    
+  # Redis认证配置
+  redis:
+    host: "127.0.0.1"
+    port: 6379
+    password: ""
+    database: 0
+    connection_pool_size: 10
+    max_retry_count: 3
+    retry_delay_ms: 100
+    connect_timeout_ms: 5000
+    command_timeout_ms: 5000
+    keepalive_interval_s: 30
+    key_prefix: "mqtt:auth:"
+    cache_ttl_seconds: 300
+
+# 进程监控配置
+monitoring:
+  enabled: true
+  interval_seconds: 10
+  verbose_output: true
+  json_output_file: "status.json"
+
+# 事件转发配置
+event_forwarding:
+  enabled: false

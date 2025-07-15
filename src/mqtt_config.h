@@ -95,6 +95,66 @@ struct MonitoringConfig
 };
 
 /**
+ * @brief 认证提供者配置
+ */
+struct AuthProviderConfig
+{
+  std::string type = "";                   // 提供者类型：sqlite, redis, ldap等
+  int priority = 100;                      // 优先级（数字越小优先级越高）
+  bool enabled = true;                     // 是否启用
+  std::map<std::string, std::string> settings;  // 提供者特定设置
+};
+
+/**
+ * @brief SQLite认证配置
+ */
+struct SQLiteAuthConfig
+{
+  std::string db_path = "auth.db";         // 数据库文件路径
+  int connection_pool_size = 10;           // 连接池大小
+  int max_retry_count = 3;                 // 最大重试次数
+  int retry_delay_ms = 100;                // 重试延迟（毫秒）
+  int query_timeout_ms = 5000;             // 查询超时（毫秒）
+  bool enable_wal_mode = true;             // 是否启用WAL模式
+  bool enable_foreign_keys = true;         // 是否启用外键约束
+  int cache_size_kb = 2048;                // SQLite缓存大小（KB）
+};
+
+/**
+ * @brief Redis认证配置
+ */
+struct RedisAuthConfig
+{
+  std::string host = "127.0.0.1";          // Redis服务器地址
+  int port = 6379;                         // Redis服务器端口
+  std::string password = "";               // Redis密码
+  int database = 0;                        // Redis数据库索引
+  int connection_pool_size = 10;           // 连接池大小
+  int max_retry_count = 3;                 // 最大重试次数
+  int retry_delay_ms = 100;                // 重试延迟（毫秒）
+  int connect_timeout_ms = 5000;           // 连接超时（毫秒）
+  int command_timeout_ms = 5000;           // 命令超时（毫秒）
+  int keepalive_interval_s = 30;           // 保活间隔（秒）
+  std::string key_prefix = "mqtt:auth:";   // Redis键前缀
+  int cache_ttl_seconds = 300;             // 缓存TTL（秒）
+};
+
+/**
+ * @brief 认证配置
+ */
+struct AuthConfig
+{
+  bool enabled = false;                    // 是否启用认证
+  bool allow_anonymous = false;            // 是否允许匿名连接
+  bool cache_enabled = true;               // 是否启用认证缓存
+  int cache_ttl_seconds = 300;             // 缓存TTL（秒）
+  
+  std::vector<AuthProviderConfig> providers;  // 认证提供者列表
+  SQLiteAuthConfig sqlite;                 // SQLite认证配置
+  RedisAuthConfig redis;                   // Redis认证配置
+};
+
+/**
  * @brief 主配置结构
  */
 struct Config
@@ -105,6 +165,7 @@ struct Config
   LogConfig log;
   EventForwardingConfig event_forwarding;
   MonitoringConfig monitoring;
+  AuthConfig auth;
 };
 
 /**
@@ -155,6 +216,9 @@ class ConfigManager
   void parse_log_config(const YAML::Node& node);
   void parse_event_forwarding_config(const YAML::Node& node);
   void parse_monitoring_config(const YAML::Node& node);
+  void parse_auth_config(const YAML::Node& node);
+  void parse_sqlite_auth_config(const YAML::Node& node);
+  void parse_redis_auth_config(const YAML::Node& node);
 };
 
 }  // namespace mqtt
