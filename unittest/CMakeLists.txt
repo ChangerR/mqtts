@@ -73,6 +73,11 @@ add_executable(test_mqtt_session_manager_router test_mqtt_session_manager_router
     ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
     ${CMAKE_SOURCE_DIR}/src/logger.cpp)
 
+# 添加WebSocket测试
+add_executable(test_websocket_frame test_websocket_frame.cpp)
+add_executable(test_websocket_protocol_handler test_websocket_protocol_handler.cpp)
+add_executable(test_websocket_mqtt_bridge test_websocket_mqtt_bridge.cpp)
+
 # 添加头文件搜索路径
 target_include_directories(test_connect PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
 target_include_directories(test_mqtt_allocator PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
@@ -103,6 +108,11 @@ target_include_directories(test_mqtt_auth_redis PRIVATE ${CMAKE_SOURCE_DIR} ${GT
 target_include_directories(test_mqtt_router_service PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
 target_include_directories(test_mqtt_router_rpc_client PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
 target_include_directories(test_mqtt_session_manager_router PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
+
+# WebSocket测试的头文件搜索路径
+target_include_directories(test_websocket_frame PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_websocket_protocol_handler PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_websocket_mqtt_bridge PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
 
 # 链接必要的库（包括Google Test）
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
@@ -135,6 +145,11 @@ target_link_libraries(test_mqtt_router_service PRIVATE colib_static mqtt_router 
 target_link_libraries(test_mqtt_router_rpc_client PRIVATE colib_static mqtt_router tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 target_link_libraries(test_mqtt_session_manager_router PRIVATE colib_static mqtt_parser mqtt_router tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 
+# WebSocket测试的链接库
+target_link_libraries(test_websocket_frame PRIVATE websocket mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_websocket_protocol_handler PRIVATE websocket mqtt_parser colib_static tcmalloc_minimal gtest pthread dl)
+target_link_libraries(test_websocket_mqtt_bridge PRIVATE websocket mqtt_parser mqtt_router colib_static tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+
 # 启用测试
 enable_testing()
 add_test(NAME test_connect COMMAND test_connect)
@@ -157,4 +172,9 @@ add_test(NAME test_session_manager_stress COMMAND test_session_manager_stress)
 # 添加路由器测试
 add_test(NAME test_mqtt_router_service COMMAND test_mqtt_router_service)
 add_test(NAME test_mqtt_router_rpc_client COMMAND test_mqtt_router_rpc_client) 
-add_test(NAME test_mqtt_session_manager_router COMMAND test_mqtt_session_manager_router) 
+add_test(NAME test_mqtt_session_manager_router COMMAND test_mqtt_session_manager_router)
+
+# 添加WebSocket测试
+add_test(NAME test_websocket_frame COMMAND test_websocket_frame)
+add_test(NAME test_websocket_protocol_handler COMMAND test_websocket_protocol_handler)
+add_test(NAME test_websocket_mqtt_bridge COMMAND test_websocket_mqtt_bridge) 

@@ -89,6 +89,16 @@ add_library(mqtt_router STATIC
 # mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
 target_link_libraries(mqtt_router colib_static)
 
+# 添加websocket库
+add_library(websocket STATIC
+    src/websocket_frame.cpp
+    src/websocket_protocol_handler.cpp
+    src/websocket_server.cpp
+    src/websocket_mqtt_bridge.cpp
+    src/mqtt_allocator.cpp
+    src/mqtt_string_utils.cpp
+)
+
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
     src/mqtt_auth_manager.cpp
@@ -101,26 +111,31 @@ add_library(mqtt_auth STATIC
 # 查找认证相关依赖
 find_package(PkgConfig REQUIRED)
 
-# 查找SQLite3
-find_package(SQLite3 REQUIRED)
+# 查找SQLite3 (可选)
+find_package(SQLite3 QUIET)
 
-# 查找hiredis (Redis client)
-pkg_check_modules(HIREDIS REQUIRED hiredis)
+# 查找hiredis (Redis client, 可选)
+pkg_check_modules(HIREDIS hiredis)
 
-# 查找OpenSSL (用于密码哈希)
-find_package(OpenSSL REQUIRED)
+# 查找OpenSSL (用于密码哈希, 可选)
+find_package(OpenSSL QUIET)
 
 # mqtt_auth 需要链接相关依赖
-target_link_libraries(mqtt_auth 
-    SQLite::SQLite3
-    ${HIREDIS_LIBRARIES}
-    OpenSSL::SSL
-    OpenSSL::Crypto
-)
+if(SQLite3_FOUND)
+    target_link_libraries(mqtt_auth SQLite::SQLite3)
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_SQLITE3)
+endif()
 
-target_include_directories(mqtt_auth PUBLIC
-    ${HIREDIS_INCLUDE_DIRS}
-)
+if(HIREDIS_FOUND)
+    target_link_libraries(mqtt_auth ${HIREDIS_LIBRARIES})
+    target_include_directories(mqtt_auth PUBLIC ${HIREDIS_INCLUDE_DIRS})
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_HIREDIS)
+endif()
+
+if(OpenSSL_FOUND)
+    target_link_libraries(mqtt_auth OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_OPENSSL)
+endif()
 
 # 查找yaml-cpp库的静态版本
 find_package(PkgConfig REQUIRED)
@@ -188,6 +203,28 @@ target_include_directories(performance_analyzer PUBLIC
 
 target_link_libraries(performance_analyzer 
     mqtt_router
+    colib_static
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
+)
+
+# 添加WebSocket服务器可执行文件
+add_executable(websocket_server src/websocket_main.cpp)
+
+target_include_directories(websocket_server PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(websocket_server 
+    websocket
+    mqtt_parser
+    mqtt_router
+    mqtt_auth
     colib_static
     tcmalloc_minimal
     pthread 

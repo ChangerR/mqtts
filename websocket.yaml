@@ -1,0 +1,54 @@
+# WebSocket MQTT Bridge 配置文件
+
+# WebSocket服务器配置
+websocket:
+  enabled: true  # 是否启用WebSocket服务器
+  bind_address: "127.0.0.1"  # 绑定地址
+  port: 8080  # 监听端口
+  max_connections: 10000  # 最大连接数
+  thread_count: 2  # 线程数
+  backlog: 128  # socket backlog
+  max_frame_size: 1048576  # 最大帧大小(字节)
+  max_message_size: 10485760  # 最大消息大小(字节)
+  handshake_timeout: 10  # 握手超时时间(秒)
+  ping_interval: 30  # Ping间隔(秒)
+  pong_timeout: 10  # Pong超时时间(秒)
+  message_format: "json"  # 消息格式: json, mqtt_packet, text_protocol
+
+# MQTT协议配置
+mqtt:
+  max_packet_size: 1048576  # 最大包大小(字节)
+  keep_alive_default: 60  # 默认保活时间(秒)
+  keep_alive_max: 3600  # 最大保活时间(秒)
+  max_qos: 2  # 最大QoS级别
+  retain_available: true  # 支持retain消息
+  wildcard_subscription_available: true  # 支持通配符订阅
+  subscription_identifier_available: true  # 支持订阅标识符
+  shared_subscription_available: false  # 支持共享订阅
+  topic_alias_maximum: 65535  # 主题别名最大值
+  receive_maximum: 65535  # 接收最大值
+
+# 内存配置
+memory:
+  client_max_size: 1048576  # 客户端最大内存大小(字节)
+
+# 日志配置
+log:
+  level: "debug"  # 日志级别: trace, debug, info, warn, error, critical
+  file_path: "logs/websocket.log"  # 日志文件路径，空字符串输出到控制台
+  max_file_size: 10485760  # 日志文件最大大小(字节)
+  max_files: 10  # 最大日志文件数量
+  flush_immediately: false  # 立即刷新
+
+# 认证配置
+auth:
+  enabled: false  # 是否启用认证
+  provider: "sqlite"  # 认证提供者: sqlite, redis, ldap
+  sqlite:
+    database_path: "auth.db"  # SQLite数据库文件路径
+  redis:
+    host: "127.0.0.1"  # Redis服务器地址
+    port: 6379  # Redis端口
+    password: ""  # Redis密码
+    database: 0  # Redis数据库编号
+    key_prefix: "mqtt_auth:"  # 键前缀

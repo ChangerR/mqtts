@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <string>
+#include <map>
+#include <vector>
 
 // 前向声明
 namespace YAML {
@@ -46,6 +48,25 @@ struct MQTTProtocolConfig
 struct MemoryConfig
 {
   size_t client_max_size = 1048576;
+};
+
+/**
+ * @brief WebSocket配置
+ */
+struct WebSocketConfig
+{
+  bool enabled = false;                         // 是否启用WebSocket服务器
+  std::string bind_address = "0.0.0.0";        // 绑定地址
+  uint16_t port = 8080;                         // 监听端口
+  int max_connections = 10000;                  // 最大连接数
+  int thread_count = 2;                         // 线程数
+  int backlog = 128;                            // socket backlog
+  size_t max_frame_size = 1048576;             // 最大帧大小(字节)
+  size_t max_message_size = 10485760;          // 最大消息大小(字节)
+  int handshake_timeout = 10;                   // 握手超时时间(秒)
+  int ping_interval = 30;                       // Ping间隔(秒)
+  int pong_timeout = 10;                        // Pong超时时间(秒)
+  std::string message_format = "json";          // 消息格式: json, mqtt_packet, text_protocol
 };
 
 /**
