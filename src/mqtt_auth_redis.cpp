@@ -1,3 +1,5 @@
+#ifdef HAVE_HIREDIS
+
 #include "mqtt_auth_redis.h"
 #include "logger.h"
 #include <openssl/sha.h>
@@ -996,3 +998,5 @@ void RedisAuthProvider::free_redis_reply(redisReply* reply) {
 
 } // namespace auth
 } // namespace mqtt
+
+#endif // HAVE_HIREDIS

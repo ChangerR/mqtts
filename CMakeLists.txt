@@ -34,8 +34,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 设置静态链接
 set(BUILD_SHARED_LIBS OFF)
 
+# 设置编译器标志，包含调试信息
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 设置调试信息标志
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+
+# 如果没有指定构建类型，默认使用RelWithDebInfo（包含调试信息的优化版本）
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Choose the type of build" FORCE)
+endif()
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -std=gnu++11")
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -std=c++11")
 endif()
 
 set(THIRD_PART_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd")
@@ -88,16 +105,6 @@ add_library(mqtt_router STATIC
 
 # mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
 target_link_libraries(mqtt_router colib_static)
-
-# 添加websocket库
-add_library(websocket STATIC
-    src/websocket_frame.cpp
-    src/websocket_protocol_handler.cpp
-    src/websocket_server.cpp
-    src/websocket_mqtt_bridge.cpp
-    src/mqtt_allocator.cpp
-    src/mqtt_string_utils.cpp
-)
 
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
@@ -203,28 +210,6 @@ target_include_directories(performance_analyzer PUBLIC
 
 target_link_libraries(performance_analyzer 
     mqtt_router
-    colib_static
-    tcmalloc_minimal
-    pthread 
-    dl
-    -Wl,-Bstatic
-    ${YAML_CPP_STATIC_LIBRARIES}
-    -Wl,-Bdynamic
-)
-
-# 添加WebSocket服务器可执行文件
-add_executable(websocket_server src/websocket_main.cpp)
-
-target_include_directories(websocket_server PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${YAML_CPP_INCLUDE_DIRS}
-)
-
-target_link_libraries(websocket_server 
-    websocket
-    mqtt_parser
-    mqtt_router
-    mqtt_auth
     colib_static
     tcmalloc_minimal
     pthread 

@@ -1,3 +1,5 @@
+#ifdef HAVE_SQLITE3
+
 #include "mqtt_auth_sqlite.h"
 #include "logger.h"
 #include <openssl/sha.h>
@@ -854,3 +856,5 @@ int SQLiteAuthProvider::sqlite_exec_callback(void* data, int argc, char** argv, 
 
 } // namespace auth
 } // namespace mqtt
+
+#endif // HAVE_SQLITE3

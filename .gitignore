@@ -41,3 +41,4 @@ test_mqtts.yaml
 
 # Object files and dependencies
 *.o.d
+.claude/

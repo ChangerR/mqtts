@@ -1,7 +1,7 @@
 #include "mqtt_auth_interface.h"
 #include "logger.h"
 #include <algorithm>
-#include <shared_mutex>
+#include <mutex>
 
 namespace mqtt {
 namespace auth {
@@ -19,7 +19,7 @@ AuthManager::~AuthManager() {
 int AuthManager::initialize() {
     LOG_INFO("Initializing AuthManager");
     
-    std::unique_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     for (auto& entry : providers_) {
         int ret = entry.provider->initialize();
         if (ret != MQ_SUCCESS) {
@@ -38,32 +38,32 @@ int AuthManager::initialize() {
 void AuthManager::cleanup() {
     LOG_INFO("Cleaning up AuthManager");
     
-    std::unique_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     for (auto& entry : providers_) {
         entry.provider->cleanup();
     }
     providers_.clear();
     
-    std::unique_lock<std::shared_mutex> cache_lock(cache_mutex_);
+    std::unique_lock<std::mutex> cache_lock(cache_mutex_);
     auth_cache_.clear();
 }
 
 int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int priority) {
     if (!provider) {
         LOG_ERROR("Cannot add null auth provider");
-        return MQ_ERR_INVALID_PARAM;
+        return MQ_ERR_INVALID_ARGS;
     }
     
     const char* provider_name = provider->get_provider_name();
     LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
     
-    std::unique_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     
     // 检查是否已存在同名提供者
     for (const auto& entry : providers_) {
         if (std::string(entry.provider->get_provider_name()) == provider_name) {
             LOG_ERROR("Auth provider with name '{}' already exists", provider_name);
-            return MQ_ERR_ALREADY_EXISTS;
+            return MQ_ERR_INVALID_ARGS;
         }
     }
     
@@ -77,7 +77,7 @@ int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int prior
 int AuthManager::remove_provider(const std::string& provider_name) {
     LOG_INFO("Removing auth provider: {}", provider_name);
     
-    std::unique_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     
     auto it = std::find_if(providers_.begin(), providers_.end(),
         [&provider_name](const ProviderEntry& entry) {
@@ -86,7 +86,7 @@ int AuthManager::remove_provider(const std::string& provider_name) {
     
     if (it == providers_.end()) {
         LOG_WARN("Auth provider '{}' not found", provider_name);
-        return MQ_ERR_NOT_FOUND;
+        return MQ_ERR_NOT_FOUND_V2;
     }
     
     it->provider->cleanup();
@@ -115,7 +115,7 @@ AuthResult AuthManager::authenticate_user(const MQTTString& username,
         }
     }
     
-    std::shared_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     
     if (providers_.empty()) {
         LOG_WARN("No auth providers configured, denying access");
@@ -176,7 +176,7 @@ AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
         return AuthResult::SUCCESS;
     }
     
-    std::shared_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     
     if (providers_.empty()) {
         LOG_WARN("No auth providers configured for topic access check");
@@ -215,7 +215,7 @@ AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
 std::map<std::string, AuthStats> AuthManager::get_all_stats() const {
     std::map<std::string, AuthStats> all_stats;
     
-    std::shared_lock<std::shared_mutex> lock(providers_mutex_);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
     for (const auto& entry : providers_) {
         all_stats[entry.provider->get_provider_name()] = entry.provider->get_stats();
     }
@@ -228,7 +228,7 @@ void AuthManager::set_cache_enabled(bool enabled, int cache_ttl_seconds) {
     cache_ttl_seconds_ = cache_ttl_seconds;
     
     if (!enabled) {
-        std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+        std::unique_lock<std::mutex> lock(cache_mutex_);
         auth_cache_.clear();
     }
     
@@ -247,7 +247,7 @@ std::string AuthManager::make_cache_key(const MQTTString& username, const MQTTSt
 }
 
 bool AuthManager::get_from_cache(const std::string& key, AuthResult& result, UserInfo& user_info) const {
-    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+    std::unique_lock<std::mutex> lock(cache_mutex_);
     
     auto it = auth_cache_.find(key);
     if (it == auth_cache_.end()) {
@@ -275,7 +275,7 @@ void AuthManager::put_to_cache(const std::string& key, AuthResult result, const 
         return;
     }
     
-    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    std::unique_lock<std::mutex> lock(cache_mutex_);
     
     CacheEntry entry(allocator_);
     entry.result = result;
@@ -287,7 +287,7 @@ void AuthManager::put_to_cache(const std::string& key, AuthResult result, const 
     entry.expire_time = std::chrono::steady_clock::now() + 
                        std::chrono::seconds(cache_ttl_seconds_);
     
-    auth_cache_[key] = std::move(entry);
+    auth_cache_.emplace(key, std::move(entry));
 }
 
 void AuthManager::cleanup_expired_cache() {
@@ -295,7 +295,7 @@ void AuthManager::cleanup_expired_cache() {
         return;
     }
     
-    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    std::unique_lock<std::mutex> lock(cache_mutex_);
     
     auto now = std::chrono::steady_clock::now();
     auto it = auth_cache_.begin();

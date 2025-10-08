@@ -401,7 +401,7 @@ int MQTTRedoLogManager::load_and_replay(MQTTPersistentTopicTree* topic_tree) {
     uint64_t entry_count = 0;
     RouterLogEntry entry(allocator_);
     
-    while (read_log_entry_from_file(entry) == 0) {
+    while (read_log_entry_from_file(log_file, entry) == 0) {
         if (topic_tree->apply_redo_log_entry(entry) == 0) {
             entry_count++;
             if (entry.sequence_id >= next_sequence_id_) {
@@ -414,14 +414,7 @@ int MQTTRedoLogManager::load_and_replay(MQTTPersistentTopicTree* topic_tree) {
     return 0;
 }
 
-int MQTTRedoLogManager::read_log_entry_from_file(RouterLogEntry& entry) {
-    std::ifstream log_file(redo_log_path_, std::ios::binary);
-    if (!log_file.is_open()) {
-        return -1;
-    }
-    
-    static std::streampos current_pos = 0;
-    log_file.seekg(current_pos);
+int MQTTRedoLogManager::read_log_entry_from_file(std::ifstream& log_file, RouterLogEntry& entry) {
     
     uint8_t op_type;
     if (!log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type))) {
@@ -483,7 +476,6 @@ int MQTTRedoLogManager::read_log_entry_from_file(RouterLogEntry& entry) {
         return -1;
     }
     
-    current_pos = log_file.tellg();
     return 0;
 }
 
@@ -520,7 +512,7 @@ int MQTTRedoLogManager::truncate_after_snapshot(uint64_t last_applied_sequence) 
         if (sequence_id <= last_applied_sequence) {
             old_log_file.seekg(pos);
             RouterLogEntry temp_entry(allocator_);
-            if (read_log_entry_from_file(temp_entry) == 0) {
+            if (read_log_entry_from_file(old_log_file, temp_entry) == 0) {
                 continue;
             } else {
                 break;

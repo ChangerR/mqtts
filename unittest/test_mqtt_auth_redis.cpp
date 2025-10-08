@@ -1,6 +1,5 @@
 #include "../src/mqtt_auth_redis.h"
 #include "../src/mqtt_allocator.h"
-#include "../src/mqtt_memory_manager.h"
 #include "../src/logger.h"
 #include <cassert>
 #include <iostream>

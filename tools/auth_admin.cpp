@@ -1,35 +1,59 @@
-#include "../src/mqtt_auth_sqlite.h"
-#include "../src/mqtt_auth_redis.h"
 #include "../src/mqtt_allocator.h"
-#include "../src/mqtt_memory_manager.h"
+#include "../src/mqtt_auth_interface.h"
+#include "../src/mqtt_stl_allocator.h"
 #include "../src/logger.h"
 #include <iostream>
 #include <string>
 #include <vector>
-#include <memory>
+
+#ifdef HAVE_SQLITE3
+#include "../src/mqtt_auth_sqlite.h"
+using SQLiteAuthProvider = mqtt::auth::SQLiteAuthProvider;
+using SQLiteAuthConfig = mqtt::auth::SQLiteAuthConfig;
+#endif
+
+#ifdef HAVE_HIREDIS
+#include "../src/mqtt_auth_redis.h"
+using RedisAuthProvider = mqtt::auth::RedisAuthProvider;
+using RedisAuthConfig = mqtt::auth::RedisAuthConfig;
+#endif
 
 using namespace mqtt;
 using namespace mqtt::auth;
 
+// C++11 compatibility: define make_unique if not available
+#if __cplusplus < 201402L
+namespace std {
+    template<typename T, typename... Args>
+    std::unique_ptr<T> make_unique(Args&&... args) {
+        return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+    }
+}
+#endif
+
 class AuthAdmin {
 public:
     AuthAdmin() {
-        // 初始化内存管理
-        MQTTMemoryManager::get_instance().initialize(1024 * 1024);  // 1MB
+        // 获取根分配器
         allocator_ = MQTTMemoryManager::get_instance().get_root_allocator();
     }
     
     ~AuthAdmin() {
+#ifdef HAVE_SQLITE3
         if (sqlite_provider_) {
             sqlite_provider_->cleanup();
         }
+#endif
+#ifdef HAVE_HIREDIS
         if (redis_provider_) {
             redis_provider_->cleanup();
         }
-        MQTTMemoryManager::get_instance().cleanup();
+#endif
+        // cleanup会在程序结束时自动调用
     }
     
     int init_sqlite(const std::string& db_path) {
+#ifdef HAVE_SQLITE3
         SQLiteAuthConfig config;
         config.db_path = db_path;
         config.connection_pool_size = 3;
@@ -43,9 +67,14 @@ public:
         
         std::cout << "SQLite auth provider initialized successfully" << std::endl;
         return MQ_SUCCESS;
+#else
+        std::cerr << "SQLite support not compiled in. Please install libsqlite3-dev and recompile." << std::endl;
+        return -1;
+#endif
     }
     
     int init_redis(const std::string& host, int port, const std::string& password = "") {
+#ifdef HAVE_HIREDIS
         RedisAuthConfig config;
         config.host = host;
         config.port = port;
@@ -61,6 +90,10 @@ public:
         
         std::cout << "Redis auth provider initialized successfully" << std::endl;
         return MQ_SUCCESS;
+#else
+        std::cerr << "Redis support not compiled in. Please install libhiredis-dev and recompile." << std::endl;
+        return -1;
+#endif
     }
     
     void show_help() {
@@ -88,19 +121,27 @@ public:
     }
     
     int add_user(const std::string& username, const std::string& password, bool is_super_user = false) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        MQTTString mqtt_password = to_mqtt_string(password, allocator_);
+        
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->add_user(mqtt_username, mqtt_password, is_super_user);
         }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->add_user(mqtt_username, mqtt_password, is_super_user);
+        }
+#endif
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        MQTTString mqtt_password(password, MQTTStrAllocator(allocator_));
-        
-        int ret = provider->add_user(mqtt_username, mqtt_password, is_super_user);
         if (ret == MQ_SUCCESS) {
             std::cout << "User '" << username << "' added successfully" << 
                          (is_super_user ? " (super user)" : "") << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to add user '" << username << "': " << ret << std::endl;
         }
@@ -109,17 +150,25 @@ public:
     }
     
     int remove_user(const std::string& username) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->remove_user(mqtt_username);
         }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->remove_user(mqtt_username);
+        }
+#endif
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        
-        int ret = provider->remove_user(mqtt_username);
         if (ret == MQ_SUCCESS) {
             std::cout << "User '" << username << "' removed successfully" << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to remove user '" << username << "': " << ret << std::endl;
         }
@@ -128,18 +177,26 @@ public:
     }
     
     int update_password(const std::string& username, const std::string& new_password) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        MQTTString mqtt_password = to_mqtt_string(new_password, allocator_);
+        
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->update_user_password(mqtt_username, mqtt_password);
         }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->update_user_password(mqtt_username, mqtt_password);
+        }
+#endif
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        MQTTString mqtt_password(new_password, MQTTStrAllocator(allocator_));
-        
-        int ret = provider->update_user_password(mqtt_username, mqtt_password);
         if (ret == MQ_SUCCESS) {
             std::cout << "Password updated for user '" << username << "'" << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to update password for user '" << username << "': " << ret << std::endl;
         }
@@ -148,12 +205,6 @@ public:
     }
     
     int add_topic_permission(const std::string& username, const std::string& topic_pattern, const std::string& permission) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
-        }
-        
         Permission perm;
         if (permission == "read") {
             perm = Permission::READ;
@@ -166,13 +217,27 @@ public:
             return -1;
         }
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        MQTTString mqtt_topic(topic_pattern, MQTTStrAllocator(allocator_));
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        MQTTString mqtt_topic = to_mqtt_string(topic_pattern, allocator_);
         
-        int ret = provider->add_topic_permission(mqtt_username, mqtt_topic, perm);
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
+        }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
+        }
+#endif
+        
         if (ret == MQ_SUCCESS) {
             std::cout << "Topic permission added: " << username << " -> " << topic_pattern 
                      << " (" << permission << ")" << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to add topic permission: " << ret << std::endl;
         }
@@ -181,18 +246,26 @@ public:
     }
     
     int remove_topic_permission(const std::string& username, const std::string& topic_pattern) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        MQTTString mqtt_topic = to_mqtt_string(topic_pattern, allocator_);
+        
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->remove_topic_permission(mqtt_username, mqtt_topic);
         }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->remove_topic_permission(mqtt_username, mqtt_topic);
+        }
+#endif
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        MQTTString mqtt_topic(topic_pattern, MQTTStrAllocator(allocator_));
-        
-        int ret = provider->remove_topic_permission(mqtt_username, mqtt_topic);
         if (ret == MQ_SUCCESS) {
             std::cout << "Topic permission removed: " << username << " -> " << topic_pattern << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to remove topic permission: " << ret << std::endl;
         }
@@ -201,17 +274,25 @@ public:
     }
     
     int clear_topics(const std::string& username) {
-        auto provider = get_current_provider();
-        if (!provider) {
-            std::cerr << "No provider initialized" << std::endl;
-            return -1;
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        
+        int ret = -1;
+        
+#ifdef HAVE_SQLITE3
+        if (sqlite_provider_) {
+            ret = sqlite_provider_->clear_user_permissions(mqtt_username);
         }
+#endif
+#ifdef HAVE_HIREDIS
+        if (redis_provider_) {
+            ret = redis_provider_->clear_user_permissions(mqtt_username);
+        }
+#endif
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        
-        int ret = provider->clear_user_permissions(mqtt_username);
         if (ret == MQ_SUCCESS) {
             std::cout << "All topic permissions cleared for user '" << username << "'" << std::endl;
+        } else if (ret == -1) {
+            std::cerr << "No provider initialized" << std::endl;
         } else {
             std::cerr << "Failed to clear topic permissions: " << ret << std::endl;
         }
@@ -247,10 +328,10 @@ public:
             return -1;
         }
         
-        MQTTString mqtt_username(username, MQTTStrAllocator(allocator_));
-        MQTTString mqtt_password(password, MQTTStrAllocator(allocator_));
-        MQTTString client_id("test_client", MQTTStrAllocator(allocator_));
-        MQTTString client_ip("127.0.0.1", MQTTStrAllocator(allocator_));
+        MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+        MQTTString mqtt_password = to_mqtt_string(password, allocator_);
+        MQTTString client_id = to_mqtt_string("test_client", allocator_);
+        MQTTString client_ip = to_mqtt_string("127.0.0.1", allocator_);
         
         UserInfo user_info(allocator_);
         AuthResult result = provider->authenticate_user(mqtt_username, mqtt_password, 
@@ -301,10 +382,10 @@ public:
         }
         
         UserInfo user_info(allocator_);
-        user_info.username = MQTTString(username, MQTTStrAllocator(allocator_));
+        user_info.username = to_mqtt_string(username, allocator_);
         user_info.is_super_user = provider->is_super_user(user_info.username);
         
-        MQTTString mqtt_topic(topic, MQTTStrAllocator(allocator_));
+        MQTTString mqtt_topic = to_mqtt_string(topic, allocator_);
         
         AuthResult result = provider->check_topic_access(user_info, mqtt_topic, perm);
         
@@ -331,19 +412,26 @@ public:
 
 private:
     MQTTAllocator* allocator_;
+#ifdef HAVE_SQLITE3
     std::unique_ptr<SQLiteAuthProvider> sqlite_provider_;
+#endif
+#ifdef HAVE_HIREDIS
     std::unique_ptr<RedisAuthProvider> redis_provider_;
+#endif
     
     IAuthProvider* get_current_provider() {
+#ifdef HAVE_SQLITE3
         if (sqlite_provider_) return sqlite_provider_.get();
+#endif
+#ifdef HAVE_HIREDIS
         if (redis_provider_) return redis_provider_.get();
+#endif
         return nullptr;
     }
 };
 
 int main(int argc, char* argv[]) {
-    // 初始化日志系统
-    Logger::set_level(LogLevel::INFO);
+    // 日志系统通过单例自动初始化
     
     AuthAdmin admin;
     

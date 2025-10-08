@@ -283,23 +283,26 @@ void* MQTTServer::client_routine(void* arg)
 
 void MQTTServer::handle_client(ClientContext* ctx)
 {
+  int ret = MQ_SUCCESS;
   // Create protocol handler
   MQTTProtocolHandler* handler = new (ctx->allocator->allocate(sizeof(MQTTProtocolHandler)))
       MQTTProtocolHandler(ctx->allocator);
 
   // Initialize handler
-  handler->init(ctx->client, ctx->client_ip, ctx->client_port);
+  if (MQ_FAIL(handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {
+    LOG_WARN("failed to init handler, error: {}", ret);
+  } else {
+    // Set session manager reference
+    mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+    handler->set_session_manager(&session_manager);
 
-  // Set session manager reference
-  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
-  handler->set_session_manager(&session_manager);
-
-  // Process packets until client disconnects
-  int ret = handler->process();
-  if (ret != 0) {
-    LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
+    // Process packets until client disconnects
+    ret = handler->process();
+    if (ret != 0) {
+      LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
+    }
   }
-
+  
   // Cleanup
   handler->~MQTTProtocolHandler();
   ctx->allocator->deallocate(handler, sizeof(MQTTProtocolHandler));

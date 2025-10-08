@@ -1,8 +1,8 @@
 # MQTT服务器配置文件
 # 服务器配置
 server:
-  bind_address: "127.0.0.1"  # 绑定地址
-  port: 1884  # 监听端口
+  bind_address: "0.0.0.0"  # 绑定地址
+  port: 1883  # 监听端口
   max_connections: 10000  # 最大连接数
   backlog: 128  # socket backlog
   thread_count: 2  # 线程数

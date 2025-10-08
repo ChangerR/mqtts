@@ -1,6 +1,8 @@
 #pragma once
 
 #include "mqtt_auth_interface.h"
+
+#ifdef HAVE_HIREDIS
 #include <hiredis/hiredis.h>
 #include <memory>
 #include <shared_mutex>
@@ -280,3 +282,14 @@ private:
 
 } // namespace auth
 } // namespace mqtt
+
+#else // HAVE_HIREDIS
+
+// Dummy declarations when hiredis is not available
+namespace mqtt {
+namespace auth {
+  // Empty namespace when hiredis is not available
+}
+}
+
+#endif // HAVE_HIREDIS

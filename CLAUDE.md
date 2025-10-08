@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Build the project
 mkdir -p build && cd build
-cmake .. && make -j$(nproc)
+cmake .. && make -j2
 
 # Build and run tests  
 cd build && make test

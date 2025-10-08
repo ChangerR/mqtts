@@ -146,7 +146,7 @@ public:
     
 private:
     int write_log_entry_to_file(const RouterLogEntry& entry);
-    int read_log_entry_from_file(RouterLogEntry& entry);
+    int read_log_entry_from_file(std::ifstream& log_file, RouterLogEntry& entry);
     
     MQTTAllocator* allocator_;
     MQTTRouterConfig config_;

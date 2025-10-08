@@ -1,6 +1,8 @@
 #pragma once
 
 #include "mqtt_auth_interface.h"
+
+#ifdef HAVE_SQLITE3
 #include <sqlite3.h>
 #include <memory>
 #include <shared_mutex>
@@ -215,3 +217,14 @@ private:
 
 } // namespace auth
 } // namespace mqtt
+
+#else // HAVE_SQLITE3
+
+// Dummy declarations when SQLite3 is not available
+namespace mqtt {
+namespace auth {
+  // Empty namespace when SQLite3 is not available
+}
+}
+
+#endif // HAVE_SQLITE3
