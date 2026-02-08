@@ -601,7 +601,7 @@ bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) c
 // 线程本地缓存定义
 thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_manager_ = nullptr;
 
-GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING)
+GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING), event_forwarding_service_(nullptr), server_id_(MQTTStrAllocator(nullptr))
 {
   // 初始化全局分配器
   MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
@@ -619,6 +619,9 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
 
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
+
+  // 初始化服务器ID为空，由外部设置
+  server_id_ = MQTTString(MQTTStrAllocator(global_allocator_));
 
   LOG_INFO(
       "GlobalSessionManager initialized with high-performance lock-free architecture and topic "
@@ -1389,6 +1392,296 @@ int GlobalSessionManager::get_total_pending_message_count(size_t& total_count) c
   }
   
   return MQ_SUCCESS;
+}
+
+void GlobalSessionManager::set_event_forwarding_service(events::EventForwardingService* forwarding_service)
+{
+  event_forwarding_service_ = forwarding_service;
+  LOG_INFO("Event forwarding service set: {}", (forwarding_service ? "enabled" : "disabled"));
+}
+
+void GlobalSessionManager::trigger_login_event(const MQTTString& client_id,
+                                               const MQTTString& username,
+                                               const MQTTString& protocol_version,
+                                               int keep_alive,
+                                               bool clean_session,
+                                               const MQTTString& client_ip,
+                                               int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create login event data
+  events::LoginEventData login_data;
+  login_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  login_data.username = username;
+  login_data.protocol_version = protocol_version;
+  login_data.keep_alive = keep_alive;
+  login_data.clean_session = clean_session;
+  
+  // Create and forward event
+  auto event = events::createLoginEvent(login_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward login event for client: {}", from_mqtt_string(client_id));
+  }
+}
+
+void GlobalSessionManager::trigger_logout_event(const MQTTString& client_id,
+                                                const MQTTString& reason,
+                                                int session_duration_seconds,
+                                                int64_t bytes_sent,
+                                                int64_t bytes_received,
+                                                int messages_sent,
+                                                int messages_received,
+                                                const MQTTString& client_ip,
+                                                int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create logout event data
+  events::LogoutEventData logout_data;
+  logout_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  logout_data.reason = reason;
+  logout_data.session_duration_seconds = session_duration_seconds;
+  logout_data.bytes_sent = bytes_sent;
+  logout_data.bytes_received = bytes_received;
+  logout_data.messages_sent = messages_sent;
+  logout_data.messages_received = messages_received;
+  
+  // Create and forward event
+  auto event = events::createLogoutEvent(logout_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward logout event for client: {}", from_mqtt_string(client_id));
+  }
+}
+
+void GlobalSessionManager::trigger_publish_event(const MQTTString& client_id,
+                                                 const MQTTString& topic,
+                                                 int qos,
+                                                 bool retain,
+                                                 bool duplicate,
+                                                 int payload_size,
+                                                 const MQTTVector<uint8_t>& payload,
+                                                 const MQTTString& client_ip,
+                                                 int client_port)
+{
+  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
+    return;  // Event forwarding is disabled
+  }
+  
+  // Create publish event data
+  events::PublishEventData publish_data;
+  publish_data.metadata = events::createEventMetadata(
+      to_mqtt_string("mqtt_server", global_allocator_), 
+      client_id, 
+      client_ip, 
+      client_port);
+  publish_data.topic = topic;
+  publish_data.qos = qos;
+  publish_data.retain = retain;
+  publish_data.duplicate = duplicate;
+  publish_data.payload_size = payload_size;
+  
+  // Only include payload if it's small (to save bandwidth)
+  if (payload.size() <= 1024) {  // 1KB limit
+    publish_data.payload = payload;
+  }
+  
+  // Create and forward event
+  auto event = events::createPublishEvent(publish_data);
+  if (!event_forwarding_service_->forwardEvent(event)) {
+    LOG_DEBUG("Failed to forward publish event for client: {}, topic: {}", 
+              from_mqtt_string(client_id), from_mqtt_string(topic));
+  }
+}
+
+//==============================================================================
+// 路由客户端相关方法实现
+//==============================================================================
+
+void GlobalSessionManager::set_router_client(std::unique_ptr<MQTTRouterRpcClient> router_client)
+{
+  router_client_ = std::move(router_client);
+  LOG_INFO("Router client set for GlobalSessionManager");
+}
+
+MQTTRouterRpcClient* GlobalSessionManager::get_router_client() const
+{
+  return router_client_.get();
+}
+
+void GlobalSessionManager::set_server_id(const MQTTString& server_id)
+{
+  server_id_ = server_id;
+  LOG_INFO("Server ID set to: {}", from_mqtt_string(server_id));
+}
+
+const MQTTString& GlobalSessionManager::get_server_id() const
+{
+  return server_id_;
+}
+
+int GlobalSessionManager::register_with_router()
+{
+  if (!router_client_) {
+    LOG_DEBUG("No router client available for registration");
+    return MQ_ERR_INVALID_STATE;
+  }
+  
+  if (!router_client_->is_connected()) {
+    LOG_ERROR("Router client is not connected");
+    return MQ_ERR_CONNECT;
+  }
+  
+  LOG_INFO("Server registered with router successfully");
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::notify_router_client_connect(const MQTTString& client_id,
+                                                      const MQTTString& username,
+                                                      uint32_t protocol_version,
+                                                      uint32_t keep_alive,
+                                                      bool clean_session)
+{
+  if (!router_client_) {
+    return MQ_SUCCESS;  // 路由器不可用，但不影响本地功能
+  }
+  
+  MQTTRouterRpcClient::ClientConnectRequest request(global_allocator_);
+  request.server_id = server_id_;
+  request.client_id = client_id;
+  request.username = username;
+  request.protocol_version = protocol_version;
+  request.keep_alive = keep_alive;
+  request.clean_session = clean_session;
+  
+  int result = router_client_->client_connect_async(request);
+  if (result != MQ_SUCCESS) {
+    LOG_WARN("Failed to notify router about client connect: {}", from_mqtt_string(client_id));
+  }
+  
+  return result;
+}
+
+int GlobalSessionManager::notify_router_client_disconnect(const MQTTString& client_id,
+                                                         const MQTTString& disconnect_reason)
+{
+  if (!router_client_) {
+    return MQ_SUCCESS;  // 路由器不可用，但不影响本地功能
+  }
+  
+  MQTTRouterRpcClient::ClientDisconnectRequest request(global_allocator_);
+  request.server_id = server_id_;
+  request.client_id = client_id;
+  request.disconnect_reason = disconnect_reason;
+  
+  int result = router_client_->client_disconnect_async(request);
+  if (result != MQ_SUCCESS) {
+    LOG_WARN("Failed to notify router about client disconnect: {}", from_mqtt_string(client_id));
+  }
+  
+  return result;
+}
+
+int GlobalSessionManager::subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos)
+{
+  // 先进行本地订阅
+  int local_result = subscribe_topic(topic_filter, client_id, qos);
+  if (local_result != MQ_SUCCESS) {
+    return local_result;
+  }
+  
+  // 然后通知路由器
+  if (router_client_) {
+    MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
+    request.server_id = server_id_;
+    request.client_id = client_id;
+    request.topic_filter = topic_filter;
+    request.qos = qos;
+    
+    int router_result = router_client_->subscribe_async(request);
+    if (router_result != MQ_SUCCESS) {
+      LOG_WARN("Failed to notify router about subscription: {} -> {}", 
+               from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+    }
+  }
+  
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id)
+{
+  // 先进行本地取消订阅
+  int local_result = unsubscribe_topic(topic_filter, client_id);
+  if (local_result != MQ_SUCCESS) {
+    return local_result;
+  }
+  
+  // 然后通知路由器
+  if (router_client_) {
+    MQTTRouterRpcClient::UnsubscribeRequest request(global_allocator_);
+    request.server_id = server_id_;
+    request.client_id = client_id;
+    request.topic_filter = topic_filter;
+    
+    int router_result = router_client_->unsubscribe_async(request);
+    if (router_result != MQ_SUCCESS) {
+      LOG_WARN("Failed to notify router about unsubscription: {} -> {}", 
+               from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+    }
+  }
+  
+  return MQ_SUCCESS;
+}
+
+int GlobalSessionManager::forward_publish_via_router(const MQTTString& topic, const PublishPacket& packet,
+                                                    const MQTTString& sender_client_id)
+{
+  // 先进行本地转发
+  int local_count = forward_publish_by_topic(topic, packet, sender_client_id);
+  
+  // 然后查询路由器获取远程订阅者
+  if (router_client_) {
+    MQTTRouterRpcClient::RoutePublishRequest request(global_allocator_);
+    request.topic = topic;
+    request.qos = packet.qos;
+    request.retain = packet.retain;
+    request.publisher_server_id = server_id_;
+    request.publisher_client_id = sender_client_id;
+    
+    // 复制payload
+    if (!packet.payload.empty()) {
+      request.payload = packet.payload;
+    }
+    
+    MQTTRouterRpcClient::RouteTargetVector targets{MQTTSTLAllocator<MQTTRouterRpcClient::RouteTarget>(global_allocator_)};
+    int router_result = router_client_->route_publish(request, targets);
+    
+    if (router_result == MQ_SUCCESS) {
+      LOG_DEBUG("Router returned {} remote targets for topic: {}", targets.size(), from_mqtt_string(topic));
+      // 这里可以进一步处理远程路由目标，比如通过其他RPC调用转发到远程服务器
+    } else {
+      LOG_DEBUG("Failed to query router for remote targets: {}", router_result);
+    }
+  }
+  
+  return local_count;
+}
+
+bool GlobalSessionManager::is_router_available() const
+{
+  return router_client_ && router_client_->is_connected();
 }
 
 }  // namespace mqtt

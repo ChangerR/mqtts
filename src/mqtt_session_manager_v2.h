@@ -20,6 +20,8 @@
 #include "mqtt_topic_tree.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
+#include "mqtt_event_forwarding_service.h"
+#include "mqtt_router_rpc_client.h"
 
 namespace mqtt {
 
@@ -377,6 +379,161 @@ class GlobalSessionManager
    */
   int get_total_pending_message_count(size_t& total_count) const;
 
+  /**
+   * @brief 设置事件转发服务
+   * @param forwarding_service 事件转发服务指针
+   */
+  void set_event_forwarding_service(events::EventForwardingService* forwarding_service);
+
+  /**
+   * @brief 触发登录事件
+   * @param client_id 客户端ID
+   * @param username 用户名
+   * @param protocol_version 协议版本
+   * @param keep_alive 保活时间
+   * @param clean_session 清理会话标志
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_login_event(const MQTTString& client_id,
+                          const MQTTString& username,
+                          const MQTTString& protocol_version,
+                          int keep_alive,
+                          bool clean_session,
+                          const MQTTString& client_ip = MQTTString(),
+                          int client_port = 0);
+
+  /**
+   * @brief 触发登出事件
+   * @param client_id 客户端ID
+   * @param reason 登出原因
+   * @param session_duration_seconds 会话持续时间（秒）
+   * @param bytes_sent 发送字节数
+   * @param bytes_received 接收字节数
+   * @param messages_sent 发送消息数
+   * @param messages_received 接收消息数
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_logout_event(const MQTTString& client_id,
+                           const MQTTString& reason,
+                           int session_duration_seconds,
+                           int64_t bytes_sent,
+                           int64_t bytes_received,
+                           int messages_sent,
+                           int messages_received,
+                           const MQTTString& client_ip = MQTTString(),
+                           int client_port = 0);
+
+  /**
+   * @brief 触发发布事件
+   * @param client_id 客户端ID
+   * @param topic 主题
+   * @param qos QoS级别
+   * @param retain 保留标志
+   * @param duplicate 重复标志
+   * @param payload_size 载荷大小
+   * @param payload 载荷数据（可选）
+   * @param client_ip 客户端IP
+   * @param client_port 客户端端口
+   */
+  void trigger_publish_event(const MQTTString& client_id,
+                            const MQTTString& topic,
+                            int qos,
+                            bool retain,
+                            bool duplicate,
+                            int payload_size,
+                            const MQTTVector<uint8_t>& payload = MQTTVector<uint8_t>(),
+                            const MQTTString& client_ip = MQTTString(),
+                            int client_port = 0);
+
+  /**
+   * @brief 设置路由RPC客户端
+   * @param router_client 路由RPC客户端指针
+   */
+  void set_router_client(std::unique_ptr<MQTTRouterRpcClient> router_client);
+
+  /**
+   * @brief 获取路由RPC客户端
+   * @return 路由RPC客户端指针
+   */
+  MQTTRouterRpcClient* get_router_client() const;
+
+  /**
+   * @brief 设置服务器ID
+   * @param server_id 服务器ID
+   */
+  void set_server_id(const MQTTString& server_id);
+
+  /**
+   * @brief 获取服务器ID
+   * @return 服务器ID
+   */
+  const MQTTString& get_server_id() const;
+
+  /**
+   * @brief 向路由器注册服务器
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int register_with_router();
+
+  /**
+   * @brief 通知路由器客户端连接
+   * @param client_id 客户端ID
+   * @param username 用户名
+   * @param protocol_version 协议版本
+   * @param keep_alive 保活时间
+   * @param clean_session 清理会话标志
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int notify_router_client_connect(const MQTTString& client_id,
+                                  const MQTTString& username = MQTTString(),
+                                  uint32_t protocol_version = 4,
+                                  uint32_t keep_alive = 60,
+                                  bool clean_session = true);
+
+  /**
+   * @brief 通知路由器客户端断开
+   * @param client_id 客户端ID
+   * @param disconnect_reason 断开原因
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int notify_router_client_disconnect(const MQTTString& client_id,
+                                     const MQTTString& disconnect_reason = MQTTString());
+
+  /**
+   * @brief 通过路由器订阅主题
+   * @param topic_filter 主题过滤器
+   * @param client_id 客户端ID
+   * @param qos QoS级别
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+
+  /**
+   * @brief 通过路由器取消订阅主题
+   * @param topic_filter 主题过滤器
+   * @param client_id 客户端ID
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id);
+
+  /**
+   * @brief 通过路由器转发PUBLISH消息
+   * @param topic 主题
+   * @param packet 发布包
+   * @param sender_client_id 发送者客户端ID
+   * @return 转发的目标数量
+   */
+  int forward_publish_via_router(const MQTTString& topic, const PublishPacket& packet,
+                                const MQTTString& sender_client_id);
+
+  /**
+   * @brief 检查路由器是否可用
+   * @return true可用，false不可用
+   */
+  bool is_router_available() const;
+
  private:
   // 运行状态
   enum class ManagerState {
@@ -403,6 +560,13 @@ class GlobalSessionManager
 
   // 高性能主题匹配树
   std::unique_ptr<ConcurrentTopicTree> topic_tree_;
+
+  // 事件转发服务
+  events::EventForwardingService* event_forwarding_service_;
+
+  // 路由RPC客户端
+  std::unique_ptr<MQTTRouterRpcClient> router_client_;
+  MQTTString server_id_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;

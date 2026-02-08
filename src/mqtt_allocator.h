@@ -70,6 +70,15 @@ class MQTTMemoryManager
     }
     return thread_local_root_;
   }
+  
+  // Cleanup thread local allocator
+  static void cleanup_thread_local()
+  {
+    if (thread_local_root_) {
+      delete thread_local_root_;
+      thread_local_root_ = nullptr;
+    }
+  }
 
   // Get allocator for a specific client - thread safe
   MQTTAllocator* get_allocator(const std::string& client_id) const

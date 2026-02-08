@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package mqtt.router;
+
+// MQTT路由服务定义
+service MQTTRouterService {
+    // 订阅管理
+    rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
+    rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+    
+    // 客户端生命周期管理
+    rpc ClientConnect(ClientConnectRequest) returns (ClientConnectResponse);
+    rpc ClientDisconnect(ClientDisconnectRequest) returns (ClientDisconnectResponse);
+    
+    // 消息路由
+    rpc RoutePublish(RoutePublishRequest) returns (RoutePublishResponse);
+    
+    // 批量操作
+    rpc BatchSubscribe(BatchSubscribeRequest) returns (BatchSubscribeResponse);
+    rpc BatchUnsubscribe(BatchUnsubscribeRequest) returns (BatchUnsubscribeResponse);
+    
+    // 统计和监控
+    rpc GetStatistics(GetStatisticsRequest) returns (GetStatisticsResponse);
+    rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+    
+    // 心跳和健康检查
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// 订阅请求
+message SubscribeRequest {
+    string server_id = 1;
+    string client_id = 2;
+    string topic_filter = 3;
+    uint32 qos = 4;
+}
+
+message SubscribeResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+}
+
+// 取消订阅请求
+message UnsubscribeRequest {
+    string server_id = 1;
+    string client_id = 2;
+    string topic_filter = 3;
+}
+
+message UnsubscribeResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+}
+
+// 客户端连接请求
+message ClientConnectRequest {
+    string server_id = 1;
+    string client_id = 2;
+    string username = 3;
+    uint32 protocol_version = 4;
+    uint32 keep_alive = 5;
+    bool clean_session = 6;
+}
+
+message ClientConnectResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+}
+
+// 客户端断开请求
+message ClientDisconnectRequest {
+    string server_id = 1;
+    string client_id = 2;
+    string disconnect_reason = 3;
+}
+
+message ClientDisconnectResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+}
+
+// 路由发布请求
+message RoutePublishRequest {
+    string topic = 1;
+    bytes payload = 2;
+    uint32 qos = 3;
+    bool retain = 4;
+    string publisher_server_id = 5;
+    string publisher_client_id = 6;
+}
+
+// 路由目标
+message RouteTarget {
+    string server_id = 1;
+    string client_id = 2;
+    uint32 qos = 3;
+}
+
+message RoutePublishResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+    repeated RouteTarget targets = 3;
+}
+
+// 批量订阅请求
+message BatchSubscribeRequest {
+    repeated SubscribeRequest requests = 1;
+}
+
+message BatchSubscribeResponse {
+    repeated SubscribeResponse responses = 1;
+}
+
+// 批量取消订阅请求
+message BatchUnsubscribeRequest {
+    repeated UnsubscribeRequest requests = 1;
+}
+
+message BatchUnsubscribeResponse {
+    repeated UnsubscribeResponse responses = 1;
+}
+
+// 统计信息请求
+message GetStatisticsRequest {
+}
+
+message GetStatisticsResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+    uint64 total_servers = 3;
+    uint64 total_clients = 4;
+    uint64 total_subscriptions = 5;
+    uint64 total_routes = 6;
+    uint64 memory_usage_bytes = 7;
+    uint64 redo_log_entries = 8;
+    uint64 last_snapshot_time = 9;
+}
+
+// 服务器信息请求
+message GetServerInfoRequest {
+    string server_id = 1;
+}
+
+message ServerInfo {
+    string server_id = 1;
+    string host = 2;
+    uint32 port = 3;
+    uint64 last_heartbeat_time = 4;
+    bool is_active = 5;
+    uint64 client_count = 6;
+    uint64 subscription_count = 7;
+}
+
+message GetServerInfoResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+    repeated ServerInfo servers = 3;
+}
+
+// 心跳请求
+message HeartbeatRequest {
+    string server_id = 1;
+    string host = 2;
+    uint32 port = 3;
+    uint64 client_count = 4;
+    uint64 subscription_count = 5;
+}
+
+message HeartbeatResponse {
+    int32 error_code = 1;
+    string error_message = 2;
+    uint64 current_time = 3;
+}

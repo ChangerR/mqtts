@@ -163,6 +163,7 @@ int MQTTSocket::send(const uint8_t* buf, int len)
           continue;                                // Try sending again after poll
         } else {
           LOG_ERROR("Failed to send data - {}", strerror(errno));
+          connected_ = false;  // Mark socket as disconnected
           ret = MQ_ERR_SOCKET_SEND;
         }
       } else {
@@ -196,6 +197,7 @@ int MQTTSocket::recv(char* buf, int& len)
           continue;
         } else {
           LOG_ERROR("Failed to receive data - {}", strerror(errno));
+          connected_ = false;  // Mark socket as disconnected
           ret = MQ_ERR_SOCKET_RECV;
         }
       } else if (received == 0) {

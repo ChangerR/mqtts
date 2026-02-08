@@ -34,8 +34,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 设置静态链接
 set(BUILD_SHARED_LIBS OFF)
 
+# 设置编译器标志，包含调试信息
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 设置调试信息标志
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+
+# 如果没有指定构建类型，默认使用RelWithDebInfo（包含调试信息的优化版本）
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Choose the type of build" FORCE)
+endif()
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -std=gnu++11")
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -std=c++11")
 endif()
 
 set(THIRD_PART_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd")
@@ -71,7 +88,65 @@ add_library(mqtt_parser STATIC
     src/mqtt_topic_tree.cpp
 	src/mqtt_send_worker_pool.cpp
 	src/mqtt_process_monitor.cpp
+	src/mqtt_event_types.cpp
+	src/mqtt_event_forwarding_queue.cpp
+	src/mqtt_event_rpc_client.cpp
+	src/mqtt_event_forwarding_service.cpp
+	src/websocket_frame.cpp
+	src/websocket_protocol_handler.cpp
+	src/websocket_mqtt_bridge.cpp
+	src/websocket_handler_adapter.cpp
 )
+
+# 添加mqtt_router库
+add_library(mqtt_router STATIC
+    src/mqtt_router_service.cpp
+    src/mqtt_router_rpc_client.cpp
+    src/mqtt_allocator.cpp
+    src/mqtt_string_utils.cpp
+    src/mqtt_topic_tree.cpp
+)
+
+# mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
+target_link_libraries(mqtt_router colib_static)
+
+# 添加mqtt_auth库
+add_library(mqtt_auth STATIC
+    src/mqtt_auth_manager.cpp
+    src/mqtt_auth_sqlite.cpp
+    src/mqtt_auth_redis.cpp
+    src/mqtt_allocator.cpp
+    src/mqtt_string_utils.cpp
+)
+
+# 查找认证相关依赖
+find_package(PkgConfig REQUIRED)
+
+# 查找SQLite3 (可选)
+find_package(SQLite3 QUIET)
+
+# 查找hiredis (Redis client, 可选)
+pkg_check_modules(HIREDIS hiredis)
+
+# 查找OpenSSL (用于密码哈希, 可选)
+find_package(OpenSSL QUIET)
+
+# mqtt_auth 需要链接相关依赖
+if(SQLite3_FOUND)
+    target_link_libraries(mqtt_auth SQLite::SQLite3)
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_SQLITE3)
+endif()
+
+if(HIREDIS_FOUND)
+    target_link_libraries(mqtt_auth ${HIREDIS_LIBRARIES})
+    target_include_directories(mqtt_auth PUBLIC ${HIREDIS_INCLUDE_DIRS})
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_HIREDIS)
+endif()
+
+if(OpenSSL_FOUND)
+    target_link_libraries(mqtt_auth OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(mqtt_auth PRIVATE HAVE_OPENSSL)
+endif()
 
 # 查找yaml-cpp库的静态版本
 find_package(PkgConfig REQUIRED)
@@ -83,10 +158,12 @@ target_include_directories(mqtt_parser PUBLIC
 )
 
 # 使用yaml-cpp的静态库
-target_link_libraries(mqtt_parser 
+target_link_libraries(mqtt_parser
     -Wl,-Bstatic
     ${YAML_CPP_STATIC_LIBRARIES}
     -Wl,-Bdynamic
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # 添加主程序
@@ -102,9 +179,86 @@ add_executable(mqtts
 target_link_libraries(mqtts 
     colib_static 
     mqtt_parser
+    mqtt_router
+    mqtt_auth
     tcmalloc_minimal
     pthread 
     dl
+)
+
+# 添加路由器服务可执行文件
+add_executable(mqtt_router_service src/mqtt_router_main.cpp)
+
+# 为mqtt_router可执行文件添加依赖配置
+target_include_directories(mqtt_router_service PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(mqtt_router_service 
+    colib_static
+    mqtt_router
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
+)
+
+# 添加性能分析工具
+add_executable(performance_analyzer tools/performance_analyzer.cpp)
+
+target_include_directories(performance_analyzer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(performance_analyzer 
+    mqtt_router
+    colib_static
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
+)
+
+# 添加认证管理工具
+add_executable(auth_admin tools/auth_admin.cpp)
+
+target_include_directories(auth_admin PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${YAML_CPP_INCLUDE_DIRS}
+)
+
+target_link_libraries(auth_admin 
+    mqtt_auth
+    colib_static
+    tcmalloc_minimal
+    pthread 
+    dl
+    -Wl,-Bstatic
+    ${YAML_CPP_STATIC_LIBRARIES}
+    -Wl,-Bdynamic
+)
+
+# 添加WebSocket MQTT集成测试客户端
+add_executable(simple_websocket_mqtt_test simple_websocket_mqtt_test.cpp)
+
+target_include_directories(simple_websocket_mqtt_test PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(simple_websocket_mqtt_test
+    mqtt_parser
+    colib_static
+    tcmalloc_minimal
+    pthread
+    dl
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # 启用测试

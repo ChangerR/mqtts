@@ -66,8 +66,11 @@ protected:
         // Clean up coroutine environment
         coro_scope_.reset();
         
+        // Clean up thread local allocator
+        MQTTMemoryManager::cleanup_thread_local();
+        
         // Wait for cleanup to complete
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     
     std::unique_ptr<MockMQTTProtocolHandler> create_mock_handler(const std::string& client_id) {

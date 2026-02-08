@@ -1,8 +1,8 @@
 # MQTT服务器配置文件
 # 服务器配置
 server:
-  bind_address: "127.0.0.1"  # 绑定地址
-  port: 1884  # 监听端口
+  bind_address: "0.0.0.0"  # 绑定地址
+  port: 1883  # 监听端口
   max_connections: 10000  # 最大连接数
   backlog: 128  # socket backlog
   thread_count: 2  # 线程数
@@ -23,6 +23,21 @@ mqtt:
 # 内存配置
 memory:
   client_max_size: 1048576  # 客户端最大内存大小(字节)
+
+# WebSocket服务器配置
+websocket:
+  enabled: true  # 是否启用WebSocket服务器
+  bind_address: "127.0.0.1"  # 绑定地址
+  port: 8080  # 监听端口
+  max_connections: 10000  # 最大连接数
+  thread_count: 2  # 线程数
+  backlog: 128  # socket backlog
+  max_frame_size: 1048576  # 最大帧大小(字节)
+  max_message_size: 10485760  # 最大消息大小(字节)
+  handshake_timeout: 10  # 握手超时时间(秒)
+  ping_interval: 30  # Ping间隔(秒)
+  pong_timeout: 10  # Pong超时时间(秒)
+  message_format: "json"  # 消息格式: json, mqtt_packet, text_protocol
 
 # 日志配置
 log:

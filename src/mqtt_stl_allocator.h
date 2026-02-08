@@ -5,6 +5,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
+#include <map>
+#include <new>
+#include <stdexcept>
+#include <cstdlib>
 #include "mqtt_allocator.h"
 
 namespace mqtt {
@@ -41,22 +46,39 @@ class MQTTSTLAllocator
 
   pointer allocate(size_type n)
   {
-    MQTTAllocator* alloc = allocator_;
-    if (!alloc) {
-      // 使用root allocator作为默认分配器
-      alloc = MQTTMemoryManager::get_instance().get_root_allocator();
+    if (n == 0) {
+      return nullptr;
     }
-    return static_cast<pointer>(alloc->allocate(n * sizeof(T)));
+    
+    MQTTAllocator* alloc = get_effective_allocator();
+    
+    if (!alloc) {
+      // Fallback to standard allocator if our custom allocator is not available
+      return static_cast<pointer>(std::malloc(n * sizeof(T)));
+    }
+    
+    void* ptr = alloc->allocate(n * sizeof(T));
+    if (!ptr) {
+      throw std::bad_alloc();
+    }
+    
+    return static_cast<pointer>(ptr);
   }
 
   void deallocate(pointer p, size_type n)
   {
-    MQTTAllocator* alloc = allocator_;
-    if (!alloc) {
-      // 使用root allocator作为默认分配器
-      alloc = MQTTMemoryManager::get_instance().get_root_allocator();
+    if (!p || n == 0) {
+      return;
     }
-    alloc->deallocate(p, n * sizeof(T));
+    
+    MQTTAllocator* alloc = get_effective_allocator();
+    
+    if (alloc) {
+      alloc->deallocate(p, n * sizeof(T));
+    } else {
+      // Fallback to standard free if our custom allocator is not available
+      std::free(p);
+    }
   }
 
   template <typename U, typename... Args>
@@ -79,13 +101,20 @@ class MQTTSTLAllocator
     if (allocator_) {
       return allocator_;
     }
-    return MQTTMemoryManager::get_instance().get_root_allocator();
+    
+    // Use try-catch to handle potential shutdown issues
+    try {
+      return MQTTMemoryManager::get_instance().get_root_allocator();
+    } catch (...) {
+      return nullptr;
+    }
   }
 
   template <typename U>
   bool operator==(const MQTTSTLAllocator<U>& other) const
   {
-    return allocator_ == other.get_allocator();
+    // For stateless allocators, always return true if both use the same effective allocator
+    return get_effective_allocator() == other.get_effective_allocator();
   }
 
   template <typename U>
@@ -105,6 +134,13 @@ using MQTTByteVector = std::vector<uint8_t, MQTTSTLAllocator<uint8_t>>;
 
 template <typename T>
 using MQTTVector = std::vector<T, MQTTSTLAllocator<T>>;
+
+template <typename Key, typename Value>
+using MQTTMap = std::unordered_map<Key, Value, std::hash<Key>, std::equal_to<Key>, MQTTSTLAllocator<std::pair<const Key, Value>>>;
+
+// For compatibility with existing code
+template<typename T>
+using mqtt_stl_allocator = MQTTSTLAllocator<T>;
 
 using MQTTStringPair = std::pair<MQTTString, MQTTString>;
 using MQTTUserProperties = MQTTVector<MQTTStringPair>;

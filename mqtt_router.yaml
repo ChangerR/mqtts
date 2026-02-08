@@ -1,0 +1,23 @@
+router:
+  # Router service configuration
+  service_host: "127.0.0.1"
+  service_port: 9090
+  
+  # Persistence configuration
+  redo_log_path: "./data/mqtt_router.redo"
+  snapshot_path: "./data/mqtt_router.snapshot"
+  snapshot_interval_seconds: 300     # 5 minutes
+  redo_log_flush_interval_ms: 1000   # 1 second
+  max_redo_log_entries: 10000
+  
+  # Performance configuration
+  worker_thread_count: 4
+  coroutines_per_thread: 8
+  max_memory_limit: 1073741824       # 1GB
+
+# Logging configuration
+logging:
+  level: "info"
+  file: "./logs/mqtt_router.log"
+  max_file_size: "100MB"
+  max_files: 10
