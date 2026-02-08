@@ -1,10 +1,15 @@
 #include "mqtt_server.h"
 #include <arpa/inet.h>
+#include <cstring>
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_memory_tags.h"
 #include "mqtt_protocol_handler.h"
 #include "mqtt_session_manager_v2.h"
+#include "mqtt_string_utils.h"
+#include "websocket_protocol_handler.h"
+#include "websocket_mqtt_bridge.h"
+#include "websocket_handler_adapter.h"
 using namespace mqtt;
 
 MQTTServer::MQTTServer(const std::string& host, int port)
@@ -281,31 +286,139 @@ void* MQTTServer::client_routine(void* arg)
   return NULL;
 }
 
+// Helper function to detect if incoming connection is WebSocket upgrade request
+static bool is_websocket_upgrade(MQTTSocket* socket)
+{
+  // Peek at the first few bytes without consuming them
+  char peek_buffer[16];
+  int peek_len = sizeof(peek_buffer);
+
+  // Use MSG_PEEK flag to peek without consuming (blocking is OK since we're in a coroutine)
+  int fd = socket->get_fd();
+
+  // Wait for data to be available using poll (compatible with libco)
+  struct pollfd pf = {0};
+  pf.fd = fd;
+  pf.events = POLLIN;
+  int poll_ret = co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 1 second timeout
+
+  if (poll_ret <= 0) {
+    return false;  // Timeout or error
+  }
+
+  ssize_t bytes = recv(fd, peek_buffer, peek_len, MSG_PEEK);
+
+  if (bytes < 4) {
+    return false;  // Not enough data or error, assume not WebSocket
+  }
+
+  // Check if it starts with "GET " which indicates HTTP request
+  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' && peek_buffer[3] == ' ');
+}
+
 void MQTTServer::handle_client(ClientContext* ctx)
 {
   int ret = MQ_SUCCESS;
-  // Create protocol handler
-  MQTTProtocolHandler* handler = new (ctx->allocator->allocate(sizeof(MQTTProtocolHandler)))
-      MQTTProtocolHandler(ctx->allocator);
 
-  // Initialize handler
-  if (MQ_FAIL(handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {
-    LOG_WARN("failed to init handler, error: {}", ret);
-  } else {
-    // Set session manager reference
+  // Detect if this is a WebSocket connection
+  bool is_websocket = is_websocket_upgrade(ctx->client);
+
+  if (is_websocket) {
+    LOG_INFO("Detected WebSocket upgrade request from {}:{}", ctx->client_ip, ctx->client_port);
+
+    // Create WebSocket protocol handler
+    websocket::WebSocketProtocolHandler* ws_handler =
+        new (ctx->allocator->allocate(sizeof(websocket::WebSocketProtocolHandler)))
+        websocket::WebSocketProtocolHandler(ctx->allocator);
+
+    // Create WebSocket-MQTT bridge
+    websocket::WebSocketMQTTBridge* bridge =
+        new (ctx->allocator->allocate(sizeof(websocket::WebSocketMQTTBridge)))
+        websocket::WebSocketMQTTBridge(ctx->allocator, websocket::MessageFormat::JSON);
+
+    // Create adapter to bridge WebSocket and MQTT protocol handlers
+    websocket::WebSocketHandlerAdapter* adapter =
+        new (ctx->allocator->allocate(sizeof(websocket::WebSocketHandlerAdapter)))
+        websocket::WebSocketHandlerAdapter(ctx->allocator, bridge, ws_handler, ctx->client_id);
+
+    // Initialize bridge with session manager
     mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
-    handler->set_session_manager(&session_manager);
+    if (MQ_SUCC(bridge->init(&session_manager))) {
+      // Initialize WebSocket handler
+      if (MQ_SUCC(ws_handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {
+        // Set the client ID for WebSocket handler
+        ws_handler->set_client_id(ctx->client_id);
 
-    // Process packets until client disconnects
-    ret = handler->process();
-    if (ret != 0) {
-      LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
+        // Register handler with bridge
+        bridge->register_handler(ctx->client_id, ws_handler);
+
+        // Set bridge reference in handler
+        ws_handler->set_bridge(bridge);
+
+        // Register the adapter with the session manager for message forwarding
+        mqtt::MQTTString client_id_mqtt = mqtt::to_mqtt_string(ctx->client_id, ctx->allocator);
+        if (MQ_SUCC(session_manager.register_session(client_id_mqtt, adapter))) {
+          LOG_INFO("WebSocket handler adapter registered for client {}", ctx->client_id);
+
+          // Process WebSocket connection
+          ret = ws_handler->process();
+          if (ret != 0) {
+            LOG_WARN("WebSocket client {}:{} disconnected with error: {}",
+                     ctx->client_ip, ctx->client_port, ret);
+          }
+
+          // Unregister from session manager
+          session_manager.unregister_session(client_id_mqtt);
+        } else {
+          LOG_ERROR("Failed to register WebSocket adapter with session manager");
+        }
+
+        // Unregister handler from bridge
+        bridge->unregister_handler(ctx->client_id);
+      } else {
+        LOG_ERROR("Failed to initialize WebSocket handler");
+      }
+    } else {
+      LOG_ERROR("Failed to initialize WebSocket-MQTT bridge");
     }
+
+    // Cleanup
+    adapter->~WebSocketHandlerAdapter();
+    ctx->allocator->deallocate(adapter, sizeof(websocket::WebSocketHandlerAdapter));
+
+    ws_handler->~WebSocketProtocolHandler();
+    ctx->allocator->deallocate(ws_handler, sizeof(websocket::WebSocketProtocolHandler));
+
+    bridge->~WebSocketMQTTBridge();
+    ctx->allocator->deallocate(bridge, sizeof(websocket::WebSocketMQTTBridge));
+
+  } else {
+    // Regular MQTT connection
+    LOG_INFO("Regular MQTT connection from {}:{}", ctx->client_ip, ctx->client_port);
+
+    // Create protocol handler
+    MQTTProtocolHandler* handler = new (ctx->allocator->allocate(sizeof(MQTTProtocolHandler)))
+        MQTTProtocolHandler(ctx->allocator);
+
+    // Initialize handler
+    if (MQ_FAIL(handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {
+      LOG_WARN("failed to init handler, error: {}", ret);
+    } else {
+      // Set session manager reference
+      mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+      handler->set_session_manager(&session_manager);
+
+      // Process packets until client disconnects
+      ret = handler->process();
+      if (ret != 0) {
+        LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
+      }
+    }
+
+    // Cleanup
+    handler->~MQTTProtocolHandler();
+    ctx->allocator->deallocate(handler, sizeof(MQTTProtocolHandler));
   }
-  
-  // Cleanup
-  handler->~MQTTProtocolHandler();
-  ctx->allocator->deallocate(handler, sizeof(MQTTProtocolHandler));
 }
 
 int MQTTServer::eventloop_callback(void* arg)

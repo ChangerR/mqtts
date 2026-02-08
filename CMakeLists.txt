@@ -92,6 +92,10 @@ add_library(mqtt_parser STATIC
 	src/mqtt_event_forwarding_queue.cpp
 	src/mqtt_event_rpc_client.cpp
 	src/mqtt_event_forwarding_service.cpp
+	src/websocket_frame.cpp
+	src/websocket_protocol_handler.cpp
+	src/websocket_mqtt_bridge.cpp
+	src/websocket_handler_adapter.cpp
 )
 
 # 添加mqtt_router库
@@ -154,10 +158,12 @@ target_include_directories(mqtt_parser PUBLIC
 )
 
 # 使用yaml-cpp的静态库
-target_link_libraries(mqtt_parser 
+target_link_libraries(mqtt_parser
     -Wl,-Bstatic
     ${YAML_CPP_STATIC_LIBRARIES}
     -Wl,-Bdynamic
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # 添加主程序
@@ -236,6 +242,23 @@ target_link_libraries(auth_admin
     -Wl,-Bstatic
     ${YAML_CPP_STATIC_LIBRARIES}
     -Wl,-Bdynamic
+)
+
+# 添加WebSocket MQTT集成测试客户端
+add_executable(simple_websocket_mqtt_test simple_websocket_mqtt_test.cpp)
+
+target_include_directories(simple_websocket_mqtt_test PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(simple_websocket_mqtt_test
+    mqtt_parser
+    colib_static
+    tcmalloc_minimal
+    pthread
+    dl
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 # 启用测试
