@@ -183,6 +183,16 @@ log_info "创建Dockerfile..."
 cat > "$DOCKER_BUILD_DIR/Dockerfile" << EOF
 FROM ubuntu:22.04
 
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    libssl3 \\
+    libyaml-cpp0.7 \\
+    libsqlite3-0 \\
+    libhiredis0.14 \\
+    netcat-openbsd \\
+    ca-certificates \\
+  && rm -rf /var/lib/apt/lists/*
+
 # 创建必要的目录
 RUN mkdir -p /app/bin /app/config /app/logs
 
@@ -201,8 +211,8 @@ RUN chmod +x /app/bin/mqtts && \\
 # 设置工作目录
 WORKDIR /app
 
-# 暴露MQTT端口
-EXPOSE 1883 8883
+# 暴露MQTT/WebSocket端口
+EXPOSE 1883 8883 8080
 
 # 切换到非特权用户
 USER mqtts

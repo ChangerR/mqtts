@@ -189,7 +189,7 @@ void SQLiteConnectionPool::configure_connection(sqlite3* db) {
 
 SQLiteAuthProvider::SQLiteAuthProvider(const SQLiteAuthConfig& config, MQTTAllocator* allocator)
     : config_(config), allocator_(allocator) {
-    connection_pool_ = std::make_unique<SQLiteConnectionPool>(config);
+    connection_pool_ = std::unique_ptr<SQLiteConnectionPool>(new SQLiteConnectionPool(config));
 }
 
 SQLiteAuthProvider::~SQLiteAuthProvider() {
@@ -228,7 +228,7 @@ void SQLiteAuthProvider::cleanup() {
         connection_pool_->cleanup();
     }
     
-    std::unique_lock<std::shared_mutex> lock(topic_cache_mutex_);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
     topic_cache_.user_permissions.clear();
 }
 
@@ -476,7 +476,7 @@ int SQLiteAuthProvider::add_topic_permission(const MQTTString& username, const M
     }
     
     // 使缓存失效
-    std::unique_lock<std::shared_mutex> lock(topic_cache_mutex_);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
     topic_cache_.user_permissions.erase(from_mqtt_string(username));
     
     LOG_INFO("Topic permission added for user '{}': {} -> {}", 
@@ -514,7 +514,7 @@ int SQLiteAuthProvider::remove_topic_permission(const MQTTString& username, cons
     }
     
     // 使缓存失效
-    std::unique_lock<std::shared_mutex> lock(topic_cache_mutex_);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
     topic_cache_.user_permissions.erase(from_mqtt_string(username));
     
     LOG_INFO("Topic permission removed for user '{}': {}", 
@@ -551,7 +551,7 @@ int SQLiteAuthProvider::clear_user_permissions(const MQTTString& username) {
     }
     
     // 使缓存失效
-    std::unique_lock<std::shared_mutex> lock(topic_cache_mutex_);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
     topic_cache_.user_permissions.erase(from_mqtt_string(username));
     
     LOG_INFO("All permissions cleared for user '{}'", from_mqtt_string(username));
@@ -707,7 +707,7 @@ AuthResult SQLiteAuthProvider::check_topic_access_internal(const MQTTString& use
     std::string topic_str = from_mqtt_string(topic);
     
     {
-        std::shared_lock<std::shared_mutex> lock(topic_cache_mutex_);
+        mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
         if (is_topic_cache_valid()) {
             auto it = topic_cache_.user_permissions.find(username_str);
             if (it != topic_cache_.user_permissions.end()) {
@@ -730,7 +730,7 @@ AuthResult SQLiteAuthProvider::check_topic_access_internal(const MQTTString& use
     
     // 重新检查缓存
     {
-        std::shared_lock<std::shared_mutex> lock(topic_cache_mutex_);
+        mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
         auto it = topic_cache_.user_permissions.find(username_str);
         if (it != topic_cache_.user_permissions.end()) {
             for (const auto& perm : it->second) {
@@ -782,7 +782,7 @@ void SQLiteAuthProvider::update_topic_cache(const MQTTString& username) {
     connection_pool_->release_connection(conn);
     
     // 更新缓存
-    std::unique_lock<std::shared_mutex> lock(topic_cache_mutex_);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
     topic_cache_.user_permissions[from_mqtt_string(username)] = std::move(permissions);
     topic_cache_.last_update = std::chrono::steady_clock::now();
 }

@@ -29,7 +29,7 @@ RedisConnection::~RedisConnection() {
 }
 
 bool RedisConnection::is_connected() const {
-    return ctx_ && !(ctx_->flags & REDIS_DISCONNECTED);
+    return ctx_ && ctx_->err == 0;
 }
 
 int RedisConnection::ping() {
@@ -267,7 +267,7 @@ int RedisConnectionPool::configure_connection(redisContext* ctx) {
 
 RedisAuthProvider::RedisAuthProvider(const RedisAuthConfig& config, MQTTAllocator* allocator)
     : config_(config), allocator_(allocator) {
-    connection_pool_ = std::make_unique<RedisConnectionPool>(config);
+    connection_pool_ = std::unique_ptr<RedisConnectionPool>(new RedisConnectionPool(config));
 }
 
 RedisAuthProvider::~RedisAuthProvider() {
@@ -300,7 +300,7 @@ void RedisAuthProvider::cleanup() {
         connection_pool_->cleanup();
     }
     
-    std::unique_lock<std::shared_mutex> lock(local_cache_.mutex);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
     local_cache_.users.clear();
 }
 
@@ -817,7 +817,7 @@ int RedisAuthProvider::load_user_from_redis(const MQTTString& username, UserCach
         reply->element[1]->type == REDIS_REPLY_NIL) {
         free_redis_reply(reply);
         connection_pool_->release_connection(conn);
-        return MQ_ERR_NOT_FOUND;
+        return MQ_ERR_NOT_FOUND_V2;
     }
     
     user_info.password_hash = reply->element[0]->str;
@@ -857,7 +857,7 @@ int RedisAuthProvider::load_user_permissions_from_redis(const MQTTString& userna
             int perm_value = std::atoi(member.substr(colon_pos + 1).c_str());
             
             TopicPermission perm(allocator_);
-            perm.topic_pattern = MQTTString(topic_pattern, MQTTStrAllocator(allocator_));
+            perm.topic_pattern = to_mqtt_string(topic_pattern, allocator_);
             perm.permission = static_cast<Permission>(perm_value);
             permissions.push_back(std::move(perm));
         }
@@ -870,7 +870,7 @@ int RedisAuthProvider::load_user_permissions_from_redis(const MQTTString& userna
 }
 
 bool RedisAuthProvider::get_from_local_cache(const MQTTString& username, UserCache::UserInfo& user_info) {
-    std::shared_lock<std::shared_mutex> lock(local_cache_.mutex);
+    mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
     
     auto it = local_cache_.users.find(from_mqtt_string(username));
     if (it == local_cache_.users.end()) {
@@ -886,17 +886,17 @@ bool RedisAuthProvider::get_from_local_cache(const MQTTString& username, UserCac
 }
 
 void RedisAuthProvider::put_to_local_cache(const MQTTString& username, const UserCache::UserInfo& user_info) {
-    std::unique_lock<std::shared_mutex> lock(local_cache_.mutex);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
     local_cache_.users[from_mqtt_string(username)] = user_info;
 }
 
 void RedisAuthProvider::remove_from_local_cache(const MQTTString& username) {
-    std::unique_lock<std::shared_mutex> lock(local_cache_.mutex);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
     local_cache_.users.erase(from_mqtt_string(username));
 }
 
 void RedisAuthProvider::cleanup_expired_local_cache() {
-    std::unique_lock<std::shared_mutex> lock(local_cache_.mutex);
+    std::unique_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
     
     auto now = std::chrono::steady_clock::now();
     auto it = local_cache_.users.begin();

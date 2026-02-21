@@ -69,6 +69,8 @@
 #define MQ_ERR_TIMEOUT_V2 -705
 #define MQ_ERR_QUEUE_FULL -706
 #define MQ_ERR_INVALID_STATE -707
+#define MQ_ERR_AUTH -708
+#define MQ_ERR_DATABASE -709
 
 // Topic Tree error codes (-800 to -899)
 #define MQ_ERR_TOPIC_TREE -800
@@ -220,6 +222,10 @@ static inline const char* mqtt_error_string(int error_code)
       return "Resource not found";
     case MQ_ERR_TIMEOUT_V2:
       return "Operation timeout";
+    case MQ_ERR_AUTH:
+      return "Authentication failed";
+    case MQ_ERR_DATABASE:
+      return "Database operation failed";
 
     // Topic tree errors
     case MQ_ERR_TOPIC_TREE:
