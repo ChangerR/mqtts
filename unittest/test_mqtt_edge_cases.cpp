@@ -7,11 +7,11 @@
 #include <limits>
 #include <thread>
 #include <chrono>
-#include "src/mqtt_allocator.h"
-#include "src/mqtt_define.h"
-#include "src/mqtt_packet.h"
-#include "src/mqtt_parser.h"
-#include "src/mqtt_serialize_buffer.h"
+#include "mqtt_allocator.h"
+#include "mqtt_define.h"
+#include "mqtt_packet.h"
+#include "mqtt_parser.h"
+#include "mqtt_serialize_buffer.h"
 
 using namespace mqtt;
 
@@ -375,7 +375,7 @@ TEST_F(MQTTv5EdgeCasesTest, EmptyTopicName)
 
 TEST_F(MQTTv5EdgeCasesTest, TopicNameWithNullCharacters)
 {
-    // Test PUBLISH packet with topic name containing null characters
+    // MQTT UTF-8 strings must not contain U+0000, parser should reject it.
     uint8_t publish_null_topic[] = {
         0x30, 0x0f,  // Fixed header: type=PUBLISH, QoS=0, remaining length=15
         0x00, 0x06, 't', 'e', 's', 't', 0x00, 0x00,  // Topic name with null characters
@@ -386,15 +386,8 @@ TEST_F(MQTTv5EdgeCasesTest, TopicNameWithNullCharacters)
     Packet* packet = nullptr;
     int ret = parser->parse_packet(publish_null_topic, sizeof(publish_null_topic), &packet);
     
-    EXPECT_EQ(ret, MQ_SUCCESS);
-    EXPECT_NE(packet, nullptr);
-    EXPECT_EQ(packet->type, PacketType::PUBLISH);
-    
-    PublishPacket* publish = static_cast<PublishPacket*>(packet);
-    EXPECT_EQ(publish->topic_name.length(), 6);
-    EXPECT_EQ(publish->topic_name[0], 't');
-    EXPECT_EQ(publish->topic_name[4], 0x00);
-    EXPECT_EQ(publish->topic_name[5], 0x00);
+    EXPECT_NE(ret, MQ_SUCCESS);
+    EXPECT_EQ(packet, nullptr);
 }
 
 TEST_F(MQTTv5EdgeCasesTest, TopicNameWithWildcards)
