@@ -707,6 +707,8 @@ int MQTTRouterService::initialize() {
 }
 
 int MQTTRouterService::start() {
+    should_stop_ = false;
+
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
         spdlog::error("Failed to create socket: {}", strerror(errno));
@@ -751,9 +753,31 @@ int MQTTRouterService::start() {
 }
 
 int MQTTRouterService::stop() {
+    if (should_stop_ && listen_fd_ < 0 && worker_threads_.empty() && !snapshot_thread_.joinable()) {
+        return 0;
+    }
+
     should_stop_ = true;
     
     if (listen_fd_ >= 0) {
+        // Wake blocking accept() calls before closing listening fd.
+        for (size_t i = 0; i < worker_threads_.size(); ++i) {
+            int wake_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (wake_fd < 0) {
+                continue;
+            }
+
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = inet_addr(config_.service_host.c_str());
+            addr.sin_port = htons(config_.service_port);
+
+            connect(wake_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+            close(wake_fd);
+        }
+
+        shutdown(listen_fd_, SHUT_RDWR);
         close(listen_fd_);
         listen_fd_ = -1;
     }
@@ -763,6 +787,7 @@ int MQTTRouterService::stop() {
             thread.join();
         }
     }
+    worker_threads_.clear();
     
     if (snapshot_thread_.joinable()) {
         snapshot_thread_.join();
@@ -783,11 +808,19 @@ void MQTTRouterService::worker_thread_func(int thread_id) {
         
         int client_fd = accept(listen_fd_, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN || should_stop_) {
+            if (should_stop_) {
+                break;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             spdlog::error("Failed to accept connection: {}", strerror(errno));
             continue;
+        }
+
+        if (should_stop_) {
+            close(client_fd);
+            break;
         }
         
         handle_client_connection(client_fd);

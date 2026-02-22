@@ -2,8 +2,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include "src/mqtt_allocator.h"
-#include "src/mqtt_parser.h"
+#include "mqtt_allocator.h"
+#include "mqtt_parser.h"
 
 void test_parse_connect()
 {

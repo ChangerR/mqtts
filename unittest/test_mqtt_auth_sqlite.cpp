@@ -1,6 +1,6 @@
-#include "../src/mqtt_auth_sqlite.h"
-#include "../src/mqtt_allocator.h"
-#include "../src/logger.h"
+#include "mqtt_auth_sqlite.h"
+#include "mqtt_allocator.h"
+#include "logger.h"
 #include <cassert>
 #include <iostream>
 #include <filesystem>

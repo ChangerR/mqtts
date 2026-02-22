@@ -2,8 +2,8 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
-#include "src/mqtt_allocator.h"
-#include "src/websocket_frame.h"
+#include "mqtt_allocator.h"
+#include "websocket_frame.h"
 
 using namespace websocket;
 

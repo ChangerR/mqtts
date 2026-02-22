@@ -3,8 +3,8 @@
 
 #include <stdexcept>
 #include <memory>
-#include "../3rd/libco/co_comm.h"
-#include "../3rd/libco/co_routine.h"
+#include "co_comm.h"
+#include "co_routine.h"
 
 namespace mqtt {
 

@@ -1142,7 +1142,7 @@ int MQTTParser::parse_mqtt_string(const uint8_t* buffer, size_t length, MQTTStri
   if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
     LOG_ERROR("Packet too short for string");
   } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
-    LOG_ERROR("String parsing failed with error: %d", ret);
+    LOG_ERROR("String parsing failed with error: {}", ret);
   }
   
   return mapped_error;
@@ -1157,7 +1157,7 @@ int MQTTParser::parse_string(const uint8_t* buffer, size_t length, std::string& 
   if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
     LOG_ERROR("Packet too short for string");
   } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
-    LOG_ERROR("String parsing failed with error: %d", ret);
+    LOG_ERROR("String parsing failed with error: {}", ret);
   }
   
   return mapped_error;
@@ -1172,7 +1172,7 @@ int MQTTParser::parse_binary_data(const uint8_t* buffer, size_t length, std::vec
   if (mapped_error == MQ_ERR_PACKET_INCOMPLETE) {
     LOG_ERROR("Packet too short for binary data");
   } else if (mapped_error == MQ_ERR_PACKET_INVALID) {
-    LOG_ERROR("Binary data parsing failed with error: %d", ret);
+    LOG_ERROR("Binary data parsing failed with error: {}", ret);
   }
   
   return mapped_error;

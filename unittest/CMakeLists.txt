@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Google Test 头文件路径
 set(GTEST_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/3rd/gperftools/vendor/googletest/googletest/include)
 set(GTEST_LIB_DIR ${CMAKE_BINARY_DIR}/3rd/gperftools)
+set(TEST_INCLUDE_DIRS ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${MQTTS_INCLUDE_DIRS})
 
 # 添加测试可执行文件
 add_executable(test_connect test_connect.cpp)
@@ -17,29 +18,29 @@ add_executable(test_mqttv5_protocol test_mqttv5_protocol.cpp)
 add_executable(test_publish_serialization test_publish_serialization.cpp)
 add_executable(test_debug_serialization test_debug_serialization.cpp)
 add_executable(test_mqttv5_client test_mqttv5_client.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_server.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 add_executable(test_send_publish test_send_publish.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 add_executable(test_qos_reply test_qos_reply.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 add_executable(test_debug_properties test_debug_properties.cpp)
 add_executable(test_mqtt_protocol_comprehensive test_mqtt_protocol_comprehensive.cpp)
 add_executable(test_mqtt_serialization_comprehensive test_mqtt_serialization_comprehensive.cpp)
 add_executable(test_mqtt_edge_cases test_mqtt_edge_cases.cpp)
 add_executable(test_mqtt_session_manager_optimization test_mqtt_session_manager_optimization.cpp)
 add_executable(test_mqtt_session_manager_memory test_mqtt_session_manager_memory.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_session_manager_v2.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 # 添加认证系统测试
 add_executable(test_mqtt_auth_manager test_mqtt_auth_manager.cpp)
 # Disable broken auth tests for now - they need significant fixes
@@ -47,69 +48,69 @@ add_executable(test_mqtt_auth_manager test_mqtt_auth_manager.cpp)
 # add_executable(test_mqtt_auth_redis test_mqtt_auth_redis.cpp)
 
 add_executable(test_simple_memory test_simple_memory.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_session_manager_v2.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 add_executable(test_session_manager_allocator test_session_manager_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_session_manager_v2.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 add_executable(test_session_manager_stress test_session_manager_stress.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_session_manager_v2.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_allocator.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 
 # 添加路由器测试
 add_executable(test_mqtt_router_service test_mqtt_router_service.cpp)
 add_executable(test_mqtt_router_rpc_client test_mqtt_router_rpc_client.cpp)
 add_executable(test_mqtt_session_manager_router test_mqtt_session_manager_router.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_session_manager_v2.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_protocol_handler.cpp
-    ${CMAKE_SOURCE_DIR}/src/mqtt_socket.cpp
-    ${CMAKE_SOURCE_DIR}/src/logger.cpp)
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 
 # 添加 WebSocket 测试
 add_executable(test_websocket_frame test_websocket_frame.cpp)
 
 # 添加头文件搜索路径
-target_include_directories(test_connect PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_allocator PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_parser PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_topic_tree PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqttv5_protocol PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_publish_serialization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_debug_serialization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqttv5_client PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_send_publish PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_qos_reply PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_debug_properties PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_protocol_comprehensive PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_serialization_comprehensive PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_edge_cases PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_session_manager_optimization PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
-target_include_directories(test_mqtt_session_manager_memory PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_simple_memory PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_session_manager_allocator PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_session_manager_stress PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_connect PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_allocator PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_parser PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_topic_tree PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqttv5_protocol PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_publish_serialization PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_debug_serialization PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqttv5_client PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_send_publish PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_qos_reply PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_debug_properties PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_protocol_comprehensive PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_serialization_comprehensive PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_edge_cases PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_session_manager_optimization PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_session_manager_memory PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_simple_memory PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_session_manager_allocator PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_session_manager_stress PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 
 # 认证系统测试的头文件搜索路径
-target_include_directories(test_mqtt_auth_manager PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-# target_include_directories(test_mqtt_auth_sqlite PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-# target_include_directories(test_mqtt_auth_redis PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_mqtt_auth_manager PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+# target_include_directories(test_mqtt_auth_sqlite PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+# target_include_directories(test_mqtt_auth_redis PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 
 # 路由器测试的头文件搜索路径
-target_include_directories(test_mqtt_router_service PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_mqtt_router_rpc_client PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
-target_include_directories(test_mqtt_session_manager_router PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_mqtt_router_service PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_mqtt_router_rpc_client PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_mqtt_session_manager_router PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 
 # WebSocket 测试的头文件搜索路径
-target_include_directories(test_websocket_frame PRIVATE ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR})
+target_include_directories(test_websocket_frame PRIVATE ${TEST_INCLUDE_DIRS})
 
 # 链接必要的库（包括Google Test）
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)

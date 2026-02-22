@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include "../src/mqtt_session_manager_v2.h"
-#include "../src/mqtt_allocator.h"
-#include "../src/logger.h"
+#include "mqtt_session_manager_v2.h"
+#include "mqtt_allocator.h"
+#include "logger.h"
 
 using namespace mqtt;
 

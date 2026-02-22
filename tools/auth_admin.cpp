@@ -1,19 +1,19 @@
-#include "../src/mqtt_allocator.h"
-#include "../src/mqtt_auth_interface.h"
-#include "../src/mqtt_stl_allocator.h"
-#include "../src/logger.h"
+#include "mqtt_allocator.h"
+#include "mqtt_auth_interface.h"
+#include "mqtt_stl_allocator.h"
+#include "logger.h"
 #include <iostream>
 #include <string>
 #include <vector>
 
 #ifdef HAVE_SQLITE3
-#include "../src/mqtt_auth_sqlite.h"
+#include "mqtt_auth_sqlite.h"
 using SQLiteAuthProvider = mqtt::auth::SQLiteAuthProvider;
 using SQLiteAuthConfig = mqtt::auth::SQLiteAuthConfig;
 #endif
 
 #ifdef HAVE_HIREDIS
-#include "../src/mqtt_auth_redis.h"
+#include "mqtt_auth_redis.h"
 using RedisAuthProvider = mqtt::auth::RedisAuthProvider;
 using RedisAuthConfig = mqtt::auth::RedisAuthConfig;
 #endif

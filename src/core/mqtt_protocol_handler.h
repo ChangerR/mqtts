@@ -27,7 +27,7 @@ class MQTTProtocolHandler
 {
  public:
   MQTTProtocolHandler(MQTTAllocator* allocator);
-  ~MQTTProtocolHandler();
+  virtual ~MQTTProtocolHandler();
 
   // Initialize handler with socket
   int init(MQTTSocket* socket, const std::string& client_ip, int client_port);
@@ -85,7 +85,7 @@ class MQTTProtocolHandler
   virtual int send_publish(const PublishPacket& packet);
 
   // Session management
-  bool is_connected() const { return connected_; }
+  virtual bool is_connected() const { return connected_; }
   void set_client_id(const MQTTString& client_id) { client_id_ = client_id; }
   const MQTTString& get_client_id() const { return client_id_; }
   uint16_t get_next_packet_id() { return next_packet_id_++; }
