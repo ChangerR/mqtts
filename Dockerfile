@@ -33,17 +33,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false -d /app mqtts \
-  && mkdir -p /app/bin /app/config /app/logs \
+  && mkdir -p /app/bin /app/lib /app/config /app/logs \
   && chown -R mqtts:mqtts /app
 
 COPY --from=builder /src/build/mqtts /app/bin/mqtts
+COPY --from=builder /src/build/3rd/gperftools/libtcmalloc_minimal.so /app/lib/libtcmalloc_minimal.so
 COPY mqtts.yaml /app/config/mqtts.yaml
 
 RUN chmod +x /app/bin/mqtts \
   && chown -R mqtts:mqtts /app
 
+ENV LD_LIBRARY_PATH=/app/lib
+
 WORKDIR /app
-EXPOSE 1883 8883 8080
+EXPOSE 1883 8883 18080
 
 USER mqtts
 

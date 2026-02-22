@@ -28,7 +28,7 @@ memory:
 websocket:
   enabled: true  # 是否启用WebSocket服务器
   bind_address: "127.0.0.1"  # 绑定地址
-  port: 8080  # 监听端口
+  port: 18080  # 监听端口
   max_connections: 10000  # 最大连接数
   thread_count: 2  # 线程数
   backlog: 128  # socket backlog
@@ -46,3 +46,8 @@ log:
   max_file_size: 10485760  # 日志文件最大大小(字节)
   max_files: 10  # 最大日志文件数量
   flush_immediately: false  # 立即刷新 
+
+monitoring:
+  enabled: true  # 是否启用监控
+  interval_seconds: 60  # 监控数据收集间隔(秒) 
+  json_output_file: "monitoring_data.json"  # 监控数据输出文件路径，空字符串不输出到文件

@@ -30,15 +30,22 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   docker rm -f "$CONTAINER_NAME" >/dev/null
 fi
 
-docker run -d \
-  --name "$CONTAINER_NAME" \
-  --restart unless-stopped \
-  -p 1883:1883 \
-  -p 8080:8080 \
-  -v "$CONFIG_PATH":/app/config/mqtts.yaml:ro \
-  -v "$LOG_DIR":/app/logs \
-  "${EXTRA_ARGS[@]}" \
-  "$IMAGE_NAME"
+DOCKER_RUN_CMD=(
+  docker run -d
+  --name "$CONTAINER_NAME"
+  --restart unless-stopped
+  -p 1883:1883
+  -p 18080:18080
+  -v "$CONFIG_PATH":/app/config/mqtts.yaml:ro
+  -v "$LOG_DIR":/app/logs
+)
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+  DOCKER_RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+DOCKER_RUN_CMD+=("$IMAGE_NAME")
+"${DOCKER_RUN_CMD[@]}"
 
 echo "容器已启动: $CONTAINER_NAME"
 docker ps --filter "name=$CONTAINER_NAME"
