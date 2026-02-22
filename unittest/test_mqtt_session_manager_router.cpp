@@ -2,6 +2,7 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_router_rpc_client.h"
 #include "mqtt_allocator.h"
@@ -30,43 +31,51 @@ public:
     // 重写父类方法
     int initialize() override { return 0; }
     int connect() override { 
+        std::lock_guard<std::mutex> lock(mutex_);
         connected_ = true; 
         return 0; 
     }
     int disconnect() override { 
+        std::lock_guard<std::mutex> lock(mutex_);
         connected_ = false; 
         return 0; 
     }
     
     bool is_connected() const override { 
+        std::lock_guard<std::mutex> lock(mutex_);
         return connected_; 
     }
     
     int subscribe_async(const SubscribeRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         subscribe_calls_++;
         last_subscribe_request_ = request;
         return 0;
     }
     
     int unsubscribe_async(const UnsubscribeRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         unsubscribe_calls_++;
         last_unsubscribe_request_ = request;
         return 0;
     }
     
     int client_connect_async(const ClientConnectRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         connect_calls_++;
         last_connect_request_ = request;
         return 0;
     }
     
     int client_disconnect_async(const ClientDisconnectRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         disconnect_calls_++;
         last_disconnect_request_ = request;
         return 0;
     }
     
     int route_publish(const RoutePublishRequest& request, RouteTargetVector& targets) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         publish_calls_++;
         last_publish_request_ = request;
         
@@ -89,11 +98,26 @@ public:
     }
     
     // 测试辅助方法
-    int get_subscribe_calls() const { return subscribe_calls_; }
-    int get_unsubscribe_calls() const { return unsubscribe_calls_; }
-    int get_connect_calls() const { return connect_calls_; }
-    int get_disconnect_calls() const { return disconnect_calls_; }
-    int get_publish_calls() const { return publish_calls_; }
+    int get_subscribe_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return subscribe_calls_;
+    }
+    int get_unsubscribe_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return unsubscribe_calls_;
+    }
+    int get_connect_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return connect_calls_;
+    }
+    int get_disconnect_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return disconnect_calls_;
+    }
+    int get_publish_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return publish_calls_;
+    }
     
     const SubscribeRequest& get_last_subscribe_request() const { return last_subscribe_request_; }
     const UnsubscribeRequest& get_last_unsubscribe_request() const { return last_unsubscribe_request_; }
@@ -102,6 +126,7 @@ public:
     const RoutePublishRequest& get_last_publish_request() const { return last_publish_request_; }
     
     void reset_counters() {
+        std::lock_guard<std::mutex> lock(mutex_);
         subscribe_calls_ = 0;
         unsubscribe_calls_ = 0;
         connect_calls_ = 0;
@@ -110,6 +135,7 @@ public:
     }
 
 private:
+    mutable std::mutex mutex_;
     bool connected_;
     int subscribe_calls_;
     int unsubscribe_calls_;
@@ -127,8 +153,9 @@ private:
 class GlobalSessionManagerRouterTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // 创建全局会话管理器
-        session_manager_ = &GlobalSessionManagerInstance::instance();
+        // 为每个测试创建独立管理器，避免跨用例状态污染
+        session_manager_holder_ = std::make_unique<GlobalSessionManager>();
+        session_manager_ = session_manager_holder_.get();
         
         // 预注册线程
         ASSERT_EQ(session_manager_->pre_register_threads(2, 100), MQ_SUCCESS);
@@ -158,8 +185,11 @@ protected:
         if (test_allocator_ && test_allocator_->get_parent()) {
             test_allocator_->get_parent()->remove_child("test_session_router");
         }
+
+        session_manager_holder_.reset();
     }
 
+    std::unique_ptr<GlobalSessionManager> session_manager_holder_;
     GlobalSessionManager* session_manager_;
     MQTTAllocator* test_allocator_;
     std::unique_ptr<MockRouterRpcClient> mock_rpc_client_;
@@ -355,7 +385,8 @@ TEST_F(GlobalSessionManagerRouterTest, RouterUnavailable) {
 class GlobalSessionManagerRouterMultiThreadTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        session_manager_ = &GlobalSessionManagerInstance::instance();
+        session_manager_holder_ = std::make_unique<GlobalSessionManager>();
+        session_manager_ = session_manager_holder_.get();
         
         // 预注册线程
         ASSERT_EQ(session_manager_->pre_register_threads(4, 1000), MQ_SUCCESS);
@@ -380,8 +411,11 @@ protected:
         if (test_allocator_ && test_allocator_->get_parent()) {
             test_allocator_->get_parent()->remove_child("test_multithread_router");
         }
+
+        session_manager_holder_.reset();
     }
 
+    std::unique_ptr<GlobalSessionManager> session_manager_holder_;
     GlobalSessionManager* session_manager_;
     MQTTAllocator* test_allocator_;
     std::unique_ptr<MockRouterRpcClient> mock_rpc_client_;

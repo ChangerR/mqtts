@@ -2,17 +2,18 @@
 #include <thread>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <atomic>
 #include <random>
-#include "../src/mqtt_session_manager_v2.h"
-#include "../src/mqtt_allocator.h"
-#include "../src/mqtt_memory_tags.h"
-#include "../src/mqtt_stl_allocator.h"
-#include "../src/mqtt_packet.h"
-#include "../src/mqtt_define.h"
-#include "../src/logger.h"
+#include "mqtt_session_manager_v2.h"
+#include "mqtt_allocator.h"
+#include "mqtt_memory_tags.h"
+#include "mqtt_stl_allocator.h"
+#include "mqtt_packet.h"
+#include "mqtt_define.h"
+#include "logger.h"
 #include "coroutine_test_helper.h"
 
 using namespace mqtt;
@@ -122,14 +123,23 @@ TEST_F(SessionManagerStressTest, RapidManagerCreationDestruction) {
     
     // Verify no serious memory leaks (allow some reasonable fluctuation)
     size_t final_usage = MQTTMemoryManager::get_instance().get_tag_usage(MQTTMemoryTag::MEM_TAG_SESSION_MANAGER);
-    EXPECT_LT(final_usage, max_usage * 2);  // Should not exceed 2x peak
+    if (max_usage == 0) {
+        EXPECT_EQ(final_usage, 0u);
+    } else {
+        EXPECT_LE(final_usage, max_usage * 2);  // Should not exceed 2x peak
+    }
 }
 
 // Test memory fragmentation scenario (basic allocator stress)
 TEST_F(SessionManagerStressTest, MemoryFragmentation) {
     const int num_cycles = 20;
+    struct AllocationRecord {
+        MQTTAllocator* allocator;
+        void* ptr;
+        size_t size;
+    };
     std::vector<MQTTAllocator*> allocators;
-    std::vector<std::vector<void*>> allocated_ptrs(num_cycles);
+    std::vector<std::vector<AllocationRecord>> allocated_ptrs(num_cycles);
     
     // Create some allocators
     for (int i = 0; i < 5; ++i) {
@@ -155,7 +165,7 @@ TEST_F(SessionManagerStressTest, MemoryFragmentation) {
             
             void* ptr = allocators[allocator_idx]->allocate(size);
             if (ptr) {
-                allocated_ptrs[cycle].push_back(ptr);
+                allocated_ptrs[cycle].push_back({allocators[allocator_idx], ptr, size});
             }
         }
         
@@ -164,11 +174,12 @@ TEST_F(SessionManagerStressTest, MemoryFragmentation) {
             int prev_cycle = cycle - 1;
             if (!allocated_ptrs[prev_cycle].empty()) {
                 for (size_t i = 0; i < allocated_ptrs[prev_cycle].size(); i += 2) {
-                    // Only free half, creating fragments
-                    int allocator_idx = allocator_dist(gen);
-                    allocators[allocator_idx]->deallocate(allocated_ptrs[prev_cycle][i], size_dist(gen));
+                    AllocationRecord& record = allocated_ptrs[prev_cycle][i];
+                    if (record.ptr) {
+                        record.allocator->deallocate(record.ptr, record.size);
+                        record.ptr = nullptr;
+                    }
                 }
-                allocated_ptrs[prev_cycle].clear();
             }
         }
     }
@@ -183,12 +194,10 @@ TEST_F(SessionManagerStressTest, MemoryFragmentation) {
     
     // Clean up all allocated memory
     for (int cycle = 0; cycle < num_cycles; ++cycle) {
-        for (void* ptr : allocated_ptrs[cycle]) {
-            if (ptr) {
-                // Simplified cleanup, use first allocator
-                if (!allocators.empty()) {
-                    allocators[0]->deallocate(ptr, 64);  // Use average size
-                }
+        for (AllocationRecord& record : allocated_ptrs[cycle]) {
+            if (record.ptr) {
+                record.allocator->deallocate(record.ptr, record.size);
+                record.ptr = nullptr;
             }
         }
         allocated_ptrs[cycle].clear();
@@ -258,17 +267,22 @@ TEST_F(SessionManagerStressTest, ConcurrentAllocatorOperations) {
     const int operations_per_thread = 50;
     std::atomic<int> successful_operations{0};
     std::atomic<int> failed_operations{0};
+    std::mutex allocator_children_mutex;
     
     std::vector<std::thread> threads;
     
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([this, t, operations_per_thread, &successful_operations, &failed_operations]() {
+        threads.emplace_back([this, t, operations_per_thread, &successful_operations, &failed_operations, &allocator_children_mutex]() {
             for (int op = 0; op < operations_per_thread; ++op) {
                 try {
                     std::string allocator_id = "concurrent_" + std::to_string(t) + "_" + std::to_string(op);
                     
                     // Create allocator
-                    MQTTAllocator* allocator = root_allocator_->create_child(allocator_id, MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+                    MQTTAllocator* allocator = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(allocator_children_mutex);
+                        allocator = root_allocator_->create_child(allocator_id, MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+                    }
                     
                     if (allocator != nullptr) {
                         // Allocate memory
@@ -286,7 +300,10 @@ TEST_F(SessionManagerStressTest, ConcurrentAllocatorOperations) {
                         }
                         
                         // Clean up allocator
-                        root_allocator_->remove_child(allocator_id);
+                        {
+                            std::lock_guard<std::mutex> lock(allocator_children_mutex);
+                            root_allocator_->remove_child(allocator_id);
+                        }
                     } else {
                         failed_operations.fetch_add(1);
                     }
@@ -318,7 +335,12 @@ TEST_F(SessionManagerStressTest, ConcurrentAllocatorOperations) {
 // Test memory usage statistics accuracy
 TEST_F(SessionManagerStressTest, MemoryUsageAccuracy) {
     std::vector<MQTTAllocator*> allocators;
-    std::vector<std::pair<void*, size_t>> allocations;
+    struct AllocationRecord {
+        MQTTAllocator* allocator;
+        void* ptr;
+        size_t size;
+    };
+    std::vector<AllocationRecord> allocations;
     
     // Create multiple allocators
     for (int i = 0; i < 3; ++i) {
@@ -340,7 +362,7 @@ TEST_F(SessionManagerStressTest, MemoryUsageAccuracy) {
         for (MQTTAllocator* allocator : allocators) {
             void* ptr = allocator->allocate(size);
             if (ptr) {
-                allocations.push_back({ptr, size});
+                allocations.push_back({allocator, ptr, size});
                 expected_total_usage += size;
             }
         }
@@ -360,11 +382,8 @@ TEST_F(SessionManagerStressTest, MemoryUsageAccuracy) {
     EXPECT_GE(actual_total_usage, expected_total_usage * 0.8);  // Not less than 0.8x expected
     
     // Precisely free all memory
-    for (auto& alloc : allocations) {
-        // Find corresponding allocator (simplified, use first one)
-        if (!allocators.empty()) {
-            allocators[0]->deallocate(alloc.first, alloc.second);
-        }
+    for (const auto& alloc : allocations) {
+        alloc.allocator->deallocate(alloc.ptr, alloc.size);
     }
     
     // Verify usage after freeing
