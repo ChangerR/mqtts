@@ -1,9 +1,9 @@
-#include "../src/mqtt_auth_interface.h"
-#include "../src/mqtt_auth_manager.cpp"
-#include "../src/mqtt_allocator.h"
-#include "../src/mqtt_string_utils.h"
-#include "../src/mqtt_stl_allocator.h"
-#include "../src/logger.h"
+#include "mqtt_auth_interface.h"
+#include "mqtt_auth_manager.cpp"
+#include "mqtt_allocator.h"
+#include "mqtt_string_utils.h"
+#include "mqtt_stl_allocator.h"
+#include "logger.h"
 #include <cassert>
 #include <iostream>
 #include <memory>

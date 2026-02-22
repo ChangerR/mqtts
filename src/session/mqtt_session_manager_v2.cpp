@@ -599,13 +599,23 @@ bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) c
 //==============================================================================
 
 // 线程本地缓存定义
+thread_local GlobalSessionManager* GlobalSessionManager::cached_manager_owner_ = nullptr;
 thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_manager_ = nullptr;
 
 GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING), event_forwarding_service_(nullptr), server_id_(MQTTStrAllocator(nullptr))
 {
   // 初始化全局分配器
   MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
-  global_allocator_ = root_allocator->create_child("global_session_manager", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+  global_allocator_ = root_allocator->get_child("global_session_manager");
+  if (!global_allocator_) {
+    global_allocator_ = root_allocator->create_child("global_session_manager",
+                                                     MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+  }
+  if (!global_allocator_) {
+    // Fallback: avoid null dereference in tests that create/destroy managers repeatedly.
+    global_allocator_ = root_allocator;
+    LOG_WARN("Failed to create/find global_session_manager allocator, falling back to root allocator");
+  }
 
   // TODO: 简化容器初始化，去除复杂的STL分配器
   // 容器使用默认分配器，后期可以优化
@@ -614,8 +624,15 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
   message_cache_.reset(new MessageContentCache());
 
   // 为主题匹配树创建专用的allocator
-  MQTTAllocator* topic_tree_allocator =
-      global_allocator_->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+  MQTTAllocator* topic_tree_allocator = global_allocator_->get_child("topic_tree");
+  if (!topic_tree_allocator) {
+    topic_tree_allocator =
+        global_allocator_->create_child("topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+  }
+  if (!topic_tree_allocator) {
+    topic_tree_allocator = global_allocator_;
+    LOG_WARN("Failed to create/find topic_tree allocator, using global allocator");
+  }
 
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
@@ -643,6 +660,17 @@ GlobalSessionManager::~GlobalSessionManager()
 
   // 清理主题匹配树
   topic_tree_.reset();
+
+  if (global_allocator_ && global_allocator_->get_parent()) {
+    global_allocator_->get_parent()->remove_child(global_allocator_->get_id());
+    global_allocator_ = nullptr;
+  }
+
+  // 清理当前线程上的缓存，避免跨实例悬空指针
+  if (cached_manager_owner_ == this) {
+    cached_manager_owner_ = nullptr;
+    cached_thread_manager_ = nullptr;
+  }
 
   LOG_INFO("GlobalSessionManager destroyed, all managers cleared");
 }
@@ -706,6 +734,7 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
   thread_manager_array_.push_back(manager_ptr);
 
   // 设置线程本地缓存
+  cached_manager_owner_ = this;
   cached_thread_manager_ = manager_ptr;
 
   LOG_INFO("Registered thread manager for thread: {} (total: {})",
@@ -732,8 +761,13 @@ int GlobalSessionManager::finalize_thread_registration()
 ThreadLocalSessionManager* GlobalSessionManager::get_thread_manager()
 {
   // 优先使用线程本地缓存，避免锁和哈希查找
-  if (cached_thread_manager_) {
+  if (cached_manager_owner_ == this && cached_thread_manager_) {
     return cached_thread_manager_;
+  }
+
+  if (cached_manager_owner_ != this) {
+    cached_thread_manager_ = nullptr;
+    cached_manager_owner_ = this;
   }
 
   // 如果缓存为空，进行一次查找并缓存结果
@@ -745,6 +779,7 @@ ThreadLocalSessionManager* GlobalSessionManager::get_thread_manager()
     auto it = thread_managers_.find(current_thread_id);
     if (it != thread_managers_.end()) {
       cached_thread_manager_ = it->second.get();
+      cached_manager_owner_ = this;
       return cached_thread_manager_;
     }
   } else {

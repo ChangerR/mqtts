@@ -56,11 +56,27 @@ elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
 endif()
 
 set(THIRD_PART_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd")
+set(MQTTS_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+set(MQTTS_INCLUDE_DIRS
+    "${MQTTS_SRC_DIR}"
+    "${MQTTS_SRC_DIR}/app"
+    "${MQTTS_SRC_DIR}/auth"
+    "${MQTTS_SRC_DIR}/common"
+    "${MQTTS_SRC_DIR}/core"
+    "${MQTTS_SRC_DIR}/events"
+    "${MQTTS_SRC_DIR}/memory"
+    "${MQTTS_SRC_DIR}/protocol"
+    "${MQTTS_SRC_DIR}/router"
+    "${MQTTS_SRC_DIR}/session"
+    "${MQTTS_SRC_DIR}/topic"
+    "${MQTTS_SRC_DIR}/utils"
+    "${MQTTS_SRC_DIR}/websocket"
+)
 include_directories(
 	"${THIRD_PART_DIR}/spdlog/include"
 	"${THIRD_PART_DIR}/libco"
 	"${THIRD_PART_DIR}/gperftools/src"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${MQTTS_INCLUDE_DIRS}
 )
 
 # Build only tcmalloc
@@ -78,33 +94,33 @@ add_subdirectory(3rd EXCLUDE_FROM_ALL)
 
 # 添加mqtt_parser库
 add_library(mqtt_parser STATIC
-    src/mqtt_parser.cpp
-    src/mqtt_allocator.cpp
-    src/mqtt_serialize_buffer.cpp
-    src/mqtt_string_utils.cpp
-    src/mqtt_config.cpp
-    src/mqtt_session_manager_v2.cpp
-	src/mqtt_session_info.cpp
-    src/mqtt_topic_tree.cpp
-	src/mqtt_send_worker_pool.cpp
-	src/mqtt_process_monitor.cpp
-	src/mqtt_event_types.cpp
-	src/mqtt_event_forwarding_queue.cpp
-	src/mqtt_event_rpc_client.cpp
-	src/mqtt_event_forwarding_service.cpp
-	src/websocket_frame.cpp
-	src/websocket_protocol_handler.cpp
-	src/websocket_mqtt_bridge.cpp
-	src/websocket_handler_adapter.cpp
+    src/protocol/mqtt_parser.cpp
+    src/memory/mqtt_allocator.cpp
+    src/protocol/mqtt_serialize_buffer.cpp
+    src/common/mqtt_string_utils.cpp
+    src/common/mqtt_config.cpp
+    src/session/mqtt_session_manager_v2.cpp
+	src/session/mqtt_session_info.cpp
+    src/topic/mqtt_topic_tree.cpp
+	src/session/mqtt_send_worker_pool.cpp
+	src/session/mqtt_process_monitor.cpp
+	src/events/mqtt_event_types.cpp
+	src/events/mqtt_event_forwarding_queue.cpp
+	src/events/mqtt_event_rpc_client.cpp
+	src/events/mqtt_event_forwarding_service.cpp
+	src/websocket/websocket_frame.cpp
+	src/websocket/websocket_protocol_handler.cpp
+	src/websocket/websocket_mqtt_bridge.cpp
+	src/websocket/websocket_handler_adapter.cpp
 )
 
 # 添加mqtt_router库
 add_library(mqtt_router STATIC
-    src/mqtt_router_service.cpp
-    src/mqtt_router_rpc_client.cpp
-    src/mqtt_allocator.cpp
-    src/mqtt_string_utils.cpp
-    src/mqtt_topic_tree.cpp
+    src/router/mqtt_router_service.cpp
+    src/router/mqtt_router_rpc_client.cpp
+    src/memory/mqtt_allocator.cpp
+    src/common/mqtt_string_utils.cpp
+    src/topic/mqtt_topic_tree.cpp
 )
 
 # mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
@@ -112,11 +128,11 @@ target_link_libraries(mqtt_router colib_static)
 
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
-    src/mqtt_auth_manager.cpp
-    src/mqtt_auth_sqlite.cpp
-    src/mqtt_auth_redis.cpp
-    src/mqtt_allocator.cpp
-    src/mqtt_string_utils.cpp
+    src/auth/mqtt_auth_manager.cpp
+    src/auth/mqtt_auth_sqlite.cpp
+    src/auth/mqtt_auth_redis.cpp
+    src/memory/mqtt_allocator.cpp
+    src/common/mqtt_string_utils.cpp
 )
 
 # 查找认证相关依赖
@@ -153,7 +169,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
 
 target_include_directories(mqtt_parser PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MQTTS_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIRS}
 )
 
@@ -168,11 +184,11 @@ target_link_libraries(mqtt_parser
 
 # 添加主程序
 add_executable(mqtts 
-	src/main.cpp 
-	src/mqtt_socket.cpp 
-	src/mqtt_server.cpp
-	src/mqtt_protocol_handler.cpp
-	src/logger.cpp
+	src/app/main.cpp 
+	src/core/mqtt_socket.cpp 
+	src/core/mqtt_server.cpp
+	src/core/mqtt_protocol_handler.cpp
+	src/common/logger.cpp
 )
 
 # 静态链接所有库
@@ -187,11 +203,11 @@ target_link_libraries(mqtts
 )
 
 # 添加路由器服务可执行文件
-add_executable(mqtt_router_service src/mqtt_router_main.cpp)
+add_executable(mqtt_router_service src/app/mqtt_router_main.cpp)
 
 # 为mqtt_router可执行文件添加依赖配置
 target_include_directories(mqtt_router_service PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MQTTS_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIRS}
 )
 
@@ -210,7 +226,7 @@ target_link_libraries(mqtt_router_service
 add_executable(performance_analyzer tools/performance_analyzer.cpp)
 
 target_include_directories(performance_analyzer PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MQTTS_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIRS}
 )
 
@@ -229,7 +245,7 @@ target_link_libraries(performance_analyzer
 add_executable(auth_admin tools/auth_admin.cpp)
 
 target_include_directories(auth_admin PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MQTTS_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIRS}
 )
 
@@ -248,7 +264,7 @@ target_link_libraries(auth_admin
 add_executable(simple_websocket_mqtt_test simple_websocket_mqtt_test.cpp)
 
 target_include_directories(simple_websocket_mqtt_test PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${MQTTS_INCLUDE_DIRS}
 )
 
 target_link_libraries(simple_websocket_mqtt_test

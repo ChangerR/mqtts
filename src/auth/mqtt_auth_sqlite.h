@@ -5,9 +5,11 @@
 #ifdef HAVE_SQLITE3
 #include <sqlite3.h>
 #include <memory>
-#include <shared_mutex>
+#include "mqtt_shared_mutex_compat.h"
 #include <unordered_map>
 #include <chrono>
+#include <queue>
+#include <condition_variable>
 
 namespace mqtt {
 namespace auth {
@@ -188,7 +190,7 @@ private:
     std::chrono::steady_clock::time_point last_update;
   };
   mutable TopicPermissionCache topic_cache_;
-  mutable std::shared_mutex topic_cache_mutex_;
+  mutable mqtt::compat::shared_mutex topic_cache_mutex_;
   static const int TOPIC_CACHE_TTL_SECONDS = 300;  // 5分钟缓存
   
   int create_tables();

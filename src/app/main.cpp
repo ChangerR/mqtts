@@ -3,7 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <memory>
-#include "../build/generated/version.h"
+#include "version.h"
 #include "logger.h"
 #include "mqtt_config.h"
 #include "mqtt_server.h"

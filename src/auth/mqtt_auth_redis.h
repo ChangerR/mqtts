@@ -5,7 +5,7 @@
 #ifdef HAVE_HIREDIS
 #include <hiredis/hiredis.h>
 #include <memory>
-#include <shared_mutex>
+#include "mqtt_shared_mutex_compat.h"
 #include <queue>
 #include <condition_variable>
 
@@ -242,7 +242,7 @@ private:
     };
     
     std::unordered_map<std::string, UserInfo> users;
-    mutable std::shared_mutex mutex;
+    mutable mqtt::compat::shared_mutex mutex;
   };
   
   mutable UserCache local_cache_;

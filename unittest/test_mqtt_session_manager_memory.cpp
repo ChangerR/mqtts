@@ -5,15 +5,15 @@
 #include <vector>
 #include <string>
 #include <unordered_set>
-#include "../src/mqtt_session_manager_v2.h"
-#include "../src/mqtt_allocator.h"
-#include "../src/mqtt_memory_tags.h"
-#include "../src/mqtt_protocol_handler.h"
-#include "../src/mqtt_define.h"
-#include "../src/mqtt_stl_allocator.h"
-#include "../src/mqtt_packet.h"
-#include "../src/mqtt_message_queue.h"
-#include "../src/logger.h"
+#include "mqtt_session_manager_v2.h"
+#include "mqtt_allocator.h"
+#include "mqtt_memory_tags.h"
+#include "mqtt_protocol_handler.h"
+#include "mqtt_define.h"
+#include "mqtt_stl_allocator.h"
+#include "mqtt_packet.h"
+#include "mqtt_message_queue.h"
+#include "logger.h"
 #include "coroutine_test_helper.h"
 
 using namespace mqtt;
@@ -150,6 +150,8 @@ TEST_F(SessionManagerMemoryTest, MemoryCleanupBehavior) {
     // Register sessions
     std::vector<std::unique_ptr<MockMQTTProtocolHandler>> handlers;
     const int num_sessions = 5;
+    const int invalid_sessions = num_sessions / 2;
+    const int expected_remaining = num_sessions - invalid_sessions;
     
     for (int i = 0; i < num_sessions; ++i) {
         std::string client_id = "cleanup_test_client_" + std::to_string(i);
@@ -165,13 +167,13 @@ TEST_F(SessionManagerMemoryTest, MemoryCleanupBehavior) {
     size_t usage_after_registration = thread_allocator->get_memory_usage();
     
     // Disconnect some handlers to make them invalid
-    for (int i = 0; i < num_sessions / 2; ++i) {
+    for (int i = 0; i < invalid_sessions; ++i) {
         handlers[i]->set_connected(false);
     }
     
     // Run cleanup
     int cleaned_count = manager_->cleanup_all_invalid_sessions();
-    EXPECT_EQ(cleaned_count, num_sessions / 2);
+    EXPECT_EQ(cleaned_count, invalid_sessions);
     
     // Check memory usage after cleanup
     size_t usage_after_cleanup = thread_allocator->get_memory_usage();
@@ -180,7 +182,7 @@ TEST_F(SessionManagerMemoryTest, MemoryCleanupBehavior) {
              usage_after_registration, usage_after_cleanup);
     
     // Verify remaining session count
-    EXPECT_EQ(manager_->get_total_session_count(), num_sessions / 2);
+    EXPECT_EQ(manager_->get_total_session_count(), expected_remaining);
     
     // Cleanup remaining sessions
     for (int i = num_sessions / 2; i < num_sessions; ++i) {

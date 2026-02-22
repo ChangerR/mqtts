@@ -569,6 +569,7 @@ class GlobalSessionManager
   MQTTString server_id_;
 
   // 线程本地缓存（避免重复查找）
+  thread_local static GlobalSessionManager* cached_manager_owner_;
   thread_local static ThreadLocalSessionManager* cached_thread_manager_;
 
   /**
