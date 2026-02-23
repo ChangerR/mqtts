@@ -47,6 +47,18 @@ static int mqtt_packet_total_length(const uint8_t* data, size_t data_len, size_t
     return MQ_ERR_PACKET_INVALID;
 }
 
+static bool is_supported_protocol_name_version(const mqtt::MQTTString& protocol_name,
+                                               uint8_t protocol_version) {
+    const std::string name = mqtt::from_mqtt_string(protocol_name);
+    if (protocol_version == 3) {
+        return name == "MQIsdp";
+    }
+    if (protocol_version == 4 || protocol_version == 5) {
+        return name == "MQTT";
+    }
+    return false;
+}
+
 // Simple JSON parsing helpers
 static bool json_get_string(const std::string& json, const std::string& key, std::string& value) {
     std::string search_key = "\"" + key + "\"";
@@ -188,7 +200,9 @@ WebSocketMQTTBridge::WebSocketMQTTBridge(MQTTAllocator* allocator, MessageFormat
       session_manager_(nullptr),
       handlers_(mqtt::mqtt_stl_allocator<std::pair<const std::string, WebSocketProtocolHandler*>>(allocator)),
       subscriptions_(mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>(allocator)),
-      pending_binary_buffers_(mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>(allocator)) {
+      pending_binary_buffers_(mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>(allocator)),
+      client_protocol_versions_(mqtt::mqtt_stl_allocator<std::pair<const std::string, uint8_t>>(allocator)),
+      allow_mqtt3x_(true) {
 }
 
 WebSocketMQTTBridge::~WebSocketMQTTBridge() {
@@ -202,6 +216,7 @@ WebSocketMQTTBridge::~WebSocketMQTTBridge() {
     handlers_.clear();
     subscriptions_.clear();
     pending_binary_buffers_.clear();
+    client_protocol_versions_.clear();
 }
 
 int WebSocketMQTTBridge::init(mqtt::GlobalSessionManager* session_manager) {
@@ -222,6 +237,7 @@ int WebSocketMQTTBridge::register_handler(const std::string& client_id, WebSocke
     }
 
     handlers_[client_id] = handler;
+    client_protocol_versions_.erase(client_id);
     LOG_INFO("Registered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -250,6 +266,7 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
     // Remove handler
     handlers_.erase(client_id);
     pending_binary_buffers_.erase(client_id);
+    client_protocol_versions_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -373,8 +390,13 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         }
 
         std::vector<uint8_t> packet_bytes(pending.begin(), pending.begin() + packet_len);
+        uint8_t protocol_version_hint = 5;
+        auto version_it = client_protocol_versions_.find(client_id);
+        if (version_it != client_protocol_versions_.end()) {
+            protocol_version_hint = version_it->second;
+        }
         mqtt::Packet* packet = nullptr;
-        ret = parse_mqtt_packet(packet_bytes, packet);
+        ret = parse_mqtt_packet(packet_bytes, packet, protocol_version_hint);
         if (ret != MQ_SUCCESS || !packet) {
             if (ret == MQ_ERR_PACKET_INCOMPLETE) {
                 // Parser认为不完整时，继续等待更多数据，避免误断开。
@@ -387,6 +409,15 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             stats_.translation_errors++;
             pending.erase(pending.begin(), pending.begin() + packet_len);
             return ret;
+        }
+
+        if (version_it == client_protocol_versions_.end() &&
+            packet->type != mqtt::PacketType::CONNECT) {
+            LOG_WARN("WebSocket client {} must send CONNECT as first MQTT packet", client_id);
+            destroy_packet(packet);
+            pending.erase(pending.begin(), pending.begin() + packet_len);
+            stats_.translation_errors++;
+            return MQ_ERR_PROTOCOL;
         }
 
         // Handle different packet types
@@ -549,13 +580,15 @@ std::string WebSocketMQTTBridge::format_text_protocol(const std::string& topic,
     return text.str();
 }
 
-int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet) {
+int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet,
+                                           uint8_t protocol_version_hint) {
     if (!allocator_) {
         LOG_ERROR("Allocator is null");
         return MQ_ERR_MEMORY_ALLOC;
     }
 
     mqtt::MQTTParser parser(allocator_);
+    parser.set_protocol_version_hint(protocol_version_hint);
     return parser.parse_packet(data.data(), data.size(), &packet);
 }
 
@@ -695,11 +728,46 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
     LOG_INFO("Received MQTT CONNECT from WebSocket client {} (mqtt_client_id='{}')",
              client_id, mqtt::from_mqtt_string(packet->client_id));
 
+    if (!is_supported_protocol_name_version(packet->protocol_name, packet->protocol_version)) {
+        LOG_WARN("WebSocket client {} provided unsupported protocol name/version: '{}' v{}",
+                 client_id, mqtt::from_mqtt_string(packet->protocol_name), packet->protocol_version);
+        if (packet->protocol_version == 3 || packet->protocol_version == 4) {
+            client_protocol_versions_[client_id] = packet->protocol_version;
+        } else {
+            client_protocol_versions_[client_id] = 5;
+        }
+        mqtt::ConnAckPacket connack(allocator_);
+        connack.type = mqtt::PacketType::CONNACK;
+        connack.session_present = false;
+        connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
+        int ret = send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
+    }
+
+    if ((packet->protocol_version == 3 || packet->protocol_version == 4) && !allow_mqtt3x_) {
+        LOG_WARN("WebSocket client {} uses MQTT 3.x while it is disabled", client_id);
+        client_protocol_versions_[client_id] = packet->protocol_version;
+        mqtt::ConnAckPacket connack(allocator_);
+        connack.type = mqtt::PacketType::CONNACK;
+        connack.session_present = false;
+        connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
+        int ret = send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
+    }
+
+    client_protocol_versions_[client_id] = packet->protocol_version;
+
     mqtt::ConnAckPacket connack(allocator_);
     connack.type = mqtt::PacketType::CONNACK;
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::Success;
-    return send_serialized_mqtt_packet(client_id, connack);
+    int ret = send_serialized_mqtt_packet(client_id, connack);
+    if (ret != MQ_SUCCESS) {
+        client_protocol_versions_.erase(client_id);
+    }
+    return ret;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet) {
@@ -801,6 +869,12 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
     }
 
     mqtt::MQTTParser parser(allocator_);
+    auto version_it = client_protocol_versions_.find(client_id);
+    if (version_it != client_protocol_versions_.end()) {
+        parser.set_protocol_version_hint(version_it->second);
+    } else {
+        parser.set_protocol_version_hint(5);
+    }
     mqtt::MQTTSerializeBuffer serialized(allocator_);
     int ret = MQ_ERR_PACKET_TYPE;
 

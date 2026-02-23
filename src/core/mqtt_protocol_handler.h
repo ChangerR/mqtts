@@ -49,6 +49,9 @@ class MQTTProtocolHandler
   }
   auth::AuthManager* get_auth_manager() const { return auth_manager_; }
 
+  void set_allow_mqtt3x(bool allow_mqtt3x) { allow_mqtt3x_ = allow_mqtt3x; }
+  bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
+
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
   int handle_connack(const ConnAckPacket* packet);
@@ -146,6 +149,8 @@ class MQTTProtocolHandler
   uint16_t topic_alias_maximum_;
   bool request_response_information_;
   bool request_problem_information_;
+  uint8_t negotiated_protocol_version_;
+  bool allow_mqtt3x_;
 
   MQTTSerializeBuffer* serialize_buffer_;  // 复用的序列化缓冲区
 

@@ -23,6 +23,9 @@ class MQTTParser
   // Parse a complete MQTT packet from buffer
   int parse_packet(const uint8_t* buffer, size_t length, Packet** packet);
 
+  void set_protocol_version_hint(uint8_t protocol_version) { protocol_version_hint_ = protocol_version; }
+  uint8_t get_protocol_version_hint() const { return protocol_version_hint_; }
+
   // Parse specific packet types
   int parse_connect(const uint8_t* buffer, size_t length, ConnectPacket** packet);
   int parse_connack(const uint8_t* buffer, size_t length, ConnAckPacket** packet);
@@ -85,7 +88,12 @@ class MQTTParser
   // Helper function to map string util error codes to parser error codes
   int map_string_util_error(int string_util_error) const;
 
+  bool is_legacy_protocol_hint() const { return protocol_version_hint_ < 5; }
+  uint8_t map_reason_code_to_legacy_connack(ReasonCode reason_code) const;
+  uint8_t map_reason_code_to_legacy_suback(ReasonCode reason_code) const;
+
   MQTTAllocator* allocator_;
+  uint8_t protocol_version_hint_;
 };
 
 }  // namespace mqtt

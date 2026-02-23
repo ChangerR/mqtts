@@ -15,6 +15,21 @@ namespace mqtt {
 static const size_t INITIAL_BUFFER_SIZE = 1024;
 static const size_t MAX_BUFFER_SIZE = 1024 * 1024;  // 1MB max size
 
+namespace {
+static bool is_supported_protocol_name_version(const MQTTString& protocol_name,
+                                               uint8_t protocol_version)
+{
+  const std::string name = from_mqtt_string(protocol_name);
+  if (protocol_version == 3) {
+    return name == "MQIsdp";
+  }
+  if (protocol_version == 4 || protocol_version == 5) {
+    return name == "MQTT";
+  }
+  return false;
+}
+}  // namespace
+
 MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
     : buffer_(nullptr),
       current_buffer_size_(0),
@@ -39,6 +54,8 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       topic_alias_maximum_(0),
       request_response_information_(false),
       request_problem_information_(true),
+      negotiated_protocol_version_(5),
+      allow_mqtt3x_(true),
       serialize_buffer_(nullptr),
       write_lock_acquired_(false),
       write_lock_condition_(),
@@ -56,6 +73,9 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
 
   // Create parser
   parser_ = new (allocator_->allocate(sizeof(MQTTParser))) MQTTParser(allocator_);
+  if (parser_) {
+    parser_->set_protocol_version_hint(5);
+  }
 
   // Create serialize buffer
   serialize_buffer_ =
@@ -477,17 +497,44 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
             client_ip_.c_str(), client_port_, packet->protocol_version,
             from_mqtt_string(packet->client_id), packet->flags.clean_start);
 
-  // Check protocol version
-  if (packet->protocol_version != 5) {
-    LOG_ERROR("Unsupported protocol version: {} from client {}:{}", packet->protocol_version,
+  auto reject_connect = [this, packet](ReasonCode reason_code, int err_code) -> int {
+    uint8_t response_version = 5;
+    if (packet->protocol_version == 3 || packet->protocol_version == 4) {
+      response_version = packet->protocol_version;
+    }
+    negotiated_protocol_version_ = response_version;
+    parser_->set_protocol_version_hint(response_version);
+    int send_ret = send_connack(reason_code, false);
+    connected_ = false;
+    if (socket_) {
+      socket_->close();
+    }
+    if (send_ret != MQ_SUCCESS) {
+      return send_ret;
+    }
+    return err_code;
+  };
+
+  if (!is_supported_protocol_name_version(packet->protocol_name, packet->protocol_version)) {
+    LOG_ERROR("Unsupported protocol name/version combination: name='{}', version={} from client {}:{}",
+              from_mqtt_string(packet->protocol_name), packet->protocol_version,
               client_ip_.c_str(), client_port_);
-    return MQ_ERR_CONNECT_PROTOCOL;
+    return reject_connect(ReasonCode::UnsupportedProtocolVersion, MQ_ERR_CONNECT_PROTOCOL);
   }
+
+  if ((packet->protocol_version == 3 || packet->protocol_version == 4) && !allow_mqtt3x_) {
+    LOG_ERROR("MQTT 3.x is disabled, rejecting client {}:{} using version {}", client_ip_.c_str(),
+              client_port_, packet->protocol_version);
+    return reject_connect(ReasonCode::UnsupportedProtocolVersion, MQ_ERR_CONNECT_PROTOCOL);
+  }
+
+  negotiated_protocol_version_ = packet->protocol_version;
+  parser_->set_protocol_version_hint(negotiated_protocol_version_);
 
   // Check if client ID is valid
   if (packet->client_id.empty()) {
     LOG_ERROR("Empty client ID from client {}:{}", client_ip_.c_str(), client_port_);
-    return MQ_ERR_CONNECT_CLIENT_ID;
+    return reject_connect(ReasonCode::ClientIdentifierNotValid, MQ_ERR_CONNECT_CLIENT_ID);
   }
 
   // Perform authentication if auth manager is available
@@ -497,7 +544,7 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
       current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
       if (!current_user_info_) {
         LOG_ERROR("Failed to allocate memory for user info");
-        return send_connack(ReasonCode::ServerUnavailable, false);
+        return reject_connect(ReasonCode::ServerUnavailable, MQ_ERR_MEMORY_ALLOC);
       }
       new (current_user_info_) auth::UserInfo(allocator_);
     }
@@ -520,23 +567,23 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
       case auth::AuthResult::INVALID_CREDENTIALS:
         LOG_WARN("Client {}:{} authentication failed: invalid credentials for user '{}'", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return send_connack(ReasonCode::BadUserNameOrPassword, false);
+        return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
       case auth::AuthResult::USER_NOT_FOUND:
         LOG_WARN("Client {}:{} authentication failed: user '{}' not found", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return send_connack(ReasonCode::BadUserNameOrPassword, false);
+        return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
       case auth::AuthResult::ACCESS_DENIED:
         LOG_WARN("Client {}:{} authentication failed: access denied for user '{}'", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return send_connack(ReasonCode::NotAuthorized, false);
+        return reject_connect(ReasonCode::NotAuthorized, MQ_ERR_CONNECT_NOT_AUTHORIZED);
       case auth::AuthResult::RATE_LIMITED:
         LOG_WARN("Client {}:{} authentication failed: rate limited for user '{}'", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return send_connack(ReasonCode::ConnectionRateExceeded, false);
+        return reject_connect(ReasonCode::ConnectionRateExceeded, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
       default:
         LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'", 
                   client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return send_connack(ReasonCode::ServerUnavailable, false);
+        return reject_connect(ReasonCode::ServerUnavailable, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
     }
   } else {
     LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}", 
@@ -882,6 +929,15 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
 
 int MQTTProtocolHandler::handle_auth(const AuthPacket* packet)
 {
+  if (negotiated_protocol_version_ < 5) {
+    LOG_WARN("Received AUTH in MQTT 3.x session from client {}:{}", client_ip_.c_str(),
+             client_port_);
+    if (socket_) {
+      socket_->close();
+    }
+    return MQ_ERR_PACKET_TYPE;
+  }
+
   if (!connected_) {
     LOG_ERROR("Received AUTH but not connected");
     return MQ_ERR_SESSION_NOT_CONNECTED;

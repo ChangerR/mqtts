@@ -65,17 +65,38 @@ static bool header_value(const std::string& request, const std::string& header_n
     return false;
 }
 
-static bool contains_protocol_token(const std::string& offered, const std::string& protocol) {
-    const std::string wanted = to_lower_ascii(protocol);
+static bool is_supported_mqtt_subprotocol_token(const std::string& token) {
+    std::string normalized = trim_ascii(token);
+    if (normalized.size() >= 2) {
+        const char first = normalized.front();
+        const char last = normalized.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            normalized = normalized.substr(1, normalized.size() - 2);
+            normalized = trim_ascii(normalized);
+        }
+    }
+
+    const std::string lower = to_lower_ascii(normalized);
+    if (lower == "mqtt") {
+        return true;
+    }
+
+    // Accept versioned MQTT subprotocol tokens such as mqttv3.1/mqttv3.1.1/mqttv5.
+    return lower.rfind("mqttv", 0) == 0;
+}
+
+static bool select_supported_subprotocol(const std::string& offered, std::string& selected) {
     size_t start = 0;
     while (start < offered.size()) {
         size_t comma = offered.find(',', start);
         std::string token = trim_ascii(offered.substr(start, comma == std::string::npos
                                                                 ? std::string::npos
                                                                 : comma - start));
-        if (to_lower_ascii(token) == wanted) {
+        if (is_supported_mqtt_subprotocol_token(token)) {
+            selected = token;
             return true;
         }
+
         if (comma == std::string::npos) {
             break;
         }
@@ -251,7 +272,7 @@ int WebSocketProtocolHandler::handle_handshake() {
     }
 
     if (bridge_) {
-        if (selected_subprotocol_ == "mqtt") {
+        if (is_supported_mqtt_subprotocol_token(selected_subprotocol_)) {
             bridge_->set_message_format(MessageFormat::MQTT_PACKET);
             LOG_INFO("WebSocket subprotocol '{}' selected, bridge switched to MQTT_PACKET mode",
                      selected_subprotocol_);
@@ -348,9 +369,7 @@ int WebSocketProtocolHandler::parse_handshake_request(const std::string& request
 
     std::string offered_subprotocols;
     if (header_value(request, "Sec-WebSocket-Protocol", offered_subprotocols)) {
-        if (contains_protocol_token(offered_subprotocols, "mqtt")) {
-            selected_subprotocol_ = "mqtt";
-        }
+        (void)select_supported_subprotocol(offered_subprotocols, selected_subprotocol_);
         LOG_DEBUG("Client offered subprotocols: '{}', selected: '{}'",
                   offered_subprotocols,
                   selected_subprotocol_.empty() ? std::string("<none>") : selected_subprotocol_);

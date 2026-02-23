@@ -531,6 +531,139 @@ TEST_F(MQTTv5ComprehensiveTest, PubCompPacketBasic)
     EXPECT_EQ(pubcomp->reason_code, ReasonCode::Success);
 }
 
+// ============= MQTT 3.x Compatibility Tests =============
+
+TEST_F(MQTTv5ComprehensiveTest, ConnectPacketMQTT31Basic)
+{
+    uint8_t connect_data[] = {
+        0x10, 0x11,
+        0x00, 0x06, 'M', 'Q', 'I', 's', 'd', 'p',
+        0x03,
+        0x02,
+        0x00, 0x3c,
+        0x00, 0x03, 'c', 'i', 'd'
+    };
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(connect_data, sizeof(connect_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::CONNECT);
+
+    ConnectPacket* connect = static_cast<ConnectPacket*>(packet);
+    EXPECT_EQ(connect->protocol_name, "MQIsdp");
+    EXPECT_EQ(connect->protocol_version, 3);
+    EXPECT_TRUE(connect->flags.clean_start);
+    EXPECT_EQ(connect->client_id, "cid");
+}
+
+TEST_F(MQTTv5ComprehensiveTest, ConnectPacketMQTT311Basic)
+{
+    uint8_t connect_data[] = {
+        0x10, 0x0f,
+        0x00, 0x04, 'M', 'Q', 'T', 'T',
+        0x04,
+        0x02,
+        0x00, 0x3c,
+        0x00, 0x03, 'c', 'i', 'd'
+    };
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(connect_data, sizeof(connect_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::CONNECT);
+
+    ConnectPacket* connect = static_cast<ConnectPacket*>(packet);
+    EXPECT_EQ(connect->protocol_name, "MQTT");
+    EXPECT_EQ(connect->protocol_version, 4);
+    EXPECT_TRUE(connect->flags.clean_start);
+    EXPECT_EQ(connect->client_id, "cid");
+}
+
+TEST_F(MQTTv5ComprehensiveTest, LegacyPublishWithoutProperties)
+{
+    parser->set_protocol_version_hint(4);
+    uint8_t publish_data[] = {
+        0x32, 0x09,
+        0x00, 0x03, 'a', '/', 'b',
+        0x00, 0x01,
+        'h', 'i'
+    };
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(publish_data, sizeof(publish_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::PUBLISH);
+
+    PublishPacket* publish = static_cast<PublishPacket*>(packet);
+    EXPECT_EQ(publish->qos, 1);
+    EXPECT_EQ(publish->packet_id, 1);
+    EXPECT_EQ(publish->topic_name, "a/b");
+    EXPECT_EQ(std::string(publish->payload.begin(), publish->payload.end()), "hi");
+}
+
+TEST_F(MQTTv5ComprehensiveTest, LegacySubscribeWithoutProperties)
+{
+    parser->set_protocol_version_hint(4);
+    uint8_t subscribe_data[] = {
+        0x82, 0x08,
+        0x00, 0x01,
+        0x00, 0x03, 'a', '/', 'b',
+        0x01
+    };
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(subscribe_data, sizeof(subscribe_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::SUBSCRIBE);
+
+    SubscribePacket* subscribe = static_cast<SubscribePacket*>(packet);
+    ASSERT_EQ(subscribe->subscriptions.size(), 1u);
+    EXPECT_EQ(subscribe->packet_id, 1);
+    EXPECT_EQ(subscribe->subscriptions[0].first, "a/b");
+    EXPECT_EQ(subscribe->subscriptions[0].second, 1);
+}
+
+TEST_F(MQTTv5ComprehensiveTest, LegacyUnsubscribeWithoutProperties)
+{
+    parser->set_protocol_version_hint(4);
+    uint8_t unsubscribe_data[] = {
+        0xa2, 0x07,
+        0x00, 0x01,
+        0x00, 0x03, 'a', '/', 'b'
+    };
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(unsubscribe_data, sizeof(unsubscribe_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::UNSUBSCRIBE);
+
+    UnsubscribePacket* unsubscribe = static_cast<UnsubscribePacket*>(packet);
+    ASSERT_EQ(unsubscribe->topic_filters.size(), 1u);
+    EXPECT_EQ(unsubscribe->packet_id, 1);
+    EXPECT_EQ(unsubscribe->topic_filters[0], "a/b");
+}
+
+TEST_F(MQTTv5ComprehensiveTest, LegacyPubAckPacketRemainingLength2)
+{
+    parser->set_protocol_version_hint(4);
+    uint8_t puback_data[] = {0x40, 0x02, 0x00, 0x0a};
+
+    Packet* packet = nullptr;
+    int ret = parser->parse_packet(puback_data, sizeof(puback_data), &packet);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    ASSERT_NE(packet, nullptr);
+    ASSERT_EQ(packet->type, PacketType::PUBACK);
+
+    PubAckPacket* puback = static_cast<PubAckPacket*>(packet);
+    EXPECT_EQ(puback->packet_id, 10);
+    EXPECT_EQ(puback->reason_code, ReasonCode::Success);
+}
+
 // ============= Error Condition Tests =============
 
 TEST_F(MQTTv5ComprehensiveTest, InvalidPacketType)

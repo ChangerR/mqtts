@@ -1,6 +1,6 @@
 # MQTTS
 
-MQTTS 是一个基于 C++ 的 MQTT v5.0 服务端实现。
+MQTTS 是一个基于 C++ 的 MQTT 服务端实现，支持 MQTT v5.0，并兼容 MQTT 3.1 / 3.1.1（默认开启）。
 
 ## 容器优先约定（重要）
 
@@ -28,6 +28,18 @@ MQTTS 是一个基于 C++ 的 MQTT v5.0 服务端实现。
 - 构建开发镜像（基于 `.devcontainer/Dockerfile`）
 - 在容器中执行 CMake configure + build
 - 在容器中执行 `ctest --output-on-failure`
+
+## 协议兼容开关
+
+在 `mqtts.yaml` 的 `mqtt` 段中可通过 `allow_mqtt3x` 控制是否允许 MQTT 3.1/3.1.1 客户端接入：
+
+```yaml
+mqtt:
+  allow_mqtt3x: true
+```
+
+- `true`：允许 MQTT 3.1/3.1.1 + MQTT 5.0（默认）
+- `false`：仅允许 MQTT 5.0
 
 ## 分步骤命令
 

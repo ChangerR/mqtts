@@ -75,9 +75,11 @@ MQTTServer::MQTTServer(const std::string& host, int port)
   server_config_.max_connections = 1000;
   server_config_.backlog = 128;
   memory_config_.client_max_size = 1048576;
+  mqtt_protocol_config_ = mqtt::MQTTProtocolConfig();
 }
 
-MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config)
+MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config,
+                       const mqtt::MQTTProtocolConfig& mqtt_protocol_config)
     : accept_co_(NULL),
       server_socket_(NULL),
       running_(false),
@@ -85,6 +87,7 @@ MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfi
       port_(config.port),
       server_config_(config),
       memory_config_(memory_config),
+      mqtt_protocol_config_(mqtt_protocol_config),
       current_connections_(0)
 {
 }
@@ -391,6 +394,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
     websocket::WebSocketMQTTBridge* bridge =
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketMQTTBridge)))
         websocket::WebSocketMQTTBridge(ctx->allocator, websocket::MessageFormat::JSON);
+    bridge->set_allow_mqtt3x(ctx->server->mqtt_protocol_config_.allow_mqtt3x);
 
     // Create adapter to bridge WebSocket and MQTT protocol handlers
     websocket::WebSocketHandlerAdapter* adapter =
@@ -453,6 +457,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
     // Create protocol handler
     MQTTProtocolHandler* handler = new (ctx->allocator->allocate(sizeof(MQTTProtocolHandler)))
         MQTTProtocolHandler(ctx->allocator);
+    handler->set_allow_mqtt3x(ctx->server->mqtt_protocol_config_.allow_mqtt3x);
 
     // Initialize handler
     if (MQ_FAIL(handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {

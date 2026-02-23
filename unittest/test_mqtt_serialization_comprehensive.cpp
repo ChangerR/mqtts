@@ -755,6 +755,95 @@ TEST_F(MQTTv5SerializationTest, RoundTripAllPacketTypes)
     }
 }
 
+TEST_F(MQTTv5SerializationTest, LegacyConnAckSerializationMapping)
+{
+    parser->set_protocol_version_hint(4);
+
+    ConnAckPacket connack(test_allocator);
+    connack.type = PacketType::CONNACK;
+    connack.session_present = false;
+    connack.reason_code = ReasonCode::NotAuthorized;
+
+    MQTTSerializeBuffer buffer(test_allocator);
+    int ret = parser->serialize_connack(&connack, buffer);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+
+    std::vector<uint8_t> expected = {0x20, 0x02, 0x00, 0x05};
+    ASSERT_EQ(buffer.size(), expected.size());
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.data()));
+}
+
+TEST_F(MQTTv5SerializationTest, LegacySubAckSerializationMapping)
+{
+    parser->set_protocol_version_hint(4);
+
+    SubAckPacket suback(test_allocator);
+    suback.type = PacketType::SUBACK;
+    suback.packet_id = 1;
+    suback.reason_codes.push_back(ReasonCode::GrantedQoS1);
+    suback.reason_codes.push_back(ReasonCode::NotAuthorized);
+
+    MQTTSerializeBuffer buffer(test_allocator);
+    int ret = parser->serialize_suback(&suback, buffer);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+
+    std::vector<uint8_t> expected = {0x90, 0x04, 0x00, 0x01, 0x01, 0x80};
+    ASSERT_EQ(buffer.size(), expected.size());
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.data()));
+}
+
+TEST_F(MQTTv5SerializationTest, LegacyUnsubAckAndDisconnectSerialization)
+{
+    parser->set_protocol_version_hint(4);
+
+    UnsubAckPacket unsuback(test_allocator);
+    unsuback.type = PacketType::UNSUBACK;
+    unsuback.packet_id = 0x1234;
+
+    MQTTSerializeBuffer unsuback_buffer(test_allocator);
+    int ret = parser->serialize_unsuback(&unsuback, unsuback_buffer);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    std::vector<uint8_t> unsuback_expected = {0xb0, 0x02, 0x12, 0x34};
+    ASSERT_EQ(unsuback_buffer.size(), unsuback_expected.size());
+    EXPECT_TRUE(
+        std::equal(unsuback_expected.begin(), unsuback_expected.end(), unsuback_buffer.data()));
+
+    DisconnectPacket disconnect(test_allocator);
+    disconnect.type = PacketType::DISCONNECT;
+    disconnect.reason_code = ReasonCode::NormalDisconnection;
+
+    MQTTSerializeBuffer disconnect_buffer(test_allocator);
+    ret = parser->serialize_disconnect(&disconnect, disconnect_buffer);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+    std::vector<uint8_t> disconnect_expected = {0xe0, 0x00};
+    ASSERT_EQ(disconnect_buffer.size(), disconnect_expected.size());
+    EXPECT_TRUE(
+        std::equal(disconnect_expected.begin(), disconnect_expected.end(), disconnect_buffer.data()));
+}
+
+TEST_F(MQTTv5SerializationTest, LegacyPublishSerializationWithoutProperties)
+{
+    parser->set_protocol_version_hint(4);
+
+    PublishPacket publish(test_allocator);
+    publish.type = PacketType::PUBLISH;
+    publish.qos = 1;
+    publish.retain = false;
+    publish.dup = false;
+    publish.topic_name = "a/b";
+    publish.packet_id = 7;
+    publish.payload = {'o', 'k'};
+    publish.properties.message_expiry_interval = 60;  // Legacy path should ignore properties.
+
+    MQTTSerializeBuffer buffer(test_allocator);
+    int ret = parser->serialize_publish(&publish, buffer);
+    ASSERT_EQ(ret, MQ_SUCCESS);
+
+    std::vector<uint8_t> expected = {0x32, 0x09, 0x00, 0x03, 'a', '/', 'b', 0x00, 0x07, 'o', 'k'};
+    ASSERT_EQ(buffer.size(), expected.size());
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buffer.data()));
+}
+
 int main(int argc, char** argv)
 {
     ::testing::InitGoogleTest(&argc, argv);

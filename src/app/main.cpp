@@ -23,7 +23,7 @@ void run_mqtt_server(const mqtt::Config& config)
   LOG_INFO("Session manager initialized for {} threads, {} max clients", config.server.thread_count,
            config.server.max_connections);
 
-  MQTTServer server(config.server, config.memory);
+  MQTTServer server(config.server, config.memory, config.mqtt);
 
   LOG_INFO("Starting MQTT server on {}:{}", config.server.bind_address, config.server.port);
 
@@ -219,6 +219,7 @@ int main(int argc, char* argv[])
   LOG_INFO("  线程数: {}", config.server.thread_count);
   LOG_INFO("  最大包大小: {} bytes", config.mqtt.max_packet_size);
   LOG_INFO("  保活时间: {} seconds", config.mqtt.keep_alive_default);
+  LOG_INFO("  允许 MQTT 3.x: {}", config.mqtt.allow_mqtt3x ? "true" : "false");
   LOG_INFO("  客户端内存大小: {} MB", config.memory.client_max_size / (1024 * 1024));
 
   run_mqtt_server(config);

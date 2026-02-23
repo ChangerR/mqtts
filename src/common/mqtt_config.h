@@ -40,6 +40,7 @@ struct MQTTProtocolConfig
   bool shared_subscription_available = false;     // 是否支持共享订阅
   uint16_t topic_alias_maximum = 65535;           // 主题别名最大值
   uint16_t receive_maximum = 65535;               // 接收最大值
+  bool allow_mqtt3x = true;                       // 是否允许 MQTT 3.1 / 3.1.1
 };
 
 /**

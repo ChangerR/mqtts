@@ -169,6 +169,10 @@ void ConfigManager::parse_mqtt_config(const YAML::Node& node)
   if (node["receive_maximum"]) {
     config_.mqtt.receive_maximum = node["receive_maximum"].as<uint16_t>();
   }
+
+  if (node["allow_mqtt3x"]) {
+    config_.mqtt.allow_mqtt3x = node["allow_mqtt3x"].as<bool>();
+  }
 }
 
 void ConfigManager::parse_memory_config(const YAML::Node& node)

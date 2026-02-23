@@ -82,6 +82,8 @@ public:
     // Configuration
     void set_message_format(MessageFormat format) { format_ = format; }
     MessageFormat get_message_format() const { return format_; }
+    void set_allow_mqtt3x(bool allow_mqtt3x) { allow_mqtt3x_ = allow_mqtt3x; }
+    bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
 
     // Statistics
     BridgeStatistics& get_statistics() { return stats_; }
@@ -103,7 +105,8 @@ private:
     std::string format_text_protocol(const std::string& topic, const std::vector<uint8_t>& payload);
 
     // Binary MQTT packet handling
-    int parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet);
+    int parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet,
+                          uint8_t protocol_version_hint);
     int handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet);
     int handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet);
     int handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet);
@@ -146,9 +149,15 @@ private:
                                                std::equal_to<std::string>,
                                                mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>>;
     BinaryBufferMap pending_binary_buffers_;
+    using ProtocolVersionMap = std::unordered_map<std::string, uint8_t,
+                                                  std::hash<std::string>,
+                                                  std::equal_to<std::string>,
+                                                  mqtt::mqtt_stl_allocator<std::pair<const std::string, uint8_t>>>;
+    ProtocolVersionMap client_protocol_versions_;
 
     // Statistics
     BridgeStatistics stats_;
+    bool allow_mqtt3x_ = true;
 };
 
 }  // namespace websocket

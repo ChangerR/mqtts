@@ -19,6 +19,7 @@ mqtt:
   shared_subscription_available: false  # 支持共享订阅
   topic_alias_maximum: 65535  # 主题别名最大值
   receive_maximum: 65535  # 接收最大值
+  allow_mqtt3x: true  # 允许 MQTT 3.1 / 3.1.1 客户端
 
 # 内存配置
 memory:
