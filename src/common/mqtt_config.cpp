@@ -42,6 +42,11 @@ int ConfigManager::load_from_file(const std::string& config_file)
       parse_auth_config(root["auth"]);
     }
 
+    if (root["websocket"]) {
+      LOG_WARN("检测到 websocket 配置段。当前版本使用 server 监听端口处理 WebSocket，"
+               "请将宿主机 WebSocket 端口转发到容器 server.port。");
+    }
+
     // 验证配置
     int ret = validate();
     if (ret != 0) {

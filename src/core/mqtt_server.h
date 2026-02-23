@@ -19,6 +19,7 @@ struct ClientContext
   MQTTServer* server;  // Server instance pointer
   MQTTSocket* client;
   std::string client_id;
+  std::string trace_id;
   std::string client_ip;
   int client_port;
   MQTTAllocator* allocator;  // Client-specific allocator

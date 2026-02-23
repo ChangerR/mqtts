@@ -90,6 +90,7 @@ public:
     void set_client_id(const std::string& client_id) { client_id_ = client_id; }
     const std::string& get_client_ip() const { return client_ip_; }
     int get_client_port() const { return client_port_; }
+    const std::string& get_selected_subprotocol() const { return selected_subprotocol_; }
 
     // Bridge integration
     void set_bridge(WebSocketMQTTBridge* bridge) { bridge_ = bridge; }
@@ -127,6 +128,7 @@ private:
     WebSocketState state_;
     std::string client_id_;
     std::string client_ip_;
+    std::string selected_subprotocol_;
     int client_port_;
 
     // Components

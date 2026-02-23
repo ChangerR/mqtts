@@ -280,6 +280,7 @@ if docker build $BUILD_ARGS -t "$IMAGE_NAME" .; then
     echo "   docker run -d \\"
     echo "     --name mqtts \\"
     echo "     -p 1883:1883 \\"
+    echo "     -p 18080:1883 \\"
     echo "     $IMAGE_NAME"
     echo
     echo "2. 查看容器状态:"

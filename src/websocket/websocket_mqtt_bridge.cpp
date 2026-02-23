@@ -1,4 +1,5 @@
 #include "websocket_mqtt_bridge.h"
+#include <algorithm>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
@@ -9,6 +10,42 @@
 #include "websocket_protocol_handler.h"
 
 namespace websocket {
+
+static int mqtt_packet_total_length(const uint8_t* data, size_t data_len, size_t& total_len) {
+    total_len = 0;
+    if (!data || data_len < 2) {
+        return MQ_ERR_PACKET_INCOMPLETE;
+    }
+
+    // Byte 0 is packet type+flags, remaining length starts at byte 1.
+    uint32_t remaining_length = 0;
+    uint32_t multiplier = 1;
+    size_t remaining_length_bytes = 0;
+    const size_t max_remaining_length_bytes = 4;
+
+    while (remaining_length_bytes < max_remaining_length_bytes) {
+        const size_t idx = 1 + remaining_length_bytes;
+        if (idx >= data_len) {
+            return MQ_ERR_PACKET_INCOMPLETE;
+        }
+
+        uint8_t encoded = data[idx];
+        remaining_length += static_cast<uint32_t>(encoded & 0x7F) * multiplier;
+        remaining_length_bytes++;
+
+        if ((encoded & 0x80) == 0) {
+            total_len = 1 + remaining_length_bytes + static_cast<size_t>(remaining_length);
+            if (data_len < total_len) {
+                return MQ_ERR_PACKET_INCOMPLETE;
+            }
+            return MQ_SUCCESS;
+        }
+
+        multiplier *= 128;
+    }
+
+    return MQ_ERR_PACKET_INVALID;
+}
 
 // Simple JSON parsing helpers
 static bool json_get_string(const std::string& json, const std::string& key, std::string& value) {
@@ -150,7 +187,8 @@ WebSocketMQTTBridge::WebSocketMQTTBridge(MQTTAllocator* allocator, MessageFormat
       format_(format),
       session_manager_(nullptr),
       handlers_(mqtt::mqtt_stl_allocator<std::pair<const std::string, WebSocketProtocolHandler*>>(allocator)),
-      subscriptions_(mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>(allocator)) {
+      subscriptions_(mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>(allocator)),
+      pending_binary_buffers_(mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>(allocator)) {
 }
 
 WebSocketMQTTBridge::~WebSocketMQTTBridge() {
@@ -163,6 +201,7 @@ WebSocketMQTTBridge::~WebSocketMQTTBridge() {
     }
     handlers_.clear();
     subscriptions_.clear();
+    pending_binary_buffers_.clear();
 }
 
 int WebSocketMQTTBridge::init(mqtt::GlobalSessionManager* session_manager) {
@@ -210,6 +249,7 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
 
     // Remove handler
     handlers_.erase(client_id);
+    pending_binary_buffers_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -312,48 +352,124 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         return MQ_ERR_INVALID_STATE;
     }
 
-    // Parse MQTT packet
-    mqtt::Packet* packet = nullptr;
-    int ret = parse_mqtt_packet(data, packet);
-    if (ret != MQ_SUCCESS || !packet) {
-        LOG_ERROR("Failed to parse MQTT packet: {}", ret);
-        stats_.translation_errors++;
-        return ret;
+    BinaryBuffer& pending = pending_binary_buffers_[client_id];
+    pending.insert(pending.end(), data.begin(), data.end());
+
+    int ret = MQ_SUCCESS;
+    while (!pending.empty()) {
+        size_t packet_len = 0;
+        ret = mqtt_packet_total_length(pending.data(), pending.size(), packet_len);
+        if (ret == MQ_ERR_PACKET_INCOMPLETE) {
+            LOG_TRACE("MQTT packet for client {} is incomplete, buffered {} bytes",
+                      client_id, pending.size());
+            return MQ_SUCCESS;
+        }
+
+        if (ret != MQ_SUCCESS) {
+            LOG_ERROR("Invalid MQTT packet framing for client {}: {}", client_id, ret);
+            stats_.translation_errors++;
+            pending.clear();
+            return ret;
+        }
+
+        std::vector<uint8_t> packet_bytes(pending.begin(), pending.begin() + packet_len);
+        mqtt::Packet* packet = nullptr;
+        ret = parse_mqtt_packet(packet_bytes, packet);
+        if (ret != MQ_SUCCESS || !packet) {
+            if (ret == MQ_ERR_PACKET_INCOMPLETE) {
+                // Parser认为不完整时，继续等待更多数据，避免误断开。
+                LOG_TRACE("Parser reported incomplete MQTT packet for client {}, buffered {} bytes",
+                          client_id, pending.size());
+                return MQ_SUCCESS;
+            }
+
+            LOG_ERROR("Failed to parse MQTT packet for client {}: {}", client_id, ret);
+            stats_.translation_errors++;
+            pending.erase(pending.begin(), pending.begin() + packet_len);
+            return ret;
+        }
+
+        // Handle different packet types
+        switch (packet->type) {
+            case mqtt::PacketType::CONNECT:
+                ret = handle_mqtt_connect(client_id, static_cast<const mqtt::ConnectPacket*>(packet));
+                break;
+            case mqtt::PacketType::SUBSCRIBE:
+                ret = handle_mqtt_subscribe(client_id, static_cast<const mqtt::SubscribePacket*>(packet));
+                break;
+            case mqtt::PacketType::UNSUBSCRIBE:
+                ret = handle_mqtt_unsubscribe(client_id, static_cast<const mqtt::UnsubscribePacket*>(packet));
+                break;
+            case mqtt::PacketType::PUBLISH:
+                ret = handle_mqtt_publish_packet(client_id, static_cast<const mqtt::PublishPacket*>(packet));
+                break;
+            case mqtt::PacketType::PINGREQ:
+                ret = handle_mqtt_pingreq(client_id);
+                break;
+            case mqtt::PacketType::PINGRESP:
+                // Client may send PINGRESP in some stacks; it's harmless for broker-side bridge.
+                LOG_TRACE("Received MQTT PINGRESP from WebSocket client {}", client_id);
+                ret = MQ_SUCCESS;
+                break;
+            case mqtt::PacketType::DISCONNECT:
+                ret = handle_mqtt_disconnect(client_id);
+                break;
+            case mqtt::PacketType::PUBACK:
+                {
+                    const auto* puback = static_cast<const mqtt::PubAckPacket*>(packet);
+                    LOG_DEBUG("Received MQTT PUBACK from WebSocket client {} (packet_id={}, reason=0x{:02x})",
+                              client_id, puback->packet_id, static_cast<uint8_t>(puback->reason_code));
+                    ret = MQ_SUCCESS;
+                }
+                break;
+            case mqtt::PacketType::PUBREC:
+                {
+                    const auto* pubrec = static_cast<const mqtt::PubRecPacket*>(packet);
+                    LOG_DEBUG("Received MQTT PUBREC from WebSocket client {} (packet_id={}, reason=0x{:02x})",
+                              client_id, pubrec->packet_id, static_cast<uint8_t>(pubrec->reason_code));
+                    mqtt::PubRelPacket pubrel(allocator_);
+                    pubrel.type = mqtt::PacketType::PUBREL;
+                    pubrel.packet_id = pubrec->packet_id;
+                    pubrel.reason_code = mqtt::ReasonCode::Success;
+                    ret = send_serialized_mqtt_packet(client_id, pubrel);
+                }
+                break;
+            case mqtt::PacketType::PUBREL:
+                {
+                    const auto* pubrel = static_cast<const mqtt::PubRelPacket*>(packet);
+                    LOG_DEBUG("Received MQTT PUBREL from WebSocket client {} (packet_id={}, reason=0x{:02x})",
+                              client_id, pubrel->packet_id, static_cast<uint8_t>(pubrel->reason_code));
+                    mqtt::PubCompPacket pubcomp(allocator_);
+                    pubcomp.type = mqtt::PacketType::PUBCOMP;
+                    pubcomp.packet_id = pubrel->packet_id;
+                    pubcomp.reason_code = mqtt::ReasonCode::Success;
+                    ret = send_serialized_mqtt_packet(client_id, pubcomp);
+                }
+                break;
+            case mqtt::PacketType::PUBCOMP:
+                {
+                    const auto* pubcomp = static_cast<const mqtt::PubCompPacket*>(packet);
+                    LOG_DEBUG("Received MQTT PUBCOMP from WebSocket client {} (packet_id={}, reason=0x{:02x})",
+                              client_id, pubcomp->packet_id, static_cast<uint8_t>(pubcomp->reason_code));
+                    ret = MQ_SUCCESS;
+                }
+                break;
+            default:
+                LOG_WARN("Unsupported MQTT packet type from WebSocket: {}", static_cast<int>(packet->type));
+                ret = MQ_ERR_PACKET_TYPE;
+                break;
+        }
+
+        destroy_packet(packet);
+        pending.erase(pending.begin(), pending.begin() + packet_len);
+
+        if (ret != MQ_SUCCESS) {
+            stats_.translation_errors++;
+            return ret;
+        }
     }
 
-    // Handle different packet types
-    switch (packet->type) {
-        case mqtt::PacketType::CONNECT:
-            ret = handle_mqtt_connect(client_id, static_cast<const mqtt::ConnectPacket*>(packet));
-            break;
-        case mqtt::PacketType::SUBSCRIBE:
-            ret = handle_mqtt_subscribe(client_id, static_cast<const mqtt::SubscribePacket*>(packet));
-            break;
-        case mqtt::PacketType::UNSUBSCRIBE:
-            ret = handle_mqtt_unsubscribe(client_id, static_cast<const mqtt::UnsubscribePacket*>(packet));
-            break;
-        case mqtt::PacketType::PUBLISH:
-            ret = handle_mqtt_publish_packet(client_id, static_cast<const mqtt::PublishPacket*>(packet));
-            break;
-        case mqtt::PacketType::PINGREQ:
-            ret = handle_mqtt_pingreq(client_id);
-            break;
-        case mqtt::PacketType::DISCONNECT:
-            ret = handle_mqtt_disconnect(client_id);
-            break;
-        default:
-            LOG_WARN("Unsupported MQTT packet type from WebSocket: {}", static_cast<int>(packet->type));
-            ret = MQ_ERR_PACKET_TYPE;
-    }
-
-    // Clean up packet
-    if (allocator_) {
-        allocator_->deallocate(packet, sizeof(*packet));
-    } else {
-        delete packet;
-    }
-
-    return ret;
+    return MQ_SUCCESS;
 }
 
 int WebSocketMQTTBridge::parse_json_message(const std::string& json, std::string& topic,
@@ -479,9 +595,16 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
 
         case MessageFormat::MQTT_PACKET:
             {
-                // TODO: Serialize MQTT packet to binary
-                LOG_WARN("MQTT_PACKET format not yet implemented for publishing to WebSocket");
-                ret = MQ_ERR_PROTOCOL;
+                mqtt::PublishPacket outbound(allocator_);
+                outbound.type = mqtt::PacketType::PUBLISH;
+                outbound.dup = packet.dup;
+                outbound.qos = packet.qos;
+                outbound.retain = packet.retain;
+                outbound.packet_id = packet.packet_id;
+                outbound.topic_name = mqtt::to_mqtt_string(mqtt::from_mqtt_string(packet.topic_name), allocator_);
+                std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
+                outbound.payload = mqtt::to_mqtt_bytes(payload_vec, allocator_);
+                ret = send_serialized_mqtt_packet(client_id, outbound);
             }
             break;
     }
@@ -569,53 +692,242 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
 // MQTT packet handlers (for binary protocol mode)
 
 int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet) {
-    LOG_INFO("Received MQTT CONNECT from WebSocket client {}", client_id);
-    // For WebSocket, we don't really need to handle CONNECT
-    // Just send CONNACK
-    // TODO: Send CONNACK packet
-    return MQ_SUCCESS;
+    LOG_INFO("Received MQTT CONNECT from WebSocket client {} (mqtt_client_id='{}')",
+             client_id, mqtt::from_mqtt_string(packet->client_id));
+
+    mqtt::ConnAckPacket connack(allocator_);
+    connack.type = mqtt::PacketType::CONNACK;
+    connack.session_present = false;
+    connack.reason_code = mqtt::ReasonCode::Success;
+    return send_serialized_mqtt_packet(client_id, connack);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet) {
     LOG_INFO("Received MQTT SUBSCRIBE from WebSocket client {}", client_id);
 
+    mqtt::SubAckPacket suback(allocator_);
+    suback.type = mqtt::PacketType::SUBACK;
+    suback.packet_id = packet->packet_id;
+
     for (const auto& sub : packet->subscriptions) {
         std::string topic_filter = mqtt::from_mqtt_string(sub.first);
-        subscribe_topic(client_id, topic_filter, sub.second);
+        int sub_ret = subscribe_topic(client_id, topic_filter, sub.second);
+        if (sub_ret == MQ_SUCCESS) {
+            switch (sub.second) {
+                case 0:
+                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
+                    break;
+                case 1:
+                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS1);
+                    break;
+                case 2:
+                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS2);
+                    break;
+                default:
+                    suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+                    break;
+            }
+        } else {
+            suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+        }
     }
 
-    // TODO: Send SUBACK packet
-    return MQ_SUCCESS;
+    return send_serialized_mqtt_packet(client_id, suback);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet) {
     LOG_INFO("Received MQTT UNSUBSCRIBE from WebSocket client {}", client_id);
 
+    mqtt::UnsubAckPacket unsuback(allocator_);
+    unsuback.type = mqtt::PacketType::UNSUBACK;
+    unsuback.packet_id = packet->packet_id;
+
     for (const auto& topic : packet->topic_filters) {
         std::string topic_filter = mqtt::from_mqtt_string(topic);
-        unsubscribe_topic(client_id, topic_filter);
+        int unsub_ret = unsubscribe_topic(client_id, topic_filter);
+        unsuback.reason_codes.push_back(unsub_ret == MQ_SUCCESS
+                                            ? mqtt::ReasonCode::Success
+                                            : mqtt::ReasonCode::NoSubscriptionExisted);
     }
 
-    // TODO: Send UNSUBACK packet
-    return MQ_SUCCESS;
+    return send_serialized_mqtt_packet(client_id, unsuback);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
     std::string topic = mqtt::from_mqtt_string(packet->topic_name);
     std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
-    return publish_message(client_id, topic, payload, packet->qos, packet->retain);
+    int ret = publish_message(client_id, topic, payload, packet->qos, packet->retain);
+    if (ret != MQ_SUCCESS) {
+        return ret;
+    }
+
+    if (packet->qos == 1) {
+        mqtt::PubAckPacket puback(allocator_);
+        puback.type = mqtt::PacketType::PUBACK;
+        puback.packet_id = packet->packet_id;
+        puback.reason_code = mqtt::ReasonCode::Success;
+        return send_serialized_mqtt_packet(client_id, puback);
+    }
+
+    if (packet->qos == 2) {
+        mqtt::PubRecPacket pubrec(allocator_);
+        pubrec.type = mqtt::PacketType::PUBREC;
+        pubrec.packet_id = packet->packet_id;
+        pubrec.reason_code = mqtt::ReasonCode::Success;
+        return send_serialized_mqtt_packet(client_id, pubrec);
+    }
+
+    return MQ_SUCCESS;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_pingreq(const std::string& client_id) {
     LOG_TRACE("Received MQTT PINGREQ from WebSocket client {}", client_id);
-    // TODO: Send PINGRESP packet
-    return MQ_SUCCESS;
+    mqtt::PingRespPacket pingresp(allocator_);
+    pingresp.type = mqtt::PacketType::PINGRESP;
+    return send_serialized_mqtt_packet(client_id, pingresp);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id) {
     LOG_INFO("Received MQTT DISCONNECT from WebSocket client {}", client_id);
     unregister_handler(client_id);
     return MQ_SUCCESS;
+}
+
+int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_id, const mqtt::Packet& packet) {
+    WebSocketProtocolHandler* handler = get_handler(client_id);
+    if (!handler || !handler->is_connected()) {
+        LOG_WARN("No active WebSocket handler for client {}", client_id);
+        return MQ_ERR_SESSION_INVALID_HANDLER;
+    }
+
+    mqtt::MQTTParser parser(allocator_);
+    mqtt::MQTTSerializeBuffer serialized(allocator_);
+    int ret = MQ_ERR_PACKET_TYPE;
+
+    switch (packet.type) {
+        case mqtt::PacketType::CONNACK:
+            ret = parser.serialize_connack(reinterpret_cast<const mqtt::ConnAckPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::SUBACK:
+            ret = parser.serialize_suback(reinterpret_cast<const mqtt::SubAckPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::UNSUBACK:
+            ret = parser.serialize_unsuback(reinterpret_cast<const mqtt::UnsubAckPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PINGRESP:
+            ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PUBACK:
+            ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PUBREC:
+            ret = parser.serialize_pubrec(reinterpret_cast<const mqtt::PubRecPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PUBREL:
+            ret = parser.serialize_pubrel(reinterpret_cast<const mqtt::PubRelPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PUBCOMP:
+            ret = parser.serialize_pubcomp(reinterpret_cast<const mqtt::PubCompPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::PUBLISH:
+            ret = parser.serialize_publish(reinterpret_cast<const mqtt::PublishPacket*>(&packet), serialized);
+            break;
+        default:
+            LOG_ERROR("Unsupported packet type for WebSocket binary serialization: 0x{:02x}",
+                      static_cast<uint8_t>(packet.type));
+            return MQ_ERR_PACKET_TYPE;
+    }
+
+    if (ret != MQ_SUCCESS) {
+        LOG_ERROR("Failed to serialize MQTT packet type 0x{:02x}: {}",
+                  static_cast<uint8_t>(packet.type), ret);
+        return ret;
+    }
+
+    std::vector<uint8_t> payload(serialized.data(), serialized.data() + serialized.size());
+    ret = handler->send_binary(payload);
+    if (ret == MQ_SUCCESS) {
+        stats_.ws_messages_sent++;
+    }
+    return ret;
+}
+
+void WebSocketMQTTBridge::destroy_packet(mqtt::Packet* packet) {
+    if (!packet) {
+        return;
+    }
+
+    if (!allocator_) {
+        delete packet;
+        return;
+    }
+
+    switch (packet->type) {
+        case mqtt::PacketType::CONNECT:
+            reinterpret_cast<mqtt::ConnectPacket*>(packet)->~ConnectPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::ConnectPacket));
+            break;
+        case mqtt::PacketType::CONNACK:
+            reinterpret_cast<mqtt::ConnAckPacket*>(packet)->~ConnAckPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::ConnAckPacket));
+            break;
+        case mqtt::PacketType::PUBLISH:
+            reinterpret_cast<mqtt::PublishPacket*>(packet)->~PublishPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PublishPacket));
+            break;
+        case mqtt::PacketType::PUBACK:
+            reinterpret_cast<mqtt::PubAckPacket*>(packet)->~PubAckPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PubAckPacket));
+            break;
+        case mqtt::PacketType::PUBREC:
+            reinterpret_cast<mqtt::PubRecPacket*>(packet)->~PubRecPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PubRecPacket));
+            break;
+        case mqtt::PacketType::PUBREL:
+            reinterpret_cast<mqtt::PubRelPacket*>(packet)->~PubRelPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PubRelPacket));
+            break;
+        case mqtt::PacketType::PUBCOMP:
+            reinterpret_cast<mqtt::PubCompPacket*>(packet)->~PubCompPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PubCompPacket));
+            break;
+        case mqtt::PacketType::SUBSCRIBE:
+            reinterpret_cast<mqtt::SubscribePacket*>(packet)->~SubscribePacket();
+            allocator_->deallocate(packet, sizeof(mqtt::SubscribePacket));
+            break;
+        case mqtt::PacketType::SUBACK:
+            reinterpret_cast<mqtt::SubAckPacket*>(packet)->~SubAckPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::SubAckPacket));
+            break;
+        case mqtt::PacketType::UNSUBSCRIBE:
+            reinterpret_cast<mqtt::UnsubscribePacket*>(packet)->~UnsubscribePacket();
+            allocator_->deallocate(packet, sizeof(mqtt::UnsubscribePacket));
+            break;
+        case mqtt::PacketType::UNSUBACK:
+            reinterpret_cast<mqtt::UnsubAckPacket*>(packet)->~UnsubAckPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::UnsubAckPacket));
+            break;
+        case mqtt::PacketType::PINGREQ:
+            reinterpret_cast<mqtt::PingReqPacket*>(packet)->~PingReqPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PingReqPacket));
+            break;
+        case mqtt::PacketType::PINGRESP:
+            reinterpret_cast<mqtt::PingRespPacket*>(packet)->~PingRespPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::PingRespPacket));
+            break;
+        case mqtt::PacketType::DISCONNECT:
+            reinterpret_cast<mqtt::DisconnectPacket*>(packet)->~DisconnectPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::DisconnectPacket));
+            break;
+        case mqtt::PacketType::AUTH:
+            reinterpret_cast<mqtt::AuthPacket*>(packet)->~AuthPacket();
+            allocator_->deallocate(packet, sizeof(mqtt::AuthPacket));
+            break;
+        default:
+            packet->~Packet();
+            allocator_->deallocate(packet, sizeof(mqtt::Packet));
+            break;
+    }
 }
 
 }  // namespace websocket

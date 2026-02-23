@@ -3,6 +3,8 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <sstream>
 #include "logger.h"
@@ -16,6 +18,71 @@ static const size_t READ_BUFFER_SIZE = 64 * 1024;  // 64KB
 static const int DEFAULT_PING_INTERVAL_MS = 30000;  // 30 seconds
 static const int DEFAULT_PONG_TIMEOUT_MS = 10000;   // 10 seconds
 static const size_t DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024;  // 10MB
+
+static std::string trim_ascii(const std::string& input) {
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin])) != 0) {
+        ++begin;
+    }
+
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1])) != 0) {
+        --end;
+    }
+    return input.substr(begin, end - begin);
+}
+
+static std::string to_lower_ascii(const std::string& input) {
+    std::string out = input;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return out;
+}
+
+static bool header_value(const std::string& request, const std::string& header_name, std::string& value) {
+    std::istringstream lines(request);
+    std::string line;
+    const std::string wanted = to_lower_ascii(header_name);
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        size_t colon_pos = line.find(':');
+        if (colon_pos == std::string::npos) {
+            continue;
+        }
+
+        std::string name = to_lower_ascii(trim_ascii(line.substr(0, colon_pos)));
+        if (name != wanted) {
+            continue;
+        }
+
+        value = trim_ascii(line.substr(colon_pos + 1));
+        return true;
+    }
+    return false;
+}
+
+static bool contains_protocol_token(const std::string& offered, const std::string& protocol) {
+    const std::string wanted = to_lower_ascii(protocol);
+    size_t start = 0;
+    while (start < offered.size()) {
+        size_t comma = offered.find(',', start);
+        std::string token = trim_ascii(offered.substr(start, comma == std::string::npos
+                                                                ? std::string::npos
+                                                                : comma - start));
+        if (to_lower_ascii(token) == wanted) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
 
 // Base64 encode helper
 static std::string base64_encode(const unsigned char* input, size_t length) {
@@ -42,6 +109,7 @@ WebSocketProtocolHandler::WebSocketProtocolHandler(MQTTAllocator* allocator)
     : allocator_(allocator),
       socket_(nullptr),
       state_(WebSocketState::CONNECTING),
+      selected_subprotocol_(),
       client_port_(0),
       parser_(allocator),
       bridge_(nullptr),
@@ -124,9 +192,9 @@ int WebSocketProtocolHandler::process() {
         WebSocketFrame frame(allocator_);
         int ret = read_frame(frame);
 
-        if (ret == MQ_ERR_SOCKET_RECV) {
-            // Connection closed by peer
-            LOG_INFO("Connection closed by peer for client {}", client_id_);
+        if (ret == MQ_ERR_SOCKET_RECV || ret == MQ_ERR_SOCKET) {
+            // Treat both recv errors and generic socket disconnect as peer close.
+            LOG_INFO("Connection closed by peer for client {} (ret={})", client_id_, ret);
             state_ = WebSocketState::CLOSED;
             break;
         } else if (ret == MQ_ERR_WS_INCOMPLETE_FRAME) {
@@ -135,7 +203,9 @@ int WebSocketProtocolHandler::process() {
         } else if (ret != MQ_SUCCESS) {
             LOG_ERROR("Failed to read frame: {}", ret);
             stats_.protocol_errors++;
-            send_close(static_cast<uint16_t>(WebSocketCloseCode::PROTOCOL_ERROR), "Frame read error");
+            if (socket_ && socket_->is_connected()) {
+                send_close(static_cast<uint16_t>(WebSocketCloseCode::PROTOCOL_ERROR), "Frame read error");
+            }
             state_ = WebSocketState::CLOSING;
             break;
         }
@@ -180,6 +250,20 @@ int WebSocketProtocolHandler::handle_handshake() {
         return ret;
     }
 
+    if (bridge_) {
+        if (selected_subprotocol_ == "mqtt") {
+            bridge_->set_message_format(MessageFormat::MQTT_PACKET);
+            LOG_INFO("WebSocket subprotocol '{}' selected, bridge switched to MQTT_PACKET mode",
+                     selected_subprotocol_);
+        } else {
+            bridge_->set_message_format(MessageFormat::JSON);
+            if (!selected_subprotocol_.empty()) {
+                LOG_WARN("Unsupported WebSocket subprotocol '{}', fallback to JSON mode",
+                         selected_subprotocol_);
+            }
+        }
+    }
+
     // Send handshake response
     ret = send_handshake_response(ws_key);
     if (ret != MQ_SUCCESS) {
@@ -193,6 +277,8 @@ int WebSocketProtocolHandler::handle_handshake() {
 
 int WebSocketProtocolHandler::read_handshake_request(std::string& request) {
     request.clear();
+    read_buffer_.clear();
+    read_buffer_offset_ = 0;
     char buffer[4096];
 
     // Read until we find "\r\n\r\n" (end of HTTP headers)
@@ -225,46 +311,49 @@ int WebSocketProtocolHandler::read_handshake_request(std::string& request) {
         }
     }
 
+    // Keep any bytes that arrived after the HTTP headers.
+    // These bytes are usually the first WebSocket frame and must not be dropped.
+    size_t header_end = request.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        LOG_ERROR("Handshake terminator not found");
+        return MQ_ERR_WS_HANDSHAKE;
+    }
+
+    size_t payload_begin = header_end + 4;
+    if (payload_begin < request.size()) {
+        read_buffer_.insert(read_buffer_.end(),
+                            request.begin() + payload_begin,
+                            request.end());
+        LOG_DEBUG("Buffered {} bytes of post-handshake data for client {}",
+                  request.size() - payload_begin,
+                  client_id_);
+        request.erase(payload_begin);
+    }
+
     return MQ_SUCCESS;
 }
 
 int WebSocketProtocolHandler::parse_handshake_request(const std::string& request, std::string& ws_key) {
-    // Simple parser for WebSocket handshake
-    // Look for "Sec-WebSocket-Key: " header
+    selected_subprotocol_.clear();
 
-    const std::string key_header = "Sec-WebSocket-Key:";
-    size_t key_pos = request.find(key_header);
-
-    if (key_pos == std::string::npos) {
+    if (!header_value(request, "Sec-WebSocket-Key", ws_key)) {
         LOG_ERROR("Sec-WebSocket-Key header not found");
         return MQ_ERR_WS_HANDSHAKE;
-    }
-
-    // Extract key value
-    key_pos += key_header.length();
-
-    // Skip whitespace
-    while (key_pos < request.length() && (request[key_pos] == ' ' || request[key_pos] == '\t')) {
-        key_pos++;
-    }
-
-    // Find end of line
-    size_t end_pos = request.find("\r\n", key_pos);
-    if (end_pos == std::string::npos) {
-        LOG_ERROR("Malformed Sec-WebSocket-Key header");
-        return MQ_ERR_WS_HANDSHAKE;
-    }
-
-    ws_key = request.substr(key_pos, end_pos - key_pos);
-
-    // Trim trailing whitespace
-    while (!ws_key.empty() && (ws_key.back() == ' ' || ws_key.back() == '\t')) {
-        ws_key.pop_back();
     }
 
     if (ws_key.empty()) {
         LOG_ERROR("Empty Sec-WebSocket-Key");
         return MQ_ERR_WS_HANDSHAKE;
+    }
+
+    std::string offered_subprotocols;
+    if (header_value(request, "Sec-WebSocket-Protocol", offered_subprotocols)) {
+        if (contains_protocol_token(offered_subprotocols, "mqtt")) {
+            selected_subprotocol_ = "mqtt";
+        }
+        LOG_DEBUG("Client offered subprotocols: '{}', selected: '{}'",
+                  offered_subprotocols,
+                  selected_subprotocol_.empty() ? std::string("<none>") : selected_subprotocol_);
     }
 
     LOG_DEBUG("Extracted WebSocket key: {}", ws_key);
@@ -291,8 +380,13 @@ int WebSocketProtocolHandler::send_handshake_response(const std::string& ws_key)
     response << "HTTP/1.1 101 Switching Protocols\r\n"
              << "Upgrade: websocket\r\n"
              << "Connection: Upgrade\r\n"
-             << "Sec-WebSocket-Accept: " << accept_key << "\r\n"
-             << "\r\n";
+             << "Sec-WebSocket-Accept: " << accept_key << "\r\n";
+
+    if (!selected_subprotocol_.empty()) {
+        response << "Sec-WebSocket-Protocol: " << selected_subprotocol_ << "\r\n";
+    }
+
+    response << "\r\n";
 
     std::string response_str = response.str();
 
@@ -308,9 +402,35 @@ int WebSocketProtocolHandler::send_handshake_response(const std::string& ws_key)
 }
 
 int WebSocketProtocolHandler::read_frame(WebSocketFrame& frame) {
-    // Read data into buffer
-    if (read_buffer_.size() - read_buffer_offset_ < 1024) {
-        // Need more data
+    while (true) {
+        size_t available = read_buffer_.size() - read_buffer_offset_;
+
+        // Parse buffered data first to avoid blocking recv when a full frame is already in memory.
+        if (available > 0) {
+            size_t bytes_consumed = 0;
+            int ret = parser_.parse_frame(read_buffer_.data() + read_buffer_offset_,
+                                          available,
+                                          frame, bytes_consumed);
+
+            if (ret == MQ_SUCCESS) {
+                read_buffer_offset_ += bytes_consumed;
+                stats_.frames_received++;
+
+                // Compact buffer if needed
+                if (read_buffer_offset_ > READ_BUFFER_SIZE / 2) {
+                    read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin() + read_buffer_offset_);
+                    read_buffer_offset_ = 0;
+                }
+
+                return MQ_SUCCESS;
+            }
+
+            if (ret != MQ_ERR_WS_INCOMPLETE_FRAME) {
+                return ret;
+            }
+        }
+
+        // Need more bytes to finish a frame.
         char temp_buffer[4096];
         int len = sizeof(temp_buffer);
         int ret = socket_->recv(temp_buffer, len);
@@ -323,29 +443,9 @@ int WebSocketProtocolHandler::read_frame(WebSocketFrame& frame) {
             return MQ_ERR_SOCKET_RECV;  // Connection closed
         }
 
-        // Append to read buffer
         read_buffer_.insert(read_buffer_.end(), temp_buffer, temp_buffer + len);
         stats_.bytes_received += len;
     }
-
-    // Try to parse a frame
-    size_t bytes_consumed = 0;
-    int ret = parser_.parse_frame(read_buffer_.data() + read_buffer_offset_,
-                                  read_buffer_.size() - read_buffer_offset_,
-                                  frame, bytes_consumed);
-
-    if (ret == MQ_SUCCESS) {
-        read_buffer_offset_ += bytes_consumed;
-        stats_.frames_received++;
-
-        // Compact buffer if needed
-        if (read_buffer_offset_ > READ_BUFFER_SIZE / 2) {
-            read_buffer_.erase(read_buffer_.begin(), read_buffer_.begin() + read_buffer_offset_);
-            read_buffer_offset_ = 0;
-        }
-    }
-
-    return ret;
 }
 
 int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame) {

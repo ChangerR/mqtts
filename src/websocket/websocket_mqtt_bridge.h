@@ -110,6 +110,8 @@ private:
     int handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet);
     int handle_mqtt_pingreq(const std::string& client_id);
     int handle_mqtt_disconnect(const std::string& client_id);
+    int send_serialized_mqtt_packet(const std::string& client_id, const mqtt::Packet& packet);
+    void destroy_packet(mqtt::Packet* packet);
 
     // Send response to WebSocket client
     int send_to_websocket(const std::string& client_id, const std::string& text);
@@ -136,6 +138,14 @@ private:
                                                std::equal_to<std::string>,
                                                mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>>;
     SubscriptionMap subscriptions_;
+
+    // Pending MQTT byte stream per WebSocket client (for fragmented/partial packets)
+    using BinaryBuffer = std::vector<uint8_t, mqtt::mqtt_stl_allocator<uint8_t>>;
+    using BinaryBufferMap = std::unordered_map<std::string, BinaryBuffer,
+                                               std::hash<std::string>,
+                                               std::equal_to<std::string>,
+                                               mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>>;
+    BinaryBufferMap pending_binary_buffers_;
 
     // Statistics
     BridgeStatistics stats_;

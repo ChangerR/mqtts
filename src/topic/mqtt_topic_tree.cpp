@@ -303,6 +303,9 @@ bool TopicTreeNode::compare_and_swap_intermediate_node(IntermediateNode* expecte
       intermediate_node_.compare_exchange_weak(expected, desired, std::memory_order_acq_rel);
   if (success) {
     intrusive_ptr_release(expected);
+    // The caller-created desired node starts with ref_count=1 (caller ownership).
+    // Keep only the tree-held ref after successful CAS to avoid leaking one extra ref.
+    intrusive_ptr_release(desired);
   } else {
     intrusive_ptr_release(desired);
   }

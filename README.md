@@ -70,7 +70,7 @@ TEST_REGEX=test_mqtt_parser ./bin/container-validate.sh test
 等价于调用 `./bin/docker-run.sh`，默认行为：
 
 - 自动构建运行镜像 `mqtts:local`（若本地不存在）
-- 启动容器并映射端口 `1883`（MQTT）和 `8080`（WebSocket）
+- 启动容器并映射端口 `1883`（MQTT/WS）和 `18080`（WS 兼容入口，转发到容器 `1883`）
 - 挂载配置 `${PROJECT_ROOT}/mqtts.yaml -> /app/config/mqtts.yaml:ro`
 
 查看日志：

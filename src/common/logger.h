@@ -1,8 +1,10 @@
 #pragma once
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
+#include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
+#include <string>
 #include "singleton.h"
 
 // 前向声明
@@ -13,14 +15,9 @@ struct LogConfig;
 class Logger
 {
  public:
-  Logger()
-  {
-    log_ = spdlog::stdout_color_mt("console");
-    log_->set_level(spdlog::level::trace);
-    log_->set_pattern("%^[%D %T.%e] [%t] [%l] [%@,%!] %v%$");
-  }
+  Logger();
 
-  ~Logger() { log_ = nullptr; }
+  ~Logger();
 
   /**
    * @brief 根据配置初始化日志系统
@@ -43,12 +40,45 @@ class Logger
 
 typedef Singleton<Logger> SingletonLogger;
 #define LOG (SingletonLogger::instance().log_)
-#define LOG_TRACE(...) SPDLOG_LOGGER_TRACE(LOG, __VA_ARGS__)
-#define LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(LOG, __VA_ARGS__)
-#define LOG_INFO(...) SPDLOG_LOGGER_INFO(LOG, __VA_ARGS__)
-#define LOG_WARN(...) SPDLOG_LOGGER_WARN(LOG, __VA_ARGS__)
-#define LOG_ERROR(...) SPDLOG_LOGGER_ERROR(LOG, __VA_ARGS__)
-#define LOG_CRITICAL(...) SPDLOG_LOGGER_CRITICAL(LOG, __VA_ARGS__)
+
+namespace mqtt_log_ctx {
+extern const char* const kDefaultTraceId;
+void ensure_trace_id();
+void bind_trace_id(const std::string& trace_id);
+void clear_trace_id();
+const std::string& current_trace_id();
+}  // namespace mqtt_log_ctx
+
+#define LOG_TRACE(...)      \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_TRACE(LOG, __VA_ARGS__); \
+  } while (0)
+#define LOG_DEBUG(...)      \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_DEBUG(LOG, __VA_ARGS__); \
+  } while (0)
+#define LOG_INFO(...)       \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_INFO(LOG, __VA_ARGS__); \
+  } while (0)
+#define LOG_WARN(...)       \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_WARN(LOG, __VA_ARGS__); \
+  } while (0)
+#define LOG_ERROR(...)      \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_ERROR(LOG, __VA_ARGS__); \
+  } while (0)
+#define LOG_CRITICAL(...)   \
+  do {                      \
+    mqtt_log_ctx::ensure_trace_id(); \
+    SPDLOG_LOGGER_CRITICAL(LOG, __VA_ARGS__); \
+  } while (0)
 
 #define LOG_HEXDUMP(data, len)                                                         \
   do {                                                                                 \

@@ -287,7 +287,11 @@ main() {
       run_tests
       ;;
     run)
-      run_service_container "${COMMAND_ARGS[@]}"
+      if [ "${COMMAND_ARGS+set}" = "set" ] && [ "${#COMMAND_ARGS[@]}" -gt 0 ]; then
+        run_service_container "${COMMAND_ARGS[@]}"
+      else
+        run_service_container
+      fi
       ;;
     shell)
       open_shell

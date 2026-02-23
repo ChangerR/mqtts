@@ -35,7 +35,8 @@ DOCKER_RUN_CMD=(
   --name "$CONTAINER_NAME"
   --restart unless-stopped
   -p 1883:1883
-  -p 18080:18080
+  # 当前实现中 MQTT 与 WebSocket 复用同一监听端口(1883)
+  -p 18080:1883
   -v "$CONFIG_PATH":/app/config/mqtts.yaml:ro
   -v "$LOG_DIR":/app/logs
 )

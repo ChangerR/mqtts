@@ -46,7 +46,7 @@ RUN chmod +x /app/bin/mqtts \
 ENV LD_LIBRARY_PATH=/app/lib
 
 WORKDIR /app
-EXPOSE 1883 8883 18080
+EXPOSE 1883 8883
 
 USER mqtts
 

@@ -25,6 +25,8 @@ memory:
   client_max_size: 1048576  # 客户端最大内存大小(字节)
 
 # WebSocket服务器配置
+# 注意：当前版本通过 server.port 处理 MQTT + WebSocket(HTTP Upgrade)。
+# 下列 websocket 配置为兼容预留项，端口映射建议将宿主机 18080 转发到容器 1883。
 websocket:
   enabled: true  # 是否启用WebSocket服务器
   bind_address: "127.0.0.1"  # 绑定地址
@@ -37,7 +39,7 @@ websocket:
   handshake_timeout: 10  # 握手超时时间(秒)
   ping_interval: 30  # Ping间隔(秒)
   pong_timeout: 10  # Pong超时时间(秒)
-  message_format: "json"  # 消息格式: json, mqtt_packet, text_protocol
+  message_format: "mqtt_packet"  # 消息格式: json, mqtt_packet, text_protocol
 
 # 日志配置
 log:

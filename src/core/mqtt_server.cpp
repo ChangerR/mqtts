@@ -1,5 +1,8 @@
 #include "mqtt_server.h"
+#include <algorithm>
 #include <arpa/inet.h>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include "logger.h"
 #include "mqtt_allocator.h"
@@ -11,6 +14,52 @@
 #include "websocket_mqtt_bridge.h"
 #include "websocket_handler_adapter.h"
 using namespace mqtt;
+
+namespace {
+static std::string to_fixed_base62(uint64_t value, size_t width)
+{
+  static const char kAlphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  std::string encoded;
+  do {
+    encoded.push_back(kAlphabet[value % 62]);
+    value /= 62;
+  } while (value > 0);
+
+  while (encoded.size() < width) {
+    encoded.push_back('0');
+  }
+
+  if (encoded.size() > width) {
+    encoded.resize(width);
+  }
+  std::reverse(encoded.begin(), encoded.end());
+  return encoded;
+}
+
+static uint32_t encode_client_ip(const std::string& ip)
+{
+  struct in_addr addr;
+  if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
+    return ntohl(addr.s_addr);
+  }
+  return static_cast<uint32_t>(std::hash<std::string>{}(ip));
+}
+
+static std::string generate_session_trace_id(const std::string& client_ip, int client_port)
+{
+  const uint64_t ts_us =
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+  const uint32_t ip_code = encode_client_ip(client_ip);
+  const uint16_t port_code = static_cast<uint16_t>(client_port & 0xFFFF);
+  const uint64_t endpoint_code = (static_cast<uint64_t>(ip_code) << 16) | port_code;  // 48 bits
+
+  // Session trace id based on time + client endpoint.
+  // Y + ts_us(10) + ip_port(9) => 20 chars
+  return "Y-" + to_fixed_base62(ts_us, 10) + to_fixed_base62(endpoint_code, 9) + "-0";
+}
+}  // namespace
 
 MQTTServer::MQTTServer(const std::string& host, int port)
     : accept_co_(NULL),
@@ -244,6 +293,7 @@ void* MQTTServer::accept_routine(void* arg)
     ctx->client_id = client_id;
     ctx->client_ip = client->get_peer_addr();
     ctx->client_port = client->get_peer_port();
+    ctx->trace_id = generate_session_trace_id(ctx->client_ip, ctx->client_port);
     ctx->allocator = client_allocator;
 
     // Create client coroutine
@@ -259,6 +309,12 @@ void* MQTTServer::client_routine(void* arg)
 {
   ClientContext* ctx = (ClientContext*)arg;
   MQTTSocket* client = ctx->client;
+  const std::string session_trace_id = ctx->trace_id;
+  mqtt_log_ctx::bind_trace_id(session_trace_id);
+  struct TraceCleanupGuard
+  {
+    ~TraceCleanupGuard() { mqtt_log_ctx::clear_trace_id(); }
+  } trace_cleanup_guard;
 
   // Handle client connection
   handle_client(ctx);
@@ -367,8 +423,6 @@ void MQTTServer::handle_client(ClientContext* ctx)
                      ctx->client_ip, ctx->client_port, ret);
           }
 
-          // Unregister from session manager
-          session_manager.unregister_session(client_id_mqtt);
         } else {
           LOG_ERROR("Failed to register WebSocket adapter with session manager");
         }

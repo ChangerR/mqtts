@@ -1,7 +1,96 @@
 #include "logger.h"
 #include <iostream>
+#include <pthread.h>
+#include "co_routine.h"
 #include "mqtt_config.h"
 #include "version.h"
+
+namespace mqtt_log_ctx {
+const char* const kDefaultTraceId = "-";
+
+namespace {
+pthread_key_t g_trace_id_key = 0;
+pthread_once_t g_trace_id_once = PTHREAD_ONCE_INIT;
+const std::string g_default_trace_id(kDefaultTraceId);
+
+void make_trace_id_key()
+{
+  (void)pthread_key_create(&g_trace_id_key, NULL);
+}
+
+const std::string* get_trace_id_ptr()
+{
+  pthread_once(&g_trace_id_once, make_trace_id_key);
+  return static_cast<const std::string*>(co_getspecific(g_trace_id_key));
+}
+}  // namespace
+
+void ensure_trace_id()
+{
+  // Intentionally no-op:
+  // trace id lifecycle is explicitly managed in MQTTServer::client_routine.
+}
+
+void bind_trace_id(const std::string& trace_id)
+{
+  pthread_once(&g_trace_id_once, make_trace_id_key);
+  const std::string& non_empty_trace_id = trace_id.empty() ? g_default_trace_id : trace_id;
+  (void)co_setspecific(g_trace_id_key, &non_empty_trace_id);
+}
+
+void clear_trace_id()
+{
+  pthread_once(&g_trace_id_once, make_trace_id_key);
+  (void)co_setspecific(g_trace_id_key, NULL);
+}
+
+const std::string& current_trace_id()
+{
+  const std::string* trace_id = get_trace_id_ptr();
+  if (trace_id == NULL || trace_id->empty()) {
+    return g_default_trace_id;
+  }
+  return *trace_id;
+}
+}  // namespace mqtt_log_ctx
+
+namespace {
+class TraceIdFlagFormatter final : public spdlog::custom_flag_formatter
+{
+ public:
+  void format(const spdlog::details::log_msg&, const std::tm&,
+              spdlog::memory_buf_t& dest) override
+  {
+    const std::string& trace_id = mqtt_log_ctx::current_trace_id();
+    dest.append(trace_id.data(), trace_id.data() + trace_id.size());
+  }
+
+  std::unique_ptr<spdlog::custom_flag_formatter> clone() const override
+  {
+    return std::unique_ptr<spdlog::custom_flag_formatter>(new TraceIdFlagFormatter());
+  }
+};
+
+std::unique_ptr<spdlog::formatter> make_formatter(const std::string& pattern)
+{
+  std::unique_ptr<spdlog::pattern_formatter> formatter(new spdlog::pattern_formatter());
+  formatter->add_flag<TraceIdFlagFormatter>('*');
+  formatter->set_pattern(pattern);
+  return std::unique_ptr<spdlog::formatter>(formatter.release());
+}
+}  // namespace
+
+Logger::Logger()
+{
+  log_ = spdlog::stdout_color_mt("console");
+  log_->set_level(spdlog::level::trace);
+  log_->set_formatter(make_formatter("%^[%D %T.%e] [%t] [%l] [%@,%!] [%*] %v%$"));
+}
+
+Logger::~Logger()
+{
+  log_ = nullptr;
+}
 
 int Logger::configure(const mqtt::LogConfig& config)
 {
@@ -18,14 +107,14 @@ int Logger::configure(const mqtt::LogConfig& config)
 
     // 始终添加控制台sink
     auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    console_sink->set_pattern("%^[%D %T.%e] [%t] [%l] [%@,%!] %v%$");
+    console_sink->set_formatter(make_formatter("%^[%D %T.%e] [%t] [%l] [%@,%!] [%*] %v%$"));
     sinks.push_back(console_sink);
 
     // 如果配置了文件路径，添加文件sink
     if (!config.file_path.empty()) {
       auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
           config.file_path, config.max_file_size, config.max_files);
-      file_sink->set_pattern("[%D %T.%e] [%t] [%l] [%@,%!] %v");
+      file_sink->set_formatter(make_formatter("[%D %T.%e] [%t] [%l] [%@,%!] [%*] %v"));
       sinks.push_back(file_sink);
     }
 
