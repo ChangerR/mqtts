@@ -3,7 +3,7 @@
 #include <vector>
 #include "mqtt_parser.h"
 #include "mqtt_allocator.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 #include "mqtt_memory_tags.h"
 
 namespace mqtt {
@@ -19,7 +19,7 @@ class PublishSerializationTest : public ::testing::Test
     parser_ = new MQTTParser(allocator_);
     ASSERT_NE(parser_, nullptr);
     
-    buffer_ = new MQTTSerializeBuffer(allocator_);
+    buffer_ = new MQTTBuffer(allocator_);
     ASSERT_NE(buffer_, nullptr);
   }
 
@@ -94,7 +94,7 @@ class PublishSerializationTest : public ::testing::Test
  protected:
   MQTTAllocator* allocator_;
   MQTTParser* parser_;
-  MQTTSerializeBuffer* buffer_;
+  MQTTBuffer* buffer_;
 };
 
 // Test basic PUBLISH packet serialization and parsing (QoS 0)

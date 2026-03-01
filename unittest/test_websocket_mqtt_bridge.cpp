@@ -3,7 +3,7 @@
 #include <vector>
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 #include "websocket_mqtt_bridge.h"
 
 namespace {
@@ -15,7 +15,7 @@ std::vector<uint8_t> serialize_puback(MQTTAllocator& allocator, uint16_t packet_
     packet.packet_id = packet_id;
     packet.reason_code = mqtt::ReasonCode::Success;
 
-    mqtt::MQTTSerializeBuffer buffer(&allocator);
+    mqtt::MQTTBuffer buffer(&allocator);
     int ret = parser.serialize_puback(&packet, buffer);
     assert(ret == MQ_SUCCESS);
     return std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
@@ -28,7 +28,7 @@ std::vector<uint8_t> serialize_pubcomp(MQTTAllocator& allocator, uint16_t packet
     packet.packet_id = packet_id;
     packet.reason_code = mqtt::ReasonCode::Success;
 
-    mqtt::MQTTSerializeBuffer buffer(&allocator);
+    mqtt::MQTTBuffer buffer(&allocator);
     int ret = parser.serialize_pubcomp(&packet, buffer);
     assert(ret == MQ_SUCCESS);
     return std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
@@ -39,7 +39,7 @@ std::vector<uint8_t> serialize_pingresp(MQTTAllocator& allocator) {
     mqtt::PingRespPacket packet(&allocator);
     packet.type = mqtt::PacketType::PINGRESP;
 
-    mqtt::MQTTSerializeBuffer buffer(&allocator);
+    mqtt::MQTTBuffer buffer(&allocator);
     int ret = parser.serialize_pingresp(&packet, buffer);
     assert(ret == MQ_SUCCESS);
     return std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
@@ -50,7 +50,7 @@ std::vector<uint8_t> serialize_pingreq(MQTTAllocator& allocator) {
     mqtt::PingReqPacket packet(&allocator);
     packet.type = mqtt::PacketType::PINGREQ;
 
-    mqtt::MQTTSerializeBuffer buffer(&allocator);
+    mqtt::MQTTBuffer buffer(&allocator);
     int ret = parser.serialize_pingreq(&packet, buffer);
     assert(ret == MQ_SUCCESS);
     return std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());

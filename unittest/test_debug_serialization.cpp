@@ -1,9 +1,10 @@
 #include <gtest/gtest.h>
+#include <cstring>
 #include <iostream>
 #include <iomanip>
 #include "mqtt_parser.h"
 #include "mqtt_allocator.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 #include "mqtt_memory_tags.h"
 
 namespace mqtt {
@@ -13,7 +14,7 @@ TEST(DebugSerializationTest, SimpleDebug)
 {
   MQTTAllocator allocator("test", MQTTMemoryTag::MEM_TAG_CLIENT);
   MQTTParser parser(&allocator);
-  MQTTSerializeBuffer buffer(&allocator);
+  MQTTBuffer buffer(&allocator);
   
   // Create a simple publish packet
   PublishPacket packet(&allocator);

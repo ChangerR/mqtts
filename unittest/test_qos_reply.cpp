@@ -6,7 +6,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
 #include "mqtt_protocol_handler.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 class MockQoSSocket
 {
@@ -89,7 +89,7 @@ void test_qos1_puback_reply()
     publish_packet.packet_id = 1234;
     
     // Serialize the PUBLISH packet
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     int ret = parser.serialize_publish(&publish_packet, serialize_buffer);
     assert(ret == 0);
     
@@ -136,7 +136,7 @@ void test_qos2_pubrec_reply()
     publish_packet.packet_id = 5678;
     
     // Serialize the PUBLISH packet
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     int ret = parser.serialize_publish(&publish_packet, serialize_buffer);
     assert(ret == 0);
     
@@ -183,7 +183,7 @@ void test_qos0_no_reply()
     publish_packet.packet_id = 0;  // QoS 0 doesn't need packet ID
     
     // Serialize the PUBLISH packet
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     int ret = parser.serialize_publish(&publish_packet, serialize_buffer);
     assert(ret == 0);
     
@@ -221,7 +221,7 @@ void test_puback_serialization()
     puback_packet.reason_code = mqtt::ReasonCode::Success;
     
     // Serialize the PUBACK packet
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     int ret = parser.serialize_puback(&puback_packet, serialize_buffer);
     assert(ret == 0);
     assert(serialize_buffer.size() > 0);
@@ -264,7 +264,7 @@ void test_pubrec_serialization()
     pubrec_packet.reason_code = mqtt::ReasonCode::Success;
     
     // Serialize the PUBREC packet
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     int ret = parser.serialize_pubrec(&pubrec_packet, serialize_buffer);
     assert(ret == 0);
     assert(serialize_buffer.size() > 0);

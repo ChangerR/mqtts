@@ -5,7 +5,7 @@
 #include <memory>
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 int main()
 {
@@ -29,7 +29,7 @@ int main()
     // Properties should be empty (default constructed)
     
     // Try to serialize the packet which will include properties serialization
-    mqtt::MQTTSerializeBuffer buffer(&allocator);
+    mqtt::MQTTBuffer buffer(&allocator);
     int ret = parser.serialize_publish(packet, buffer);
     
     std::cout << "serialize_publish returned: " << ret << std::endl;

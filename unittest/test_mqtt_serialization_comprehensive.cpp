@@ -8,7 +8,7 @@
 #include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 using namespace mqtt;
 
@@ -61,7 +61,7 @@ TEST_F(MQTTv5SerializationTest, ConnectPacketSerialization)
     connect.properties.maximum_packet_size = 65536;
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_connect(&connect, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -108,7 +108,7 @@ TEST_F(MQTTv5SerializationTest, ConnectPacketWithWillSerialization)
     connect.will_properties.message_expiry_interval = 600;
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_connect(&connect, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -156,7 +156,7 @@ TEST_F(MQTTv5SerializationTest, ConnAckPacketSerialization)
     connack.properties.server_reference = "server_ref";
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_connack(&connack, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -206,7 +206,7 @@ TEST_F(MQTTv5SerializationTest, PublishPacketQoS0Serialization)
     publish.properties.correlation_data = {0x01, 0x02, 0x03, 0x04};
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_publish(&publish, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -249,7 +249,7 @@ TEST_F(MQTTv5SerializationTest, PublishPacketQoS1Serialization)
     publish.properties.subscription_identifier = 10;
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_publish(&publish, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -288,7 +288,7 @@ TEST_F(MQTTv5SerializationTest, SubscribePacketSerialization)
     subscribe.subscriptions.push_back(std::make_pair(MQTTString("topic/filter3", MQTTStrAllocator(test_allocator)), 2));
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_subscribe(&subscribe, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -329,7 +329,7 @@ TEST_F(MQTTv5SerializationTest, SubAckPacketSerialization)
     suback.reason_codes.push_back(ReasonCode::UnspecifiedError);
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_suback(&suback, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -366,7 +366,7 @@ TEST_F(MQTTv5SerializationTest, UnsubscribePacketSerialization)
     unsubscribe.topic_filters.push_back(MQTTString("topic/filter3", MQTTStrAllocator(test_allocator)));
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_unsubscribe(&unsubscribe, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -402,7 +402,7 @@ TEST_F(MQTTv5SerializationTest, UnsubAckPacketSerialization)
     unsuback.reason_codes.push_back(ReasonCode::UnspecifiedError);
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_unsuback(&unsuback, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -435,7 +435,7 @@ TEST_F(MQTTv5SerializationTest, PubAckPacketSerialization)
     puback.properties.reason_string = "Publication acknowledged";
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_puback(&puback, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -466,7 +466,7 @@ TEST_F(MQTTv5SerializationTest, DisconnectPacketSerialization)
     disconnect.properties.server_reference = "other.server.com";
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_disconnect(&disconnect, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -498,7 +498,7 @@ TEST_F(MQTTv5SerializationTest, AuthPacketSerialization)
     auth.properties.reason_string = "Continue authentication";
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_auth(&auth, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -528,7 +528,7 @@ TEST_F(MQTTv5SerializationTest, PingReqPacketSerialization)
     pingreq.type = PacketType::PINGREQ;
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_pingreq(&pingreq, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -547,7 +547,7 @@ TEST_F(MQTTv5SerializationTest, PingRespPacketSerialization)
     pingresp.type = PacketType::PINGRESP;
 
     // Serialize packet
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_pingresp(&pingresp, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -693,7 +693,7 @@ TEST_F(MQTTv5SerializationTest, RoundTripAllPacketTypes)
         }
 
         // Serialize and parse back
-        MQTTSerializeBuffer buffer(test_allocator);
+        MQTTBuffer buffer(test_allocator);
         int ret = MQ_SUCCESS;
         
         switch (type) {
@@ -764,7 +764,7 @@ TEST_F(MQTTv5SerializationTest, LegacyConnAckSerializationMapping)
     connack.session_present = false;
     connack.reason_code = ReasonCode::NotAuthorized;
 
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_connack(&connack, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -783,7 +783,7 @@ TEST_F(MQTTv5SerializationTest, LegacySubAckSerializationMapping)
     suback.reason_codes.push_back(ReasonCode::GrantedQoS1);
     suback.reason_codes.push_back(ReasonCode::NotAuthorized);
 
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_suback(&suback, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 
@@ -800,7 +800,7 @@ TEST_F(MQTTv5SerializationTest, LegacyUnsubAckAndDisconnectSerialization)
     unsuback.type = PacketType::UNSUBACK;
     unsuback.packet_id = 0x1234;
 
-    MQTTSerializeBuffer unsuback_buffer(test_allocator);
+    MQTTBuffer unsuback_buffer(test_allocator);
     int ret = parser->serialize_unsuback(&unsuback, unsuback_buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
     std::vector<uint8_t> unsuback_expected = {0xb0, 0x02, 0x12, 0x34};
@@ -812,7 +812,7 @@ TEST_F(MQTTv5SerializationTest, LegacyUnsubAckAndDisconnectSerialization)
     disconnect.type = PacketType::DISCONNECT;
     disconnect.reason_code = ReasonCode::NormalDisconnection;
 
-    MQTTSerializeBuffer disconnect_buffer(test_allocator);
+    MQTTBuffer disconnect_buffer(test_allocator);
     ret = parser->serialize_disconnect(&disconnect, disconnect_buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
     std::vector<uint8_t> disconnect_expected = {0xe0, 0x00};
@@ -835,7 +835,7 @@ TEST_F(MQTTv5SerializationTest, LegacyPublishSerializationWithoutProperties)
     publish.payload = {'o', 'k'};
     publish.properties.message_expiry_interval = 60;  // Legacy path should ignore properties.
 
-    MQTTSerializeBuffer buffer(test_allocator);
+    MQTTBuffer buffer(test_allocator);
     int ret = parser->serialize_publish(&publish, buffer);
     ASSERT_EQ(ret, MQ_SUCCESS);
 

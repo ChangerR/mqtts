@@ -6,7 +6,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
 #include "mqtt_protocol_handler.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 void test_publish_serialization_qos0()
 {
@@ -14,7 +14,7 @@ void test_publish_serialization_qos0()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -60,7 +60,7 @@ void test_publish_serialization_qos1()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -106,7 +106,7 @@ void test_publish_serialization_qos2()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -152,7 +152,7 @@ void test_publish_serialization_with_retain()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -197,7 +197,7 @@ void test_publish_serialization_with_dup()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -243,7 +243,7 @@ void test_publish_serialization_empty_payload()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;
@@ -284,7 +284,7 @@ void test_publish_serialization_large_payload()
     
     MQTTAllocator allocator("test_client", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
     mqtt::MQTTParser parser(&allocator);
-    mqtt::MQTTSerializeBuffer serialize_buffer(&allocator);
+    mqtt::MQTTBuffer serialize_buffer(&allocator);
     
     mqtt::PublishPacket publish_packet(&allocator);
     publish_packet.type = mqtt::PacketType::PUBLISH;

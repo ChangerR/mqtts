@@ -8,7 +8,7 @@
 #include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 using namespace mqtt;
 
