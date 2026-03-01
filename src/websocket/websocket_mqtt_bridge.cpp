@@ -875,7 +875,7 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
     } else {
         parser.set_protocol_version_hint(5);
     }
-    mqtt::MQTTSerializeBuffer serialized(allocator_);
+    mqtt::MQTTBuffer serialized(allocator_);
     int ret = MQ_ERR_PACKET_TYPE;
 
     switch (packet.type) {

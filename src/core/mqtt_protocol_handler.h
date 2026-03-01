@@ -13,7 +13,7 @@
 #include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
 #include "mqtt_auth_interface.h"
@@ -152,7 +152,7 @@ class MQTTProtocolHandler
   uint8_t negotiated_protocol_version_;
   bool allow_mqtt3x_;
 
-  MQTTSerializeBuffer* serialize_buffer_;  // 复用的序列化缓冲区
+  MQTTBuffer* serialize_buffer_;  // 复用的序列化缓冲区
 
   // 写入锁状态和条件变量，支持超时等待
   mutable std::atomic<bool> write_lock_acquired_;

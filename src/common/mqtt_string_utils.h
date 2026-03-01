@@ -6,7 +6,7 @@
 #include <vector>
 #include <type_traits>
 #include "mqtt_stl_allocator.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 
 namespace mqtt {
 
@@ -83,7 +83,7 @@ int parse_binary_data_impl(const uint8_t* buffer, size_t length, VectorType& dat
 
 // Template-based unified string serialization
 template<typename StringType>
-int serialize_string_impl(const StringType& str, MQTTSerializeBuffer& buffer)
+int serialize_string_impl(const StringType& str, MQTTBuffer& buffer)
 {
     // Check string length limit
     if (str.length() > MQTT_MAX_STRING_LENGTH) {
@@ -116,7 +116,7 @@ int serialize_string_impl(const StringType& str, MQTTSerializeBuffer& buffer)
 
 // Template-based unified binary data serialization
 template<typename VectorType>
-int serialize_binary_data_impl(const VectorType& data, MQTTSerializeBuffer& buffer)
+int serialize_binary_data_impl(const VectorType& data, MQTTBuffer& buffer)
 {
     // Check data length limit
     if (data.size() > MQTT_MAX_BINARY_LENGTH) {
@@ -155,19 +155,19 @@ inline int parse_binary_data(const uint8_t* buffer, size_t length, std::vector<u
     return parse_binary_data_impl(buffer, length, data, bytes_read);
 }
 
-inline int serialize_mqtt_string(const MQTTString& str, MQTTSerializeBuffer& buffer) {
+inline int serialize_mqtt_string(const MQTTString& str, MQTTBuffer& buffer) {
     return serialize_string_impl(str, buffer);
 }
 
-inline int serialize_string(const std::string& str, MQTTSerializeBuffer& buffer) {
+inline int serialize_string(const std::string& str, MQTTBuffer& buffer) {
     return serialize_string_impl(str, buffer);
 }
 
-inline int serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTSerializeBuffer& buffer) {
+inline int serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTBuffer& buffer) {
     return serialize_binary_data_impl(data, buffer);
 }
 
-inline int serialize_binary_data(const std::vector<uint8_t>& data, MQTTSerializeBuffer& buffer) {
+inline int serialize_binary_data(const std::vector<uint8_t>& data, MQTTBuffer& buffer) {
     return serialize_binary_data_impl(data, buffer);
 }
 

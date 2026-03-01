@@ -5,7 +5,7 @@
 #include <vector>
 #include "mqtt_allocator.h"
 #include "mqtt_packet.h"
-#include "mqtt_serialize_buffer.h"
+#include "mqtt_buffer.h"
 #include "mqtt_string_utils.h"
 
 namespace mqtt {
@@ -44,21 +44,21 @@ class MQTTParser
   int parse_auth(const uint8_t* buffer, size_t length, AuthPacket** packet);
 
   // Serialize packets to buffer
-  int serialize_connect(const ConnectPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_connack(const ConnAckPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_publish(const PublishPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_puback(const PubAckPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_pubrec(const PubRecPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_pubrel(const PubRelPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_pubcomp(const PubCompPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_subscribe(const SubscribePacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_pingreq(const PingReqPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_pingresp(const PingRespPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_disconnect(const DisconnectPacket* packet, MQTTSerializeBuffer& buffer);
-  int serialize_auth(const AuthPacket* packet, MQTTSerializeBuffer& buffer);
+  int serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffer);
+  int serialize_connack(const ConnAckPacket* packet, MQTTBuffer& buffer);
+  int serialize_publish(const PublishPacket* packet, MQTTBuffer& buffer);
+  int serialize_puback(const PubAckPacket* packet, MQTTBuffer& buffer);
+  int serialize_pubrec(const PubRecPacket* packet, MQTTBuffer& buffer);
+  int serialize_pubrel(const PubRelPacket* packet, MQTTBuffer& buffer);
+  int serialize_pubcomp(const PubCompPacket* packet, MQTTBuffer& buffer);
+  int serialize_subscribe(const SubscribePacket* packet, MQTTBuffer& buffer);
+  int serialize_suback(const SubAckPacket* packet, MQTTBuffer& buffer);
+  int serialize_unsubscribe(const UnsubscribePacket* packet, MQTTBuffer& buffer);
+  int serialize_unsuback(const UnsubAckPacket* packet, MQTTBuffer& buffer);
+  int serialize_pingreq(const PingReqPacket* packet, MQTTBuffer& buffer);
+  int serialize_pingresp(const PingRespPacket* packet, MQTTBuffer& buffer);
+  int serialize_disconnect(const DisconnectPacket* packet, MQTTBuffer& buffer);
+  int serialize_auth(const AuthPacket* packet, MQTTBuffer& buffer);
 
  private:
   // Helper functions for parsing
@@ -76,14 +76,14 @@ class MQTTParser
                          std::vector<ReasonCode>& reason_codes, size_t& bytes_read);
 
   // Helper functions for serialization
-  int serialize_remaining_length(uint32_t remaining_length, MQTTSerializeBuffer& buffer);
-  int serialize_string(const std::string& str, MQTTSerializeBuffer& buffer);
-  int serialize_mqtt_string(const MQTTString& str, MQTTSerializeBuffer& buffer);
-  int serialize_binary_data(const std::vector<uint8_t>& data, MQTTSerializeBuffer& buffer);
-  int serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTSerializeBuffer& buffer);
-  int serialize_properties(const Properties& properties, MQTTSerializeBuffer& buffer);
+  int serialize_remaining_length(uint32_t remaining_length, MQTTBuffer& buffer);
+  int serialize_string(const std::string& str, MQTTBuffer& buffer);
+  int serialize_mqtt_string(const MQTTString& str, MQTTBuffer& buffer);
+  int serialize_binary_data(const std::vector<uint8_t>& data, MQTTBuffer& buffer);
+  int serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTBuffer& buffer);
+  int serialize_properties(const Properties& properties, MQTTBuffer& buffer);
   int serialize_reason_codes(const std::vector<ReasonCode>& reason_codes,
-                             MQTTSerializeBuffer& buffer);
+                             MQTTBuffer& buffer);
 
   // Helper function to map string util error codes to parser error codes
   int map_string_util_error(int string_util_error) const;

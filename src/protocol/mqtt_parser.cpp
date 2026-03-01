@@ -1534,7 +1534,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();  // 重置buffer以便复用
   const bool is_legacy = (packet->protocol_version == 3 || packet->protocol_version == 4);
@@ -1551,7 +1551,7 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuff
     total_length += 2 + packet->will_topic.length();    // Will topic
     total_length += 2 + packet->will_payload.length();  // Will payload
     if (!is_legacy) {
-      MQTTSerializeBuffer temp_will_props_buffer(allocator_);
+      MQTTBuffer temp_will_props_buffer(allocator_);
       int will_props_ret = serialize_properties(packet->will_properties, temp_will_props_buffer);
       if (will_props_ret != 0) {
         return will_props_ret;
@@ -1570,7 +1570,7 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuff
 
   if (!is_legacy) {
     // Calculate properties length (using a temporary buffer)
-    MQTTSerializeBuffer temp_props_buffer(allocator_);
+    MQTTBuffer temp_props_buffer(allocator_);
     int props_ret = serialize_properties(packet->properties, temp_props_buffer);
     if (props_ret != 0) {
       return props_ret;
@@ -1669,12 +1669,12 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTSerializeBuff
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();  // 重置buffer以便复用
   const bool is_legacy = is_legacy_protocol_hint();
 
-  MQTTSerializeBuffer temp_properties_buffer(allocator_);
+  MQTTBuffer temp_properties_buffer(allocator_);
   int ret = MQ_SUCCESS;
   if (!is_legacy) {
     // First, serialize properties to calculate their actual size
@@ -1746,7 +1746,7 @@ int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTSerializeBuff
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::CONNACK));
@@ -1770,7 +1770,7 @@ int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTSerializeBuff
   }
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -1802,7 +1802,7 @@ int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTSerializeBuff
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_puback(const PubAckPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_puback(const PubAckPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBACK));
@@ -1826,7 +1826,7 @@ int MQTTParser::serialize_puback(const PubAckPacket* packet, MQTTSerializeBuffer
   uint32_t remaining_length = 2;  // 包ID
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -1860,7 +1860,7 @@ int MQTTParser::serialize_puback(const PubAckPacket* packet, MQTTSerializeBuffer
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_pubrec(const PubRecPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_pubrec(const PubRecPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREC));
@@ -1884,7 +1884,7 @@ int MQTTParser::serialize_pubrec(const PubRecPacket* packet, MQTTSerializeBuffer
   uint32_t remaining_length = 2;  // 包ID
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -1918,7 +1918,7 @@ int MQTTParser::serialize_pubrec(const PubRecPacket* packet, MQTTSerializeBuffer
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_pubrel(const PubRelPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_pubrel(const PubRelPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREL) | 0x02);  // 设置QoS=1
@@ -1942,7 +1942,7 @@ int MQTTParser::serialize_pubrel(const PubRelPacket* packet, MQTTSerializeBuffer
   uint32_t remaining_length = 2;  // 包ID
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -1976,7 +1976,7 @@ int MQTTParser::serialize_pubrel(const PubRelPacket* packet, MQTTSerializeBuffer
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_pubcomp(const PubCompPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_pubcomp(const PubCompPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBCOMP));
@@ -2000,7 +2000,7 @@ int MQTTParser::serialize_pubcomp(const PubCompPacket* packet, MQTTSerializeBuff
   uint32_t remaining_length = 2;  // 包ID
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -2034,7 +2034,7 @@ int MQTTParser::serialize_pubcomp(const PubCompPacket* packet, MQTTSerializeBuff
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBACK));
@@ -2062,7 +2062,7 @@ int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer
   }
 
   // 序列化属性到临时缓冲区
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -2103,7 +2103,7 @@ int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTSerializeBuffer
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBACK));
@@ -2125,7 +2125,7 @@ int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBu
   }
 
   // 序列化属性到临时缓冲区
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -2166,7 +2166,7 @@ int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTSerializeBu
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_pingreq(const PingReqPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_pingreq(const PingReqPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PINGREQ));
@@ -2178,7 +2178,7 @@ int MQTTParser::serialize_pingreq(const PingReqPacket* packet, MQTTSerializeBuff
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_pingresp(const PingRespPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_pingresp(const PingRespPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PINGRESP));
@@ -2190,7 +2190,7 @@ int MQTTParser::serialize_pingresp(const PingRespPacket* packet, MQTTSerializeBu
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::DISCONNECT));
@@ -2208,7 +2208,7 @@ int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTSeriali
   uint32_t remaining_length = 1;  // 原因码
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -2234,7 +2234,7 @@ int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTSeriali
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTBuffer& buffer)
 {
   if (is_legacy_protocol_hint()) {
     return MQ_ERR_PACKET_TYPE;
@@ -2249,7 +2249,7 @@ int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTSerializeBuffer& bu
   uint32_t remaining_length = 1;  // 原因码
 
   // 序列化属性
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   ret = serialize_properties(packet->properties, properties_buffer);
   if (ret != 0) {
     return ret;
@@ -2275,7 +2275,7 @@ int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTSerializeBuffer& bu
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   const bool is_legacy = is_legacy_protocol_hint();
@@ -2285,7 +2285,7 @@ int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTSerialize
   if (ret != 0)
     return ret;
 
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   if (!is_legacy) {
     // Serialize properties
     ret = serialize_properties(packet->properties, properties_buffer);
@@ -2340,7 +2340,7 @@ int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTSerialize
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTBuffer& buffer)
 {
   int ret;
   do {
@@ -2356,7 +2356,7 @@ int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTSerial
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_string(const std::string& str, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_string(const std::string& str, MQTTBuffer& buffer)
 {
   int ret = mqtt::serialize_string(str, buffer);
   int mapped_error = map_string_util_error(ret);
@@ -2368,7 +2368,7 @@ int MQTTParser::serialize_string(const std::string& str, MQTTSerializeBuffer& bu
   return mapped_error;
 }
 
-int MQTTParser::serialize_mqtt_string(const MQTTString& str, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_mqtt_string(const MQTTString& str, MQTTBuffer& buffer)
 {
   int ret = mqtt::serialize_mqtt_string(str, buffer);
   int mapped_error = map_string_util_error(ret);
@@ -2380,7 +2380,7 @@ int MQTTParser::serialize_mqtt_string(const MQTTString& str, MQTTSerializeBuffer
   return mapped_error;
 }
 
-int MQTTParser::serialize_binary_data(const std::vector<uint8_t>& data, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_binary_data(const std::vector<uint8_t>& data, MQTTBuffer& buffer)
 {
   int ret = mqtt::serialize_binary_data(data, buffer);
   int mapped_error = map_string_util_error(ret);
@@ -2392,7 +2392,7 @@ int MQTTParser::serialize_binary_data(const std::vector<uint8_t>& data, MQTTSeri
   return mapped_error;
 }
 
-int MQTTParser::serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTBuffer& buffer)
 {
   int ret = mqtt::serialize_mqtt_binary_data(data, buffer);
   int mapped_error = map_string_util_error(ret);
@@ -2404,7 +2404,7 @@ int MQTTParser::serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTSeria
   return mapped_error;
 }
 
-int MQTTParser::serialize_properties(const Properties& properties, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& buffer)
 {
   // 第一遍：计算所有属性的总长度
   size_t properties_total_length = 0;
@@ -2839,7 +2839,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTSerialize
   return MQ_SUCCESS;
 }
 
-int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSerializeBuffer& buffer)
+int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   const bool is_legacy = is_legacy_protocol_hint();
@@ -2850,7 +2850,7 @@ int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTSeria
     return ret;
 
   // Serialize properties
-  MQTTSerializeBuffer properties_buffer(allocator_);
+  MQTTBuffer properties_buffer(allocator_);
   if (!is_legacy) {
     ret = serialize_properties(packet->properties, properties_buffer);
     if (ret != 0) {

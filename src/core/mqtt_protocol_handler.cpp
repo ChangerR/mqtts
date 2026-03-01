@@ -79,7 +79,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
 
   // Create serialize buffer
   serialize_buffer_ =
-      new (allocator_->allocate(sizeof(MQTTSerializeBuffer))) MQTTSerializeBuffer(allocator_);
+      new (allocator_->allocate(sizeof(MQTTBuffer))) MQTTBuffer(allocator_);
 }
 
 MQTTProtocolHandler::~MQTTProtocolHandler()
@@ -95,8 +95,8 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
     allocator_->deallocate(parser_, sizeof(MQTTParser));
   }
   if (serialize_buffer_) {
-    serialize_buffer_->~MQTTSerializeBuffer();
-    allocator_->deallocate(serialize_buffer_, sizeof(MQTTSerializeBuffer));
+    serialize_buffer_->~MQTTBuffer();
+    allocator_->deallocate(serialize_buffer_, sizeof(MQTTBuffer));
   }
   if (current_user_info_) {
     current_user_info_->~UserInfo();

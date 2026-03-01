@@ -64,6 +64,7 @@ set(MQTTS_INCLUDE_DIRS
     "${MQTTS_SRC_DIR}/common"
     "${MQTTS_SRC_DIR}/core"
     "${MQTTS_SRC_DIR}/events"
+    "${MQTTS_SRC_DIR}/http"
     "${MQTTS_SRC_DIR}/memory"
     "${MQTTS_SRC_DIR}/protocol"
     "${MQTTS_SRC_DIR}/router"
@@ -96,8 +97,9 @@ add_subdirectory(3rd EXCLUDE_FROM_ALL)
 add_library(mqtt_parser STATIC
     src/protocol/mqtt_parser.cpp
     src/memory/mqtt_allocator.cpp
-    src/protocol/mqtt_serialize_buffer.cpp
     src/common/mqtt_string_utils.cpp
+    src/common/logger.cpp
+    src/common/mqtt_buffer.cpp
     src/common/mqtt_config.cpp
     src/session/mqtt_session_manager_v2.cpp
 	src/session/mqtt_session_info.cpp
@@ -112,6 +114,8 @@ add_library(mqtt_parser STATIC
 	src/websocket/websocket_protocol_handler.cpp
 	src/websocket/websocket_mqtt_bridge.cpp
 	src/websocket/websocket_handler_adapter.cpp
+	src/http/http_message.cpp
+	src/http/http_parser.cpp
 )
 
 # 添加mqtt_router库
@@ -120,8 +124,13 @@ add_library(mqtt_router STATIC
     src/router/mqtt_router_rpc_client.cpp
     src/memory/mqtt_allocator.cpp
     src/common/mqtt_string_utils.cpp
+    src/common/logger.cpp
+    src/common/mqtt_buffer.cpp
     src/topic/mqtt_topic_tree.cpp
 )
+
+# mqtt_parser 依赖 logger.cpp 中的协程局部存储接口
+target_link_libraries(mqtt_parser colib_static)
 
 # mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
 target_link_libraries(mqtt_router colib_static)
@@ -133,6 +142,8 @@ add_library(mqtt_auth STATIC
     src/auth/mqtt_auth_redis.cpp
     src/memory/mqtt_allocator.cpp
     src/common/mqtt_string_utils.cpp
+    src/common/logger.cpp
+    src/common/mqtt_buffer.cpp
 )
 
 # 查找认证相关依赖
@@ -168,9 +179,12 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
 
+pkg_check_modules(LLHTTP REQUIRED llhttp)
+
 target_include_directories(mqtt_parser PUBLIC
     ${MQTTS_INCLUDE_DIRS}
     ${YAML_CPP_INCLUDE_DIRS}
+    ${LLHTTP_INCLUDE_DIRS}
 )
 
 # 使用yaml-cpp的静态库
@@ -180,6 +194,7 @@ target_link_libraries(mqtt_parser
     -Wl,-Bdynamic
     OpenSSL::SSL
     OpenSSL::Crypto
+    ${LLHTTP_LIBRARIES}
 )
 
 # 添加主程序
@@ -275,6 +290,7 @@ target_link_libraries(simple_websocket_mqtt_test
     dl
     OpenSSL::SSL
     OpenSSL::Crypto
+    ${LLHTTP_LIBRARIES}
 )
 
 # 启用测试
