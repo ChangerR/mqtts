@@ -13,6 +13,7 @@ set(TEST_INCLUDE_DIRS ${CMAKE_SOURCE_DIR} ${GTEST_INCLUDE_DIR} ${MQTTS_INCLUDE_D
 add_executable(test_connect test_connect.cpp)
 add_executable(test_mqtt_allocator test_mqtt_allocator.cpp)
 add_executable(test_mqtt_parser test_mqtt_parser.cpp)
+add_executable(test_mqtt_buffer test_mqtt_buffer.cpp)
 add_executable(test_mqtt_topic_tree test_mqtt_topic_tree.cpp)
 add_executable(test_mqttv5_protocol test_mqttv5_protocol.cpp)
 add_executable(test_publish_serialization test_publish_serialization.cpp)
@@ -81,11 +82,13 @@ add_executable(test_websocket_mqtt_bridge test_websocket_mqtt_bridge.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)
+add_executable(test_http_parser test_http_parser.cpp)
 
 # 添加头文件搜索路径
 target_include_directories(test_connect PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_mqtt_allocator PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_mqtt_parser PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_mqtt_buffer PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_mqtt_topic_tree PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_mqttv5_protocol PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_publish_serialization PRIVATE ${TEST_INCLUDE_DIRS})
@@ -121,6 +124,7 @@ target_include_directories(test_websocket_mqtt_bridge PRIVATE ${TEST_INCLUDE_DIR
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqtt_allocator PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqtt_parser PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_buffer PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqtt_topic_tree PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_mqttv5_protocol PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_publish_serialization PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
@@ -151,12 +155,15 @@ target_link_libraries(test_mqtt_session_manager_router PRIVATE colib_static mqtt
 # WebSocket 测试的链接库
 target_link_libraries(test_websocket_frame PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 target_link_libraries(test_websocket_mqtt_bridge PRIVATE colib_static mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+target_include_directories(test_http_parser PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_http_parser PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 
 # 启用测试
 enable_testing()
 add_test(NAME test_connect COMMAND test_connect)
 add_test(NAME test_mqtt_allocator COMMAND test_mqtt_allocator)
 add_test(NAME test_mqtt_parser COMMAND test_mqtt_parser)
+add_test(NAME test_mqtt_buffer COMMAND test_mqtt_buffer)
 add_test(NAME test_mqtt_topic_tree COMMAND test_mqtt_topic_tree)
 add_test(NAME test_mqttv5_protocol COMMAND test_mqttv5_protocol)
 add_test(NAME test_publish_serialization COMMAND test_publish_serialization)
@@ -179,3 +186,4 @@ add_test(NAME test_mqtt_session_manager_router COMMAND test_mqtt_session_manager
 # 添加 WebSocket 测试
 add_test(NAME test_websocket_frame COMMAND test_websocket_frame)
 add_test(NAME test_websocket_mqtt_bridge COMMAND test_websocket_mqtt_bridge)
+add_test(NAME test_http_parser COMMAND test_http_parser)
