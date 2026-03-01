@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "mqtt_buffer.h"
 #include "logger.h"
 #include "mqtt_define.h"
 
@@ -14,7 +15,10 @@ class MQTTSocket
   int accept(MQTTSocket*& client);  // 返回具体错误码
   int connect(const char* ip, int port);
   int send(const uint8_t* buf, int len);
+  int send(const mqtt::MQTTBuffer& buffer);
   int recv(char* buf, int& len);
+  int recv(mqtt::MQTTBuffer& buffer, int& len);
+  bool is_websocket_upgrade_request(int timeout_ms = 1000);
   int close();
 
   // Socket configuration

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <sstream>
+#include "http_parser.h"
 #include "logger.h"
 #include "websocket_mqtt_bridge.h"
 
@@ -38,31 +39,6 @@ static std::string to_lower_ascii(const std::string& input) {
         return static_cast<char>(std::tolower(c));
     });
     return out;
-}
-
-static bool header_value(const std::string& request, const std::string& header_name, std::string& value) {
-    std::istringstream lines(request);
-    std::string line;
-    const std::string wanted = to_lower_ascii(header_name);
-    while (std::getline(lines, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-
-        size_t colon_pos = line.find(':');
-        if (colon_pos == std::string::npos) {
-            continue;
-        }
-
-        std::string name = to_lower_ascii(trim_ascii(line.substr(0, colon_pos)));
-        if (name != wanted) {
-            continue;
-        }
-
-        value = trim_ascii(line.substr(colon_pos + 1));
-        return true;
-    }
-    return false;
 }
 
 static bool is_supported_mqtt_subprotocol_token(const std::string& token) {
@@ -357,18 +333,40 @@ int WebSocketProtocolHandler::read_handshake_request(std::string& request) {
 int WebSocketProtocolHandler::parse_handshake_request(const std::string& request, std::string& ws_key) {
     selected_subprotocol_.clear();
 
-    if (!header_value(request, "Sec-WebSocket-Key", ws_key)) {
-        LOG_ERROR("Sec-WebSocket-Key header not found");
+    http::HttpParser parser(allocator_, http::HttpParserType::REQUEST);
+    size_t consumed = 0;
+    http::HttpParseStatus status = parser.execute(request.data(), request.size(), consumed);
+    if (status != http::HttpParseStatus::OK || !parser.message_complete()) {
+        LOG_ERROR("Failed to parse HTTP request with parser status {}", static_cast<int>(status));
         return MQ_ERR_WS_HANDSHAKE;
     }
 
-    if (ws_key.empty()) {
-        LOG_ERROR("Empty Sec-WebSocket-Key");
+    const http::HttpRequest& http_request = parser.request();
+    if (http_request.method != mqtt::to_mqtt_string("GET", allocator_)) {
+        LOG_ERROR("WebSocket handshake requires GET, got {}", mqtt::from_mqtt_string(http_request.method));
         return MQ_ERR_WS_HANDSHAKE;
     }
 
-    std::string offered_subprotocols;
-    if (header_value(request, "Sec-WebSocket-Protocol", offered_subprotocols)) {
+    const mqtt::MQTTString ws_key_mqtt = http_request.get_header(mqtt::to_mqtt_string("sec-websocket-key", allocator_));
+    ws_key.assign(ws_key_mqtt.data(), ws_key_mqtt.size());
+    if (ws_key_mqtt.empty()) {
+        LOG_ERROR("Sec-WebSocket-Key header not found or empty");
+        return MQ_ERR_WS_HANDSHAKE;
+    }
+
+    const mqtt::MQTTString upgrade = http::to_lower_ascii(http_request.get_header(mqtt::to_mqtt_string("upgrade", allocator_)), allocator_);
+    const mqtt::MQTTString connection = http::to_lower_ascii(http_request.get_header(mqtt::to_mqtt_string("connection", allocator_)), allocator_);
+    if (upgrade != mqtt::to_mqtt_string("websocket", allocator_) || connection.find("upgrade") == mqtt::MQTTString::npos) {
+        LOG_ERROR("Invalid websocket upgrade headers, upgrade='{}', connection='{}'",
+                  mqtt::from_mqtt_string(upgrade),
+                  mqtt::from_mqtt_string(connection));
+        return MQ_ERR_WS_HANDSHAKE;
+    }
+
+    const mqtt::MQTTString offered_subprotocols_mqtt =
+        http_request.get_header(mqtt::to_mqtt_string("sec-websocket-protocol", allocator_));
+    if (!offered_subprotocols_mqtt.empty()) {
+        const std::string offered_subprotocols = mqtt::from_mqtt_string(offered_subprotocols_mqtt);
         (void)select_supported_subprotocol(offered_subprotocols, selected_subprotocol_);
         LOG_DEBUG("Client offered subprotocols: '{}', selected: '{}'",
                   offered_subprotocols,
@@ -394,20 +392,19 @@ std::string WebSocketProtocolHandler::compute_accept_key(const std::string& ws_k
 int WebSocketProtocolHandler::send_handshake_response(const std::string& ws_key) {
     std::string accept_key = compute_accept_key(ws_key);
 
-    // Build HTTP response
-    std::ostringstream response;
-    response << "HTTP/1.1 101 Switching Protocols\r\n"
-             << "Upgrade: websocket\r\n"
-             << "Connection: Upgrade\r\n"
-             << "Sec-WebSocket-Accept: " << accept_key << "\r\n";
+    http::HttpResponse response(allocator_);
+    response.status_code = 101;
+    response.reason.assign("Switching Protocols");
+    response.set_header(mqtt::to_mqtt_string("Upgrade", allocator_), mqtt::to_mqtt_string("websocket", allocator_));
+    response.set_header(mqtt::to_mqtt_string("Connection", allocator_), mqtt::to_mqtt_string("Upgrade", allocator_));
+    response.set_header(mqtt::to_mqtt_string("Sec-WebSocket-Accept", allocator_), mqtt::to_mqtt_string(accept_key, allocator_));
 
     if (!selected_subprotocol_.empty()) {
-        response << "Sec-WebSocket-Protocol: " << selected_subprotocol_ << "\r\n";
+        response.set_header(mqtt::to_mqtt_string("Sec-WebSocket-Protocol", allocator_),
+                            mqtt::to_mqtt_string(selected_subprotocol_, allocator_));
     }
 
-    response << "\r\n";
-
-    std::string response_str = response.str();
+    const mqtt::MQTTString response_str = response.serialize();
 
     int ret = socket_->send(reinterpret_cast<const uint8_t*>(response_str.c_str()),
                            response_str.length());

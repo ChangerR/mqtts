@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <limits>
 
 #include "co_routine.h"
 
@@ -175,6 +176,20 @@ int MQTTSocket::send(const uint8_t* buf, int len)
   return ret;
 }
 
+int MQTTSocket::send(const mqtt::MQTTBuffer& buffer)
+{
+  if (buffer.empty()) {
+    return MQ_SUCCESS;
+  }
+
+  if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    LOG_ERROR("Buffer too large to send: {} bytes", buffer.size());
+    return MQ_ERR_INVALID_ARGS;
+  }
+
+  return send(buffer.data(), static_cast<int>(buffer.size()));
+}
+
 int MQTTSocket::recv(char* buf, int& len)
 {
   int ret = MQ_SUCCESS;
@@ -213,6 +228,74 @@ int MQTTSocket::recv(char* buf, int& len)
   }
 
   return ret;
+}
+
+int MQTTSocket::recv(mqtt::MQTTBuffer& buffer, int& len)
+{
+  if (len < 0) {
+    LOG_ERROR("Invalid recv length: {}", len);
+    return MQ_ERR_INVALID_ARGS;
+  }
+
+  if (len == 0) {
+    return MQ_SUCCESS;
+  }
+
+  size_t old_size = buffer.size();
+  size_t append_capacity = static_cast<size_t>(len);
+  if (append_capacity > static_cast<size_t>(std::numeric_limits<size_t>::max() - old_size)) {
+    LOG_ERROR("recv size overflow: old_size={}, append={}", old_size, append_capacity);
+    return MQ_ERR_INVALID_ARGS;
+  }
+
+  size_t required = old_size + append_capacity;
+  if (!buffer.reserve(required)) {
+    LOG_ERROR("Failed to reserve MQTTBuffer for recv, required={}", required);
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+
+  int read_len = len;
+  int ret = recv(reinterpret_cast<char*>(buffer.data() + old_size), read_len);
+  if (MQ_FAIL(ret)) {
+    return ret;
+  }
+
+  if (read_len > 0 && !buffer.resize(old_size + static_cast<size_t>(read_len))) {
+    LOG_ERROR("Failed to resize MQTTBuffer after recv, old_size={}, read_len={}", old_size, read_len);
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+
+  len = read_len;
+  return MQ_SUCCESS;
+}
+
+
+bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
+{
+  if (!connected_) {
+    return false;
+  }
+
+  char peek_buffer[16] = {0};
+  int fd = get_fd();
+  if (fd < 0) {
+    return false;
+  }
+
+  struct pollfd pf = {0};
+  pf.fd = fd;
+  pf.events = POLLIN;
+  int poll_ret = co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
+  if (poll_ret <= 0) {
+    return false;
+  }
+
+  ssize_t bytes = ::recv(fd, peek_buffer, sizeof(peek_buffer), MSG_PEEK | MSG_NOSIGNAL);
+  if (bytes < 4) {
+    return false;
+  }
+
+  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' && peek_buffer[3] == ' ');
 }
 
 int MQTTSocket::close()

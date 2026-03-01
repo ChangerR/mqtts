@@ -345,42 +345,12 @@ void* MQTTServer::client_routine(void* arg)
   return NULL;
 }
 
-// Helper function to detect if incoming connection is WebSocket upgrade request
-static bool is_websocket_upgrade(MQTTSocket* socket)
-{
-  // Peek at the first few bytes without consuming them
-  char peek_buffer[16];
-  int peek_len = sizeof(peek_buffer);
-
-  // Use MSG_PEEK flag to peek without consuming (blocking is OK since we're in a coroutine)
-  int fd = socket->get_fd();
-
-  // Wait for data to be available using poll (compatible with libco)
-  struct pollfd pf = {0};
-  pf.fd = fd;
-  pf.events = POLLIN;
-  int poll_ret = co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 1 second timeout
-
-  if (poll_ret <= 0) {
-    return false;  // Timeout or error
-  }
-
-  ssize_t bytes = recv(fd, peek_buffer, peek_len, MSG_PEEK);
-
-  if (bytes < 4) {
-    return false;  // Not enough data or error, assume not WebSocket
-  }
-
-  // Check if it starts with "GET " which indicates HTTP request
-  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' && peek_buffer[3] == ' ');
-}
-
 void MQTTServer::handle_client(ClientContext* ctx)
 {
   int ret = MQ_SUCCESS;
 
   // Detect if this is a WebSocket connection
-  bool is_websocket = is_websocket_upgrade(ctx->client);
+  bool is_websocket = ctx->client->is_websocket_upgrade_request();
 
   if (is_websocket) {
     LOG_INFO("Detected WebSocket upgrade request from {}:{}", ctx->client_ip, ctx->client_port);
