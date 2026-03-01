@@ -215,6 +215,35 @@ int MQTTSocket::recv(char* buf, int& len)
   return ret;
 }
 
+
+bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
+{
+  if (!connected_) {
+    return false;
+  }
+
+  char peek_buffer[16] = {0};
+  int fd = get_fd();
+  if (fd < 0) {
+    return false;
+  }
+
+  struct pollfd pf = {0};
+  pf.fd = fd;
+  pf.events = POLLIN;
+  int poll_ret = co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
+  if (poll_ret <= 0) {
+    return false;
+  }
+
+  ssize_t bytes = ::recv(fd, peek_buffer, sizeof(peek_buffer), MSG_PEEK | MSG_NOSIGNAL);
+  if (bytes < 4) {
+    return false;
+  }
+
+  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' && peek_buffer[3] == ' ');
+}
+
 int MQTTSocket::close()
 {
   if (fd_ >= 0) {

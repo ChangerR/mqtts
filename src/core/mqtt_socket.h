@@ -15,6 +15,7 @@ class MQTTSocket
   int connect(const char* ip, int port);
   int send(const uint8_t* buf, int len);
   int recv(char* buf, int& len);
+  bool is_websocket_upgrade_request(int timeout_ms = 1000);
   int close();
 
   // Socket configuration
