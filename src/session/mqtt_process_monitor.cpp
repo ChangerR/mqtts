@@ -34,29 +34,38 @@ ProcessMonitor::~ProcessMonitor()
 
 int ProcessMonitor::start()
 {
-    if (running_.load()) {
-        LOG_WARN("Process monitor is already running");
-        return MQ_SUCCESS;
-    }
-    
-    if (!session_manager_) {
-        LOG_ERROR("Session manager is null, cannot start process monitor");
-        return MQ_ERR_INVALID_ARGS;
-    }
-    
-    running_.store(true);
-    start_time_ = std::chrono::steady_clock::now();
-    
-    try {
-        monitor_thread_.reset(new std::thread(&ProcessMonitor::monitor_loop, this));
-        LOG_INFO("Process monitor started with {}s interval", interval_seconds_);
-    } catch (const std::exception& e) {
-        LOG_ERROR("Failed to start process monitor thread: {}", e.what());
-        running_.store(false);
-        return MQ_ERR_INTERNAL;
-    }
-    
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      if (running_.load()) {
+          LOG_WARN("Process monitor is already running");
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      if (!session_manager_) {
+          LOG_ERROR("Session manager is null, cannot start process monitor");
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+      
+      running_.store(true);
+      start_time_ = std::chrono::steady_clock::now();
+      
+      try {
+          monitor_thread_.reset(new std::thread(&ProcessMonitor::monitor_loop, this));
+          LOG_INFO("Process monitor started with {}s interval", interval_seconds_);
+      } catch (const std::exception& e) {
+          LOG_ERROR("Failed to start process monitor thread: {}", e.what());
+          running_.store(false);
+          __mq_ret = MQ_ERR_INTERNAL;
+          break;
+      }
+      
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 void ProcessMonitor::stop()

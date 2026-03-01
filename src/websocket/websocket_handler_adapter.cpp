@@ -25,31 +25,38 @@ int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
                                           bool retain,
                                           bool dup,
                                           const mqtt::Properties& properties) {
-    if (!bridge_) {
-        LOG_ERROR("Bridge is null in WebSocketHandlerAdapter");
-        return MQ_ERR_PARAM_V2;
-    }
+  int __mq_ret = 0;
+  do {
+      if (!bridge_) {
+          LOG_ERROR("Bridge is null in WebSocketHandlerAdapter");
+          __mq_ret = MQ_ERR_PARAM_V2;
+          break;
+      }
+  
+      // Create a PublishPacket to forward to the bridge
+      mqtt::PublishPacket packet(adapter_allocator_);
+      packet.topic_name = topic;
+      packet.payload = payload;
+      packet.qos = qos;
+      packet.retain = retain;
+      packet.dup = dup;
+      // Note: properties are not currently used in the bridge
+  
+      // Forward to the WebSocket bridge, which will send it to the WebSocket client
+      int ret = bridge_->handle_mqtt_publish(client_id_, packet);
+  
+      if (ret != MQ_SUCCESS) {
+          LOG_ERROR("Failed to forward message to WebSocket client {}: {}", client_id_, ret);
+      } else {
+          LOG_DEBUG("Forwarded PUBLISH to WebSocket client {} (topic: {}, qos: {})",
+                    client_id_, mqtt::from_mqtt_string(topic), qos);
+      }
+  
+      __mq_ret = ret;
+      break;
+  } while (false);
 
-    // Create a PublishPacket to forward to the bridge
-    mqtt::PublishPacket packet(adapter_allocator_);
-    packet.topic_name = topic;
-    packet.payload = payload;
-    packet.qos = qos;
-    packet.retain = retain;
-    packet.dup = dup;
-    // Note: properties are not currently used in the bridge
-
-    // Forward to the WebSocket bridge, which will send it to the WebSocket client
-    int ret = bridge_->handle_mqtt_publish(client_id_, packet);
-
-    if (ret != MQ_SUCCESS) {
-        LOG_ERROR("Failed to forward message to WebSocket client {}: {}", client_id_, ret);
-    } else {
-        LOG_DEBUG("Forwarded PUBLISH to WebSocket client {} (topic: {}, qos: {})",
-                  client_id_, mqtt::from_mqtt_string(topic), qos);
-    }
-
-    return ret;
+  return __mq_ret;
 }
 
 }  // namespace websocket

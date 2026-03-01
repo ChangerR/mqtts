@@ -41,64 +41,82 @@ void WebSocketFrame::clear() {
 }
 
 int WebSocketFrame::get_close_info(uint16_t& code, std::string& reason) const {
-    if (opcode != WebSocketOpcode::CLOSE) {
-        return MQ_ERR_INVALID_ARGS;
-    }
+  int __mq_ret = 0;
+  do {
+      if (opcode != WebSocketOpcode::CLOSE) {
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+  
+      if (payload.empty()) {
+          code = static_cast<uint16_t>(WebSocketCloseCode::NO_STATUS_RECEIVED);
+          reason.clear();
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+  
+      if (payload.size() < 2) {
+          LOG_ERROR("Invalid close frame: payload too short");
+          __mq_ret = MQ_ERR_WS_INVALID_FRAME;
+          break;
+      }
+  
+      // Extract status code (network byte order)
+      code = (static_cast<uint16_t>(payload[0]) << 8) | static_cast<uint16_t>(payload[1]);
+  
+      // Extract reason (if present)
+      if (payload.size() > 2) {
+          reason.assign(payload.begin() + 2, payload.end());
+          // Validate UTF-8
+          if (!WebSocketFrameParser::is_valid_utf8(
+                  reinterpret_cast<const uint8_t*>(reason.data()), reason.size())) {
+              LOG_ERROR("Invalid close frame: reason is not valid UTF-8");
+              __mq_ret = MQ_ERR_WS_INVALID_UTF8;
+              break;
+          }
+      } else {
+          reason.clear();
+      }
+  
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    if (payload.empty()) {
-        code = static_cast<uint16_t>(WebSocketCloseCode::NO_STATUS_RECEIVED);
-        reason.clear();
-        return MQ_SUCCESS;
-    }
-
-    if (payload.size() < 2) {
-        LOG_ERROR("Invalid close frame: payload too short");
-        return MQ_ERR_WS_INVALID_FRAME;
-    }
-
-    // Extract status code (network byte order)
-    code = (static_cast<uint16_t>(payload[0]) << 8) | static_cast<uint16_t>(payload[1]);
-
-    // Extract reason (if present)
-    if (payload.size() > 2) {
-        reason.assign(payload.begin() + 2, payload.end());
-        // Validate UTF-8
-        if (!WebSocketFrameParser::is_valid_utf8(
-                reinterpret_cast<const uint8_t*>(reason.data()), reason.size())) {
-            LOG_ERROR("Invalid close frame: reason is not valid UTF-8");
-            return MQ_ERR_WS_INVALID_UTF8;
-        }
-    } else {
-        reason.clear();
-    }
-
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int WebSocketFrame::set_close_info(uint16_t code, const std::string& reason) {
-    if (opcode != WebSocketOpcode::CLOSE) {
-        return MQ_ERR_INVALID_ARGS;
-    }
+  int __mq_ret = 0;
+  do {
+      if (opcode != WebSocketOpcode::CLOSE) {
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+  
+      payload.clear();
+  
+      // Add status code (network byte order)
+      payload.push_back(static_cast<uint8_t>(code >> 8));
+      payload.push_back(static_cast<uint8_t>(code & 0xFF));
+  
+      // Add reason (if not empty)
+      if (!reason.empty()) {
+          // Validate UTF-8
+          if (!WebSocketFrameParser::is_valid_utf8(
+                  reinterpret_cast<const uint8_t*>(reason.data()), reason.size())) {
+              LOG_ERROR("Invalid close reason: not valid UTF-8");
+              __mq_ret = MQ_ERR_WS_INVALID_UTF8;
+              break;
+          }
+          payload.insert(payload.end(), reason.begin(), reason.end());
+      }
+  
+      payload_length = payload.size();
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    payload.clear();
-
-    // Add status code (network byte order)
-    payload.push_back(static_cast<uint8_t>(code >> 8));
-    payload.push_back(static_cast<uint8_t>(code & 0xFF));
-
-    // Add reason (if not empty)
-    if (!reason.empty()) {
-        // Validate UTF-8
-        if (!WebSocketFrameParser::is_valid_utf8(
-                reinterpret_cast<const uint8_t*>(reason.data()), reason.size())) {
-            LOG_ERROR("Invalid close reason: not valid UTF-8");
-            return MQ_ERR_WS_INVALID_UTF8;
-        }
-        payload.insert(payload.end(), reason.begin(), reason.end());
-    }
-
-    payload_length = payload.size();
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 // WebSocketFrameParser implementation
@@ -112,203 +130,242 @@ WebSocketFrameParser::~WebSocketFrameParser() {
 
 int WebSocketFrameParser::parse_frame(const uint8_t* data, size_t data_len,
                                       WebSocketFrame& frame, size_t& bytes_consumed) {
-    if (!data || data_len == 0) {
-        return MQ_ERR_INVALID_ARGS;
-    }
+  int __mq_ret = 0;
+  do {
+      if (!data || data_len == 0) {
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+  
+      // Parse header
+      size_t header_len = 0;
+      int ret = parse_header(data, data_len, frame, header_len);
+      if (ret != MQ_SUCCESS) {
+          __mq_ret = ret;
+          break;
+      }
+  
+      // Parse payload
+      ret = parse_payload(data, data_len, frame, header_len, bytes_consumed);
+      if (ret != MQ_SUCCESS) {
+          __mq_ret = ret;
+          break;
+      }
+  
+      // Validate the complete frame
+      ret = validate_frame(frame);
+      if (ret != MQ_SUCCESS) {
+          LOG_ERROR("Frame validation failed: {}", ret);
+          __mq_ret = ret;
+          break;
+      }
+  
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    // Parse header
-    size_t header_len = 0;
-    int ret = parse_header(data, data_len, frame, header_len);
-    if (ret != MQ_SUCCESS) {
-        return ret;
-    }
-
-    // Parse payload
-    ret = parse_payload(data, data_len, frame, header_len, bytes_consumed);
-    if (ret != MQ_SUCCESS) {
-        return ret;
-    }
-
-    // Validate the complete frame
-    ret = validate_frame(frame);
-    if (ret != MQ_SUCCESS) {
-        LOG_ERROR("Frame validation failed: {}", ret);
-        return ret;
-    }
-
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int WebSocketFrameParser::parse_header(const uint8_t* data, size_t data_len,
                                        WebSocketFrame& frame, size_t& header_len) {
-    // Minimum header is 2 bytes
-    if (data_len < 2) {
-        return MQ_ERR_WS_INCOMPLETE_FRAME;
-    }
+  int __mq_ret = 0;
+  do {
+      // Minimum header is 2 bytes
+      if (data_len < 2) {
+          __mq_ret = MQ_ERR_WS_INCOMPLETE_FRAME;
+          break;
+      }
+  
+      // Byte 0: FIN, RSV, Opcode
+      uint8_t byte0 = data[0];
+      frame.fin = (byte0 & 0x80) != 0;
+      frame.rsv1 = (byte0 & 0x40) != 0;
+      frame.rsv2 = (byte0 & 0x20) != 0;
+      frame.rsv3 = (byte0 & 0x10) != 0;
+      frame.opcode = static_cast<WebSocketOpcode>(byte0 & 0x0F);
+  
+      // Validate opcode
+      if (!is_valid_opcode(static_cast<uint8_t>(frame.opcode))) {
+          LOG_ERROR("Invalid opcode: {}", static_cast<int>(frame.opcode));
+          __mq_ret = MQ_ERR_WS_INVALID_OPCODE;
+          break;
+      }
+  
+      // Byte 1: MASK, Payload length (first 7 bits)
+      uint8_t byte1 = data[1];
+      frame.masked = (byte1 & 0x80) != 0;
+      uint8_t payload_len = byte1 & 0x7F;
+  
+      size_t offset = 2;
+  
+      // Determine actual payload length
+      if (payload_len < 126) {
+          frame.payload_length = payload_len;
+      } else if (payload_len == 126) {
+          // Next 2 bytes are payload length
+          if (data_len < offset + 2) {
+              __mq_ret = MQ_ERR_WS_INCOMPLETE_FRAME;
+              break;
+          }
+          frame.payload_length = (static_cast<uint64_t>(data[offset]) << 8) |
+                                static_cast<uint64_t>(data[offset + 1]);
+          offset += 2;
+      } else {  // payload_len == 127
+          // Next 8 bytes are payload length
+          if (data_len < offset + 8) {
+              __mq_ret = MQ_ERR_WS_INCOMPLETE_FRAME;
+              break;
+          }
+          frame.payload_length = 0;
+          for (int i = 0; i < 8; ++i) {
+              frame.payload_length = (frame.payload_length << 8) | static_cast<uint64_t>(data[offset + i]);
+          }
+          offset += 8;
+      }
+  
+      // Check payload length limit
+      if (frame.payload_length > max_payload_size_) {
+          LOG_ERROR("Payload length {} exceeds maximum {}", frame.payload_length, max_payload_size_);
+          __mq_ret = MQ_ERR_WS_FRAME_TOO_LARGE;
+          break;
+      }
+  
+      // Control frames must have payload <= 125 bytes
+      if (frame.is_control_frame() && frame.payload_length > 125) {
+          LOG_ERROR("Control frame payload too large: {}", frame.payload_length);
+          __mq_ret = MQ_ERR_WS_PROTOCOL;
+          break;
+      }
+  
+      // Control frames must not be fragmented
+      if (frame.is_control_frame() && !frame.fin) {
+          LOG_ERROR("Control frame must not be fragmented");
+          __mq_ret = MQ_ERR_WS_PROTOCOL;
+          break;
+      }
+  
+      // Read masking key if present
+      if (frame.masked) {
+          if (data_len < offset + 4) {
+              __mq_ret = MQ_ERR_WS_INCOMPLETE_FRAME;
+              break;
+          }
+          std::memcpy(frame.masking_key, data + offset, 4);
+          offset += 4;
+      } else {
+          std::memset(frame.masking_key, 0, sizeof(frame.masking_key));
+      }
+  
+      header_len = offset;
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    // Byte 0: FIN, RSV, Opcode
-    uint8_t byte0 = data[0];
-    frame.fin = (byte0 & 0x80) != 0;
-    frame.rsv1 = (byte0 & 0x40) != 0;
-    frame.rsv2 = (byte0 & 0x20) != 0;
-    frame.rsv3 = (byte0 & 0x10) != 0;
-    frame.opcode = static_cast<WebSocketOpcode>(byte0 & 0x0F);
-
-    // Validate opcode
-    if (!is_valid_opcode(static_cast<uint8_t>(frame.opcode))) {
-        LOG_ERROR("Invalid opcode: {}", static_cast<int>(frame.opcode));
-        return MQ_ERR_WS_INVALID_OPCODE;
-    }
-
-    // Byte 1: MASK, Payload length (first 7 bits)
-    uint8_t byte1 = data[1];
-    frame.masked = (byte1 & 0x80) != 0;
-    uint8_t payload_len = byte1 & 0x7F;
-
-    size_t offset = 2;
-
-    // Determine actual payload length
-    if (payload_len < 126) {
-        frame.payload_length = payload_len;
-    } else if (payload_len == 126) {
-        // Next 2 bytes are payload length
-        if (data_len < offset + 2) {
-            return MQ_ERR_WS_INCOMPLETE_FRAME;
-        }
-        frame.payload_length = (static_cast<uint64_t>(data[offset]) << 8) |
-                              static_cast<uint64_t>(data[offset + 1]);
-        offset += 2;
-    } else {  // payload_len == 127
-        // Next 8 bytes are payload length
-        if (data_len < offset + 8) {
-            return MQ_ERR_WS_INCOMPLETE_FRAME;
-        }
-        frame.payload_length = 0;
-        for (int i = 0; i < 8; ++i) {
-            frame.payload_length = (frame.payload_length << 8) | static_cast<uint64_t>(data[offset + i]);
-        }
-        offset += 8;
-    }
-
-    // Check payload length limit
-    if (frame.payload_length > max_payload_size_) {
-        LOG_ERROR("Payload length {} exceeds maximum {}", frame.payload_length, max_payload_size_);
-        return MQ_ERR_WS_FRAME_TOO_LARGE;
-    }
-
-    // Control frames must have payload <= 125 bytes
-    if (frame.is_control_frame() && frame.payload_length > 125) {
-        LOG_ERROR("Control frame payload too large: {}", frame.payload_length);
-        return MQ_ERR_WS_PROTOCOL;
-    }
-
-    // Control frames must not be fragmented
-    if (frame.is_control_frame() && !frame.fin) {
-        LOG_ERROR("Control frame must not be fragmented");
-        return MQ_ERR_WS_PROTOCOL;
-    }
-
-    // Read masking key if present
-    if (frame.masked) {
-        if (data_len < offset + 4) {
-            return MQ_ERR_WS_INCOMPLETE_FRAME;
-        }
-        std::memcpy(frame.masking_key, data + offset, 4);
-        offset += 4;
-    } else {
-        std::memset(frame.masking_key, 0, sizeof(frame.masking_key));
-    }
-
-    header_len = offset;
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int WebSocketFrameParser::parse_payload(const uint8_t* data, size_t data_len,
                                         WebSocketFrame& frame, size_t header_len,
                                         size_t& bytes_consumed) {
-    // Check if we have enough data for payload
-    if (data_len < header_len + frame.payload_length) {
-        return MQ_ERR_WS_INCOMPLETE_FRAME;
-    }
+  int __mq_ret = 0;
+  do {
+      // Check if we have enough data for payload
+      if (data_len < header_len + frame.payload_length) {
+          __mq_ret = MQ_ERR_WS_INCOMPLETE_FRAME;
+          break;
+      }
+  
+      // Read payload
+      frame.payload.clear();
+      if (frame.payload_length > 0) {
+          frame.payload.resize(frame.payload_length);
+          std::memcpy(frame.payload.data(), data + header_len, frame.payload_length);
+  
+          // Unmask if needed
+          if (frame.masked) {
+              apply_mask(frame.payload.data(), frame.payload.size(), frame.masking_key);
+          }
+      }
+  
+      // Validate UTF-8 for text frames
+      if (frame.opcode == WebSocketOpcode::TEXT && frame.fin) {
+          if (!is_valid_utf8(frame.payload.data(), frame.payload.size())) {
+              LOG_ERROR("Text frame contains invalid UTF-8");
+              __mq_ret = MQ_ERR_WS_INVALID_UTF8;
+              break;
+          }
+      }
+  
+      bytes_consumed = header_len + frame.payload_length;
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    // Read payload
-    frame.payload.clear();
-    if (frame.payload_length > 0) {
-        frame.payload.resize(frame.payload_length);
-        std::memcpy(frame.payload.data(), data + header_len, frame.payload_length);
-
-        // Unmask if needed
-        if (frame.masked) {
-            apply_mask(frame.payload.data(), frame.payload.size(), frame.masking_key);
-        }
-    }
-
-    // Validate UTF-8 for text frames
-    if (frame.opcode == WebSocketOpcode::TEXT && frame.fin) {
-        if (!is_valid_utf8(frame.payload.data(), frame.payload.size())) {
-            LOG_ERROR("Text frame contains invalid UTF-8");
-            return MQ_ERR_WS_INVALID_UTF8;
-        }
-    }
-
-    bytes_consumed = header_len + frame.payload_length;
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int WebSocketFrameParser::serialize_frame(const WebSocketFrame& frame, std::vector<uint8_t>& output) {
-    output.clear();
+  int __mq_ret = 0;
+  do {
+      output.clear();
+  
+      // Validate frame first
+      int ret = validate_frame(frame);
+      if (ret != MQ_SUCCESS) {
+          __mq_ret = ret;
+          break;
+      }
+  
+      // Byte 0: FIN, RSV, Opcode
+      uint8_t byte0 = (frame.fin ? 0x80 : 0x00) |
+                      (frame.rsv1 ? 0x40 : 0x00) |
+                      (frame.rsv2 ? 0x20 : 0x00) |
+                      (frame.rsv3 ? 0x10 : 0x00) |
+                      (static_cast<uint8_t>(frame.opcode) & 0x0F);
+      output.push_back(byte0);
+  
+      // Byte 1: MASK, Payload length
+      uint8_t byte1 = frame.masked ? 0x80 : 0x00;
+  
+      if (frame.payload_length < 126) {
+          byte1 |= static_cast<uint8_t>(frame.payload_length);
+          output.push_back(byte1);
+      } else if (frame.payload_length <= 0xFFFF) {
+          byte1 |= 126;
+          output.push_back(byte1);
+          output.push_back(static_cast<uint8_t>(frame.payload_length >> 8));
+          output.push_back(static_cast<uint8_t>(frame.payload_length & 0xFF));
+      } else {
+          byte1 |= 127;
+          output.push_back(byte1);
+          for (int i = 7; i >= 0; --i) {
+              output.push_back(static_cast<uint8_t>((frame.payload_length >> (i * 8)) & 0xFF));
+          }
+      }
+  
+      // Masking key (if masked)
+      if (frame.masked) {
+          output.insert(output.end(), frame.masking_key, frame.masking_key + 4);
+      }
+  
+      // Payload
+      if (frame.payload_length > 0) {
+          if (frame.masked) {
+              // Apply masking
+              std::vector<uint8_t> masked_payload(frame.payload.begin(), frame.payload.end());
+              apply_mask(masked_payload.data(), masked_payload.size(), frame.masking_key);
+              output.insert(output.end(), masked_payload.begin(), masked_payload.end());
+          } else {
+              output.insert(output.end(), frame.payload.begin(), frame.payload.end());
+          }
+      }
+  
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    // Validate frame first
-    int ret = validate_frame(frame);
-    if (ret != MQ_SUCCESS) {
-        return ret;
-    }
-
-    // Byte 0: FIN, RSV, Opcode
-    uint8_t byte0 = (frame.fin ? 0x80 : 0x00) |
-                    (frame.rsv1 ? 0x40 : 0x00) |
-                    (frame.rsv2 ? 0x20 : 0x00) |
-                    (frame.rsv3 ? 0x10 : 0x00) |
-                    (static_cast<uint8_t>(frame.opcode) & 0x0F);
-    output.push_back(byte0);
-
-    // Byte 1: MASK, Payload length
-    uint8_t byte1 = frame.masked ? 0x80 : 0x00;
-
-    if (frame.payload_length < 126) {
-        byte1 |= static_cast<uint8_t>(frame.payload_length);
-        output.push_back(byte1);
-    } else if (frame.payload_length <= 0xFFFF) {
-        byte1 |= 126;
-        output.push_back(byte1);
-        output.push_back(static_cast<uint8_t>(frame.payload_length >> 8));
-        output.push_back(static_cast<uint8_t>(frame.payload_length & 0xFF));
-    } else {
-        byte1 |= 127;
-        output.push_back(byte1);
-        for (int i = 7; i >= 0; --i) {
-            output.push_back(static_cast<uint8_t>((frame.payload_length >> (i * 8)) & 0xFF));
-        }
-    }
-
-    // Masking key (if masked)
-    if (frame.masked) {
-        output.insert(output.end(), frame.masking_key, frame.masking_key + 4);
-    }
-
-    // Payload
-    if (frame.payload_length > 0) {
-        if (frame.masked) {
-            // Apply masking
-            std::vector<uint8_t> masked_payload(frame.payload.begin(), frame.payload.end());
-            apply_mask(masked_payload.data(), masked_payload.size(), frame.masking_key);
-            output.insert(output.end(), masked_payload.begin(), masked_payload.end());
-        } else {
-            output.insert(output.end(), frame.payload.begin(), frame.payload.end());
-        }
-    }
-
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 void WebSocketFrameParser::apply_mask(uint8_t* data, size_t data_len, const uint8_t* mask) {
@@ -322,53 +379,66 @@ void WebSocketFrameParser::apply_mask(uint8_t* data, size_t data_len, const uint
 }
 
 int WebSocketFrameParser::validate_frame(const WebSocketFrame& frame) {
-    // Check reserved bits (must be 0 unless extension is negotiated)
-    if (frame.rsv1 || frame.rsv2 || frame.rsv3) {
-        LOG_ERROR("Reserved bits must be 0");
-        return MQ_ERR_WS_RESERVED_BITS;
-    }
+  int __mq_ret = 0;
+  do {
+      // Check reserved bits (must be 0 unless extension is negotiated)
+      if (frame.rsv1 || frame.rsv2 || frame.rsv3) {
+          LOG_ERROR("Reserved bits must be 0");
+          __mq_ret = MQ_ERR_WS_RESERVED_BITS;
+          break;
+      }
+  
+      // Validate opcode
+      if (!is_valid_opcode(static_cast<uint8_t>(frame.opcode))) {
+          LOG_ERROR("Invalid opcode: {}", static_cast<int>(frame.opcode));
+          __mq_ret = MQ_ERR_WS_INVALID_OPCODE;
+          break;
+      }
+  
+      // Control frames validation
+      if (frame.is_control_frame()) {
+          if (!frame.fin) {
+              LOG_ERROR("Control frame must have FIN=1");
+              __mq_ret = MQ_ERR_WS_PROTOCOL;
+              break;
+          }
+          if (frame.payload_length > 125) {
+              LOG_ERROR("Control frame payload too large: {}", frame.payload_length);
+              __mq_ret = MQ_ERR_WS_PROTOCOL;
+              break;
+          }
+      }
+  
+      // Validate close frame
+      if (frame.opcode == WebSocketOpcode::CLOSE && !frame.payload.empty()) {
+          if (frame.payload.size() < 2) {
+              LOG_ERROR("Close frame payload must be >= 2 bytes if present");
+              __mq_ret = MQ_ERR_WS_CLOSE_CODE;
+              break;
+          }
+          // Validate close reason UTF-8
+          if (frame.payload.size() > 2) {
+              if (!is_valid_utf8(frame.payload.data() + 2, frame.payload.size() - 2)) {
+                  LOG_ERROR("Close frame reason must be valid UTF-8");
+                  __mq_ret = MQ_ERR_WS_INVALID_UTF8;
+                  break;
+              }
+          }
+      }
+  
+      // Validate payload length matches actual payload
+      if (frame.payload_length != frame.payload.size()) {
+          LOG_ERROR("Payload length mismatch: expected {}, got {}",
+                   frame.payload_length, frame.payload.size());
+          __mq_ret = MQ_ERR_WS_PAYLOAD_LENGTH;
+          break;
+      }
+  
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
 
-    // Validate opcode
-    if (!is_valid_opcode(static_cast<uint8_t>(frame.opcode))) {
-        LOG_ERROR("Invalid opcode: {}", static_cast<int>(frame.opcode));
-        return MQ_ERR_WS_INVALID_OPCODE;
-    }
-
-    // Control frames validation
-    if (frame.is_control_frame()) {
-        if (!frame.fin) {
-            LOG_ERROR("Control frame must have FIN=1");
-            return MQ_ERR_WS_PROTOCOL;
-        }
-        if (frame.payload_length > 125) {
-            LOG_ERROR("Control frame payload too large: {}", frame.payload_length);
-            return MQ_ERR_WS_PROTOCOL;
-        }
-    }
-
-    // Validate close frame
-    if (frame.opcode == WebSocketOpcode::CLOSE && !frame.payload.empty()) {
-        if (frame.payload.size() < 2) {
-            LOG_ERROR("Close frame payload must be >= 2 bytes if present");
-            return MQ_ERR_WS_CLOSE_CODE;
-        }
-        // Validate close reason UTF-8
-        if (frame.payload.size() > 2) {
-            if (!is_valid_utf8(frame.payload.data() + 2, frame.payload.size() - 2)) {
-                LOG_ERROR("Close frame reason must be valid UTF-8");
-                return MQ_ERR_WS_INVALID_UTF8;
-            }
-        }
-    }
-
-    // Validate payload length matches actual payload
-    if (frame.payload_length != frame.payload.size()) {
-        LOG_ERROR("Payload length mismatch: expected {}, got {}",
-                 frame.payload_length, frame.payload.size());
-        return MQ_ERR_WS_PAYLOAD_LENGTH;
-    }
-
-    return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 bool WebSocketFrameParser::is_valid_opcode(uint8_t opcode) {

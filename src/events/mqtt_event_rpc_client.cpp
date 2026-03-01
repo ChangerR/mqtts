@@ -76,20 +76,28 @@ EventRpcClient::~EventRpcClient() {
 }
 
 int EventRpcClient::initialize() {
-    if (initialized_.load()) {
-        return MQ_SUCCESS;
-    }
-    
-    try {
-        socket_.reset(new MQTTSocket());
-        initialized_.store(true);
-        
-        LOG_INFO("EventRpcClient initialized");
-        return MQ_SUCCESS;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Failed to initialize EventRpcClient: {}", e.what());
-        return MQ_ERR_INTERNAL;
-    }
+  int __mq_ret = 0;
+  do {
+      if (initialized_.load()) {
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      try {
+          socket_.reset(new MQTTSocket());
+          initialized_.store(true);
+          
+          LOG_INFO("EventRpcClient initialized");
+          __mq_ret = MQ_SUCCESS;
+          break;
+      } catch (const std::exception& e) {
+          LOG_ERROR("Failed to initialize EventRpcClient: {}", e.what());
+          __mq_ret = MQ_ERR_INTERNAL;
+          break;
+      }
+  } while (false);
+
+  return __mq_ret;
 }
 
 RpcResponse EventRpcClient::sendEvent(const MQTTEvent& event) {
@@ -267,65 +275,85 @@ RpcResponse EventRpcClient::deserializeResponse(const MQTTVector<uint8_t>& data)
 }
 
 int EventRpcClient::sendData(const MQTTVector<uint8_t>& data) {
-    if (!socket_ || !connected_.load()) {
-        return MQ_ERR_SOCKET_SEND;
-    }
-    
-    try {
-        ssize_t sent = socket_->send(data.data(), data.size());
-        if (sent != static_cast<ssize_t>(data.size())) {
-            LOG_ERROR("Failed to send complete data: sent={}, expected={}", sent, data.size());
-            return MQ_ERR_SOCKET_SEND;
-        }
-        
-        stats_.bytes_sent.fetch_add(data.size());
-        return MQ_SUCCESS;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception during send: {}", e.what());
-        return MQ_ERR_SOCKET_SEND;
-    }
+  int __mq_ret = 0;
+  do {
+      if (!socket_ || !connected_.load()) {
+          __mq_ret = MQ_ERR_SOCKET_SEND;
+          break;
+      }
+      
+      try {
+          ssize_t sent = socket_->send(data.data(), data.size());
+          if (sent != static_cast<ssize_t>(data.size())) {
+              LOG_ERROR("Failed to send complete data: sent={}, expected={}", sent, data.size());
+              __mq_ret = MQ_ERR_SOCKET_SEND;
+              break;
+          }
+          
+          stats_.bytes_sent.fetch_add(data.size());
+          __mq_ret = MQ_SUCCESS;
+          break;
+      } catch (const std::exception& e) {
+          LOG_ERROR("Exception during send: {}", e.what());
+          __mq_ret = MQ_ERR_SOCKET_SEND;
+          break;
+      }
+  } while (false);
+
+  return __mq_ret;
 }
 
 int EventRpcClient::receiveData(MQTTVector<uint8_t>& data) {
-    if (!socket_ || !connected_.load()) {
-        return MQ_ERR_SOCKET_RECV;
-    }
-    
-    try {
-        // First, read the response length (4 bytes)
-        uint8_t length_buffer[4];
-        int recv_len = 4;
-        ssize_t received = socket_->recv(reinterpret_cast<char*>(length_buffer), recv_len);
-        if (received != 4) {
-            LOG_ERROR("Failed to receive response length: received={}", received);
-            return MQ_ERR_SOCKET_RECV;
-        }
-        
-        uint32_t response_length = (static_cast<uint32_t>(length_buffer[0]) << 24) |
-                                  (static_cast<uint32_t>(length_buffer[1]) << 16) |
-                                  (static_cast<uint32_t>(length_buffer[2]) << 8) |
-                                  static_cast<uint32_t>(length_buffer[3]);
-        
-        if (response_length > 1024 * 1024) {  // 1MB limit
-            LOG_ERROR("Response too large: {}", response_length);
-            return MQ_ERR_PACKET_TOO_LARGE;
-        }
-        
-        // Read the response data
-        data.resize(response_length);
-        int recv_len2 = static_cast<int>(response_length);
-        received = socket_->recv(reinterpret_cast<char*>(data.data()), recv_len2);
-        if (received != static_cast<ssize_t>(response_length)) {
-            LOG_ERROR("Failed to receive complete response: received={}, expected={}", received, response_length);
-            return MQ_ERR_SOCKET_RECV;
-        }
-        
-        stats_.bytes_received.fetch_add(4 + response_length);
-        return MQ_SUCCESS;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception during receive: {}", e.what());
-        return MQ_ERR_SOCKET_RECV;
-    }
+  int __mq_ret = 0;
+  do {
+      if (!socket_ || !connected_.load()) {
+          __mq_ret = MQ_ERR_SOCKET_RECV;
+          break;
+      }
+      
+      try {
+          // First, read the response length (4 bytes)
+          uint8_t length_buffer[4];
+          int recv_len = 4;
+          ssize_t received = socket_->recv(reinterpret_cast<char*>(length_buffer), recv_len);
+          if (received != 4) {
+              LOG_ERROR("Failed to receive response length: received={}", received);
+              __mq_ret = MQ_ERR_SOCKET_RECV;
+              break;
+          }
+          
+          uint32_t response_length = (static_cast<uint32_t>(length_buffer[0]) << 24) |
+                                    (static_cast<uint32_t>(length_buffer[1]) << 16) |
+                                    (static_cast<uint32_t>(length_buffer[2]) << 8) |
+                                    static_cast<uint32_t>(length_buffer[3]);
+          
+          if (response_length > 1024 * 1024) {  // 1MB limit
+              LOG_ERROR("Response too large: {}", response_length);
+              __mq_ret = MQ_ERR_PACKET_TOO_LARGE;
+              break;
+          }
+          
+          // Read the response data
+          data.resize(response_length);
+          int recv_len2 = static_cast<int>(response_length);
+          received = socket_->recv(reinterpret_cast<char*>(data.data()), recv_len2);
+          if (received != static_cast<ssize_t>(response_length)) {
+              LOG_ERROR("Failed to receive complete response: received={}, expected={}", received, response_length);
+              __mq_ret = MQ_ERR_SOCKET_RECV;
+              break;
+          }
+          
+          stats_.bytes_received.fetch_add(4 + response_length);
+          __mq_ret = MQ_SUCCESS;
+          break;
+      } catch (const std::exception& e) {
+          LOG_ERROR("Exception during receive: {}", e.what());
+          __mq_ret = MQ_ERR_SOCKET_RECV;
+          break;
+      }
+  } while (false);
+
+  return __mq_ret;
 }
 
 MQTTVector<uint8_t> EventRpcClient::createRpcRequest(const MQTTVector<uint8_t>& serialized_batch) {
@@ -365,27 +393,35 @@ RpcResponse EventRpcClient::parseRpcResponse(const MQTTVector<uint8_t>& response
 }
 
 int EventRpcClient::establishConnection() {
-    if (!initialized_.load()) {
-        if (initialize() != MQ_SUCCESS) {
-            return MQ_ERR_INTERNAL;
-        }
-    }
-    
-    try {
-        int result = socket_->connect(server_host_.c_str(), server_port_);
-        if (result == MQ_SUCCESS) {
-            connected_.store(true);
-            LOG_INFO("EventRpcClient connected to {}:{}", server_host_, server_port_);
-        } else {
-            LOG_ERROR("Failed to connect to {}:{}, error: {}", server_host_, server_port_, result);
-            stats_.connection_errors.fetch_add(1);
-        }
-        return result;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Exception during connection: {}", e.what());
-        stats_.connection_errors.fetch_add(1);
-        return MQ_ERR_SOCKET_CONNECT;
-    }
+  int __mq_ret = 0;
+  do {
+      if (!initialized_.load()) {
+          if (initialize() != MQ_SUCCESS) {
+              __mq_ret = MQ_ERR_INTERNAL;
+              break;
+          }
+      }
+      
+      try {
+          int result = socket_->connect(server_host_.c_str(), server_port_);
+          if (result == MQ_SUCCESS) {
+              connected_.store(true);
+              LOG_INFO("EventRpcClient connected to {}:{}", server_host_, server_port_);
+          } else {
+              LOG_ERROR("Failed to connect to {}:{}, error: {}", server_host_, server_port_, result);
+              stats_.connection_errors.fetch_add(1);
+          }
+          __mq_ret = result;
+          break;
+      } catch (const std::exception& e) {
+          LOG_ERROR("Exception during connection: {}", e.what());
+          stats_.connection_errors.fetch_add(1);
+          __mq_ret = MQ_ERR_SOCKET_CONNECT;
+          break;
+      }
+  } while (false);
+
+  return __mq_ret;
 }
 
 void EventRpcClient::closeConnection() {

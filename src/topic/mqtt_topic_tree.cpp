@@ -31,41 +31,51 @@ IntermediateNode::~IntermediateNode() {}
 
 int IntermediateNode::safe_copy_containers(IntermediateNode* dest) const
 {
-  int ret = MQ_SUCCESS;
-
-  // Copy children map
-  if (!children_.empty()) {
-    if (dest->children_.max_size() < children_.size()) {
-      LOG_ERROR("Destination children container too small");
-      return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
-    }
-
-    for (const auto& child_pair : children_) {
-      auto result = dest->children_.insert(child_pair);
-      if (!result.second) {
-        LOG_ERROR("Failed to copy child node");
-        return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+  
+    // Copy children map
+    if (!children_.empty()) {
+      if (dest->children_.max_size() < children_.size()) {
+        LOG_ERROR("Destination children container too small");
+        __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+        break;
+      }
+  
+      for (const auto& child_pair : children_) {
+        auto result = dest->children_.insert(child_pair);
+        if (!result.second) {
+          LOG_ERROR("Failed to copy child node");
+          __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+          break;
+        }
       }
     }
-  }
-
-  // Copy subscribers set
-  if (!subscribers_.empty()) {
-    if (dest->subscribers_.max_size() < subscribers_.size()) {
-      LOG_ERROR("Destination subscribers container too small");
-      return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
-    }
-
-    for (const auto& subscriber : subscribers_) {
-      auto result = dest->subscribers_.insert(subscriber);
-      if (!result.second) {
-        LOG_ERROR("Failed to copy subscriber");
-        return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  
+    // Copy subscribers set
+    if (!subscribers_.empty()) {
+      if (dest->subscribers_.max_size() < subscribers_.size()) {
+        LOG_ERROR("Destination subscribers container too small");
+        __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+        break;
+      }
+  
+      for (const auto& subscriber : subscribers_) {
+        auto result = dest->subscribers_.insert(subscriber);
+        if (!result.second) {
+          LOG_ERROR("Failed to copy subscriber");
+          __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+          break;
+        }
       }
     }
-  }
+  
+    __mq_ret = ret;
+    break;
+  } while (false);
 
-  return ret;
+  return __mq_ret;
 }
 
 int IntermediateNode::clone(IntermediateNode*& cloned_node) const
@@ -255,29 +265,38 @@ TopicTreeNode::TopicTreeNode(MQTTAllocator* allocator)
 
 int TopicTreeNode::init()
 {
-  if (MQ_ISNULL(allocator_)) {
-    LOG_ERROR("Allocator is null");
-    return MQ_ERR_PARAM_V2;
-  }
+  int __mq_ret = 0;
+  do {
+    if (MQ_ISNULL(allocator_)) {
+      LOG_ERROR("Allocator is null");
+      __mq_ret = MQ_ERR_PARAM_V2;
+      break;
+    }
+  
+    if (intermediate_node_.load() != nullptr) {
+      LOG_ERROR("Node already initialized");
+      __mq_ret = MQ_ERR_INVALID_STATE;
+      break;
+    }
+  
+    // 安全分配IntermediateNode
+    void* memory = allocator_->allocate(sizeof(IntermediateNode));
+    if (MQ_ISNULL(memory)) {
+      LOG_ERROR("Failed to allocate memory for IntermediateNode");
+      __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+      break;
+    }
+  
+    // 使用placement new构造对象（在内存已分配的情况下，placement new不会失败）
+    IntermediateNode* node = new (memory) IntermediateNode(allocator_);
+    // 注意：placement new在有效内存上不会返回nullptr
+  
+    intermediate_node_.store(node);
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  if (intermediate_node_.load() != nullptr) {
-    LOG_ERROR("Node already initialized");
-    return MQ_ERR_INVALID_STATE;
-  }
-
-  // 安全分配IntermediateNode
-  void* memory = allocator_->allocate(sizeof(IntermediateNode));
-  if (MQ_ISNULL(memory)) {
-    LOG_ERROR("Failed to allocate memory for IntermediateNode");
-    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
-  }
-
-  // 使用placement new构造对象（在内存已分配的情况下，placement new不会失败）
-  IntermediateNode* node = new (memory) IntermediateNode(allocator_);
-  // 注意：placement new在有效内存上不会返回nullptr
-
-  intermediate_node_.store(node);
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 TopicTreeNode::~TopicTreeNode()
@@ -562,329 +581,390 @@ int ConcurrentTopicTree::get_or_create_node(const TopicTreeLevelVector& levels,
                                             bool create_if_not_exists,
                                             std::shared_ptr<TopicTreeNode>& node)
 {
-  int ret = MQ_SUCCESS;
-  std::shared_ptr<TopicTreeNode> current = root_;
-
-  for (const MQTTString& level : levels) {
-    std::shared_ptr<TopicTreeNode> child;
-    ret = current->get_child(level, child);
-
-    if (ret == MQ_ERR_NOT_FOUND_V2) {
-      if (!create_if_not_exists) {
-        return MQ_ERR_NOT_FOUND_V2;
-      }
-
-      // Use mutex to serialize node creation to avoid race conditions
-      std::lock_guard<std::mutex> lock(node_creation_mutex_);
-      
-      // Double-check if another thread created the node while we were waiting
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+    std::shared_ptr<TopicTreeNode> current = root_;
+  
+    for (const MQTTString& level : levels) {
+      std::shared_ptr<TopicTreeNode> child;
       ret = current->get_child(level, child);
-      if (MQ_SUCC(ret)) {
-        // Node was created by another thread, use it
-        continue;
-      }
-
-      // Create new child node
-      child = std::make_shared<TopicTreeNode>(allocator_);
-      if (!child) {
-        LOG_ERROR("Failed to create new TopicTreeNode");
-        return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
-      }
-
-      // Initialize the new node
-      ret = child->init();
-      if (MQ_FAIL(ret)) {
-        LOG_ERROR("Failed to initialize new TopicTreeNode: {}", ret);
-        return ret;
-      }
-
-      // Lock-free add child node with retry limit (still needed for subscriber updates)
-      int retry_count = 0;
-      const int max_retries = 50; // Reduced retries since we have mutex for node creation
-      while (retry_count < max_retries) {
-        IntermediateNode* old_node = current->get_intermediate_node();
-        IntermediateNode* new_node = nullptr;
-        ret = old_node->clone(new_node);
-        if (MQ_FAIL(ret)) {
-          intrusive_ptr_release(old_node);
-          return ret;
-        }
-
-        ret = new_node->add_child(level, child);
-        if (MQ_FAIL(ret)) {
-          intrusive_ptr_release(old_node);
-          MQTTAllocator* allocator = new_node->get_allocator();
-          new_node->~IntermediateNode();
-          allocator->deallocate(new_node, sizeof(IntermediateNode));
-          return ret;
-        }
-
-        if (current->compare_and_swap_intermediate_node(old_node, new_node)) {
-          intrusive_ptr_release(old_node);
-          total_nodes_.fetch_add(1, std::memory_order_relaxed);
+  
+      if (ret == MQ_ERR_NOT_FOUND_V2) {
+        if (!create_if_not_exists) {
+          __mq_ret = MQ_ERR_NOT_FOUND_V2;
           break;
-        } else {
-          intrusive_ptr_release(old_node);
-          MQTTAllocator* allocator = new_node->get_allocator();
-          new_node->~IntermediateNode();
-          allocator->deallocate(new_node, sizeof(IntermediateNode));
-          
-          retry_count++;
-          // Small delay to reduce contention
-          if (retry_count > 5) {
-            std::this_thread::yield();
+        }
+  
+        // Use mutex to serialize node creation to avoid race conditions
+        std::lock_guard<std::mutex> lock(node_creation_mutex_);
+        
+        // Double-check if another thread created the node while we were waiting
+        ret = current->get_child(level, child);
+        if (MQ_SUCC(ret)) {
+          // Node was created by another thread, use it
+          continue;
+        }
+  
+        // Create new child node
+        child = std::make_shared<TopicTreeNode>(allocator_);
+        if (!child) {
+          LOG_ERROR("Failed to create new TopicTreeNode");
+          __mq_ret = MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+          break;
+        }
+  
+        // Initialize the new node
+        ret = child->init();
+        if (MQ_FAIL(ret)) {
+          LOG_ERROR("Failed to initialize new TopicTreeNode: {}", ret);
+          __mq_ret = ret;
+          break;
+        }
+  
+        // Lock-free add child node with retry limit (still needed for subscriber updates)
+        int retry_count = 0;
+        const int max_retries = 50; // Reduced retries since we have mutex for node creation
+        while (retry_count < max_retries) {
+          IntermediateNode* old_node = current->get_intermediate_node();
+          IntermediateNode* new_node = nullptr;
+          ret = old_node->clone(new_node);
+          if (MQ_FAIL(ret)) {
+            intrusive_ptr_release(old_node);
+            __mq_ret = ret;
+            break;
+          }
+  
+          ret = new_node->add_child(level, child);
+          if (MQ_FAIL(ret)) {
+            intrusive_ptr_release(old_node);
+            MQTTAllocator* allocator = new_node->get_allocator();
+            new_node->~IntermediateNode();
+            allocator->deallocate(new_node, sizeof(IntermediateNode));
+            __mq_ret = ret;
+            break;
+          }
+  
+          if (current->compare_and_swap_intermediate_node(old_node, new_node)) {
+            intrusive_ptr_release(old_node);
+            total_nodes_.fetch_add(1, std::memory_order_relaxed);
+            break;
+          } else {
+            intrusive_ptr_release(old_node);
+            MQTTAllocator* allocator = new_node->get_allocator();
+            new_node->~IntermediateNode();
+            allocator->deallocate(new_node, sizeof(IntermediateNode));
+            
+            retry_count++;
+            // Small delay to reduce contention
+            if (retry_count > 5) {
+              std::this_thread::yield();
+            }
           }
         }
+        
+        // Final check if we've exceeded retries
+        if (retry_count >= max_retries) {
+          LOG_ERROR("Failed to add child node after {} retries", max_retries);
+          __mq_ret = MQ_ERR_TOPIC_TREE_CONCURRENT;
+          break;
+        }
+      } else if (MQ_FAIL(ret)) {
+        __mq_ret = ret;
+        break;
       }
-      
-      // Final check if we've exceeded retries
-      if (retry_count >= max_retries) {
-        LOG_ERROR("Failed to add child node after {} retries", max_retries);
-        return MQ_ERR_TOPIC_TREE_CONCURRENT;
-      }
-    } else if (MQ_FAIL(ret)) {
-      return ret;
+  
+      current = child;
     }
+  
+    node = current;
+    __mq_ret = ret;
+    break;
+  } while (false);
 
-    current = child;
-  }
-
-  node = current;
-  return ret;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::add_subscriber_to_node(std::shared_ptr<TopicTreeNode> node,
                                                 const SubscriberInfo& subscriber)
 {
-  int ret = MQ_SUCCESS;
-  int retry_count = 0;
-  const int max_retries = 100; // Prevent infinite loops
-
-  while (retry_count < max_retries) {
-    IntermediateNode* old_node = node->get_intermediate_node();
-    if (MQ_ISNULL(old_node)) {
-      LOG_ERROR("Failed to get intermediate node");
-      return MQ_ERR_INTERNAL;
-    }
-
-    // Check if already exists
-    const SubscriberSet* existing_subscribers = nullptr;
-    ret = old_node->get_subscribers(existing_subscribers);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      return ret;
-    }
-
-    bool already_exists = (existing_subscribers &&
-                           existing_subscribers->find(subscriber) != existing_subscribers->end());
-
-    IntermediateNode* new_node = nullptr;
-    ret = old_node->clone(new_node);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      return ret;
-    }
-
-    ret = new_node->add_subscriber(subscriber);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      MQTTAllocator* allocator = new_node->get_allocator();
-      new_node->~IntermediateNode();
-      allocator->deallocate(new_node, sizeof(IntermediateNode));
-      return ret;
-    }
-
-    if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
-      intrusive_ptr_release(old_node);
-      if (!already_exists) {
-        total_subscribers_.fetch_add(1, std::memory_order_relaxed);
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+    int retry_count = 0;
+    const int max_retries = 100; // Prevent infinite loops
+  
+    while (retry_count < max_retries) {
+      IntermediateNode* old_node = node->get_intermediate_node();
+      if (MQ_ISNULL(old_node)) {
+        LOG_ERROR("Failed to get intermediate node");
+        __mq_ret = MQ_ERR_INTERNAL;
+        break;
       }
-      return MQ_SUCCESS;
-    } else {
-      intrusive_ptr_release(old_node);
-      MQTTAllocator* allocator = new_node->get_allocator();
-      new_node->~IntermediateNode();
-      allocator->deallocate(new_node, sizeof(IntermediateNode));
-      
-      retry_count++;
-      // Small delay to reduce contention
-      if (retry_count > 10) {
-        std::this_thread::yield();
+  
+      // Check if already exists
+      const SubscriberSet* existing_subscribers = nullptr;
+      ret = old_node->get_subscribers(existing_subscribers);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        __mq_ret = ret;
+        break;
+      }
+  
+      bool already_exists = (existing_subscribers &&
+                             existing_subscribers->find(subscriber) != existing_subscribers->end());
+  
+      IntermediateNode* new_node = nullptr;
+      ret = old_node->clone(new_node);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        __mq_ret = ret;
+        break;
+      }
+  
+      ret = new_node->add_subscriber(subscriber);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        MQTTAllocator* allocator = new_node->get_allocator();
+        new_node->~IntermediateNode();
+        allocator->deallocate(new_node, sizeof(IntermediateNode));
+        __mq_ret = ret;
+        break;
+      }
+  
+      if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
+        intrusive_ptr_release(old_node);
+        if (!already_exists) {
+          total_subscribers_.fetch_add(1, std::memory_order_relaxed);
+        }
+        __mq_ret = MQ_SUCCESS;
+        break;
+      } else {
+        intrusive_ptr_release(old_node);
+        MQTTAllocator* allocator = new_node->get_allocator();
+        new_node->~IntermediateNode();
+        allocator->deallocate(new_node, sizeof(IntermediateNode));
+        
+        retry_count++;
+        // Small delay to reduce contention
+        if (retry_count > 10) {
+          std::this_thread::yield();
+        }
       }
     }
-  }
+  
+    LOG_ERROR("Failed to add subscriber after {} retries", max_retries);
+    __mq_ret = MQ_ERR_TOPIC_TREE_CONCURRENT;
+    break;
+  } while (false);
 
-  LOG_ERROR("Failed to add subscriber after {} retries", max_retries);
-  return MQ_ERR_TOPIC_TREE_CONCURRENT;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::remove_subscriber_from_node(std::shared_ptr<TopicTreeNode> node,
                                                      const MQTTString& client_id)
 {
-  int ret = MQ_SUCCESS;
-  int retry_count = 0;
-  const int max_retries = 100; // Prevent infinite loops
-
-  while (retry_count < max_retries) {
-    IntermediateNode* old_node = node->get_intermediate_node();
-    if (MQ_ISNULL(old_node)) {
-      LOG_ERROR("Failed to get intermediate node");
-      return MQ_ERR_INTERNAL;
-    }
-
-    // Check if exists
-    SubscriberInfo temp_info;
-    temp_info.client_id = client_id;
-    const SubscriberSet* existing_subscribers = nullptr;
-    ret = old_node->get_subscribers(existing_subscribers);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      return ret;
-    }
-
-    bool exists = (existing_subscribers &&
-                   existing_subscribers->find(temp_info) != existing_subscribers->end());
-
-    if (!exists) {
-      intrusive_ptr_release(old_node);
-      return MQ_ERR_NOT_FOUND_V2;
-    }
-
-    IntermediateNode* new_node = nullptr;
-    ret = old_node->clone(new_node);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      return ret;
-    }
-
-    ret = new_node->remove_subscriber(client_id);
-    if (MQ_FAIL(ret)) {
-      intrusive_ptr_release(old_node);
-      MQTTAllocator* allocator = new_node->get_allocator();
-      new_node->~IntermediateNode();
-      allocator->deallocate(new_node, sizeof(IntermediateNode));
-      return ret;
-    }
-
-    if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
-      intrusive_ptr_release(old_node);
-      total_subscribers_.fetch_sub(1, std::memory_order_relaxed);
-      return MQ_SUCCESS;
-    } else {
-      intrusive_ptr_release(old_node);
-      MQTTAllocator* allocator = new_node->get_allocator();
-      new_node->~IntermediateNode();
-      allocator->deallocate(new_node, sizeof(IntermediateNode));
-      
-      retry_count++;
-      // Small delay to reduce contention
-      if (retry_count > 10) {
-        std::this_thread::yield();
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+    int retry_count = 0;
+    const int max_retries = 100; // Prevent infinite loops
+  
+    while (retry_count < max_retries) {
+      IntermediateNode* old_node = node->get_intermediate_node();
+      if (MQ_ISNULL(old_node)) {
+        LOG_ERROR("Failed to get intermediate node");
+        __mq_ret = MQ_ERR_INTERNAL;
+        break;
+      }
+  
+      // Check if exists
+      SubscriberInfo temp_info;
+      temp_info.client_id = client_id;
+      const SubscriberSet* existing_subscribers = nullptr;
+      ret = old_node->get_subscribers(existing_subscribers);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        __mq_ret = ret;
+        break;
+      }
+  
+      bool exists = (existing_subscribers &&
+                     existing_subscribers->find(temp_info) != existing_subscribers->end());
+  
+      if (!exists) {
+        intrusive_ptr_release(old_node);
+        __mq_ret = MQ_ERR_NOT_FOUND_V2;
+        break;
+      }
+  
+      IntermediateNode* new_node = nullptr;
+      ret = old_node->clone(new_node);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        __mq_ret = ret;
+        break;
+      }
+  
+      ret = new_node->remove_subscriber(client_id);
+      if (MQ_FAIL(ret)) {
+        intrusive_ptr_release(old_node);
+        MQTTAllocator* allocator = new_node->get_allocator();
+        new_node->~IntermediateNode();
+        allocator->deallocate(new_node, sizeof(IntermediateNode));
+        __mq_ret = ret;
+        break;
+      }
+  
+      if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
+        intrusive_ptr_release(old_node);
+        total_subscribers_.fetch_sub(1, std::memory_order_relaxed);
+        __mq_ret = MQ_SUCCESS;
+        break;
+      } else {
+        intrusive_ptr_release(old_node);
+        MQTTAllocator* allocator = new_node->get_allocator();
+        new_node->~IntermediateNode();
+        allocator->deallocate(new_node, sizeof(IntermediateNode));
+        
+        retry_count++;
+        // Small delay to reduce contention
+        if (retry_count > 10) {
+          std::this_thread::yield();
+        }
       }
     }
-  }
+  
+    LOG_ERROR("Failed to remove subscriber after {} retries", max_retries);
+    __mq_ret = MQ_ERR_TOPIC_TREE_CONCURRENT;
+    break;
+  } while (false);
 
-  LOG_ERROR("Failed to remove subscriber after {} retries", max_retries);
-  return MQ_ERR_TOPIC_TREE_CONCURRENT;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
                                    uint8_t qos)
 {
-  if (!is_initialized()) {
-    LOG_ERROR("Topic tree not initialized");
-    return MQ_ERR_TOPIC_TREE;
-  }
-
-  if (topic_filter.empty() || client_id.empty()) {
-    LOG_ERROR("Invalid topic filter or client ID for subscription");
-    return MQ_ERR_PARAM_V2;
-  }
-
-  TopicTreeLevelVector levels;
-  int ret = split_topic_levels(topic_filter, levels);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  if (levels.empty()) {
-    LOG_ERROR("Invalid topic filter format: {}", from_mqtt_string(topic_filter));
-    return MQ_ERR_PARAM_V2;
-  }
-
-  // MQTT规范：主题过滤器不能以 # 开头，除非是单独的 #
-  std::string topic_str = from_mqtt_string(topic_filter);
-  if (topic_str.find('#') != std::string::npos) {
-    // # 只能出现在末尾，且前面必须是 / 或者是单独的 #
-    size_t hash_pos = topic_str.find('#');
-    if (hash_pos != topic_str.size() - 1 ||                  // # 不在末尾
-        (hash_pos > 0 && topic_str[hash_pos - 1] != '/')) {  // # 前面不是 /
-      if (topic_str != "#") {                                // 除非是单独的 #
-        LOG_ERROR("Invalid topic filter format: {}", topic_str);
-        return MQ_ERR_PARAM_V2;
+  int __mq_ret = 0;
+  do {
+    if (!is_initialized()) {
+      LOG_ERROR("Topic tree not initialized");
+      __mq_ret = MQ_ERR_TOPIC_TREE;
+      break;
+    }
+  
+    if (topic_filter.empty() || client_id.empty()) {
+      LOG_ERROR("Invalid topic filter or client ID for subscription");
+      __mq_ret = MQ_ERR_PARAM_V2;
+      break;
+    }
+  
+    TopicTreeLevelVector levels;
+    int ret = split_topic_levels(topic_filter, levels);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    if (levels.empty()) {
+      LOG_ERROR("Invalid topic filter format: {}", from_mqtt_string(topic_filter));
+      __mq_ret = MQ_ERR_PARAM_V2;
+      break;
+    }
+  
+    // MQTT规范：主题过滤器不能以 # 开头，除非是单独的 #
+    std::string topic_str = from_mqtt_string(topic_filter);
+    if (topic_str.find('#') != std::string::npos) {
+      // # 只能出现在末尾，且前面必须是 / 或者是单独的 #
+      size_t hash_pos = topic_str.find('#');
+      if (hash_pos != topic_str.size() - 1 ||                  // # 不在末尾
+          (hash_pos > 0 && topic_str[hash_pos - 1] != '/')) {  // # 前面不是 /
+        if (topic_str != "#") {                                // 除非是单独的 #
+          LOG_ERROR("Invalid topic filter format: {}", topic_str);
+          __mq_ret = MQ_ERR_PARAM_V2;
+          break;
+        }
       }
     }
-  }
+  
+    std::shared_ptr<TopicTreeNode> target_node;
+    ret = get_or_create_node(levels, true, target_node);
+    if (MQ_FAIL(ret)) {
+      LOG_ERROR("Failed to create node for topic filter: {}", from_mqtt_string(topic_filter));
+      __mq_ret = ret;
+      break;
+    }
+  
+    SubscriberInfo subscriber(client_id, qos);
+    ret = add_subscriber_to_node(target_node, subscriber);
+    if (MQ_FAIL(ret)) {
+      LOG_ERROR("Failed to add subscriber to node");
+      __mq_ret = ret;
+      break;
+    }
+  
+    LOG_DEBUG("Subscribed client {} to topic filter {}", from_mqtt_string(client_id),
+              from_mqtt_string(topic_filter));
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  std::shared_ptr<TopicTreeNode> target_node;
-  ret = get_or_create_node(levels, true, target_node);
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to create node for topic filter: {}", from_mqtt_string(topic_filter));
-    return ret;
-  }
-
-  SubscriberInfo subscriber(client_id, qos);
-  ret = add_subscriber_to_node(target_node, subscriber);
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to add subscriber to node");
-    return ret;
-  }
-
-  LOG_DEBUG("Subscribed client {} to topic filter {}", from_mqtt_string(client_id),
-            from_mqtt_string(topic_filter));
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::unsubscribe(const MQTTString& topic_filter, const MQTTString& client_id)
 {
-  if (!is_initialized()) {
-    LOG_ERROR("Topic tree not initialized");
-    return MQ_ERR_TOPIC_TREE;
-  }
+  int __mq_ret = 0;
+  do {
+    if (!is_initialized()) {
+      LOG_ERROR("Topic tree not initialized");
+      __mq_ret = MQ_ERR_TOPIC_TREE;
+      break;
+    }
+  
+    if (topic_filter.empty() || client_id.empty()) {
+      LOG_ERROR("Invalid topic filter or client ID for unsubscription");
+      __mq_ret = MQ_ERR_PARAM_V2;
+      break;
+    }
+  
+    TopicTreeLevelVector levels;
+    int ret = split_topic_levels(topic_filter, levels);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    if (levels.empty()) {
+      LOG_ERROR("Invalid topic filter format: {}", from_mqtt_string(topic_filter));
+      __mq_ret = MQ_ERR_PARAM_V2;
+      break;
+    }
+  
+    std::shared_ptr<TopicTreeNode> target_node;
+    ret = get_or_create_node(levels, false, target_node);
+    if (MQ_FAIL(ret)) {
+      LOG_WARN("Topic filter not found for unsubscription: {}", from_mqtt_string(topic_filter));
+      __mq_ret = ret;
+      break;
+    }
+  
+    ret = remove_subscriber_from_node(target_node, client_id);
+    if (MQ_FAIL(ret)) {
+      LOG_WARN("Subscriber not found for unsubscription: {} from {}", from_mqtt_string(client_id),
+               from_mqtt_string(topic_filter));
+      __mq_ret = ret;
+      break;
+    }
+  
+    LOG_DEBUG("Unsubscribed client {} from topic filter {}", from_mqtt_string(client_id),
+              from_mqtt_string(topic_filter));
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  if (topic_filter.empty() || client_id.empty()) {
-    LOG_ERROR("Invalid topic filter or client ID for unsubscription");
-    return MQ_ERR_PARAM_V2;
-  }
-
-  TopicTreeLevelVector levels;
-  int ret = split_topic_levels(topic_filter, levels);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  if (levels.empty()) {
-    LOG_ERROR("Invalid topic filter format: {}", from_mqtt_string(topic_filter));
-    return MQ_ERR_PARAM_V2;
-  }
-
-  std::shared_ptr<TopicTreeNode> target_node;
-  ret = get_or_create_node(levels, false, target_node);
-  if (MQ_FAIL(ret)) {
-    LOG_WARN("Topic filter not found for unsubscription: {}", from_mqtt_string(topic_filter));
-    return ret;
-  }
-
-  ret = remove_subscriber_from_node(target_node, client_id);
-  if (MQ_FAIL(ret)) {
-    LOG_WARN("Subscriber not found for unsubscription: {} from {}", from_mqtt_string(client_id),
-             from_mqtt_string(topic_filter));
-    return ret;
-  }
-
-  LOG_DEBUG("Unsubscribed client {} from topic filter {}", from_mqtt_string(client_id),
-            from_mqtt_string(topic_filter));
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicTreeNode>& node,
@@ -892,77 +972,87 @@ int ConcurrentTopicTree::find_subscribers_recursive(const std::shared_ptr<TopicT
                                                     size_t level_index,
                                                     TopicMatchResult& result) const
 {
-  if (!node) {
-    return MQ_SUCCESS;
-  }
-
-  int ret = MQ_SUCCESS;
-
-  // 如果已经到达主题末尾，收集当前节点的订阅者和多级通配符
-  if (level_index >= topic_levels.size()) {
-    // 收集当前节点的订阅者（完全匹配的订阅）
-    SubscriberSet subscribers;
-    ret = node->get_subscribers(subscribers);
-    if (MQ_SUCC(ret)) {
-      for (const SubscriberInfo& subscriber : subscribers) {
-        result.subscribers.push_back(subscriber);
-        result.total_count++;
+  int __mq_ret = 0;
+  do {
+    if (!node) {
+      __mq_ret = MQ_SUCCESS;
+      break;
+    }
+  
+    int ret = MQ_SUCCESS;
+  
+    // 如果已经到达主题末尾，收集当前节点的订阅者和多级通配符
+    if (level_index >= topic_levels.size()) {
+      // 收集当前节点的订阅者（完全匹配的订阅）
+      SubscriberSet subscribers;
+      ret = node->get_subscribers(subscribers);
+      if (MQ_SUCC(ret)) {
+        for (const SubscriberInfo& subscriber : subscribers) {
+          result.subscribers.push_back(subscriber);
+          result.total_count++;
+        }
+      }
+  
+      // 检查多级通配符
+      std::shared_ptr<TopicTreeNode> wildcard_node;
+      ret = node->get_child(to_mqtt_string("#", allocator_), wildcard_node);
+      if (ret == MQ_SUCCESS && wildcard_node) {
+        SubscriberSet wildcard_subscribers;
+        ret = wildcard_node->get_subscribers(wildcard_subscribers);
+        if (MQ_SUCC(ret)) {
+          for (const SubscriberInfo& subscriber : wildcard_subscribers) {
+            result.subscribers.push_back(subscriber);
+            result.total_count++;
+          }
+        }
+      }
+      __mq_ret = MQ_SUCCESS;
+      break;
+    }
+  
+    const MQTTString& current_level = topic_levels[level_index];
+  
+    // 1. 精确匹配
+    std::shared_ptr<TopicTreeNode> exact_child;
+    ret = node->get_child(current_level, exact_child);
+    if (ret == MQ_SUCCESS && exact_child) {
+      ret = find_subscribers_recursive(exact_child, topic_levels, level_index + 1, result);
+      if (MQ_FAIL(ret)) {
+        __mq_ret = ret;
+        break;
       }
     }
-
-    // 检查多级通配符
-    std::shared_ptr<TopicTreeNode> wildcard_node;
-    ret = node->get_child(to_mqtt_string("#", allocator_), wildcard_node);
-    if (ret == MQ_SUCCESS && wildcard_node) {
-      SubscriberSet wildcard_subscribers;
-      ret = wildcard_node->get_subscribers(wildcard_subscribers);
+  
+    // 2. 单级通配符 '+'
+    std::shared_ptr<TopicTreeNode> single_wildcard_child;
+    ret = node->get_child(to_mqtt_string("+", allocator_), single_wildcard_child);
+    if (ret == MQ_SUCCESS && single_wildcard_child) {
+      ret = find_subscribers_recursive(single_wildcard_child, topic_levels, level_index + 1, result);
+      if (MQ_FAIL(ret)) {
+        __mq_ret = ret;
+        break;
+      }
+    }
+  
+    // 3. 多级通配符 '#' (匹配当前级别及之后的所有级别)
+    std::shared_ptr<TopicTreeNode> multi_wildcard_child;
+    ret = node->get_child(to_mqtt_string("#", allocator_), multi_wildcard_child);
+    if (ret == MQ_SUCCESS && multi_wildcard_child) {
+      SubscriberSet multi_wildcard_subscribers;
+      ret = multi_wildcard_child->get_subscribers(multi_wildcard_subscribers);
       if (MQ_SUCC(ret)) {
-        for (const SubscriberInfo& subscriber : wildcard_subscribers) {
+        for (const SubscriberInfo& subscriber : multi_wildcard_subscribers) {
           result.subscribers.push_back(subscriber);
           result.total_count++;
         }
       }
     }
-    return MQ_SUCCESS;
-  }
+  
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  const MQTTString& current_level = topic_levels[level_index];
-
-  // 1. 精确匹配
-  std::shared_ptr<TopicTreeNode> exact_child;
-  ret = node->get_child(current_level, exact_child);
-  if (ret == MQ_SUCCESS && exact_child) {
-    ret = find_subscribers_recursive(exact_child, topic_levels, level_index + 1, result);
-    if (MQ_FAIL(ret)) {
-      return ret;
-    }
-  }
-
-  // 2. 单级通配符 '+'
-  std::shared_ptr<TopicTreeNode> single_wildcard_child;
-  ret = node->get_child(to_mqtt_string("+", allocator_), single_wildcard_child);
-  if (ret == MQ_SUCCESS && single_wildcard_child) {
-    ret = find_subscribers_recursive(single_wildcard_child, topic_levels, level_index + 1, result);
-    if (MQ_FAIL(ret)) {
-      return ret;
-    }
-  }
-
-  // 3. 多级通配符 '#' (匹配当前级别及之后的所有级别)
-  std::shared_ptr<TopicTreeNode> multi_wildcard_child;
-  ret = node->get_child(to_mqtt_string("#", allocator_), multi_wildcard_child);
-  if (ret == MQ_SUCCESS && multi_wildcard_child) {
-    SubscriberSet multi_wildcard_subscribers;
-    ret = multi_wildcard_child->get_subscribers(multi_wildcard_subscribers);
-    if (MQ_SUCC(ret)) {
-      for (const SubscriberInfo& subscriber : multi_wildcard_subscribers) {
-        result.subscribers.push_back(subscriber);
-        result.total_count++;
-      }
-    }
-  }
-
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::find_subscribers(const MQTTString& topic, TopicMatchResult& result) const
@@ -1008,29 +1098,37 @@ int ConcurrentTopicTree::find_subscribers(const MQTTString& topic, TopicMatchRes
 
 int ConcurrentTopicTree::unsubscribe_all(const MQTTString& client_id)
 {
-  if (client_id.empty()) {
-    LOG_ERROR("Invalid client ID for unsubscribe_all");
-    return 0;
-  }
-
-  // 获取客户端的所有订阅
-  std::vector<MQTTString> subscriptions;
-  int ret = get_client_subscriptions(client_id, subscriptions);
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to get client subscriptions");
-    return 0;
-  }
-
-  int unsubscribed_count = 0;
-  for (const MQTTString& subscription : subscriptions) {
-    if (unsubscribe(subscription, client_id) == MQ_SUCCESS) {
-      unsubscribed_count++;
+  int __mq_ret = 0;
+  do {
+    if (client_id.empty()) {
+      LOG_ERROR("Invalid client ID for unsubscribe_all");
+      __mq_ret = 0;
+      break;
     }
-  }
+  
+    // 获取客户端的所有订阅
+    std::vector<MQTTString> subscriptions;
+    int ret = get_client_subscriptions(client_id, subscriptions);
+    if (MQ_FAIL(ret)) {
+      LOG_ERROR("Failed to get client subscriptions");
+      __mq_ret = 0;
+      break;
+    }
+  
+    int unsubscribed_count = 0;
+    for (const MQTTString& subscription : subscriptions) {
+      if (unsubscribe(subscription, client_id) == MQ_SUCCESS) {
+        unsubscribed_count++;
+      }
+    }
+  
+    LOG_DEBUG("Unsubscribed client {} from {} topic filters", from_mqtt_string(client_id),
+              unsubscribed_count);
+    __mq_ret = unsubscribed_count;
+    break;
+  } while (false);
 
-  LOG_DEBUG("Unsubscribed client {} from {} topic filters", from_mqtt_string(client_id),
-            unsubscribed_count);
-  return unsubscribed_count;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::collect_client_subscriptions(const std::shared_ptr<TopicTreeNode>& node,
@@ -1038,57 +1136,74 @@ int ConcurrentTopicTree::collect_client_subscriptions(const std::shared_ptr<Topi
                                                       const MQTTString& client_id,
                                                       std::vector<MQTTString>& result) const
 {
-  if (!node) {
-    return MQ_SUCCESS;
-  }
-
-  int ret = MQ_SUCCESS;
-
-  // 检查当前节点是否有目标客户端的订阅
-  SubscriberSet subscribers;
-  ret = node->get_subscribers(subscribers);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  SubscriberInfo target_info;
-  target_info.client_id = client_id;
-
-  if (subscribers.find(target_info) != subscribers.end()) {
-    result.push_back(current_path);
-  }
-
-  // 递归检查子节点
-  TopicTreeChildrenMap children;
-  ret = node->get_children(children);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  for (const auto& child_pair : children) {
-    MQTTString child_path = current_path.empty() ? child_pair.first : 
-        to_mqtt_string(from_mqtt_string(current_path) + "/" + from_mqtt_string(child_pair.first), allocator_);
-    ret = collect_client_subscriptions(child_pair.second, child_path, client_id, result);
-    if (MQ_FAIL(ret)) {
-      return ret;
+  int __mq_ret = 0;
+  do {
+    if (!node) {
+      __mq_ret = MQ_SUCCESS;
+      break;
     }
-  }
+  
+    int ret = MQ_SUCCESS;
+  
+    // 检查当前节点是否有目标客户端的订阅
+    SubscriberSet subscribers;
+    ret = node->get_subscribers(subscribers);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    SubscriberInfo target_info;
+    target_info.client_id = client_id;
+  
+    if (subscribers.find(target_info) != subscribers.end()) {
+      result.push_back(current_path);
+    }
+  
+    // 递归检查子节点
+    TopicTreeChildrenMap children;
+    ret = node->get_children(children);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    for (const auto& child_pair : children) {
+      MQTTString child_path = current_path.empty() ? child_pair.first : 
+          to_mqtt_string(from_mqtt_string(current_path) + "/" + from_mqtt_string(child_pair.first), allocator_);
+      ret = collect_client_subscriptions(child_pair.second, child_path, client_id, result);
+      if (MQ_FAIL(ret)) {
+        __mq_ret = ret;
+        break;
+      }
+    }
+  
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::get_client_subscriptions(const MQTTString& client_id,
                                                   std::vector<MQTTString>& subscriptions) const
 {
-  subscriptions.clear();
+  int __mq_ret = 0;
+  do {
+    subscriptions.clear();
+  
+    if (!is_initialized()) {
+      LOG_ERROR("Topic tree not initialized");
+      __mq_ret = MQ_ERR_TOPIC_TREE;
+      break;
+    }
+  
+    MQTTString empty_path = to_mqtt_string("", allocator_);
+    __mq_ret = collect_client_subscriptions(root_, empty_path, client_id, subscriptions);
+    break;
+  } while (false);
 
-  if (!is_initialized()) {
-    LOG_ERROR("Topic tree not initialized");
-    return MQ_ERR_TOPIC_TREE;
-  }
-
-  MQTTString empty_path = to_mqtt_string("", allocator_);
-  return collect_client_subscriptions(root_, empty_path, client_id, subscriptions);
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::get_total_subscribers(size_t& total_count) const
@@ -1106,108 +1221,129 @@ int ConcurrentTopicTree::get_total_nodes(size_t& total_count) const
 int ConcurrentTopicTree::cleanup_empty_nodes_recursive(std::shared_ptr<TopicTreeNode> node,
                                                        const MQTTString& path, bool& should_delete)
 {
-  should_delete = false;
-
-  if (!node) {
-    should_delete = true;
-    return MQ_SUCCESS;
-  }
-
-  int ret = MQ_SUCCESS;
-  TopicTreeChildrenMap children;
-  ret = node->get_children(children);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  // 递归清理子节点
-  TopicTreeLevelVector children_to_remove;
-  for (const auto& child_pair : children) {
-    MQTTString child_path = path.empty() ? child_pair.first : 
-        to_mqtt_string(from_mqtt_string(path) + "/" + from_mqtt_string(child_pair.first), allocator_);
-    bool child_should_delete = false;
-    ret = cleanup_empty_nodes_recursive(child_pair.second, child_path, child_should_delete);
+  int __mq_ret = 0;
+  do {
+    should_delete = false;
+  
+    if (!node) {
+      should_delete = true;
+      __mq_ret = MQ_SUCCESS;
+      break;
+    }
+  
+    int ret = MQ_SUCCESS;
+    TopicTreeChildrenMap children;
+    ret = node->get_children(children);
     if (MQ_FAIL(ret)) {
-      return ret;
+      __mq_ret = ret;
+      break;
     }
-    if (child_should_delete) {
-      children_to_remove.push_back(child_pair.first);
-    }
-  }
-
-  // 移除空的子节点
-  for (const MQTTString& child_level : children_to_remove) {
-    while (true) {
-      IntermediateNode* old_node = node->get_intermediate_node();
-      if (MQ_ISNULL(old_node)) {
-        LOG_ERROR("Failed to get intermediate node");
-        return MQ_ERR_INTERNAL;
-      }
-
-      IntermediateNode* new_node = nullptr;
-      ret = old_node->clone(new_node);
+  
+    // 递归清理子节点
+    TopicTreeLevelVector children_to_remove;
+    for (const auto& child_pair : children) {
+      MQTTString child_path = path.empty() ? child_pair.first : 
+          to_mqtt_string(from_mqtt_string(path) + "/" + from_mqtt_string(child_pair.first), allocator_);
+      bool child_should_delete = false;
+      ret = cleanup_empty_nodes_recursive(child_pair.second, child_path, child_should_delete);
       if (MQ_FAIL(ret)) {
-        intrusive_ptr_release(old_node);
-        return ret;
-      }
-
-      ret = new_node->remove_child(child_level);
-      if (MQ_FAIL(ret)) {
-        intrusive_ptr_release(old_node);
-        MQTTAllocator* allocator = new_node->get_allocator();
-        new_node->~IntermediateNode();
-        allocator->deallocate(new_node, sizeof(IntermediateNode));
-        return ret;
-      }
-
-      if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
-        intrusive_ptr_release(old_node);
-        total_nodes_.fetch_sub(1, std::memory_order_relaxed);
+        __mq_ret = ret;
         break;
-      } else {
-        intrusive_ptr_release(old_node);
-        MQTTAllocator* allocator = new_node->get_allocator();
-        new_node->~IntermediateNode();
-        allocator->deallocate(new_node, sizeof(IntermediateNode));
-        // 重试
+      }
+      if (child_should_delete) {
+        children_to_remove.push_back(child_pair.first);
       }
     }
-  }
+  
+    // 移除空的子节点
+    for (const MQTTString& child_level : children_to_remove) {
+      while (true) {
+        IntermediateNode* old_node = node->get_intermediate_node();
+        if (MQ_ISNULL(old_node)) {
+          LOG_ERROR("Failed to get intermediate node");
+          __mq_ret = MQ_ERR_INTERNAL;
+          break;
+        }
+  
+        IntermediateNode* new_node = nullptr;
+        ret = old_node->clone(new_node);
+        if (MQ_FAIL(ret)) {
+          intrusive_ptr_release(old_node);
+          __mq_ret = ret;
+          break;
+        }
+  
+        ret = new_node->remove_child(child_level);
+        if (MQ_FAIL(ret)) {
+          intrusive_ptr_release(old_node);
+          MQTTAllocator* allocator = new_node->get_allocator();
+          new_node->~IntermediateNode();
+          allocator->deallocate(new_node, sizeof(IntermediateNode));
+          __mq_ret = ret;
+          break;
+        }
+  
+        if (node->compare_and_swap_intermediate_node(old_node, new_node)) {
+          intrusive_ptr_release(old_node);
+          total_nodes_.fetch_sub(1, std::memory_order_relaxed);
+          break;
+        } else {
+          intrusive_ptr_release(old_node);
+          MQTTAllocator* allocator = new_node->get_allocator();
+          new_node->~IntermediateNode();
+          allocator->deallocate(new_node, sizeof(IntermediateNode));
+          // 重试
+        }
+      }
+    }
+  
+    // 判断当前节点是否应该被删除（没有订阅者且没有子节点）
+    bool has_subs = false;
+    bool has_childs = false;
+    ret = node->has_subscribers(has_subs);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+    ret = node->has_children(has_childs);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    should_delete = !has_subs && !has_childs;
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  // 判断当前节点是否应该被删除（没有订阅者且没有子节点）
-  bool has_subs = false;
-  bool has_childs = false;
-  ret = node->has_subscribers(has_subs);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-  ret = node->has_children(has_childs);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  should_delete = !has_subs && !has_childs;
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::cleanup_empty_nodes(size_t& cleaned_count)
 {
-  size_t original_count = total_nodes_.load(std::memory_order_relaxed);
-  bool should_delete = false;
-  MQTTString empty_path = to_mqtt_string("", allocator_);
-  int ret = cleanup_empty_nodes_recursive(root_, empty_path, should_delete);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
+  int __mq_ret = 0;
+  do {
+    size_t original_count = total_nodes_.load(std::memory_order_relaxed);
+    bool should_delete = false;
+    MQTTString empty_path = to_mqtt_string("", allocator_);
+    int ret = cleanup_empty_nodes_recursive(root_, empty_path, should_delete);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    size_t final_count = total_nodes_.load(std::memory_order_relaxed);
+    cleaned_count = original_count - final_count;
+  
+    if (cleaned_count > 0) {
+      LOG_DEBUG("Cleaned up {} empty nodes", cleaned_count);
+    }
+  
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  size_t final_count = total_nodes_.load(std::memory_order_relaxed);
-  cleaned_count = original_count - final_count;
-
-  if (cleaned_count > 0) {
-    LOG_DEBUG("Cleaned up {} empty nodes", cleaned_count);
-  }
-
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 int ConcurrentTopicTree::get_memory_usage(size_t& memory_usage) const

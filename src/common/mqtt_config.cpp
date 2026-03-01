@@ -10,97 +10,118 @@ ConfigManager::~ConfigManager() = default;
 
 int ConfigManager::load_from_file(const std::string& config_file)
 {
-  try {
-    YAML::Node root = YAML::LoadFile(config_file);
-
-    // 解析各个配置段
-    if (root["server"]) {
-      parse_server_config(root["server"]);
+  int __mq_ret = 0;
+  do {
+    try {
+      YAML::Node root = YAML::LoadFile(config_file);
+  
+      // 解析各个配置段
+      if (root["server"]) {
+        parse_server_config(root["server"]);
+      }
+  
+      if (root["mqtt"]) {
+        parse_mqtt_config(root["mqtt"]);
+      }
+  
+      if (root["memory"]) {
+        parse_memory_config(root["memory"]);
+      }
+  
+      if (root["log"]) {
+        parse_log_config(root["log"]);
+      }
+  
+      if (root["event_forwarding"]) {
+        parse_event_forwarding_config(root["event_forwarding"]);
+      }
+  
+      if (root["monitoring"]) {
+        parse_monitoring_config(root["monitoring"]);
+      }
+  
+      if (root["auth"]) {
+        parse_auth_config(root["auth"]);
+      }
+  
+      if (root["websocket"]) {
+        LOG_WARN("检测到 websocket 配置段。当前版本使用 server 监听端口处理 WebSocket，"
+                 "请将宿主机 WebSocket 端口转发到容器 server.port。");
+      }
+  
+      // 验证配置
+      int ret = validate();
+      if (ret != 0) {
+        LOG_ERROR("配置验证失败");
+        __mq_ret = ret;
+        break;
+      }
+  
+      LOG_INFO("配置文件加载成功: {}", config_file);
+      __mq_ret = 0;
+      break;
+  
+    } catch (const YAML::Exception& e) {
+      LOG_ERROR("YAML解析错误: {}", e.what());
+      __mq_ret = -1;
+      break;
+    } catch (const std::exception& e) {
+      LOG_ERROR("配置文件加载失败: {}", e.what());
+      __mq_ret = -1;
+      break;
     }
+  } while (false);
 
-    if (root["mqtt"]) {
-      parse_mqtt_config(root["mqtt"]);
-    }
-
-    if (root["memory"]) {
-      parse_memory_config(root["memory"]);
-    }
-
-    if (root["log"]) {
-      parse_log_config(root["log"]);
-    }
-
-    if (root["event_forwarding"]) {
-      parse_event_forwarding_config(root["event_forwarding"]);
-    }
-
-    if (root["monitoring"]) {
-      parse_monitoring_config(root["monitoring"]);
-    }
-
-    if (root["auth"]) {
-      parse_auth_config(root["auth"]);
-    }
-
-    if (root["websocket"]) {
-      LOG_WARN("检测到 websocket 配置段。当前版本使用 server 监听端口处理 WebSocket，"
-               "请将宿主机 WebSocket 端口转发到容器 server.port。");
-    }
-
-    // 验证配置
-    int ret = validate();
-    if (ret != 0) {
-      LOG_ERROR("配置验证失败");
-      return ret;
-    }
-
-    LOG_INFO("配置文件加载成功: {}", config_file);
-    return 0;
-
-  } catch (const YAML::Exception& e) {
-    LOG_ERROR("YAML解析错误: {}", e.what());
-    return -1;
-  } catch (const std::exception& e) {
-    LOG_ERROR("配置文件加载失败: {}", e.what());
-    return -1;
-  }
+  return __mq_ret;
 }
 
 int ConfigManager::validate() const
 {
-  // 验证服务器配置
-  if (config_.server.port == 0 || config_.server.port > 65535) {
-    LOG_ERROR("无效的端口号: {}", config_.server.port);
-    return -1;
-  }
+  int __mq_ret = 0;
+  do {
+    // 验证服务器配置
+    if (config_.server.port == 0 || config_.server.port > 65535) {
+      LOG_ERROR("无效的端口号: {}", config_.server.port);
+      __mq_ret = -1;
+      break;
+    }
+  
+    if (config_.server.max_connections <= 0) {
+      LOG_ERROR("无效的最大连接数: {}", config_.server.max_connections);
+      __mq_ret = -1;
+      break;
+    }
+  
+    if (config_.server.thread_count <= 0) {
+      LOG_ERROR("无效的线程数: {}", config_.server.thread_count);
+      __mq_ret = -1;
+      break;
+    }
+  
+    // 验证MQTT配置
+    if (config_.mqtt.max_packet_size == 0) {
+      LOG_ERROR("最大包大小不能为0");
+      __mq_ret = -1;
+      break;
+    }
+  
+    if (config_.mqtt.max_qos > 2) {
+      LOG_ERROR("无效的最大QoS级别: {}", config_.mqtt.max_qos);
+      __mq_ret = -1;
+      break;
+    }
+  
+    // 验证内存配置
+    if (config_.memory.client_max_size == 0) {
+      LOG_ERROR("客户端内存大小不能为0");
+      __mq_ret = -1;
+      break;
+    }
+    __mq_ret = 0;
+    break;
+  } while (false);
 
-  if (config_.server.max_connections <= 0) {
-    LOG_ERROR("无效的最大连接数: {}", config_.server.max_connections);
-    return -1;
-  }
-
-  if (config_.server.thread_count <= 0) {
-    LOG_ERROR("无效的线程数: {}", config_.server.thread_count);
-    return -1;
-  }
-
-  // 验证MQTT配置
-  if (config_.mqtt.max_packet_size == 0) {
-    LOG_ERROR("最大包大小不能为0");
-    return -1;
-  }
-
-  if (config_.mqtt.max_qos > 2) {
-    LOG_ERROR("无效的最大QoS级别: {}", config_.mqtt.max_qos);
-    return -1;
-  }
-
-  // 验证内存配置
-  if (config_.memory.client_max_size == 0) {
-    LOG_ERROR("客户端内存大小不能为0");
-    return -1;
-  }
-  return 0;
+  return __mq_ret;
 }
 
 void ConfigManager::parse_server_config(const YAML::Node& node)

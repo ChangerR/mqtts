@@ -17,22 +17,29 @@ AuthManager::~AuthManager() {
 }
 
 int AuthManager::initialize() {
-    LOG_INFO("Initializing AuthManager");
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
-    for (auto& entry : providers_) {
-        int ret = entry.provider->initialize();
-        if (ret != MQ_SUCCESS) {
-            LOG_ERROR("Failed to initialize auth provider: {}, error: {}", 
-                     entry.provider->get_provider_name(), ret);
-            return ret;
-        }
-        LOG_INFO("Successfully initialized auth provider: {}", 
-                entry.provider->get_provider_name());
-    }
-    
-    LOG_INFO("AuthManager initialized successfully with {} providers", providers_.size());
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      LOG_INFO("Initializing AuthManager");
+      
+      std::unique_lock<std::mutex> lock(providers_mutex_);
+      for (auto& entry : providers_) {
+          int ret = entry.provider->initialize();
+          if (ret != MQ_SUCCESS) {
+              LOG_ERROR("Failed to initialize auth provider: {}, error: {}", 
+                       entry.provider->get_provider_name(), ret);
+              __mq_ret = ret;
+              break;
+          }
+          LOG_INFO("Successfully initialized auth provider: {}", 
+                  entry.provider->get_provider_name());
+      }
+      
+      LOG_INFO("AuthManager initialized successfully with {} providers", providers_.size());
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 void AuthManager::cleanup() {
@@ -49,32 +56,41 @@ void AuthManager::cleanup() {
 }
 
 int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int priority) {
-    if (!provider) {
-        LOG_ERROR("Cannot add null auth provider");
-        return MQ_ERR_INVALID_ARGS;
-    }
-    
-    const char* provider_name = provider->get_provider_name();
-    LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
-    
-    // 检查是否已存在同名提供者
-    for (const auto& entry : providers_) {
-        if (std::string(entry.provider->get_provider_name()) == provider_name) {
-            LOG_ERROR("Auth provider with name '{}' already exists", provider_name);
-            return MQ_ERR_INVALID_ARGS;
-        }
-    }
-    
-    providers_.emplace_back(std::move(provider), priority);
-    sort_providers_by_priority();
-    
-    LOG_INFO("Successfully added auth provider: {}", provider_name);
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      if (!provider) {
+          LOG_ERROR("Cannot add null auth provider");
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+      
+      const char* provider_name = provider->get_provider_name();
+      LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
+      
+      std::unique_lock<std::mutex> lock(providers_mutex_);
+      
+      // 检查是否已存在同名提供者
+      for (const auto& entry : providers_) {
+          if (std::string(entry.provider->get_provider_name()) == provider_name) {
+              LOG_ERROR("Auth provider with name '{}' already exists", provider_name);
+              __mq_ret = MQ_ERR_INVALID_ARGS;
+              break;
+          }
+      }
+      
+      providers_.emplace_back(std::move(provider), priority);
+      sort_providers_by_priority();
+      
+      LOG_INFO("Successfully added auth provider: {}", provider_name);
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int AuthManager::remove_provider(const std::string& provider_name) {
+    int ret = MQ_SUCCESS;
     LOG_INFO("Removing auth provider: {}", provider_name);
     
     std::unique_lock<std::mutex> lock(providers_mutex_);
@@ -86,14 +102,16 @@ int AuthManager::remove_provider(const std::string& provider_name) {
     
     if (it == providers_.end()) {
         LOG_WARN("Auth provider '{}' not found", provider_name);
-        return MQ_ERR_NOT_FOUND_V2;
+        ret = MQ_ERR_NOT_FOUND_V2;
+    } else {
+        it->provider->cleanup();
+        providers_.erase(it);
+        
+        LOG_INFO("Successfully removed auth provider: {}", provider_name);
+        ret = MQ_SUCCESS;
     }
-    
-    it->provider->cleanup();
-    providers_.erase(it);
-    
-    LOG_INFO("Successfully removed auth provider: {}", provider_name);
-    return MQ_SUCCESS;
+
+    return ret;
 }
 
 AuthResult AuthManager::authenticate_user(const MQTTString& username,

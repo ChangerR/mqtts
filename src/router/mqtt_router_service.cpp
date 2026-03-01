@@ -69,194 +69,228 @@ int MQTTPersistentTopicTree::unsubscribe_all(const MQTTString& server_id, const 
 }
 
 int MQTTPersistentTopicTree::find_route_targets(const MQTTString& topic, RouteTargetVector& targets) {
-    TopicMatchResult match_result;
-    int result = topic_tree_->find_subscribers(topic, match_result);
-    
-    if (result != 0) {
-        return result;
-    }
-    
-    targets.clear();
-    
-    for (const auto& subscriber : match_result.subscribers) {
-        MQTTString full_client_id = subscriber.client_id;
-        
-        size_t at_pos = full_client_id.find('@');
-        if (at_pos == MQTTString::npos) {
-            spdlog::warn("Invalid client ID format in topic tree: {}", from_mqtt_string(full_client_id));
-            continue;
-        }
-        
-        MQTTString server_id = full_client_id.substr(0, at_pos);
-        MQTTString client_id = full_client_id.substr(at_pos + 1);
-        
-        auto server_it = server_info_map_.find(server_id);
-        if (server_it != server_info_map_.end() && server_it->second.is_active) {
-            RouteTarget target(allocator_);
-            target.server_id = server_id;
-            target.client_id = client_id;
-            target.qos = subscriber.qos;
-            targets.push_back(target);
-        }
-    }
-    
-    return 0;
+  int __mq_ret = 0;
+  do {
+      TopicMatchResult match_result;
+      int result = topic_tree_->find_subscribers(topic, match_result);
+      
+      if (result != 0) {
+          __mq_ret = result;
+          break;
+      }
+      
+      targets.clear();
+      
+      for (const auto& subscriber : match_result.subscribers) {
+          MQTTString full_client_id = subscriber.client_id;
+          
+          size_t at_pos = full_client_id.find('@');
+          if (at_pos == MQTTString::npos) {
+              spdlog::warn("Invalid client ID format in topic tree: {}", from_mqtt_string(full_client_id));
+              continue;
+          }
+          
+          MQTTString server_id = full_client_id.substr(0, at_pos);
+          MQTTString client_id = full_client_id.substr(at_pos + 1);
+          
+          auto server_it = server_info_map_.find(server_id);
+          if (server_it != server_info_map_.end() && server_it->second.is_active) {
+              RouteTarget target(allocator_);
+              target.server_id = server_id;
+              target.client_id = client_id;
+              target.qos = subscriber.qos;
+              targets.push_back(target);
+          }
+      }
+      
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTPersistentTopicTree::load_from_snapshot(const std::string& snapshot_path) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    
-    std::ifstream snapshot_file(snapshot_path, std::ios::binary);
-    if (!snapshot_file.is_open()) {
-        spdlog::info("Snapshot file not found: {}", snapshot_path);
-        return 0;
-    }
-    
-    uint32_t version;
-    snapshot_file.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (version != 1) {
-        spdlog::error("Unsupported snapshot version: {}", version);
-        return -1;
-    }
-    
-    uint64_t entry_count;
-    snapshot_file.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
-    
-    for (uint64_t i = 0; i < entry_count; ++i) {
-        RouterLogEntry entry(allocator_);
-        
-        uint8_t op_type;
-        snapshot_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type));
-        entry.op_type = static_cast<RouterLogOpType>(op_type);
-        
-        uint32_t server_id_len;
-        snapshot_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len));
-        if (server_id_len > 0) {
-            MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
-            server_id_buf.resize(server_id_len);
-            snapshot_file.read(server_id_buf.data(), server_id_len);
-            entry.server_id = MQTTString(server_id_buf.data(), server_id_len, MQTTStrAllocator(allocator_));
-        }
-        
-        uint32_t client_id_len;
-        snapshot_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len));
-        if (client_id_len > 0) {
-            MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
-            client_id_buf.resize(client_id_len);
-            snapshot_file.read(client_id_buf.data(), client_id_len);
-            entry.client_id = MQTTString(client_id_buf.data(), client_id_len, MQTTStrAllocator(allocator_));
-        }
-        
-        uint32_t topic_filter_len;
-        snapshot_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len));
-        if (topic_filter_len > 0) {
-            MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
-            topic_filter_buf.resize(topic_filter_len);
-            snapshot_file.read(topic_filter_buf.data(), topic_filter_len);
-            entry.topic_filter = MQTTString(topic_filter_buf.data(), topic_filter_len, MQTTStrAllocator(allocator_));
-        }
-        
-        snapshot_file.read(reinterpret_cast<char*>(&entry.qos), sizeof(entry.qos));
-        
-        if (entry.op_type == RouterLogOpType::SUBSCRIBE) {
-            subscribe(entry.server_id, entry.topic_filter, entry.client_id, entry.qos);
-        }
-    }
-    
-    spdlog::info("Loaded {} entries from snapshot: {}", entry_count, snapshot_path);
-    return 0;
+  int __mq_ret = 0;
+  do {
+      std::lock_guard<std::mutex> lock(snapshot_mutex_);
+      
+      std::ifstream snapshot_file(snapshot_path, std::ios::binary);
+      if (!snapshot_file.is_open()) {
+          spdlog::info("Snapshot file not found: {}", snapshot_path);
+          __mq_ret = 0;
+          break;
+      }
+      
+      uint32_t version;
+      snapshot_file.read(reinterpret_cast<char*>(&version), sizeof(version));
+      if (version != 1) {
+          spdlog::error("Unsupported snapshot version: {}", version);
+          __mq_ret = -1;
+          break;
+      }
+      
+      uint64_t entry_count;
+      snapshot_file.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
+      
+      for (uint64_t i = 0; i < entry_count; ++i) {
+          RouterLogEntry entry(allocator_);
+          
+          uint8_t op_type;
+          snapshot_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type));
+          entry.op_type = static_cast<RouterLogOpType>(op_type);
+          
+          uint32_t server_id_len;
+          snapshot_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len));
+          if (server_id_len > 0) {
+              MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
+              server_id_buf.resize(server_id_len);
+              snapshot_file.read(server_id_buf.data(), server_id_len);
+              entry.server_id = MQTTString(server_id_buf.data(), server_id_len, MQTTStrAllocator(allocator_));
+          }
+          
+          uint32_t client_id_len;
+          snapshot_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len));
+          if (client_id_len > 0) {
+              MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
+              client_id_buf.resize(client_id_len);
+              snapshot_file.read(client_id_buf.data(), client_id_len);
+              entry.client_id = MQTTString(client_id_buf.data(), client_id_len, MQTTStrAllocator(allocator_));
+          }
+          
+          uint32_t topic_filter_len;
+          snapshot_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len));
+          if (topic_filter_len > 0) {
+              MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
+              topic_filter_buf.resize(topic_filter_len);
+              snapshot_file.read(topic_filter_buf.data(), topic_filter_len);
+              entry.topic_filter = MQTTString(topic_filter_buf.data(), topic_filter_len, MQTTStrAllocator(allocator_));
+          }
+          
+          snapshot_file.read(reinterpret_cast<char*>(&entry.qos), sizeof(entry.qos));
+          
+          if (entry.op_type == RouterLogOpType::SUBSCRIBE) {
+              subscribe(entry.server_id, entry.topic_filter, entry.client_id, entry.qos);
+          }
+      }
+      
+      spdlog::info("Loaded {} entries from snapshot: {}", entry_count, snapshot_path);
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTPersistentTopicTree::save_to_snapshot(const std::string& snapshot_path) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
-    
-    std::ofstream snapshot_file(snapshot_path + ".tmp", std::ios::binary);
-    if (!snapshot_file.is_open()) {
-        spdlog::error("Failed to create snapshot file: {}", snapshot_path);
-        return -1;
-    }
-    
-    uint32_t version = 1;
-    snapshot_file.write(reinterpret_cast<const char*>(&version), sizeof(version));
-    
-    MQTTVector<RouterLogEntry> all_subscriptions{MQTTSTLAllocator<RouterLogEntry>(allocator_)};
-    
-    size_t total_subscriptions = 0;
-    topic_tree_->get_total_subscribers(total_subscriptions);
-    
-    if (total_subscriptions > 0) {
-        TopicMatchResult dummy_result;
-        MQTTString dummy_topic{"$SYS/dummy", MQTTStrAllocator(allocator_)};
-        
-        for (const auto& server_pair : server_info_map_) {
-            const MQTTString& server_id = server_pair.first;
-            
-            RouterLogEntry entry(allocator_);
-            entry.op_type = RouterLogOpType::SUBSCRIBE;
-            entry.server_id = server_id;
-            entry.client_id = MQTTString("dummy_client", MQTTStrAllocator(allocator_));
-            entry.topic_filter = MQTTString("dummy/+", MQTTStrAllocator(allocator_));
-            entry.qos = 0;
-            
-            all_subscriptions.push_back(entry);
-        }
-    }
-    
-    uint64_t entry_count = all_subscriptions.size();
-    snapshot_file.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
-    
-    for (const auto& entry : all_subscriptions) {
-        uint8_t op_type = static_cast<uint8_t>(entry.op_type);
-        snapshot_file.write(reinterpret_cast<const char*>(&op_type), sizeof(op_type));
-        
-        uint32_t server_id_len = entry.server_id.length();
-        snapshot_file.write(reinterpret_cast<const char*>(&server_id_len), sizeof(server_id_len));
-        if (server_id_len > 0) {
-            snapshot_file.write(entry.server_id.c_str(), server_id_len);
-        }
-        
-        uint32_t client_id_len = entry.client_id.length();
-        snapshot_file.write(reinterpret_cast<const char*>(&client_id_len), sizeof(client_id_len));
-        if (client_id_len > 0) {
-            snapshot_file.write(entry.client_id.c_str(), client_id_len);
-        }
-        
-        uint32_t topic_filter_len = entry.topic_filter.length();
-        snapshot_file.write(reinterpret_cast<const char*>(&topic_filter_len), sizeof(topic_filter_len));
-        if (topic_filter_len > 0) {
-            snapshot_file.write(entry.topic_filter.c_str(), topic_filter_len);
-        }
-        
-        snapshot_file.write(reinterpret_cast<const char*>(&entry.qos), sizeof(entry.qos));
-    }
-    
-    snapshot_file.close();
-    
-    if (rename((snapshot_path + ".tmp").c_str(), snapshot_path.c_str()) != 0) {
-        spdlog::error("Failed to rename snapshot file: {}", snapshot_path);
-        return -1;
-    }
-    
-    spdlog::info("Saved {} entries to snapshot: {}", entry_count, snapshot_path);
-    return 0;
+  int __mq_ret = 0;
+  do {
+      std::lock_guard<std::mutex> lock(snapshot_mutex_);
+      
+      std::ofstream snapshot_file(snapshot_path + ".tmp", std::ios::binary);
+      if (!snapshot_file.is_open()) {
+          spdlog::error("Failed to create snapshot file: {}", snapshot_path);
+          __mq_ret = -1;
+          break;
+      }
+      
+      uint32_t version = 1;
+      snapshot_file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+      
+      MQTTVector<RouterLogEntry> all_subscriptions{MQTTSTLAllocator<RouterLogEntry>(allocator_)};
+      
+      size_t total_subscriptions = 0;
+      topic_tree_->get_total_subscribers(total_subscriptions);
+      
+      if (total_subscriptions > 0) {
+          TopicMatchResult dummy_result;
+          MQTTString dummy_topic{"$SYS/dummy", MQTTStrAllocator(allocator_)};
+          
+          for (const auto& server_pair : server_info_map_) {
+              const MQTTString& server_id = server_pair.first;
+              
+              RouterLogEntry entry(allocator_);
+              entry.op_type = RouterLogOpType::SUBSCRIBE;
+              entry.server_id = server_id;
+              entry.client_id = MQTTString("dummy_client", MQTTStrAllocator(allocator_));
+              entry.topic_filter = MQTTString("dummy/+", MQTTStrAllocator(allocator_));
+              entry.qos = 0;
+              
+              all_subscriptions.push_back(entry);
+          }
+      }
+      
+      uint64_t entry_count = all_subscriptions.size();
+      snapshot_file.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
+      
+      for (const auto& entry : all_subscriptions) {
+          uint8_t op_type = static_cast<uint8_t>(entry.op_type);
+          snapshot_file.write(reinterpret_cast<const char*>(&op_type), sizeof(op_type));
+          
+          uint32_t server_id_len = entry.server_id.length();
+          snapshot_file.write(reinterpret_cast<const char*>(&server_id_len), sizeof(server_id_len));
+          if (server_id_len > 0) {
+              snapshot_file.write(entry.server_id.c_str(), server_id_len);
+          }
+          
+          uint32_t client_id_len = entry.client_id.length();
+          snapshot_file.write(reinterpret_cast<const char*>(&client_id_len), sizeof(client_id_len));
+          if (client_id_len > 0) {
+              snapshot_file.write(entry.client_id.c_str(), client_id_len);
+          }
+          
+          uint32_t topic_filter_len = entry.topic_filter.length();
+          snapshot_file.write(reinterpret_cast<const char*>(&topic_filter_len), sizeof(topic_filter_len));
+          if (topic_filter_len > 0) {
+              snapshot_file.write(entry.topic_filter.c_str(), topic_filter_len);
+          }
+          
+          snapshot_file.write(reinterpret_cast<const char*>(&entry.qos), sizeof(entry.qos));
+      }
+      
+      snapshot_file.close();
+      
+      if (rename((snapshot_path + ".tmp").c_str(), snapshot_path.c_str()) != 0) {
+          spdlog::error("Failed to rename snapshot file: {}", snapshot_path);
+          __mq_ret = -1;
+          break;
+      }
+      
+      spdlog::info("Saved {} entries to snapshot: {}", entry_count, snapshot_path);
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTPersistentTopicTree::apply_redo_log_entry(const RouterLogEntry& entry) {
-    switch (entry.op_type) {
-        case RouterLogOpType::SUBSCRIBE:
-            return subscribe(entry.server_id, entry.topic_filter, entry.client_id, entry.qos);
-        case RouterLogOpType::UNSUBSCRIBE:
-            return unsubscribe(entry.server_id, entry.topic_filter, entry.client_id);
-        case RouterLogOpType::UNSUBSCRIBE_ALL:
-            return unsubscribe_all(entry.server_id, entry.client_id);
-        case RouterLogOpType::CLIENT_CONNECT:
-            return 0;
-        case RouterLogOpType::CLIENT_DISCONNECT:
-            return unsubscribe_all(entry.server_id, entry.client_id);
-        default:
-            spdlog::warn("Unknown redo log operation type: {}", static_cast<int>(entry.op_type));
-            return -1;
-    }
+  int __mq_ret = 0;
+  do {
+      switch (entry.op_type) {
+          case RouterLogOpType::SUBSCRIBE:
+              __mq_ret = subscribe(entry.server_id, entry.topic_filter, entry.client_id, entry.qos);
+              break;
+          case RouterLogOpType::UNSUBSCRIBE:
+              __mq_ret = unsubscribe(entry.server_id, entry.topic_filter, entry.client_id);
+              break;
+          case RouterLogOpType::UNSUBSCRIBE_ALL:
+              __mq_ret = unsubscribe_all(entry.server_id, entry.client_id);
+              break;
+          case RouterLogOpType::CLIENT_CONNECT:
+              __mq_ret = 0;
+              break;
+          case RouterLogOpType::CLIENT_DISCONNECT:
+              __mq_ret = unsubscribe_all(entry.server_id, entry.client_id);
+              break;
+          default:
+              spdlog::warn("Unknown redo log operation type: {}", static_cast<int>(entry.op_type));
+              __mq_ret = -1;
+              break;
+      }
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTPersistentTopicTree::get_statistics(size_t& total_servers, size_t& total_clients, size_t& total_subscriptions) {
@@ -297,21 +331,24 @@ MQTTRedoLogManager::~MQTTRedoLogManager() {
 }
 
 int MQTTRedoLogManager::initialize() {
+    int ret = 0;
     log_file_.reset(new std::ofstream(redo_log_path_, std::ios::binary | std::ios::app));
     if (!log_file_->is_open()) {
         spdlog::error("Failed to open redo log file: {}", redo_log_path_);
-        return -1;
-    }
-    
-    flush_thread_ = std::thread([this]() {
-        while (!should_stop_flush_thread_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(config_.redo_log_flush_interval_ms));
+        ret = -1;
+    } else {
+        flush_thread_ = std::thread([this]() {
+            while (!should_stop_flush_thread_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(config_.redo_log_flush_interval_ms));
+                flush_to_disk();
+            }
             flush_to_disk();
-        }
-        flush_to_disk();
-    });
-    
-    return 0;
+        });
+        
+        ret = 0;
+    }
+
+    return ret;
 }
 
 int MQTTRedoLogManager::append_log_entry(const RouterLogEntry& entry) {
@@ -332,24 +369,32 @@ int MQTTRedoLogManager::append_log_entry(const RouterLogEntry& entry) {
 }
 
 int MQTTRedoLogManager::flush_to_disk() {
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    
-    if (pending_entries_.empty()) {
-        return 0;
-    }
-    
-    for (const auto& entry : pending_entries_) {
-        if (write_log_entry_to_file(entry) != 0) {
-            spdlog::error("Failed to write redo log entry to file");
-            return -1;
-        }
-        last_flushed_sequence_ = entry.sequence_id;
-    }
-    
-    log_file_->flush();
-    pending_entries_.clear();
-    
-    return 0;
+  int __mq_ret = 0;
+  do {
+      std::lock_guard<std::mutex> lock(log_mutex_);
+      
+      if (pending_entries_.empty()) {
+          __mq_ret = 0;
+          break;
+      }
+      
+      for (const auto& entry : pending_entries_) {
+          if (write_log_entry_to_file(entry) != 0) {
+              spdlog::error("Failed to write redo log entry to file");
+              __mq_ret = -1;
+              break;
+          }
+          last_flushed_sequence_ = entry.sequence_id;
+      }
+      
+      log_file_->flush();
+      pending_entries_.clear();
+      
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTRedoLogManager::write_log_entry_to_file(const RouterLogEntry& entry) {
@@ -392,198 +437,231 @@ size_t MQTTRedoLogManager::get_pending_entries_count() {
 }
 
 int MQTTRedoLogManager::load_and_replay(MQTTPersistentTopicTree* topic_tree) {
-    std::ifstream log_file(redo_log_path_, std::ios::binary);
-    if (!log_file.is_open()) {
-        spdlog::info("Redo log file not found: {}", redo_log_path_);
-        return 0;
-    }
-    
-    uint64_t entry_count = 0;
-    RouterLogEntry entry(allocator_);
-    
-    while (read_log_entry_from_file(log_file, entry) == 0) {
-        if (topic_tree->apply_redo_log_entry(entry) == 0) {
-            entry_count++;
-            if (entry.sequence_id >= next_sequence_id_) {
-                next_sequence_id_ = entry.sequence_id + 1;
-            }
-        }
-    }
-    
-    spdlog::info("Replayed {} entries from redo log: {}", entry_count, redo_log_path_);
-    return 0;
+  int __mq_ret = 0;
+  do {
+      std::ifstream log_file(redo_log_path_, std::ios::binary);
+      if (!log_file.is_open()) {
+          spdlog::info("Redo log file not found: {}", redo_log_path_);
+          __mq_ret = 0;
+          break;
+      }
+      
+      uint64_t entry_count = 0;
+      RouterLogEntry entry(allocator_);
+      
+      while (read_log_entry_from_file(log_file, entry) == 0) {
+          if (topic_tree->apply_redo_log_entry(entry) == 0) {
+              entry_count++;
+              if (entry.sequence_id >= next_sequence_id_) {
+                  next_sequence_id_ = entry.sequence_id + 1;
+              }
+          }
+      }
+      
+      spdlog::info("Replayed {} entries from redo log: {}", entry_count, redo_log_path_);
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTRedoLogManager::read_log_entry_from_file(std::ifstream& log_file, RouterLogEntry& entry) {
-    
-    uint8_t op_type;
-    if (!log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type))) {
-        return -1;
-    }
-    entry.op_type = static_cast<RouterLogOpType>(op_type);
-    
-    if (!log_file.read(reinterpret_cast<char*>(&entry.sequence_id), sizeof(entry.sequence_id))) {
-        return -1;
-    }
-    
-    if (!log_file.read(reinterpret_cast<char*>(&entry.timestamp_ms), sizeof(entry.timestamp_ms))) {
-        return -1;
-    }
-    
-    uint32_t server_id_len;
-    if (!log_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len))) {
-        return -1;
-    }
-    
-    if (server_id_len > 0) {
-        MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
-        server_id_buf.resize(server_id_len);
-        if (!log_file.read(server_id_buf.data(), server_id_len)) {
-            return -1;
-        }
-        entry.server_id = MQTTString(server_id_buf.data(), server_id_len, MQTTStrAllocator(allocator_));
-    }
-    
-    uint32_t client_id_len;
-    if (!log_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len))) {
-        return -1;
-    }
-    
-    if (client_id_len > 0) {
-        MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
-        client_id_buf.resize(client_id_len);
-        if (!log_file.read(client_id_buf.data(), client_id_len)) {
-            return -1;
-        }
-        entry.client_id = MQTTString(client_id_buf.data(), client_id_len, MQTTStrAllocator(allocator_));
-    }
-    
-    uint32_t topic_filter_len;
-    if (!log_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len))) {
-        return -1;
-    }
-    
-    if (topic_filter_len > 0) {
-        MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
-        topic_filter_buf.resize(topic_filter_len);
-        if (!log_file.read(topic_filter_buf.data(), topic_filter_len)) {
-            return -1;
-        }
-        entry.topic_filter = MQTTString(topic_filter_buf.data(), topic_filter_len, MQTTStrAllocator(allocator_));
-    }
-    
-    if (!log_file.read(reinterpret_cast<char*>(&entry.qos), sizeof(entry.qos))) {
-        return -1;
-    }
-    
-    return 0;
+  int __mq_ret = 0;
+  do {
+      
+      uint8_t op_type;
+      if (!log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type))) {
+          __mq_ret = -1;
+          break;
+      }
+      entry.op_type = static_cast<RouterLogOpType>(op_type);
+      
+      if (!log_file.read(reinterpret_cast<char*>(&entry.sequence_id), sizeof(entry.sequence_id))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (!log_file.read(reinterpret_cast<char*>(&entry.timestamp_ms), sizeof(entry.timestamp_ms))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      uint32_t server_id_len;
+      if (!log_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (server_id_len > 0) {
+          MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
+          server_id_buf.resize(server_id_len);
+          if (!log_file.read(server_id_buf.data(), server_id_len)) {
+              __mq_ret = -1;
+              break;
+          }
+          entry.server_id = MQTTString(server_id_buf.data(), server_id_len, MQTTStrAllocator(allocator_));
+      }
+      
+      uint32_t client_id_len;
+      if (!log_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (client_id_len > 0) {
+          MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
+          client_id_buf.resize(client_id_len);
+          if (!log_file.read(client_id_buf.data(), client_id_len)) {
+              __mq_ret = -1;
+              break;
+          }
+          entry.client_id = MQTTString(client_id_buf.data(), client_id_len, MQTTStrAllocator(allocator_));
+      }
+      
+      uint32_t topic_filter_len;
+      if (!log_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (topic_filter_len > 0) {
+          MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
+          topic_filter_buf.resize(topic_filter_len);
+          if (!log_file.read(topic_filter_buf.data(), topic_filter_len)) {
+              __mq_ret = -1;
+              break;
+          }
+          entry.topic_filter = MQTTString(topic_filter_buf.data(), topic_filter_len, MQTTStrAllocator(allocator_));
+      }
+      
+      if (!log_file.read(reinterpret_cast<char*>(&entry.qos), sizeof(entry.qos))) {
+          __mq_ret = -1;
+          break;
+      }
+      
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTRedoLogManager::truncate_after_snapshot(uint64_t last_applied_sequence) {
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    
-    std::ifstream old_log_file(redo_log_path_, std::ios::binary);
-    if (!old_log_file.is_open()) {
-        return 0;
-    }
-    
-    std::string temp_log_path = redo_log_path_ + ".tmp";
-    std::ofstream new_log_file(temp_log_path, std::ios::binary);
-    if (!new_log_file.is_open()) {
-        spdlog::error("Failed to create temporary redo log file: {}", temp_log_path);
-        return -1;
-    }
-    
-    RouterLogEntry entry(allocator_);
-    
-    while (true) {
-        std::streampos pos = old_log_file.tellg();
-        
-        uint8_t op_type;
-        if (!old_log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type))) {
-            break;
-        }
-        
-        uint64_t sequence_id;
-        if (!old_log_file.read(reinterpret_cast<char*>(&sequence_id), sizeof(sequence_id))) {
-            break;
-        }
-        
-        if (sequence_id <= last_applied_sequence) {
-            old_log_file.seekg(pos);
-            RouterLogEntry temp_entry(allocator_);
-            if (read_log_entry_from_file(old_log_file, temp_entry) == 0) {
-                continue;
-            } else {
-                break;
-            }
-        }
-        
-        old_log_file.seekg(pos);
-        
-        uint64_t timestamp_ms;
-        old_log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type));
-        old_log_file.read(reinterpret_cast<char*>(&sequence_id), sizeof(sequence_id));
-        old_log_file.read(reinterpret_cast<char*>(&timestamp_ms), sizeof(timestamp_ms));
-        
-        new_log_file.write(reinterpret_cast<const char*>(&op_type), sizeof(op_type));
-        new_log_file.write(reinterpret_cast<const char*>(&sequence_id), sizeof(sequence_id));
-        new_log_file.write(reinterpret_cast<const char*>(&timestamp_ms), sizeof(timestamp_ms));
-        
-        uint32_t server_id_len;
-        old_log_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len));
-        new_log_file.write(reinterpret_cast<const char*>(&server_id_len), sizeof(server_id_len));
-        
-        if (server_id_len > 0) {
-            MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
-            server_id_buf.resize(server_id_len);
-            old_log_file.read(server_id_buf.data(), server_id_len);
-            new_log_file.write(server_id_buf.data(), server_id_len);
-        }
-        
-        uint32_t client_id_len;
-        old_log_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len));
-        new_log_file.write(reinterpret_cast<const char*>(&client_id_len), sizeof(client_id_len));
-        
-        if (client_id_len > 0) {
-            MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
-            client_id_buf.resize(client_id_len);
-            old_log_file.read(client_id_buf.data(), client_id_len);
-            new_log_file.write(client_id_buf.data(), client_id_len);
-        }
-        
-        uint32_t topic_filter_len;
-        old_log_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len));
-        new_log_file.write(reinterpret_cast<const char*>(&topic_filter_len), sizeof(topic_filter_len));
-        
-        if (topic_filter_len > 0) {
-            MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
-            topic_filter_buf.resize(topic_filter_len);
-            old_log_file.read(topic_filter_buf.data(), topic_filter_len);
-            new_log_file.write(topic_filter_buf.data(), topic_filter_len);
-        }
-        
-        uint8_t qos;
-        old_log_file.read(reinterpret_cast<char*>(&qos), sizeof(qos));
-        new_log_file.write(reinterpret_cast<const char*>(&qos), sizeof(qos));
-    }
-    
-    old_log_file.close();
-    new_log_file.close();
-    
-    if (rename(temp_log_path.c_str(), redo_log_path_.c_str()) != 0) {
-        spdlog::error("Failed to rename truncated redo log file: {}", redo_log_path_);
-        return -1;
-    }
-    
-    log_file_.reset(new std::ofstream(redo_log_path_, std::ios::binary | std::ios::app));
-    if (!log_file_->is_open()) {
-        spdlog::error("Failed to reopen redo log file after truncation: {}", redo_log_path_);
-        return -1;
-    }
-    
-    spdlog::info("Truncated redo log after sequence {}", last_applied_sequence);
-    return 0;
+  int __mq_ret = 0;
+  do {
+      std::lock_guard<std::mutex> lock(log_mutex_);
+      
+      std::ifstream old_log_file(redo_log_path_, std::ios::binary);
+      if (!old_log_file.is_open()) {
+          __mq_ret = 0;
+          break;
+      }
+      
+      std::string temp_log_path = redo_log_path_ + ".tmp";
+      std::ofstream new_log_file(temp_log_path, std::ios::binary);
+      if (!new_log_file.is_open()) {
+          spdlog::error("Failed to create temporary redo log file: {}", temp_log_path);
+          __mq_ret = -1;
+          break;
+      }
+      
+      RouterLogEntry entry(allocator_);
+      
+      while (true) {
+          std::streampos pos = old_log_file.tellg();
+          
+          uint8_t op_type;
+          if (!old_log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type))) {
+              break;
+          }
+          
+          uint64_t sequence_id;
+          if (!old_log_file.read(reinterpret_cast<char*>(&sequence_id), sizeof(sequence_id))) {
+              break;
+          }
+          
+          if (sequence_id <= last_applied_sequence) {
+              old_log_file.seekg(pos);
+              RouterLogEntry temp_entry(allocator_);
+              if (read_log_entry_from_file(old_log_file, temp_entry) == 0) {
+                  continue;
+              } else {
+                  break;
+              }
+          }
+          
+          old_log_file.seekg(pos);
+          
+          uint64_t timestamp_ms;
+          old_log_file.read(reinterpret_cast<char*>(&op_type), sizeof(op_type));
+          old_log_file.read(reinterpret_cast<char*>(&sequence_id), sizeof(sequence_id));
+          old_log_file.read(reinterpret_cast<char*>(&timestamp_ms), sizeof(timestamp_ms));
+          
+          new_log_file.write(reinterpret_cast<const char*>(&op_type), sizeof(op_type));
+          new_log_file.write(reinterpret_cast<const char*>(&sequence_id), sizeof(sequence_id));
+          new_log_file.write(reinterpret_cast<const char*>(&timestamp_ms), sizeof(timestamp_ms));
+          
+          uint32_t server_id_len;
+          old_log_file.read(reinterpret_cast<char*>(&server_id_len), sizeof(server_id_len));
+          new_log_file.write(reinterpret_cast<const char*>(&server_id_len), sizeof(server_id_len));
+          
+          if (server_id_len > 0) {
+              MQTTVector<char> server_id_buf{MQTTSTLAllocator<char>(allocator_)};
+              server_id_buf.resize(server_id_len);
+              old_log_file.read(server_id_buf.data(), server_id_len);
+              new_log_file.write(server_id_buf.data(), server_id_len);
+          }
+          
+          uint32_t client_id_len;
+          old_log_file.read(reinterpret_cast<char*>(&client_id_len), sizeof(client_id_len));
+          new_log_file.write(reinterpret_cast<const char*>(&client_id_len), sizeof(client_id_len));
+          
+          if (client_id_len > 0) {
+              MQTTVector<char> client_id_buf{MQTTSTLAllocator<char>(allocator_)};
+              client_id_buf.resize(client_id_len);
+              old_log_file.read(client_id_buf.data(), client_id_len);
+              new_log_file.write(client_id_buf.data(), client_id_len);
+          }
+          
+          uint32_t topic_filter_len;
+          old_log_file.read(reinterpret_cast<char*>(&topic_filter_len), sizeof(topic_filter_len));
+          new_log_file.write(reinterpret_cast<const char*>(&topic_filter_len), sizeof(topic_filter_len));
+          
+          if (topic_filter_len > 0) {
+              MQTTVector<char> topic_filter_buf{MQTTSTLAllocator<char>(allocator_)};
+              topic_filter_buf.resize(topic_filter_len);
+              old_log_file.read(topic_filter_buf.data(), topic_filter_len);
+              new_log_file.write(topic_filter_buf.data(), topic_filter_len);
+          }
+          
+          uint8_t qos;
+          old_log_file.read(reinterpret_cast<char*>(&qos), sizeof(qos));
+          new_log_file.write(reinterpret_cast<const char*>(&qos), sizeof(qos));
+      }
+      
+      old_log_file.close();
+      new_log_file.close();
+      
+      if (rename(temp_log_path.c_str(), redo_log_path_.c_str()) != 0) {
+          spdlog::error("Failed to rename truncated redo log file: {}", redo_log_path_);
+          __mq_ret = -1;
+          break;
+      }
+      
+      log_file_.reset(new std::ofstream(redo_log_path_, std::ios::binary | std::ios::app));
+      if (!log_file_->is_open()) {
+          spdlog::error("Failed to reopen redo log file after truncation: {}", redo_log_path_);
+          __mq_ret = -1;
+          break;
+      }
+      
+      spdlog::info("Truncated redo log after sequence {}", last_applied_sequence);
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 MQTTRouterRpcHandler::MQTTRouterRpcHandler(MQTTPersistentTopicTree* topic_tree, 
@@ -676,125 +754,151 @@ MQTTRouterService::~MQTTRouterService() {
 }
 
 int MQTTRouterService::initialize() {
-    MQTTAllocator* topic_tree_allocator = root_allocator_->create_child(
-        "topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE);
-    topic_tree_.reset(new MQTTPersistentTopicTree(topic_tree_allocator));
-    
-    MQTTAllocator* redo_log_allocator = root_allocator_->create_child(
-        "redo_log", MQTTMemoryTag::MEM_TAG_ROOT);
-    redo_log_manager_.reset(new MQTTRedoLogManager(redo_log_allocator, config_));
-    
-    MQTTAllocator* rpc_handler_allocator = root_allocator_->create_child(
-        "rpc_handler", MQTTMemoryTag::MEM_TAG_ROOT);
-    rpc_handler_.reset(new MQTTRouterRpcHandler(topic_tree_.get(), redo_log_manager_.get(), rpc_handler_allocator));
-    
-    if (topic_tree_->load_from_snapshot(config_.snapshot_path) != 0) {
-        spdlog::error("Failed to load snapshot");
-        return -1;
-    }
-    
-    if (redo_log_manager_->initialize() != 0) {
-        spdlog::error("Failed to initialize redo log manager");
-        return -1;
-    }
-    
-    if (redo_log_manager_->load_and_replay(topic_tree_.get()) != 0) {
-        spdlog::error("Failed to load and replay redo log");
-        return -1;
-    }
-    
-    return 0;
+  int __mq_ret = 0;
+  do {
+      MQTTAllocator* topic_tree_allocator = root_allocator_->create_child(
+          "topic_tree", MQTTMemoryTag::MEM_TAG_TOPIC_TREE);
+      topic_tree_.reset(new MQTTPersistentTopicTree(topic_tree_allocator));
+      
+      MQTTAllocator* redo_log_allocator = root_allocator_->create_child(
+          "redo_log", MQTTMemoryTag::MEM_TAG_ROOT);
+      redo_log_manager_.reset(new MQTTRedoLogManager(redo_log_allocator, config_));
+      
+      MQTTAllocator* rpc_handler_allocator = root_allocator_->create_child(
+          "rpc_handler", MQTTMemoryTag::MEM_TAG_ROOT);
+      rpc_handler_.reset(new MQTTRouterRpcHandler(topic_tree_.get(), redo_log_manager_.get(), rpc_handler_allocator));
+      
+      if (topic_tree_->load_from_snapshot(config_.snapshot_path) != 0) {
+          spdlog::error("Failed to load snapshot");
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (redo_log_manager_->initialize() != 0) {
+          spdlog::error("Failed to initialize redo log manager");
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (redo_log_manager_->load_and_replay(topic_tree_.get()) != 0) {
+          spdlog::error("Failed to load and replay redo log");
+          __mq_ret = -1;
+          break;
+      }
+      
+      __mq_ret = 0;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int MQTTRouterService::start() {
-    should_stop_ = false;
+  int __mq_ret = 0;
+  do {
+      should_stop_ = false;
+  
+      listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+      if (listen_fd_ < 0) {
+          spdlog::error("Failed to create socket: {}", strerror(errno));
+          __mq_ret = -1;
+          break;
+      }
+      
+      int opt = 1;
+      if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+          spdlog::error("Failed to set socket options: {}", strerror(errno));
+          close(listen_fd_);
+          __mq_ret = -1;
+          break;
+      }
+      
+      struct sockaddr_in addr;
+      memset(&addr, 0, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = inet_addr(config_.service_host.c_str());
+      addr.sin_port = htons(config_.service_port);
+      
+      if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+          spdlog::error("Failed to bind socket: {}", strerror(errno));
+          close(listen_fd_);
+          __mq_ret = -1;
+          break;
+      }
+      
+      if (listen(listen_fd_, 1024) < 0) {
+          spdlog::error("Failed to listen on socket: {}", strerror(errno));
+          close(listen_fd_);
+          __mq_ret = -1;
+          break;
+      }
+      
+      // Start worker threads
+      for (int i = 0; i < config_.worker_thread_count; ++i) {
+          worker_threads_.emplace_back(&MQTTRouterService::worker_thread_func, this, i);
+      }
+      
+      // Start snapshot thread
+      snapshot_thread_ = std::thread(&MQTTRouterService::snapshot_thread_func, this);
+      
+      spdlog::info("MQTT Router Service started on {}:{}", config_.service_host, config_.service_port);
+      __mq_ret = 0;
+      break;
+  } while (false);
 
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
-        spdlog::error("Failed to create socket: {}", strerror(errno));
-        return -1;
-    }
-    
-    int opt = 1;
-    if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        spdlog::error("Failed to set socket options: {}", strerror(errno));
-        close(listen_fd_);
-        return -1;
-    }
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(config_.service_host.c_str());
-    addr.sin_port = htons(config_.service_port);
-    
-    if (bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        spdlog::error("Failed to bind socket: {}", strerror(errno));
-        close(listen_fd_);
-        return -1;
-    }
-    
-    if (listen(listen_fd_, 1024) < 0) {
-        spdlog::error("Failed to listen on socket: {}", strerror(errno));
-        close(listen_fd_);
-        return -1;
-    }
-    
-    // Start worker threads
-    for (int i = 0; i < config_.worker_thread_count; ++i) {
-        worker_threads_.emplace_back(&MQTTRouterService::worker_thread_func, this, i);
-    }
-    
-    // Start snapshot thread
-    snapshot_thread_ = std::thread(&MQTTRouterService::snapshot_thread_func, this);
-    
-    spdlog::info("MQTT Router Service started on {}:{}", config_.service_host, config_.service_port);
-    return 0;
+  return __mq_ret;
 }
 
 int MQTTRouterService::stop() {
-    if (should_stop_ && listen_fd_ < 0 && worker_threads_.empty() && !snapshot_thread_.joinable()) {
-        return 0;
-    }
+  int __mq_ret = 0;
+  do {
+      if (should_stop_ && listen_fd_ < 0 && worker_threads_.empty() && !snapshot_thread_.joinable()) {
+          __mq_ret = 0;
+          break;
+      }
+  
+      should_stop_ = true;
+      
+      if (listen_fd_ >= 0) {
+          // Wake blocking accept() calls before closing listening fd.
+          for (size_t i = 0; i < worker_threads_.size(); ++i) {
+              int wake_fd = socket(AF_INET, SOCK_STREAM, 0);
+              if (wake_fd < 0) {
+                  continue;
+              }
+  
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_addr.s_addr = inet_addr(config_.service_host.c_str());
+              addr.sin_port = htons(config_.service_port);
+  
+              connect(wake_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+              close(wake_fd);
+          }
+  
+          shutdown(listen_fd_, SHUT_RDWR);
+          close(listen_fd_);
+          listen_fd_ = -1;
+      }
+      
+      for (auto& thread : worker_threads_) {
+          if (thread.joinable()) {
+              thread.join();
+          }
+      }
+      worker_threads_.clear();
+      
+      if (snapshot_thread_.joinable()) {
+          snapshot_thread_.join();
+      }
+      
+      spdlog::info("MQTT Router Service stopped");
+      __mq_ret = 0;
+      break;
+  } while (false);
 
-    should_stop_ = true;
-    
-    if (listen_fd_ >= 0) {
-        // Wake blocking accept() calls before closing listening fd.
-        for (size_t i = 0; i < worker_threads_.size(); ++i) {
-            int wake_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (wake_fd < 0) {
-                continue;
-            }
-
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = inet_addr(config_.service_host.c_str());
-            addr.sin_port = htons(config_.service_port);
-
-            connect(wake_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-            close(wake_fd);
-        }
-
-        shutdown(listen_fd_, SHUT_RDWR);
-        close(listen_fd_);
-        listen_fd_ = -1;
-    }
-    
-    for (auto& thread : worker_threads_) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    worker_threads_.clear();
-    
-    if (snapshot_thread_.joinable()) {
-        snapshot_thread_.join();
-    }
-    
-    spdlog::info("MQTT Router Service stopped");
-    return 0;
+  return __mq_ret;
 }
 
 void MQTTRouterService::worker_thread_func(int thread_id) {

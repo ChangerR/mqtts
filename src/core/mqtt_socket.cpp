@@ -20,53 +20,61 @@ int co_accept(int fd, struct sockaddr* addr, socklen_t* len);
 
 int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
 {
-  int ret = MQ_SUCCESS;
-  struct sockaddr_in addr;
-  int sock_ret = -1;
-
-  // Set socket options
-  if (MQ_FAIL(set_reuse_addr(reuse))) {
-    LOG_ERROR("Failed to set SO_REUSEADDR option");
-    return MQ_ERR_SOCKET;
-  }
-
-  if (MQ_FAIL(set_tcp_nodelay(true))) {
-    LOG_WARN("Failed to set TCP_NODELAY option");
-  }
-
-  if (MQ_FAIL(set_buffer_size())) {
-    LOG_WARN("Failed to set socket buffer size");
-  }
-
-  // Set socket to non-blocking mode
-  if (MQ_FAIL(set_nonblocking(true))) {
-    LOG_ERROR("Failed to set socket to non-blocking mode");
-    return MQ_ERR_SOCKET;
-  }
-
-  set_addr(ip, port, addr);
-  sock_ret = bind(fd_, (struct sockaddr*)&addr, sizeof(addr));
-  if (sock_ret != 0) {
-    LOG_ERROR("Failed to bind socket to {}:{} - {}", ip, port, strerror(errno));
-    ret = MQ_ERR_SOCKET_BIND;
-    close();
-  }
-
-  if (MQ_SUCC(ret)) {
-    sock_ret = ::listen(fd_, backlog);
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+    struct sockaddr_in addr;
+    int sock_ret = -1;
+  
+    // Set socket options
+    if (MQ_FAIL(set_reuse_addr(reuse))) {
+      LOG_ERROR("Failed to set SO_REUSEADDR option");
+      __mq_ret = MQ_ERR_SOCKET;
+      break;
+    }
+  
+    if (MQ_FAIL(set_tcp_nodelay(true))) {
+      LOG_WARN("Failed to set TCP_NODELAY option");
+    }
+  
+    if (MQ_FAIL(set_buffer_size())) {
+      LOG_WARN("Failed to set socket buffer size");
+    }
+  
+    // Set socket to non-blocking mode
+    if (MQ_FAIL(set_nonblocking(true))) {
+      LOG_ERROR("Failed to set socket to non-blocking mode");
+      __mq_ret = MQ_ERR_SOCKET;
+      break;
+    }
+  
+    set_addr(ip, port, addr);
+    sock_ret = bind(fd_, (struct sockaddr*)&addr, sizeof(addr));
     if (sock_ret != 0) {
-      LOG_ERROR("Failed to listen on socket - {}", strerror(errno));
-      ret = MQ_ERR_SOCKET_LISTEN;
+      LOG_ERROR("Failed to bind socket to {}:{} - {}", ip, port, strerror(errno));
+      ret = MQ_ERR_SOCKET_BIND;
       close();
     }
-  }
+  
+    if (MQ_SUCC(ret)) {
+      sock_ret = ::listen(fd_, backlog);
+      if (sock_ret != 0) {
+        LOG_ERROR("Failed to listen on socket - {}", strerror(errno));
+        ret = MQ_ERR_SOCKET_LISTEN;
+        close();
+      }
+    }
+  
+    if (MQ_SUCC(ret)) {
+      co_enable_hook_sys();
+      LOG_INFO("Socket listening on {}:{} (backlog: {})", ip, port, backlog);
+    }
+  
+    __mq_ret = ret;
+    break;
+  } while (false);
 
-  if (MQ_SUCC(ret)) {
-    co_enable_hook_sys();
-    LOG_INFO("Socket listening on {}:{} (backlog: {})", ip, port, backlog);
-  }
-
-  return ret;
+  return __mq_ret;
 }
 
 int MQTTSocket::accept(MQTTSocket*& client)
@@ -178,16 +186,24 @@ int MQTTSocket::send(const uint8_t* buf, int len)
 
 int MQTTSocket::send(const mqtt::MQTTBuffer& buffer)
 {
-  if (buffer.empty()) {
-    return MQ_SUCCESS;
-  }
+  int __mq_ret = 0;
+  do {
+    if (buffer.empty()) {
+      __mq_ret = MQ_SUCCESS;
+      break;
+    }
+  
+    if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      LOG_ERROR("Buffer too large to send: {} bytes", buffer.size());
+      __mq_ret = MQ_ERR_INVALID_ARGS;
+      break;
+    }
+  
+    __mq_ret = send(buffer.data(), static_cast<int>(buffer.size()));
+    break;
+  } while (false);
 
-  if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    LOG_ERROR("Buffer too large to send: {} bytes", buffer.size());
-    return MQ_ERR_INVALID_ARGS;
-  }
-
-  return send(buffer.data(), static_cast<int>(buffer.size()));
+  return __mq_ret;
 }
 
 int MQTTSocket::recv(char* buf, int& len)
@@ -232,41 +248,53 @@ int MQTTSocket::recv(char* buf, int& len)
 
 int MQTTSocket::recv(mqtt::MQTTBuffer& buffer, int& len)
 {
-  if (len < 0) {
-    LOG_ERROR("Invalid recv length: {}", len);
-    return MQ_ERR_INVALID_ARGS;
-  }
+  int __mq_ret = 0;
+  do {
+    if (len < 0) {
+      LOG_ERROR("Invalid recv length: {}", len);
+      __mq_ret = MQ_ERR_INVALID_ARGS;
+      break;
+    }
+  
+    if (len == 0) {
+      __mq_ret = MQ_SUCCESS;
+      break;
+    }
+  
+    size_t old_size = buffer.size();
+    size_t append_capacity = static_cast<size_t>(len);
+    if (append_capacity > static_cast<size_t>(std::numeric_limits<size_t>::max() - old_size)) {
+      LOG_ERROR("recv size overflow: old_size={}, append={}", old_size, append_capacity);
+      __mq_ret = MQ_ERR_INVALID_ARGS;
+      break;
+    }
+  
+    size_t required = old_size + append_capacity;
+    if (!buffer.reserve(required)) {
+      LOG_ERROR("Failed to reserve MQTTBuffer for recv, required={}", required);
+      __mq_ret = MQ_ERR_MEMORY_ALLOC;
+      break;
+    }
+  
+    int read_len = len;
+    int ret = recv(reinterpret_cast<char*>(buffer.data() + old_size), read_len);
+    if (MQ_FAIL(ret)) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    if (read_len > 0 && !buffer.resize(old_size + static_cast<size_t>(read_len))) {
+      LOG_ERROR("Failed to resize MQTTBuffer after recv, old_size={}, read_len={}", old_size, read_len);
+      __mq_ret = MQ_ERR_MEMORY_ALLOC;
+      break;
+    }
+  
+    len = read_len;
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  if (len == 0) {
-    return MQ_SUCCESS;
-  }
-
-  size_t old_size = buffer.size();
-  size_t append_capacity = static_cast<size_t>(len);
-  if (append_capacity > static_cast<size_t>(std::numeric_limits<size_t>::max() - old_size)) {
-    LOG_ERROR("recv size overflow: old_size={}, append={}", old_size, append_capacity);
-    return MQ_ERR_INVALID_ARGS;
-  }
-
-  size_t required = old_size + append_capacity;
-  if (!buffer.reserve(required)) {
-    LOG_ERROR("Failed to reserve MQTTBuffer for recv, required={}", required);
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  int read_len = len;
-  int ret = recv(reinterpret_cast<char*>(buffer.data() + old_size), read_len);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  if (read_len > 0 && !buffer.resize(old_size + static_cast<size_t>(read_len))) {
-    LOG_ERROR("Failed to resize MQTTBuffer after recv, old_size={}, read_len={}", old_size, read_len);
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  len = read_len;
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 

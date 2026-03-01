@@ -140,32 +140,53 @@ int HttpParser::on_message_complete(llhttp_t* parser) {
 }
 
 int HttpParser::append_url(const char* at, size_t length) {
-  if (type_ != HttpParserType::REQUEST) {
-    return 0;
-  }
-  request_.url.append(at, length);
-  request_.path = request_.url;
-  return 0;
+  int __mq_ret = 0;
+  do {
+    if (type_ != HttpParserType::REQUEST) {
+      __mq_ret = 0;
+      break;
+    }
+    request_.url.append(at, length);
+    request_.path = request_.url;
+    __mq_ret = 0;
+    break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int HttpParser::append_status(const char* at, size_t length) {
-  if (type_ != HttpParserType::RESPONSE) {
-    return 0;
-  }
-  response_.reason.append(at, length);
-  return 0;
+  int __mq_ret = 0;
+  do {
+    if (type_ != HttpParserType::RESPONSE) {
+      __mq_ret = 0;
+      break;
+    }
+    response_.reason.append(at, length);
+    __mq_ret = 0;
+    break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int HttpParser::append_header_field(const char* at, size_t length) {
-  if (parsing_header_value_) {
-    int ret = commit_pending_header();
-    if (ret != 0) {
-      return ret;
+  int __mq_ret = 0;
+  do {
+    if (parsing_header_value_) {
+      int ret = commit_pending_header();
+      if (ret != 0) {
+        __mq_ret = ret;
+        break;
+      }
     }
-  }
-  pending_header_field_.append(at, length);
-  parsing_header_value_ = false;
-  return 0;
+    pending_header_field_.append(at, length);
+    parsing_header_value_ = false;
+    __mq_ret = 0;
+    break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int HttpParser::append_header_value(const char* at, size_t length) {
@@ -175,54 +196,75 @@ int HttpParser::append_header_value(const char* at, size_t length) {
 }
 
 int HttpParser::commit_pending_header() {
-  if (pending_header_field_.empty()) {
-    return 0;
-  }
+  int __mq_ret = 0;
+  do {
+    if (pending_header_field_.empty()) {
+      __mq_ret = 0;
+      break;
+    }
+  
+    mqtt::MQTTString key = to_lower_ascii(pending_header_field_, allocator_);
+    mqtt::MQTTString value = pending_header_value_;
+  
+    if (type_ == HttpParserType::REQUEST) {
+      request_.set_header(key, value);
+    } else {
+      response_.set_header(key, value);
+    }
+  
+    pending_header_field_.clear();
+    pending_header_value_.clear();
+    parsing_header_value_ = false;
+    __mq_ret = 0;
+    break;
+  } while (false);
 
-  mqtt::MQTTString key = to_lower_ascii(pending_header_field_, allocator_);
-  mqtt::MQTTString value = pending_header_value_;
-
-  if (type_ == HttpParserType::REQUEST) {
-    request_.set_header(key, value);
-  } else {
-    response_.set_header(key, value);
-  }
-
-  pending_header_field_.clear();
-  pending_header_value_.clear();
-  parsing_header_value_ = false;
-  return 0;
+  return __mq_ret;
 }
 
 int HttpParser::headers_complete() {
-  int ret = commit_pending_header();
-  if (ret != 0) {
-    return ret;
-  }
+  int __mq_ret = 0;
+  do {
+    int ret = commit_pending_header();
+    if (ret != 0) {
+      __mq_ret = ret;
+      break;
+    }
+  
+    char version_buf[16] = {0};
+    std::snprintf(version_buf, sizeof(version_buf), "HTTP/%u.%u", parser_->http_major, parser_->http_minor);
+    if (type_ == HttpParserType::REQUEST) {
+      request_.version.assign(version_buf);
+      request_.method.assign(llhttp_method_name(static_cast<llhttp_method_t>(parser_->method)));
+    } else {
+      response_.version.assign(version_buf);
+      response_.status_code = parser_->status_code;
+    }
+    __mq_ret = 0;
+    break;
+  } while (false);
 
-  char version_buf[16] = {0};
-  std::snprintf(version_buf, sizeof(version_buf), "HTTP/%u.%u", parser_->http_major, parser_->http_minor);
-  if (type_ == HttpParserType::REQUEST) {
-    request_.version.assign(version_buf);
-    request_.method.assign(llhttp_method_name(static_cast<llhttp_method_t>(parser_->method)));
-  } else {
-    response_.version.assign(version_buf);
-    response_.status_code = parser_->status_code;
-  }
-  return 0;
+  return __mq_ret;
 }
 
 int HttpParser::append_body(const char* at, size_t length) {
-  if (length == 0) {
-    return 0;
-  }
+  int __mq_ret = 0;
+  do {
+    if (length == 0) {
+      __mq_ret = 0;
+      break;
+    }
+  
+    if (type_ == HttpParserType::REQUEST) {
+      (void)request_.body.append(at, length);
+    } else {
+      (void)response_.body.append(at, length);
+    }
+    __mq_ret = 0;
+    break;
+  } while (false);
 
-  if (type_ == HttpParserType::REQUEST) {
-    (void)request_.body.append(at, length);
-  } else {
-    (void)response_.body.append(at, length);
-  }
-  return 0;
+  return __mq_ret;
 }
 
 int HttpParser::mark_message_complete() {

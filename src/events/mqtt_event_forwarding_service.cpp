@@ -25,66 +25,85 @@ EventForwardingService::~EventForwardingService() {
 }
 
 int EventForwardingService::initialize() {
-    if (initialized_.load()) {
-        return MQ_SUCCESS;
-    }
-    
-    if (!enabled_.load()) {
-        LOG_INFO("EventForwardingService is disabled, skipping initialization");
-        return MQ_SUCCESS;
-    }
-    
-    // Create event queue
-    event_queue_ = std::unique_ptr<EventForwardingQueue>(new EventForwardingQueue(config_.max_queue_size, config_.queue_drop_policy));
-    if (!event_queue_) {
-        LOG_ERROR("Failed to create event forwarding queue");
-        return MQ_ERR_MEMORY_ALLOC;
-    }
-    
-    // Initialize worker threads
-    int result = initializeWorkers();
-    if (result != MQ_SUCCESS) {
-        LOG_ERROR("Failed to initialize worker threads: {}", result);
-        return result;
-    }
-    
-    // Initialize statistics
-    stats_.worker_stats.resize(config_.worker_thread_count);
-    
-    initialized_.store(true);
-    LOG_INFO("EventForwardingService initialized successfully");
-    
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      if (initialized_.load()) {
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      if (!enabled_.load()) {
+          LOG_INFO("EventForwardingService is disabled, skipping initialization");
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      // Create event queue
+      event_queue_ = std::unique_ptr<EventForwardingQueue>(new EventForwardingQueue(config_.max_queue_size, config_.queue_drop_policy));
+      if (!event_queue_) {
+          LOG_ERROR("Failed to create event forwarding queue");
+          __mq_ret = MQ_ERR_MEMORY_ALLOC;
+          break;
+      }
+      
+      // Initialize worker threads
+      int result = initializeWorkers();
+      if (result != MQ_SUCCESS) {
+          LOG_ERROR("Failed to initialize worker threads: {}", result);
+          __mq_ret = result;
+          break;
+      }
+      
+      // Initialize statistics
+      stats_.worker_stats.resize(config_.worker_thread_count);
+      
+      initialized_.store(true);
+      LOG_INFO("EventForwardingService initialized successfully");
+      
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 int EventForwardingService::start() {
-    if (!enabled_.load()) {
-        LOG_INFO("EventForwardingService is disabled, not starting");
-        return MQ_SUCCESS;
-    }
-    
-    if (!initialized_.load()) {
-        int result = initialize();
-        if (result != MQ_SUCCESS) {
-            return result;
-        }
-    }
-    
-    if (running_.load()) {
-        LOG_WARN("EventForwardingService is already running");
-        return MQ_SUCCESS;
-    }
-    
-    // Start worker threads
-    for (auto& worker : workers_) {
-        worker->running.store(true);
-        worker->thread.reset(new std::thread(&EventForwardingService::workerThreadMain, this, worker.get()));
-    }
-    
-    running_.store(true);
-    LOG_INFO("EventForwardingService started with {} worker threads", workers_.size());
-    
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      if (!enabled_.load()) {
+          LOG_INFO("EventForwardingService is disabled, not starting");
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      if (!initialized_.load()) {
+          int result = initialize();
+          if (result != MQ_SUCCESS) {
+              __mq_ret = result;
+              break;
+          }
+      }
+      
+      if (running_.load()) {
+          LOG_WARN("EventForwardingService is already running");
+          __mq_ret = MQ_SUCCESS;
+          break;
+      }
+      
+      // Start worker threads
+      for (auto& worker : workers_) {
+          worker->running.store(true);
+          worker->thread.reset(new std::thread(&EventForwardingService::workerThreadMain, this, worker.get()));
+      }
+      
+      running_.store(true);
+      LOG_INFO("EventForwardingService started with {} worker threads", workers_.size());
+      
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 void EventForwardingService::stop() {
@@ -147,30 +166,38 @@ const ForwardingServiceConfig& EventForwardingService::getConfig() const {
 }
 
 int EventForwardingService::updateConfig(const ForwardingServiceConfig& config) {
-    if (!validateConfig(config)) {
-        LOG_ERROR("Invalid configuration provided");
-        return MQ_ERR_INVALID_ARGS;
-    }
-    
-    bool was_running = running_.load();
-    
-    // Stop service if running
-    if (was_running) {
-        stop();
-    }
-    
-    // Update configuration
-    config_ = config;
-    enabled_.store(config.enabled);
-    initialized_.store(false);
-    
-    // Restart if it was running before
-    if (was_running && enabled_.load()) {
-        return start();
-    }
-    
-    LOG_INFO("EventForwardingService configuration updated");
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      if (!validateConfig(config)) {
+          LOG_ERROR("Invalid configuration provided");
+          __mq_ret = MQ_ERR_INVALID_ARGS;
+          break;
+      }
+      
+      bool was_running = running_.load();
+      
+      // Stop service if running
+      if (was_running) {
+          stop();
+      }
+      
+      // Update configuration
+      config_ = config;
+      enabled_.store(config.enabled);
+      initialized_.store(false);
+      
+      // Restart if it was running before
+      if (was_running && enabled_.load()) {
+          __mq_ret = start();
+          break;
+      }
+      
+      LOG_INFO("EventForwardingService configuration updated");
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 ForwardingServiceStats EventForwardingService::getStats() const {
@@ -276,27 +303,34 @@ void EventForwardingService::processEventBatches(WorkerContext* context) {
 }
 
 int EventForwardingService::createRpcClients(WorkerContext* context) {
-    context->rpc_clients.clear();
-    context->rpc_clients.reserve(config_.coroutines_per_thread);
-    
-    for (int i = 0; i < config_.coroutines_per_thread; ++i) {
-        std::unique_ptr<EventRpcClient> client(new EventRpcClient(
-            config_.server_host,
-            config_.server_port,
-            config_.connection_timeout_ms,
-            config_.request_timeout_ms
-        ));
-        
-        if (client->initialize() != MQ_SUCCESS) {
-            LOG_ERROR("Failed to initialize RPC client {} for worker {}", i, context->thread_id);
-            return MQ_ERR_INTERNAL;
-        }
-        
-        context->rpc_clients.push_back(std::move(client));
-    }
-    
-    LOG_DEBUG("Created {} RPC clients for worker {}", config_.coroutines_per_thread, context->thread_id);
-    return MQ_SUCCESS;
+  int __mq_ret = 0;
+  do {
+      context->rpc_clients.clear();
+      context->rpc_clients.reserve(config_.coroutines_per_thread);
+      
+      for (int i = 0; i < config_.coroutines_per_thread; ++i) {
+          std::unique_ptr<EventRpcClient> client(new EventRpcClient(
+              config_.server_host,
+              config_.server_port,
+              config_.connection_timeout_ms,
+              config_.request_timeout_ms
+          ));
+          
+          if (client->initialize() != MQ_SUCCESS) {
+              LOG_ERROR("Failed to initialize RPC client {} for worker {}", i, context->thread_id);
+              __mq_ret = MQ_ERR_INTERNAL;
+              break;
+          }
+          
+          context->rpc_clients.push_back(std::move(client));
+      }
+      
+      LOG_DEBUG("Created {} RPC clients for worker {}", config_.coroutines_per_thread, context->thread_id);
+      __mq_ret = MQ_SUCCESS;
+      break;
+  } while (false);
+
+  return __mq_ret;
 }
 
 void EventForwardingService::updateGlobalStats() const {

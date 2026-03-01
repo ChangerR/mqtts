@@ -116,30 +116,38 @@ void SendWorkerPool::stop()
 
 int SendWorkerPool::submit_task(const WorkerSendTask& task)
 {
-  if (!running_.load()) {
-    return MQ_ERR_INVALID_ARGS;
-  }
-
-  size_t worker_id = select_worker();
-  WorkerData* worker = workers_[worker_id].get();
-
-  {
-    CoroLockGuard lock(&worker->queue_mutex);  // 使用协程锁
-
-    if (worker->task_queue.size() >= max_queue_size_) {
-      LOG_WARN("Worker {} queue full, dropping task for client: {}", worker_id,
-               from_mqtt_string(task.target_client_id));
-      return MQ_ERR_TIMEOUT_V2;
+  int __mq_ret = 0;
+  do {
+    if (!running_.load()) {
+      __mq_ret = MQ_ERR_INVALID_ARGS;
+      break;
     }
+  
+    size_t worker_id = select_worker();
+    WorkerData* worker = workers_[worker_id].get();
+  
+    {
+      CoroLockGuard lock(&worker->queue_mutex);  // 使用协程锁
+  
+      if (worker->task_queue.size() >= max_queue_size_) {
+        LOG_WARN("Worker {} queue full, dropping task for client: {}", worker_id,
+                 from_mqtt_string(task.target_client_id));
+        __mq_ret = MQ_ERR_TIMEOUT_V2;
+        break;
+      }
+  
+      worker->task_queue.push(task);
+    }
+  
+    // 通知Worker有新任务
+    worker->task_available.signal();
+    total_submitted_.fetch_add(1);
+  
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-    worker->task_queue.push(task);
-  }
-
-  // 通知Worker有新任务
-  worker->task_available.signal();
-  total_submitted_.fetch_add(1);
-
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 SendWorkerPool::Statistics SendWorkerPool::get_statistics() const

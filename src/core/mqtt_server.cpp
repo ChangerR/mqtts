@@ -137,34 +137,43 @@ int MQTTServer::remove_connection()
 
 int MQTTServer::start()
 {
-  int ret = MQ_SUCCESS;
-  if (running_) {
-    LOG_WARN("Server is already running");
-    return MQ_SUCCESS;
-  }
-
-  // Create server socket
-  if (MQ_FAIL(MQTTSocket::create_tcp_socket(server_socket_))) {
-    LOG_ERROR("Failed to create server socket for {}:{}", host_, port_);
-    return MQ_ERR_SOCKET;
-  }
-
-  // Start listening - 使用配置中的backlog参数
-  if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true, server_config_.backlog))) {
-    LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
-    MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
-    if (MQ_NOT_NULL(server_socket_)) {
-      server_socket_->~MQTTSocket();  // Call destructor explicitly
-      root->deallocate(server_socket_, sizeof(MQTTSocket));
-      server_socket_ = NULL;
+  int __mq_ret = 0;
+  do {
+    int ret = MQ_SUCCESS;
+    if (running_) {
+      LOG_WARN("Server is already running");
+      __mq_ret = MQ_SUCCESS;
+      break;
     }
-    return MQ_ERR_SOCKET;
-  }
+  
+    // Create server socket
+    if (MQ_FAIL(MQTTSocket::create_tcp_socket(server_socket_))) {
+      LOG_ERROR("Failed to create server socket for {}:{}", host_, port_);
+      __mq_ret = MQ_ERR_SOCKET;
+      break;
+    }
+  
+    // Start listening - 使用配置中的backlog参数
+    if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true, server_config_.backlog))) {
+      LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
+      MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
+      if (MQ_NOT_NULL(server_socket_)) {
+        server_socket_->~MQTTSocket();  // Call destructor explicitly
+        root->deallocate(server_socket_, sizeof(MQTTSocket));
+        server_socket_ = NULL;
+      }
+      __mq_ret = MQ_ERR_SOCKET;
+      break;
+    }
+  
+    running_ = true;
+    LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", host_, port_,
+             server_config_.max_connections, server_config_.backlog);
+    __mq_ret = MQ_SUCCESS;
+    break;
+  } while (false);
 
-  running_ = true;
-  LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", host_, port_,
-           server_config_.max_connections, server_config_.backlog);
-  return MQ_SUCCESS;
+  return __mq_ret;
 }
 
 void MQTTServer::run()
@@ -452,24 +461,31 @@ void MQTTServer::handle_client(ClientContext* ctx)
 
 int MQTTServer::eventloop_callback(void* arg)
 {
-  MQTTServer* server = (MQTTServer*)arg;
-
-  // Only process if server is still running
-  if (!server->running_) {
-    return 0;
-  }
-
-  mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
-
-  // Get current thread's session manager
-  mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
-  if (local_manager) {
-    // Process pending messages without blocking (process up to 50 messages per callback)
-    int processed = local_manager->process_pending_messages_nowait(50);
-    if (processed > 0) {
-      LOG_DEBUG("Processed {} pending messages in eventloop callback", processed);
+  int __mq_ret = 0;
+  do {
+    MQTTServer* server = (MQTTServer*)arg;
+  
+    // Only process if server is still running
+    if (!server->running_) {
+      __mq_ret = 0;
+      break;
     }
-  }
+  
+    mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+  
+    // Get current thread's session manager
+    mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
+    if (local_manager) {
+      // Process pending messages without blocking (process up to 50 messages per callback)
+      int processed = local_manager->process_pending_messages_nowait(50);
+      if (processed > 0) {
+        LOG_DEBUG("Processed {} pending messages in eventloop callback", processed);
+      }
+    }
+  
+    __mq_ret = 0; // Continue eventloop
+    break;
+  } while (false);
 
-  return 0;  // Continue eventloop
+  return __mq_ret;
 }
