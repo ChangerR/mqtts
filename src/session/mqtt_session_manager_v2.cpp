@@ -602,7 +602,7 @@ bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) c
 thread_local GlobalSessionManager* GlobalSessionManager::cached_manager_owner_ = nullptr;
 thread_local ThreadLocalSessionManager* GlobalSessionManager::cached_thread_manager_ = nullptr;
 
-GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING), event_forwarding_service_(nullptr), server_id_(MQTTStrAllocator(nullptr))
+GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING), event_forwarding_service_(nullptr), server_id_(MQTTStrAllocator(nullptr)), auth_manager_(nullptr)
 {
   // 初始化全局分配器
   MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
@@ -1717,6 +1717,16 @@ int GlobalSessionManager::forward_publish_via_router(const MQTTString& topic, co
 bool GlobalSessionManager::is_router_available() const
 {
   return router_client_ && router_client_->is_connected();
+}
+
+void GlobalSessionManager::set_auth_manager(auth::AuthManager* auth_manager)
+{
+  auth_manager_ = auth_manager;
+}
+
+auth::AuthManager* GlobalSessionManager::get_auth_manager() const
+{
+  return auth_manager_;
 }
 
 }  // namespace mqtt
