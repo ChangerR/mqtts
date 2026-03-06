@@ -2,6 +2,7 @@
 
 #include "mqtt_auth_redis.h"
 #include "logger.h"
+#include "mqtt_coroutine_utils.h"
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -81,17 +82,17 @@ RedisConnectionPool::~RedisConnectionPool() {
 }
 
 int RedisConnectionPool::initialize() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
+    mqtt::CoroLockGuard lock(&pool_mutex_);
+
     if (initialized_) {
         return MQ_SUCCESS;
     }
-    
-    LOG_INFO("Initializing Redis connection pool with {} connections to {}:{}", 
+
+    LOG_INFO("Initializing Redis connection pool with {} connections to {}:{}",
              config_.connection_pool_size, config_.host, config_.port);
-    
+
     pool_.reserve(config_.connection_pool_size);
-    
+
     for (int i = 0; i < config_.connection_pool_size; ++i) {
         redisContext* ctx = create_connection();
         if (!ctx) {
@@ -99,7 +100,7 @@ int RedisConnectionPool::initialize() {
             cleanup();
             return MQ_ERR_CONNECT;
         }
-        
+
         int ret = configure_connection(ctx);
         if (ret != MQ_SUCCESS) {
             LOG_ERROR("Failed to configure Redis connection {}: {}", i, ret);
@@ -107,93 +108,100 @@ int RedisConnectionPool::initialize() {
             cleanup();
             return ret;
         }
-        
+
         auto conn = std::make_shared<RedisConnection>(ctx, i);
         pool_.push_back(conn);
         available_.push(conn);
     }
-    
+
     initialized_ = true;
     LOG_INFO("Redis connection pool initialized successfully");
     return MQ_SUCCESS;
 }
 
 void RedisConnectionPool::cleanup() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
+    mqtt::CoroLockGuard lock(&pool_mutex_);
+
     if (!initialized_) {
         return;
     }
-    
+
     LOG_INFO("Cleaning up Redis connection pool");
-    
+
     // 清空可用连接队列
     while (!available_.empty()) {
         available_.pop();
     }
-    
+
     // 关闭所有连接
     pool_.clear();
-    
+
     initialized_ = false;
 }
 
 std::shared_ptr<RedisConnection> RedisConnectionPool::acquire_connection() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
-    if (!initialized_) {
-        LOG_ERROR("Connection pool not initialized");
-        return nullptr;
-    }
-    
-    // 等待可用连接
-    pool_cv_.wait(lock, [this] { return !available_.empty(); });
-    
-    auto conn = available_.front();
-    available_.pop();
-    
-    conn->set_busy(true);
-    conn->update_last_used();
-    
-    // 检查连接健康状态
-    if (!conn->is_connected()) {
-        LOG_WARN("Redis connection {} is disconnected, attempting reconnect", conn->get_id());
-        
-        // 尝试重新连接
-        redisContext* new_ctx = create_connection();
-        if (new_ctx && configure_connection(new_ctx) == MQ_SUCCESS) {
-            // 替换连接
-            conn = std::make_shared<RedisConnection>(new_ctx, conn->get_id());
-            conn->set_busy(true);
-            conn->update_last_used();
-        } else {
-            if (new_ctx) {
-                redisFree(new_ctx);
+    while (true) {
+        {
+            mqtt::CoroLockGuard lock(&pool_mutex_);
+
+            if (!initialized_) {
+                LOG_ERROR("Connection pool not initialized");
+                return nullptr;
             }
-            LOG_ERROR("Failed to reconnect Redis connection {}", conn->get_id());
-            return nullptr;
+
+            if (!available_.empty()) {
+                auto conn = available_.front();
+                available_.pop();
+
+                conn->set_busy(true);
+                conn->update_last_used();
+
+                // 检查连接健康状态
+                if (!conn->is_connected()) {
+                    LOG_WARN("Redis connection {} is disconnected, attempting reconnect", conn->get_id());
+
+                    // 尝试重新连接
+                    redisContext* new_ctx = create_connection();
+                    if (new_ctx && configure_connection(new_ctx) == MQ_SUCCESS) {
+                        // 替换连接
+                        conn = std::make_shared<RedisConnection>(new_ctx, conn->get_id());
+                        conn->set_busy(true);
+                        conn->update_last_used();
+                    } else {
+                        if (new_ctx) {
+                            redisFree(new_ctx);
+                        }
+                        LOG_ERROR("Failed to reconnect Redis connection {}", conn->get_id());
+                        return nullptr;
+                    }
+                }
+
+                return conn;
+            }
         }
+        // 锁已释放，等待可用连接
+        pool_cv_.wait(100);  // 100ms超时
     }
-    
-    return conn;
 }
 
 void RedisConnectionPool::release_connection(std::shared_ptr<RedisConnection> conn) {
     if (!conn) {
         return;
     }
-    
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
-    conn->set_busy(false);
-    conn->update_last_used();
-    
-    available_.push(conn);
-    pool_cv_.notify_one();
+
+    {
+        mqtt::CoroLockGuard lock(&pool_mutex_);
+
+        conn->set_busy(false);
+        conn->update_last_used();
+
+        available_.push(conn);
+    }
+    pool_cv_.signal();
 }
 
 size_t RedisConnectionPool::get_active_connections() const {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
+    mqtt::CoroLockGuard lock(&pool_mutex_);
     return pool_.size() - available_.size();
 }
 
@@ -349,12 +357,12 @@ bool RedisAuthProvider::is_super_user(const MQTTString& username) {
 }
 
 AuthStats RedisAuthProvider::get_stats() const {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
+    mqtt::CoroLockGuard lock(&stats_mutex_);
     return stats_;
 }
 
 void RedisAuthProvider::reset_stats() {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
+    mqtt::CoroLockGuard lock(&stats_mutex_);
     stats_ = AuthStats();
 }
 
@@ -943,8 +951,8 @@ bool RedisAuthProvider::match_topic_pattern(const std::string& topic, const std:
 }
 
 void RedisAuthProvider::update_stats(bool login_success, bool topic_access_granted, bool cache_hit) {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
-    
+    mqtt::CoroLockGuard lock(&stats_mutex_);
+
     if (login_success) {
         stats_.total_login_attempts++;
         stats_.successful_logins++;
@@ -952,7 +960,7 @@ void RedisAuthProvider::update_stats(bool login_success, bool topic_access_grant
         stats_.total_login_attempts++;
         stats_.failed_logins++;
     }
-    
+
     if (topic_access_granted) {
         stats_.total_topic_checks++;
         stats_.topic_access_granted++;
@@ -960,7 +968,7 @@ void RedisAuthProvider::update_stats(bool login_success, bool topic_access_grant
         stats_.total_topic_checks++;
         stats_.topic_access_denied++;
     }
-    
+
     if (cache_hit) {
         stats_.cache_hits++;
     } else {
