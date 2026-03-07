@@ -12,6 +12,7 @@
 #include "mqtt_event_types.h"
 #include "mqtt_string_utils.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_coroutine_utils.h"
 #include "co_routine.h"
 
 using namespace mqtt;
@@ -127,7 +128,7 @@ private:
     MQTTAllocator* allocator_;
     std::unique_ptr<ConcurrentTopicTree> topic_tree_;
     ServerInfoMap server_info_map_;
-    std::mutex snapshot_mutex_;
+    mqtt::CoroMutex snapshot_mutex_;
 };
 
 class MQTTRedoLogManager {
@@ -154,7 +155,7 @@ private:
     RouterLogEntryVector pending_entries_;
     std::atomic<uint64_t> next_sequence_id_;
     std::atomic<uint64_t> last_flushed_sequence_;
-    std::mutex log_mutex_;
+    mqtt::CoroMutex log_mutex_;
     std::unique_ptr<std::ofstream> log_file_;
     std::thread flush_thread_;
     std::atomic<bool> should_stop_flush_thread_;

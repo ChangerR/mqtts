@@ -28,9 +28,9 @@ MQTTPersistentTopicTree::~MQTTPersistentTopicTree() {
     }
 }
 
-int MQTTPersistentTopicTree::subscribe(const MQTTString& server_id, const MQTTString& topic_filter, 
+int MQTTPersistentTopicTree::subscribe(const MQTTString& server_id, const MQTTString& topic_filter,
                                       const MQTTString& client_id, uint8_t qos) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     MQTTString full_client_id = server_id + MQTTString("@", MQTTStrAllocator(allocator_)) + client_id;
     int result = topic_tree_->subscribe(topic_filter, full_client_id, qos);
@@ -53,16 +53,16 @@ int MQTTPersistentTopicTree::subscribe(const MQTTString& server_id, const MQTTSt
     return result;
 }
 
-int MQTTPersistentTopicTree::unsubscribe(const MQTTString& server_id, const MQTTString& topic_filter, 
+int MQTTPersistentTopicTree::unsubscribe(const MQTTString& server_id, const MQTTString& topic_filter,
                                         const MQTTString& client_id) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     MQTTString full_client_id = server_id + MQTTString("@", MQTTStrAllocator(allocator_)) + client_id;
     return topic_tree_->unsubscribe(topic_filter, full_client_id);
 }
 
 int MQTTPersistentTopicTree::unsubscribe_all(const MQTTString& server_id, const MQTTString& client_id) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     MQTTString full_client_id = server_id + MQTTString("@", MQTTStrAllocator(allocator_)) + client_id;
     return topic_tree_->unsubscribe_all(full_client_id);
@@ -104,7 +104,7 @@ int MQTTPersistentTopicTree::find_route_targets(const MQTTString& topic, RouteTa
 }
 
 int MQTTPersistentTopicTree::load_from_snapshot(const std::string& snapshot_path) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     std::ifstream snapshot_file(snapshot_path, std::ios::binary);
     if (!snapshot_file.is_open()) {
@@ -168,7 +168,7 @@ int MQTTPersistentTopicTree::load_from_snapshot(const std::string& snapshot_path
 }
 
 int MQTTPersistentTopicTree::save_to_snapshot(const std::string& snapshot_path) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     std::ofstream snapshot_file(snapshot_path + ".tmp", std::ios::binary);
     if (!snapshot_file.is_open()) {
@@ -260,7 +260,7 @@ int MQTTPersistentTopicTree::apply_redo_log_entry(const RouterLogEntry& entry) {
 }
 
 int MQTTPersistentTopicTree::get_statistics(size_t& total_servers, size_t& total_clients, size_t& total_subscriptions) {
-    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    mqtt::CoroLockGuard lock(&snapshot_mutex_);
     
     total_servers = 0;
     total_clients = 0;
@@ -315,7 +315,7 @@ int MQTTRedoLogManager::initialize() {
 }
 
 int MQTTRedoLogManager::append_log_entry(const RouterLogEntry& entry) {
-    std::lock_guard<std::mutex> lock(log_mutex_);
+    mqtt::CoroLockGuard lock(&log_mutex_);
     
     RouterLogEntry log_entry = entry;
     log_entry.sequence_id = next_sequence_id_++;
@@ -332,7 +332,7 @@ int MQTTRedoLogManager::append_log_entry(const RouterLogEntry& entry) {
 }
 
 int MQTTRedoLogManager::flush_to_disk() {
-    std::lock_guard<std::mutex> lock(log_mutex_);
+    mqtt::CoroLockGuard lock(&log_mutex_);
     
     if (pending_entries_.empty()) {
         return 0;
@@ -387,7 +387,7 @@ uint64_t MQTTRedoLogManager::get_next_sequence_id() {
 }
 
 size_t MQTTRedoLogManager::get_pending_entries_count() {
-    std::lock_guard<std::mutex> lock(log_mutex_);
+    mqtt::CoroLockGuard lock(&log_mutex_);
     return pending_entries_.size();
 }
 
@@ -480,7 +480,7 @@ int MQTTRedoLogManager::read_log_entry_from_file(std::ifstream& log_file, Router
 }
 
 int MQTTRedoLogManager::truncate_after_snapshot(uint64_t last_applied_sequence) {
-    std::lock_guard<std::mutex> lock(log_mutex_);
+    mqtt::CoroLockGuard lock(&log_mutex_);
     
     std::ifstream old_log_file(redo_log_path_, std::ios::binary);
     if (!old_log_file.is_open()) {
