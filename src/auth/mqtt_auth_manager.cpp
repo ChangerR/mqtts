@@ -1,7 +1,6 @@
 #include "mqtt_auth_interface.h"
 #include "logger.h"
 #include <algorithm>
-#include <mutex>
 
 namespace mqtt {
 namespace auth {
@@ -18,8 +17,8 @@ AuthManager::~AuthManager() {
 
 int AuthManager::initialize() {
     LOG_INFO("Initializing AuthManager");
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
     for (auto& entry : providers_) {
         int ret = entry.provider->initialize();
         if (ret != MQ_SUCCESS) {
@@ -37,14 +36,14 @@ int AuthManager::initialize() {
 
 void AuthManager::cleanup() {
     LOG_INFO("Cleaning up AuthManager");
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
     for (auto& entry : providers_) {
         entry.provider->cleanup();
     }
     providers_.clear();
-    
-    std::unique_lock<std::mutex> cache_lock(cache_mutex_);
+
+    mqtt::CoroLockGuard cache_lock(&cache_mutex_);
     auth_cache_.clear();
 }
 
@@ -56,8 +55,8 @@ int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int prior
     
     const char* provider_name = provider->get_provider_name();
     LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
     
     // 检查是否已存在同名提供者
     for (const auto& entry : providers_) {
@@ -76,8 +75,8 @@ int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int prior
 
 int AuthManager::remove_provider(const std::string& provider_name) {
     LOG_INFO("Removing auth provider: {}", provider_name);
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
     
     auto it = std::find_if(providers_.begin(), providers_.end(),
         [&provider_name](const ProviderEntry& entry) {
@@ -115,8 +114,8 @@ AuthResult AuthManager::authenticate_user(const MQTTString& username,
         }
     }
     
-    std::unique_lock<std::mutex> lock(providers_mutex_);
-    
+    mqtt::CoroLockGuard lock(&providers_mutex_);
+
     if (providers_.empty()) {
         LOG_WARN("No auth providers configured, denying access");
         return AuthResult::ACCESS_DENIED;
@@ -171,13 +170,22 @@ AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
                                           Permission permission) {
     // 超级用户拥有所有权限
     if (user_info.is_super_user) {
-        LOG_DEBUG("Super user '{}' granted access to topic: {}", 
+        LOG_DEBUG("Super user '{}' granted access to topic: {}",
                  from_mqtt_string(user_info.username), from_mqtt_string(topic));
         return AuthResult::SUCCESS;
     }
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
-    
+
+    // 匿名用户默认允许访问所有主题
+    // 匿名用户标识为 "<anonymous>"
+    if (from_mqtt_string(user_info.username) == "<anonymous>") {
+        LOG_DEBUG("Anonymous user from {}:{} granted {} access to topic: {}",
+                 from_mqtt_string(user_info.client_ip), user_info.client_port,
+                 static_cast<int>(permission), from_mqtt_string(topic));
+        return AuthResult::SUCCESS;
+    }
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
+
     if (providers_.empty()) {
         LOG_WARN("No auth providers configured for topic access check");
         return AuthResult::ACCESS_DENIED;
@@ -214,8 +222,8 @@ AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
 
 std::map<std::string, AuthStats> AuthManager::get_all_stats() const {
     std::map<std::string, AuthStats> all_stats;
-    
-    std::unique_lock<std::mutex> lock(providers_mutex_);
+
+    mqtt::CoroLockGuard lock(&providers_mutex_);
     for (const auto& entry : providers_) {
         all_stats[entry.provider->get_provider_name()] = entry.provider->get_stats();
     }
@@ -226,9 +234,9 @@ std::map<std::string, AuthStats> AuthManager::get_all_stats() const {
 void AuthManager::set_cache_enabled(bool enabled, int cache_ttl_seconds) {
     cache_enabled_ = enabled;
     cache_ttl_seconds_ = cache_ttl_seconds;
-    
+
     if (!enabled) {
-        std::unique_lock<std::mutex> lock(cache_mutex_);
+        mqtt::CoroLockGuard lock(&cache_mutex_);
         auth_cache_.clear();
     }
     
@@ -247,7 +255,7 @@ std::string AuthManager::make_cache_key(const MQTTString& username, const MQTTSt
 }
 
 bool AuthManager::get_from_cache(const std::string& key, AuthResult& result, UserInfo& user_info) const {
-    std::unique_lock<std::mutex> lock(cache_mutex_);
+    mqtt::CoroLockGuard lock(&cache_mutex_);
     
     auto it = auth_cache_.find(key);
     if (it == auth_cache_.end()) {
@@ -274,9 +282,9 @@ void AuthManager::put_to_cache(const std::string& key, AuthResult result, const 
     if (!cache_enabled_) {
         return;
     }
-    
-    std::unique_lock<std::mutex> lock(cache_mutex_);
-    
+
+    mqtt::CoroLockGuard lock(&cache_mutex_);
+
     CacheEntry entry(allocator_);
     entry.result = result;
     entry.user_info.username = user_info.username;
@@ -294,8 +302,8 @@ void AuthManager::cleanup_expired_cache() {
     if (!cache_enabled_) {
         return;
     }
-    
-    std::unique_lock<std::mutex> lock(cache_mutex_);
+
+    mqtt::CoroLockGuard lock(&cache_mutex_);
     
     auto now = std::chrono::steady_clock::now();
     auto it = auth_cache_.begin();

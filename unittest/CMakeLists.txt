@@ -67,6 +67,15 @@ add_executable(test_session_manager_stress test_session_manager_stress.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 
+# 添加性能测试
+add_executable(test_mqtt_performance test_mqtt_performance.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp
+    ${CMAKE_SOURCE_DIR}/src/auth/mqtt_auth_manager.cpp)
+
 # 添加路由器测试
 add_executable(test_mqtt_router_service test_mqtt_router_service.cpp)
 add_executable(test_mqtt_router_rpc_client test_mqtt_router_rpc_client.cpp)
@@ -142,6 +151,10 @@ target_link_libraries(test_simple_memory PRIVATE colib_static mqtt_parser mqtt_r
 target_link_libraries(test_session_manager_allocator PRIVATE colib_static mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 target_link_libraries(test_session_manager_stress PRIVATE colib_static mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 
+# 性能测试的配置
+target_include_directories(test_mqtt_performance PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_link_libraries(test_mqtt_performance PRIVATE colib_static mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+
 # 认证系统测试的链接库
 target_link_libraries(test_mqtt_auth_manager PRIVATE mqtt_auth colib_static tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 # target_link_libraries(test_mqtt_auth_sqlite PRIVATE mqtt_auth colib_static tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
@@ -177,6 +190,7 @@ add_test(NAME test_mqtt_session_manager_optimization COMMAND test_mqtt_session_m
 add_test(NAME test_mqtt_session_manager_memory COMMAND test_mqtt_session_manager_memory)
 add_test(NAME test_session_manager_allocator COMMAND test_session_manager_allocator)
 add_test(NAME test_session_manager_stress COMMAND test_session_manager_stress)
+add_test(NAME test_mqtt_performance COMMAND test_mqtt_performance)
 
 # 添加路由器测试
 add_test(NAME test_mqtt_router_service COMMAND test_mqtt_router_service)

@@ -6,10 +6,10 @@
 #include <sqlite3.h>
 #include <memory>
 #include "mqtt_shared_mutex_compat.h"
+#include "mqtt_coroutine_utils.h"
 #include <unordered_map>
 #include <chrono>
 #include <queue>
-#include <condition_variable>
 
 namespace mqtt {
 namespace auth {
@@ -82,10 +82,10 @@ private:
   SQLiteAuthConfig config_;
   std::vector<std::shared_ptr<SQLiteConnection>> pool_;
   std::queue<std::shared_ptr<SQLiteConnection>> available_;
-  mutable std::mutex pool_mutex_;
-  std::condition_variable pool_cv_;
+  mutable mqtt::CoroMutex pool_mutex_;
+  mqtt::CoroCondition pool_cv_;
   bool initialized_;
-  
+
   int create_connection(sqlite3** db);
   void configure_connection(sqlite3* db);
 };
@@ -182,7 +182,7 @@ private:
   MQTTAllocator* allocator_;
   std::unique_ptr<SQLiteConnectionPool> connection_pool_;
   mutable AuthStats stats_;
-  mutable std::mutex stats_mutex_;
+  mutable mqtt::CoroMutex stats_mutex_;
   
   // 主题权限缓存
   struct TopicPermissionCache {

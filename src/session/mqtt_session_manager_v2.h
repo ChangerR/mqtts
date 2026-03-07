@@ -30,6 +30,10 @@ class MQTTProtocolHandler;
 struct SessionInfo;
 class SafeHandlerRef;
 
+namespace auth {
+class AuthManager;
+}  // namespace auth
+
 /**
  * @brief 线程本地会话管理器，管理单个线程下的所有Handler
  */
@@ -460,6 +464,18 @@ class GlobalSessionManager
   MQTTRouterRpcClient* get_router_client() const;
 
   /**
+   * @brief 设置认证管理器
+   * @param auth_manager 认证管理器指针
+   */
+  void set_auth_manager(auth::AuthManager* auth_manager);
+
+  /**
+   * @brief 获取认证管理器
+   * @return 认证管理器指针
+   */
+  auth::AuthManager* get_auth_manager() const;
+
+  /**
    * @brief 设置服务器ID
    * @param server_id 服务器ID
    */
@@ -567,6 +583,9 @@ class GlobalSessionManager
   // 路由RPC客户端
   std::unique_ptr<MQTTRouterRpcClient> router_client_;
   MQTTString server_id_;
+
+  // 认证管理器
+  auth::AuthManager* auth_manager_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static GlobalSessionManager* cached_manager_owner_;

@@ -2,6 +2,7 @@
 
 #include "mqtt_auth_sqlite.h"
 #include "logger.h"
+#include "mqtt_coroutine_utils.h"
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -40,16 +41,16 @@ SQLiteConnectionPool::~SQLiteConnectionPool() {
 }
 
 int SQLiteConnectionPool::initialize() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
+    mqtt::CoroLockGuard lock(&pool_mutex_);
+
     if (initialized_) {
         return MQ_SUCCESS;
     }
-    
+
     LOG_INFO("Initializing SQLite connection pool with {} connections", config_.connection_pool_size);
-    
+
     pool_.reserve(config_.connection_pool_size);
-    
+
     for (int i = 0; i < config_.connection_pool_size; ++i) {
         sqlite3* db = nullptr;
         int ret = create_connection(&db);
@@ -58,73 +59,80 @@ int SQLiteConnectionPool::initialize() {
             cleanup();
             return ret;
         }
-        
+
         auto conn = std::make_shared<SQLiteConnection>(db, i);
         pool_.push_back(conn);
         available_.push(conn);
     }
-    
+
     initialized_ = true;
     LOG_INFO("SQLite connection pool initialized successfully");
     return MQ_SUCCESS;
 }
 
 void SQLiteConnectionPool::cleanup() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
+    mqtt::CoroLockGuard lock(&pool_mutex_);
+
     if (!initialized_) {
         return;
     }
-    
+
     LOG_INFO("Cleaning up SQLite connection pool");
-    
+
     // 清空可用连接队列
     while (!available_.empty()) {
         available_.pop();
     }
-    
+
     // 关闭所有连接
     pool_.clear();
-    
+
     initialized_ = false;
 }
 
 std::shared_ptr<SQLiteConnection> SQLiteConnectionPool::acquire_connection() {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
-    if (!initialized_) {
-        LOG_ERROR("Connection pool not initialized");
-        return nullptr;
+    while (true) {
+        {
+            mqtt::CoroLockGuard lock(&pool_mutex_);
+
+            if (!initialized_) {
+                LOG_ERROR("Connection pool not initialized");
+                return nullptr;
+            }
+
+            if (!available_.empty()) {
+                auto conn = available_.front();
+                available_.pop();
+
+                conn->set_busy(true);
+                conn->update_last_used();
+
+                return conn;
+            }
+        }
+        // 锁已释放，等待可用连接
+        pool_cv_.wait(100);  // 100ms超时
     }
-    
-    // 等待可用连接
-    pool_cv_.wait(lock, [this] { return !available_.empty(); });
-    
-    auto conn = available_.front();
-    available_.pop();
-    
-    conn->set_busy(true);
-    conn->update_last_used();
-    
-    return conn;
 }
 
 void SQLiteConnectionPool::release_connection(std::shared_ptr<SQLiteConnection> conn) {
     if (!conn) {
         return;
     }
-    
-    std::unique_lock<std::mutex> lock(pool_mutex_);
-    
-    conn->set_busy(false);
-    conn->update_last_used();
-    
-    available_.push(conn);
-    pool_cv_.notify_one();
+
+    {
+        mqtt::CoroLockGuard lock(&pool_mutex_);
+
+        conn->set_busy(false);
+        conn->update_last_used();
+
+        available_.push(conn);
+    }
+    pool_cv_.signal();
 }
 
 size_t SQLiteConnectionPool::get_active_connections() const {
-    std::unique_lock<std::mutex> lock(pool_mutex_);
+    mqtt::CoroLockGuard lock(&pool_mutex_);
     return pool_.size() - available_.size();
 }
 
@@ -290,12 +298,12 @@ bool SQLiteAuthProvider::is_super_user(const MQTTString& username) {
 }
 
 AuthStats SQLiteAuthProvider::get_stats() const {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
+    mqtt::CoroLockGuard lock(&stats_mutex_);
     return stats_;
 }
 
 void SQLiteAuthProvider::reset_stats() {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
+    mqtt::CoroLockGuard lock(&stats_mutex_);
     stats_ = AuthStats();
 }
 
@@ -827,8 +835,8 @@ bool SQLiteAuthProvider::match_topic_pattern(const std::string& topic, const std
 }
 
 void SQLiteAuthProvider::update_stats(bool login_success, bool topic_access_granted) {
-    std::unique_lock<std::mutex> lock(stats_mutex_);
-    
+    mqtt::CoroLockGuard lock(&stats_mutex_);
+
     if (login_success) {
         stats_.total_login_attempts++;
         stats_.successful_logins++;
@@ -836,7 +844,7 @@ void SQLiteAuthProvider::update_stats(bool login_success, bool topic_access_gran
         stats_.total_login_attempts++;
         stats_.failed_logins++;
     }
-    
+
     if (topic_access_granted) {
         stats_.total_topic_checks++;
         stats_.topic_access_granted++;

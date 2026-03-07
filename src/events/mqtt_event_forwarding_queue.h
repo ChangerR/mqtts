@@ -2,14 +2,13 @@
 #define MQTT_EVENT_FORWARDING_QUEUE_H
 
 #include <atomic>
-#include <condition_variable>
 #include <memory>
-#include <mutex>
 #include <queue>
 #include <thread>
 #include "mqtt_event_types.h"
 #include "mqtt_allocator.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_coroutine_utils.h"
 
 namespace mqtt {
 namespace events {
@@ -151,8 +150,8 @@ public:
     void stop();
     
 private:
-    mutable std::mutex mutex_;
-    std::condition_variable condition_;
+    mutable mqtt::CoroMutex mutex_;
+    mqtt::CoroCondition condition_;
     std::queue<std::shared_ptr<MQTTEvent>, std::deque<std::shared_ptr<MQTTEvent>, MQTTSTLAllocator<std::shared_ptr<MQTTEvent>>>> queue_;
     size_t max_queue_size_;
     int drop_policy_;  // 0 = drop oldest, 1 = drop newest

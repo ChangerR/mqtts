@@ -52,6 +52,9 @@ class MQTTProtocolHandler
   void set_allow_mqtt3x(bool allow_mqtt3x) { allow_mqtt3x_ = allow_mqtt3x; }
   bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
 
+  void set_allow_anonymous(bool allow_anonymous) { allow_anonymous_ = allow_anonymous; }
+  bool is_anonymous_allowed() const { return allow_anonymous_; }
+
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
   int handle_connack(const ConnAckPacket* packet);
@@ -151,6 +154,7 @@ class MQTTProtocolHandler
   bool request_problem_information_;
   uint8_t negotiated_protocol_version_;
   bool allow_mqtt3x_;
+  bool allow_anonymous_;
 
   MQTTBuffer* serialize_buffer_;  // 复用的序列化缓冲区
 
@@ -172,6 +176,9 @@ class MQTTProtocolHandler
 
   // Helper method to register with session manager
   int register_session_with_manager();
+
+  // Helper method to create anonymous user info
+  void create_anonymous_user_info(const MQTTString& client_id);
 };
 
 }  // namespace mqtt

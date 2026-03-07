@@ -56,6 +56,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       request_problem_information_(true),
       negotiated_protocol_version_(5),
       allow_mqtt3x_(true),
+      allow_anonymous_(false),
       serialize_buffer_(nullptr),
       write_lock_acquired_(false),
       write_lock_condition_(),
@@ -539,6 +540,15 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 
   // Perform authentication if auth manager is available
   if (auth_manager_) {
+    // Extract authentication credentials
+    MQTTString username = packet->username.empty() ?
+        MQTTString("", MQTTStrAllocator(allocator_)) : packet->username;
+    MQTTString password = packet->password.empty() ?
+        MQTTString("", MQTTStrAllocator(allocator_)) : packet->password;
+
+    // Check if this is an anonymous connection (no username provided)
+    bool is_anonymous = username.empty();
+
     // Allocate user info if not already allocated
     if (!current_user_info_) {
       current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
@@ -549,44 +559,52 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
       new (current_user_info_) auth::UserInfo(allocator_);
     }
 
-    // Extract authentication credentials
-    MQTTString username = packet->username.empty() ? 
-        MQTTString("", MQTTStrAllocator(allocator_)) : packet->username;
-    MQTTString password = packet->password.empty() ? 
-        MQTTString("", MQTTStrAllocator(allocator_)) : packet->password;
-
     // Perform authentication
     auth::AuthResult auth_result = auth_manager_->authenticate_user(
         username, password, packet->client_id, client_ip_, client_port_, *current_user_info_);
 
     switch (auth_result) {
       case auth::AuthResult::SUCCESS:
-        LOG_INFO("Client {}:{} authenticated successfully as user '{}'", 
+        LOG_INFO("Client {}:{} authenticated successfully as user '{}'",
                  client_ip_.c_str(), client_port_, from_mqtt_string(current_user_info_->username));
         break;
       case auth::AuthResult::INVALID_CREDENTIALS:
-        LOG_WARN("Client {}:{} authentication failed: invalid credentials for user '{}'", 
+        // Check if anonymous access is allowed
+        if (is_anonymous && allow_anonymous_) {
+          LOG_INFO("Client {}:{} connecting as anonymous user (allow_anonymous=true)",
+                   client_ip_.c_str(), client_port_);
+          create_anonymous_user_info(packet->client_id);
+          break;
+        }
+        LOG_WARN("Client {}:{} authentication failed: invalid credentials for user '{}'",
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
         return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
       case auth::AuthResult::USER_NOT_FOUND:
-        LOG_WARN("Client {}:{} authentication failed: user '{}' not found", 
+        // Check if anonymous access is allowed
+        if (is_anonymous && allow_anonymous_) {
+          LOG_INFO("Client {}:{} connecting as anonymous user (allow_anonymous=true)",
+                   client_ip_.c_str(), client_port_);
+          create_anonymous_user_info(packet->client_id);
+          break;
+        }
+        LOG_WARN("Client {}:{} authentication failed: user '{}' not found",
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
         return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
       case auth::AuthResult::ACCESS_DENIED:
-        LOG_WARN("Client {}:{} authentication failed: access denied for user '{}'", 
+        LOG_WARN("Client {}:{} authentication failed: access denied for user '{}'",
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
         return reject_connect(ReasonCode::NotAuthorized, MQ_ERR_CONNECT_NOT_AUTHORIZED);
       case auth::AuthResult::RATE_LIMITED:
-        LOG_WARN("Client {}:{} authentication failed: rate limited for user '{}'", 
+        LOG_WARN("Client {}:{} authentication failed: rate limited for user '{}'",
                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
         return reject_connect(ReasonCode::ConnectionRateExceeded, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
       default:
-        LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'", 
+        LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'",
                   client_ip_.c_str(), client_port_, from_mqtt_string(username));
         return reject_connect(ReasonCode::ServerUnavailable, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
     }
   } else {
-    LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}", 
+    LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}",
              client_ip_.c_str(), client_port_);
   }
 
@@ -1483,6 +1501,27 @@ int MQTTProtocolHandler::send_pingresp()
                             serialize_buffer_->size());
   allocator_->deallocate(packet, sizeof(PingRespPacket));
   return ret;
+}
+
+void MQTTProtocolHandler::create_anonymous_user_info(const MQTTString& client_id)
+{
+  if (!current_user_info_) {
+    current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
+    if (!current_user_info_) {
+      LOG_ERROR("Failed to allocate memory for anonymous user info");
+      return;
+    }
+    new (current_user_info_) auth::UserInfo(allocator_);
+  }
+
+  // Set anonymous user info with default permissions
+  current_user_info_->username = MQTTString("<anonymous>", MQTTStrAllocator(allocator_));
+  current_user_info_->client_id = client_id;
+  current_user_info_->client_ip = client_ip_;
+  current_user_info_->client_port = client_port_;
+  current_user_info_->is_super_user = false;
+
+  LOG_DEBUG("Created anonymous user info for client {}:{}", client_ip_.c_str(), client_port_);
 }
 
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)

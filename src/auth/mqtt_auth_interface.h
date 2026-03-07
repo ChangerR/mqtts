@@ -9,6 +9,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_coroutine_utils.h"
 
 namespace mqtt {
 namespace auth {
@@ -256,7 +257,7 @@ private:
 
   MQTTAllocator* allocator_;
   std::vector<ProviderEntry> providers_;
-  mutable std::mutex providers_mutex_;
+  mutable mqtt::CoroMutex providers_mutex_;
   
   // 缓存相关
   bool cache_enabled_;
@@ -272,7 +273,7 @@ private:
   };
   
   mutable std::unordered_map<std::string, CacheEntry> auth_cache_;
-  mutable std::mutex cache_mutex_;
+  mutable mqtt::CoroMutex cache_mutex_;
   
   void sort_providers_by_priority();
   std::string make_cache_key(const MQTTString& username, const MQTTString& client_id) const;

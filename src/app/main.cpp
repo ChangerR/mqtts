@@ -9,6 +9,9 @@
 #include "mqtt_server.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_process_monitor.h"
+#include "mqtt_auth_interface.h"
+#include "mqtt_auth_sqlite.h"
+#include "mqtt_auth_redis.h"
 
 void run_mqtt_server(const mqtt::Config& config)
 {
@@ -19,6 +22,17 @@ void run_mqtt_server(const mqtt::Config& config)
 
   // 预注册线程数量和预期客户端数量
   session_manager.pre_register_threads(config.server.thread_count, config.server.max_connections);
+
+  // 初始化认证管理器
+  if (config.auth.enabled) {
+    static std::unique_ptr<mqtt::auth::AuthManager> auth_manager;
+    MQTTAllocator* allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+    auth_manager.reset(new mqtt::auth::AuthManager(allocator));
+    if (auth_manager->initialize() == MQ_SUCCESS) {
+      session_manager.set_auth_manager(auth_manager.get());
+      LOG_INFO("AuthManager initialized successfully");
+    }
+  }
 
   LOG_INFO("Session manager initialized for {} threads, {} max clients", config.server.thread_count,
            config.server.max_connections);
