@@ -36,6 +36,16 @@ class TopicTreeTest : public ::testing::Test
 
   // Helper functions
   MQTTString create_mqtt_string(const std::string& str) { return to_mqtt_string(str, tree_allocator); }
+  TopicTreeLevelVector create_subscription_list()
+  {
+    return TopicTreeLevelVector(TopicTreeAllocator<MQTTString>(tree_allocator));
+  }
+  MQTTAllocator* create_standalone_allocator(const std::string& suffix) const
+  {
+    return new MQTTAllocator("test_topic_tree_" + suffix + "_" +
+                                 std::to_string(reinterpret_cast<uintptr_t>(this)),
+                             MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+  }
 
   std::unique_ptr<ConcurrentTopicTree> tree;
   MQTTAllocator* tree_allocator;
@@ -59,6 +69,16 @@ class TopicTreePerfTest : public ::testing::Test
   }
 
   MQTTString create_mqtt_string(const std::string& str) { return to_mqtt_string(str, tree_allocator); }
+  TopicTreeLevelVector create_subscription_list()
+  {
+    return TopicTreeLevelVector(TopicTreeAllocator<MQTTString>(tree_allocator));
+  }
+  MQTTAllocator* create_standalone_allocator(const std::string& suffix) const
+  {
+    return new MQTTAllocator("perf_topic_tree_" + suffix + "_" +
+                                 std::to_string(reinterpret_cast<uintptr_t>(this)),
+                             MQTTMemoryTag::MEM_TAG_TOPIC_TREE, 0);
+  }
 
   std::unique_ptr<ConcurrentTopicTree> tree;
   MQTTAllocator* tree_allocator;
@@ -284,7 +304,7 @@ TEST_F(TopicTreeTest, GetClientSubscriptions)
     EXPECT_EQ(tree->subscribe(topic, client_id, 1), MQ_SUCCESS);
   }
 
-  std::vector<MQTTString> subscriptions;
+  TopicTreeLevelVector subscriptions = create_subscription_list();
   EXPECT_EQ(tree->get_client_subscriptions(client_id, subscriptions), MQ_SUCCESS);
   EXPECT_EQ(subscriptions.size(), topics.size());
 
@@ -321,9 +341,65 @@ TEST_F(TopicTreeTest, UnsubscribeAll)
   EXPECT_EQ(subscriber_count, 0);
 
   // Verify client has no remaining subscriptions
-  std::vector<MQTTString> remaining_subscriptions;
+  TopicTreeLevelVector remaining_subscriptions = create_subscription_list();
   EXPECT_EQ(tree->get_client_subscriptions(client_id, remaining_subscriptions), MQ_SUCCESS);
   EXPECT_EQ(remaining_subscriptions.size(), 0);
+}
+
+TEST_F(TopicTreeTest, EphemeralAllocatorInputSurvives)
+{
+  MQTTAllocator* input_allocator = create_standalone_allocator("ephemeral_input");
+  ASSERT_NE(input_allocator, nullptr);
+
+  MQTTString topic = to_mqtt_string("ephemeral/topic", input_allocator);
+  MQTTString client_id = to_mqtt_string("ephemeral_client", input_allocator);
+
+  EXPECT_EQ(tree->subscribe(topic, client_id, 1), MQ_SUCCESS);
+  delete input_allocator;
+
+  TopicMatchResult result(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string("ephemeral/topic"), result), MQ_SUCCESS);
+  ASSERT_EQ(result.total_count, 1U);
+  ASSERT_EQ(result.subscribers.size(), 1U);
+  EXPECT_EQ(from_mqtt_string(result.subscribers[0].client_id), "ephemeral_client");
+  EXPECT_EQ(result.subscribers[0].qos, 1);
+
+  EXPECT_EQ(tree->unsubscribe(create_mqtt_string("ephemeral/topic"),
+                              create_mqtt_string("ephemeral_client")),
+            MQ_SUCCESS);
+
+  size_t subscriber_count = 0;
+  EXPECT_EQ(tree->get_total_subscribers(subscriber_count), MQ_SUCCESS);
+  EXPECT_EQ(subscriber_count, 0U);
+}
+
+TEST_F(TopicTreeTest, CleanupReclaimsTreeMemory)
+{
+  size_t before_usage = tree_allocator->get_memory_usage();
+  MQTTAllocator* input_allocator = create_standalone_allocator("memory_regression");
+  ASSERT_NE(input_allocator, nullptr);
+
+  std::vector<std::string> topics = {"cleanup/a", "cleanup/b", "cleanup/c"};
+  for (const auto& topic_str : topics) {
+    EXPECT_EQ(tree->subscribe(to_mqtt_string(topic_str, input_allocator),
+                              to_mqtt_string("cleanup_client", input_allocator), 1),
+              MQ_SUCCESS);
+  }
+
+  size_t after_subscribe_usage = tree_allocator->get_memory_usage();
+  EXPECT_GT(after_subscribe_usage, before_usage);
+
+  delete input_allocator;
+
+  EXPECT_EQ(tree->unsubscribe_all(create_mqtt_string("cleanup_client")),
+            static_cast<int>(topics.size()));
+
+  size_t cleaned_nodes = 0;
+  EXPECT_EQ(tree->cleanup_empty_nodes(cleaned_nodes), MQ_SUCCESS);
+  EXPECT_GT(cleaned_nodes, 0U);
+
+  size_t after_cleanup_usage = tree_allocator->get_memory_usage();
+  EXPECT_LT(after_cleanup_usage, after_subscribe_usage);
 }
 
 // Parameter validation tests
@@ -431,16 +507,20 @@ TEST_F(TopicTreePerfTest, ConcurrentFindSubscribers)
   auto start_time = std::chrono::high_resolution_clock::now();
 
   for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&]() {
+    threads.emplace_back([&, t]() {
+      MQTTAllocator* thread_allocator =
+          create_standalone_allocator("concurrent_find_" + std::to_string(t));
+      ASSERT_NE(thread_allocator, nullptr);
       for (int i = 0; i < searches_per_thread; ++i) {
-        MQTTString search_topic = create_mqtt_string("sensor/temperature");
-        TopicMatchResult result(tree_allocator);
+        MQTTString search_topic = to_mqtt_string("sensor/temperature", thread_allocator);
+        TopicMatchResult result(thread_allocator);
         EXPECT_EQ(tree->find_subscribers(search_topic, result), MQ_SUCCESS);
         total_found.fetch_add(static_cast<int>(result.total_count));
 
         // Verify result consistency
         EXPECT_EQ(result.total_count, static_cast<size_t>(num_clients));
       }
+      delete thread_allocator;
     });
   }
 
@@ -653,56 +733,142 @@ TEST_F(TopicTreeTest, MemoryConstraintTests)
 
 TEST_F(TopicTreeTest, ConcurrentSubscriptionUnsubscription)
 {
-  const int num_threads = 2;  // Further reduced to minimize contention
-  const int operations_per_thread = 10;  // Reduced operations
-  
-  std::vector<std::thread> threads;
-  std::atomic<int> success_count(0);
-  std::atomic<int> error_count(0);
-  
+  const int num_threads = 4;
+  const int operations_per_thread = 25;
+
+  std::vector<std::thread> subscribe_threads;
+  std::atomic<int> subscribe_success(0);
+  std::atomic<int> subscribe_error(0);
+
   for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&, t]() {
+    subscribe_threads.emplace_back([&, t]() {
+      MQTTAllocator* thread_allocator =
+          create_standalone_allocator("strict_subscribe_" + std::to_string(t));
+      ASSERT_NE(thread_allocator, nullptr);
       for (int i = 0; i < operations_per_thread; ++i) {
-        std::string topic_str = "test/thread" + std::to_string(t) + "/item" + std::to_string(i);
-        std::string client_str = "client_" + std::to_string(t) + "_" + std::to_string(i);
-        
-        MQTTString topic = create_mqtt_string(topic_str);
-        MQTTString client_id = create_mqtt_string(client_str);
-        
-        // Subscribe
-        int subscribe_result = tree->subscribe(topic, client_id, 1);
-        if (subscribe_result == MQ_SUCCESS) {
-          success_count.fetch_add(1);
-          
-          // Add small delay to reduce contention
-          std::this_thread::sleep_for(std::chrono::microseconds(1));
-          
-          // Immediately unsubscribe
-          int unsubscribe_result = tree->unsubscribe(topic, client_id);
-          if (unsubscribe_result == MQ_SUCCESS) {
-            success_count.fetch_add(1);
-          } else {
-            error_count.fetch_add(1);
-          }
+        std::string topic_str = "strict/thread" + std::to_string(t) + "/item" + std::to_string(i);
+        std::string client_str = "strict_client_" + std::to_string(t) + "_" + std::to_string(i);
+
+        int result =
+            tree->subscribe(to_mqtt_string(topic_str, thread_allocator),
+                            to_mqtt_string(client_str, thread_allocator), 1);
+        if (result == MQ_SUCCESS) {
+          subscribe_success.fetch_add(1);
         } else {
-          error_count.fetch_add(1);
+          subscribe_error.fetch_add(1);
         }
       }
+      delete thread_allocator;
     });
   }
-  
-  for (auto& thread : threads) {
+
+  for (auto& thread : subscribe_threads) {
     thread.join();
   }
-  
-  // Allow for some timing issues - use EXPECT_GE instead of EXPECT_EQ
-  EXPECT_GE(success_count.load(), num_threads * operations_per_thread * 1.8); // Allow 90% success rate
-  EXPECT_LE(error_count.load(), num_threads * operations_per_thread * 0.2); // Allow 10% error rate
-  
-  // Final subscriber count should be low (allow for some race conditions)
-  size_t subscriber_count;
+
+  EXPECT_EQ(subscribe_success.load(), num_threads * operations_per_thread);
+  EXPECT_EQ(subscribe_error.load(), 0);
+
+  size_t subscriber_count = 0;
   EXPECT_EQ(tree->get_total_subscribers(subscriber_count), MQ_SUCCESS);
-  EXPECT_LE(subscriber_count, 2); // Allow for some unsubscribe failures
+  EXPECT_EQ(subscriber_count, static_cast<size_t>(num_threads * operations_per_thread));
+
+  std::vector<std::thread> unsubscribe_threads;
+  std::atomic<int> unsubscribe_success(0);
+  std::atomic<int> unsubscribe_error(0);
+
+  for (int t = 0; t < num_threads; ++t) {
+    unsubscribe_threads.emplace_back([&, t]() {
+      MQTTAllocator* thread_allocator =
+          create_standalone_allocator("strict_unsubscribe_" + std::to_string(t));
+      ASSERT_NE(thread_allocator, nullptr);
+      for (int i = 0; i < operations_per_thread; ++i) {
+        std::string topic_str = "strict/thread" + std::to_string(t) + "/item" + std::to_string(i);
+        std::string client_str = "strict_client_" + std::to_string(t) + "_" + std::to_string(i);
+
+        int result =
+            tree->unsubscribe(to_mqtt_string(topic_str, thread_allocator),
+                              to_mqtt_string(client_str, thread_allocator));
+        if (result == MQ_SUCCESS) {
+          unsubscribe_success.fetch_add(1);
+        } else {
+          unsubscribe_error.fetch_add(1);
+        }
+      }
+      delete thread_allocator;
+    });
+  }
+
+  for (auto& thread : unsubscribe_threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(unsubscribe_success.load(), num_threads * operations_per_thread);
+  EXPECT_EQ(unsubscribe_error.load(), 0);
+  EXPECT_EQ(tree->get_total_subscribers(subscriber_count), MQ_SUCCESS);
+  EXPECT_EQ(subscriber_count, 0U);
+}
+
+TEST_F(TopicTreeTest, HotNodeUpdateStress)
+{
+  const int num_threads = 4;
+  const int clients_per_thread = 20;
+  const std::string hot_topic = "hot/node/topic";
+
+  std::vector<std::thread> subscribe_threads;
+  std::atomic<int> subscribe_success(0);
+  for (int t = 0; t < num_threads; ++t) {
+    subscribe_threads.emplace_back([&, t]() {
+      MQTTAllocator* thread_allocator =
+          create_standalone_allocator("hot_subscribe_" + std::to_string(t));
+      ASSERT_NE(thread_allocator, nullptr);
+      for (int i = 0; i < clients_per_thread; ++i) {
+        std::string client_str = "hot_client_" + std::to_string(t) + "_" + std::to_string(i);
+        EXPECT_EQ(tree->subscribe(to_mqtt_string(hot_topic, thread_allocator),
+                                  to_mqtt_string(client_str, thread_allocator), 1),
+                  MQ_SUCCESS);
+        subscribe_success.fetch_add(1);
+      }
+      delete thread_allocator;
+    });
+  }
+
+  for (auto& thread : subscribe_threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(subscribe_success.load(), num_threads * clients_per_thread);
+
+  TopicMatchResult result(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string(hot_topic), result), MQ_SUCCESS);
+  EXPECT_EQ(result.total_count, static_cast<size_t>(num_threads * clients_per_thread));
+
+  std::vector<std::thread> unsubscribe_threads;
+  std::atomic<int> unsubscribe_success(0);
+  for (int t = 0; t < num_threads; ++t) {
+    unsubscribe_threads.emplace_back([&, t]() {
+      MQTTAllocator* thread_allocator =
+          create_standalone_allocator("hot_unsubscribe_" + std::to_string(t));
+      ASSERT_NE(thread_allocator, nullptr);
+      for (int i = 0; i < clients_per_thread; ++i) {
+        std::string client_str = "hot_client_" + std::to_string(t) + "_" + std::to_string(i);
+        EXPECT_EQ(tree->unsubscribe(to_mqtt_string(hot_topic, thread_allocator),
+                                    to_mqtt_string(client_str, thread_allocator)),
+                  MQ_SUCCESS);
+        unsubscribe_success.fetch_add(1);
+      }
+      delete thread_allocator;
+    });
+  }
+
+  for (auto& thread : unsubscribe_threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(unsubscribe_success.load(), num_threads * clients_per_thread);
+  result = TopicMatchResult(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string(hot_topic), result), MQ_SUCCESS);
+  EXPECT_EQ(result.total_count, 0U);
 }
 
 TEST_F(TopicTreeTest, TopicFilterValidation)

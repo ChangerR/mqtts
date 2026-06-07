@@ -16,6 +16,8 @@ public:
     MockRouterRpcClient(MQTTAllocator* allocator) 
         : MQTTRouterRpcClient(allocator, RpcClientConfig())
         , connected_(false)
+        , sync_subscribe_ret_(MQ_SUCCESS)
+        , sync_unsubscribe_ret_(MQ_SUCCESS)
         , subscribe_calls_(0)
         , unsubscribe_calls_(0)
         , connect_calls_(0)
@@ -44,6 +46,26 @@ public:
     bool is_connected() const override { 
         std::lock_guard<std::mutex> lock(mutex_);
         return connected_; 
+    }
+
+    int get_connection_state(bool& is_connected) const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        is_connected = connected_;
+        return MQ_SUCCESS;
+    }
+
+    int subscribe(const SubscribeRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        subscribe_calls_++;
+        last_subscribe_request_ = request;
+        return sync_subscribe_ret_;
+    }
+
+    int unsubscribe(const UnsubscribeRequest& request) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        unsubscribe_calls_++;
+        last_unsubscribe_request_ = request;
+        return sync_unsubscribe_ret_;
     }
     
     int subscribe_async(const SubscribeRequest& request) override {
@@ -134,9 +156,21 @@ public:
         publish_calls_ = 0;
     }
 
+    void set_sync_subscribe_ret(int ret) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sync_subscribe_ret_ = ret;
+    }
+
+    void set_sync_unsubscribe_ret(int ret) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sync_unsubscribe_ret_ = ret;
+    }
+
 private:
     mutable std::mutex mutex_;
     bool connected_;
+    int sync_subscribe_ret_;
+    int sync_unsubscribe_ret_;
     int subscribe_calls_;
     int unsubscribe_calls_;
     int connect_calls_;
@@ -361,6 +395,61 @@ TEST_F(GlobalSessionManagerRouterTest, PublishViaRouter) {
 TEST_F(GlobalSessionManagerRouterTest, RegisterWithRouter) {
     // 测试向路由器注册
     ASSERT_EQ(session_manager_->register_with_router(), MQ_SUCCESS);
+}
+
+TEST_F(GlobalSessionManagerRouterTest, StrictClusterSubscribeRollbackOnRouterFailure) {
+    MockRouterRpcClient* mock_client = static_cast<MockRouterRpcClient*>(session_manager_->get_router_client());
+    ClusterConfig config;
+    MQTTString topic_filter("strict/topic", MQTTStrAllocator(test_allocator_));
+    MQTTString client_id("strict_client", MQTTStrAllocator(test_allocator_));
+    std::vector<SubscriberInfo> subscribers;
+
+    ASSERT_NE(mock_client, nullptr);
+    config.cluster_enabled = true;
+    config.server_id = "test_server";
+    config.server_token = "token";
+    config.forwarding_host = "127.0.0.1";
+    config.forwarding_port = 29091;
+    ASSERT_EQ(session_manager_->set_cluster_config(config), MQ_SUCCESS);
+
+    mock_client->reset_counters();
+    mock_client->set_sync_subscribe_ret(MQ_ERR_ROUTER_PROTOCOL);
+
+    ASSERT_EQ(session_manager_->subscribe_topic_with_router(topic_filter, client_id, 1),
+              MQ_ERR_ROUTER_PROTOCOL);
+    ASSERT_EQ(session_manager_->find_topic_subscribers(topic_filter, subscribers), MQ_SUCCESS);
+    ASSERT_TRUE(subscribers.empty());
+    ASSERT_EQ(mock_client->get_subscribe_calls(), 1);
+}
+
+TEST_F(GlobalSessionManagerRouterTest, StrictClusterUnsubscribeRollbackOnRouterFailure) {
+    MockRouterRpcClient* mock_client = static_cast<MockRouterRpcClient*>(session_manager_->get_router_client());
+    ClusterConfig config;
+    MQTTString topic_filter("strict/unsubscribe", MQTTStrAllocator(test_allocator_));
+    MQTTString client_id("strict_unsub_client", MQTTStrAllocator(test_allocator_));
+    std::vector<SubscriberInfo> subscribers;
+
+    ASSERT_NE(mock_client, nullptr);
+    config.cluster_enabled = true;
+    config.server_id = "test_server";
+    config.server_token = "token";
+    config.forwarding_host = "127.0.0.1";
+    config.forwarding_port = 29092;
+    ASSERT_EQ(session_manager_->set_cluster_config(config), MQ_SUCCESS);
+
+    mock_client->set_sync_subscribe_ret(MQ_SUCCESS);
+    ASSERT_EQ(session_manager_->subscribe_topic_with_router(topic_filter, client_id, 2), MQ_SUCCESS);
+
+    mock_client->reset_counters();
+    mock_client->set_sync_unsubscribe_ret(MQ_ERR_ROUTER_PROTOCOL);
+
+    ASSERT_EQ(session_manager_->unsubscribe_topic_with_router(topic_filter, client_id),
+              MQ_ERR_ROUTER_PROTOCOL);
+    ASSERT_EQ(session_manager_->find_topic_subscribers(topic_filter, subscribers), MQ_SUCCESS);
+    ASSERT_EQ(subscribers.size(), 1U);
+    ASSERT_EQ(subscribers[0].client_id, client_id);
+    ASSERT_EQ(subscribers[0].qos, 2);
+    ASSERT_EQ(mock_client->get_unsubscribe_calls(), 1);
 }
 
 TEST_F(GlobalSessionManagerRouterTest, RouterUnavailable) {

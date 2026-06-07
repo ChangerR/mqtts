@@ -6,6 +6,68 @@
 namespace mqtt {
 namespace auth {
 
+namespace
+{
+
+void split_topic_levels_local(const std::string& value, std::vector<std::string>& levels)
+{
+    size_t start_pos = 0;
+    size_t slash_pos = 0;
+
+    levels.clear();
+    while (start_pos <= value.length()) {
+        slash_pos = value.find('/', start_pos);
+        if (slash_pos == std::string::npos) {
+            levels.push_back(value.substr(start_pos));
+            start_pos = value.length() + 1;
+        } else {
+            levels.push_back(value.substr(start_pos, slash_pos - start_pos));
+            start_pos = slash_pos + 1;
+        }
+    }
+}
+
+bool match_topic_pattern_local(const std::string& topic, const std::string& pattern)
+{
+    bool matched = false;
+    std::vector<std::string> topic_levels;
+    std::vector<std::string> pattern_levels;
+    size_t topic_index = 0;
+    size_t pattern_index = 0;
+
+    split_topic_levels_local(topic, topic_levels);
+    split_topic_levels_local(pattern, pattern_levels);
+
+    while (!matched && topic_index < topic_levels.size() && pattern_index < pattern_levels.size()) {
+        if (pattern_levels[pattern_index] == "#") {
+            matched = (pattern_index == pattern_levels.size() - 1);
+            topic_index = topic_levels.size();
+            pattern_index = pattern_levels.size();
+        } else if (pattern_levels[pattern_index] == "+" ||
+                   pattern_levels[pattern_index] == topic_levels[topic_index]) {
+            ++topic_index;
+            ++pattern_index;
+        } else {
+            topic_index = topic_levels.size();
+            pattern_index = pattern_levels.size();
+        }
+    }
+
+    if (!matched) {
+        if (topic_index == topic_levels.size() && pattern_index == pattern_levels.size()) {
+            matched = true;
+        } else if (pattern_index < pattern_levels.size() &&
+                   pattern_levels[pattern_index] == "#" &&
+                   pattern_index == pattern_levels.size() - 1) {
+            matched = true;
+        }
+    }
+
+    return matched;
+}
+
+}  // namespace
+
 AuthManager::AuthManager(MQTTAllocator* allocator)
     : allocator_(allocator),
       cache_enabled_(false),
@@ -166,6 +228,84 @@ AuthResult AuthManager::authenticate_user(const MQTTString& username,
     return last_result;
 }
 
+int AuthManager::authenticate_user(const MQTTString& username,
+                                   const MQTTString& password,
+                                   const MQTTString& client_id,
+                                   const MQTTString& client_ip,
+                                   uint16_t client_port,
+                                   AuthResult& auth_result,
+                                   ClientAuthContext& auth_context) {
+    int ret = MQ_SUCCESS;
+    std::vector<TopicPermission> permissions;
+    IAuthProvider* matched_provider = NULL;
+
+    auth_context.user_info.username.clear();
+    auth_context.user_info.client_id.clear();
+    auth_context.user_info.client_ip.clear();
+    auth_context.user_info.client_port = 0;
+    auth_context.user_info.is_super_user = false;
+    auth_context.acl_rules.clear();
+    auth_context.is_super_user = false;
+    auth_context.acl_version = 0;
+    auth_context.expires_at_ms = 0;
+    auth_result = AuthResult::INTERNAL_ERROR;
+
+    cleanup_expired_cache();
+    {
+        std::unique_lock<std::mutex> lock(providers_mutex_);
+
+        if (providers_.empty()) {
+            auth_result = AuthResult::ACCESS_DENIED;
+        } else {
+            for (const auto& entry : providers_) {
+                if (!entry.provider->is_healthy()) {
+                    continue;
+                }
+
+                auth_result = entry.provider->authenticate_user(
+                    username, password, client_id, client_ip, client_port, auth_context.user_info);
+                if (auth_result == AuthResult::SUCCESS) {
+                    matched_provider = entry.provider.get();
+                    break;
+                } else if (auth_result == AuthResult::USER_NOT_FOUND) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            if (auth_result == AuthResult::SUCCESS && matched_provider != NULL) {
+                permissions.clear();
+                ret = matched_provider->get_user_permissions(auth_context.user_info.username, permissions);
+                if (ret == MQ_ERR_NOT_FOUND_V2) {
+                    ret = MQ_SUCCESS;
+                }
+                for (size_t i = 0; MQ_SUCCESS == ret && i < permissions.size(); ++i) {
+                    TopicAclRule rule(allocator_);
+                    rule.topic_pattern = permissions[i].topic_pattern;
+                    rule.permission = permissions[i].permission;
+                    rule.max_qos = 2;
+                    auth_context.acl_rules.push_back(rule);
+                }
+            }
+        }
+    }
+
+    if (MQ_SUCCESS == ret && auth_result == AuthResult::SUCCESS) {
+        auth_context.is_super_user = auth_context.user_info.is_super_user;
+        auth_context.acl_version = 1;
+        if (cache_enabled_ && cache_ttl_seconds_ > 0) {
+            auth_context.expires_at_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()) +
+                static_cast<uint64_t>(cache_ttl_seconds_) * 1000;
+            put_to_cache(make_cache_key(username, client_id), auth_result, auth_context.user_info);
+        }
+    }
+
+    return ret;
+}
+
 AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
                                           const MQTTString& topic,
                                           Permission permission) {
@@ -210,6 +350,35 @@ AuthResult AuthManager::check_topic_access(const UserInfo& user_info,
     LOG_WARN("No provider handled topic access check for user '{}', topic '{}'", 
             from_mqtt_string(user_info.username), from_mqtt_string(topic));
     return AuthResult::ACCESS_DENIED;
+}
+
+int AuthManager::check_topic_access(const ClientAuthContext& auth_context,
+                                    const MQTTString& topic,
+                                    Permission permission,
+                                    AuthResult& auth_result) {
+    int ret = MQ_SUCCESS;
+    bool matched = false;
+    const std::string topic_str = from_mqtt_string(topic);
+
+    auth_result = AuthResult::ACCESS_DENIED;
+    if (auth_context.is_super_user) {
+        auth_result = AuthResult::SUCCESS;
+    } else if (!auth_context.acl_rules.empty()) {
+        for (size_t i = 0; i < auth_context.acl_rules.size() && !matched; ++i) {
+            const TopicAclRule& rule = auth_context.acl_rules[i];
+            if (match_topic_pattern_local(topic_str, from_mqtt_string(rule.topic_pattern))) {
+                matched = true;
+                if (rule.permission == Permission::READWRITE ||
+                    rule.permission == permission) {
+                    auth_result = AuthResult::SUCCESS;
+                }
+            }
+        }
+    } else {
+        auth_result = check_topic_access(auth_context.user_info, topic, permission);
+    }
+
+    return ret;
 }
 
 std::map<std::string, AuthStats> AuthManager::get_all_stats() const {

@@ -67,6 +67,34 @@ struct TopicPermission {
       permission(Permission::NONE) {}
 };
 
+struct TopicAclRule {
+  MQTTString topic_pattern;
+  Permission permission;
+  uint8_t max_qos;
+
+  explicit TopicAclRule(MQTTAllocator* allocator)
+      : topic_pattern(MQTTStrAllocator(allocator)), permission(Permission::NONE), max_qos(0)
+  {
+  }
+};
+
+struct ClientAuthContext {
+  UserInfo user_info;
+  MQTTVector<TopicAclRule> acl_rules;
+  uint64_t acl_version;
+  uint64_t expires_at_ms;
+  bool is_super_user;
+
+  explicit ClientAuthContext(MQTTAllocator* allocator)
+      : user_info(allocator),
+        acl_rules(MQTTSTLAllocator<TopicAclRule>(allocator)),
+        acl_version(0),
+        expires_at_ms(0),
+        is_super_user(false)
+  {
+  }
+};
+
 /**
  * @brief 认证统计信息
  */
@@ -136,6 +164,15 @@ public:
   virtual AuthResult check_topic_access(const UserInfo& user_info,
                                        const MQTTString& topic,
                                        Permission permission) = 0;
+
+  virtual int get_user_permissions(const MQTTString& username,
+                                   std::vector<TopicPermission>& permissions)
+  {
+    int ret = MQ_ERR_NOT_FOUND_V2;
+    (void)username;
+    permissions.clear();
+    return ret;
+  }
 
   /**
    * @brief 检查用户是否有超级用户权限
@@ -221,6 +258,14 @@ public:
                              uint16_t client_port,
                              UserInfo& user_info);
 
+  int authenticate_user(const MQTTString& username,
+                        const MQTTString& password,
+                        const MQTTString& client_id,
+                        const MQTTString& client_ip,
+                        uint16_t client_port,
+                        AuthResult& auth_result,
+                        ClientAuthContext& auth_context);
+
   /**
    * @brief 检查主题访问权限
    * @param user_info 用户信息
@@ -231,6 +276,11 @@ public:
   AuthResult check_topic_access(const UserInfo& user_info,
                                const MQTTString& topic,
                                Permission permission);
+
+  int check_topic_access(const ClientAuthContext& auth_context,
+                         const MQTTString& topic,
+                         Permission permission,
+                         AuthResult& auth_result);
 
   /**
    * @brief 获取所有提供者的统计信息

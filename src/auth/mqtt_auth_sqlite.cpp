@@ -558,6 +558,41 @@ int SQLiteAuthProvider::clear_user_permissions(const MQTTString& username) {
     return MQ_SUCCESS;
 }
 
+int SQLiteAuthProvider::get_user_permissions(const MQTTString& username,
+                                             std::vector<TopicPermission>& permissions) {
+    int ret = MQ_SUCCESS;
+
+    permissions.clear();
+    {
+        mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+        if (is_topic_cache_valid()) {
+            auto it = topic_cache_.user_permissions.find(from_mqtt_string(username));
+            if (it != topic_cache_.user_permissions.end()) {
+                permissions = it->second;
+                ret = MQ_SUCCESS;
+            } else {
+                ret = MQ_ERR_NOT_FOUND_V2;
+            }
+        } else {
+            ret = MQ_ERR_NOT_FOUND_V2;
+        }
+    }
+
+    if (ret != MQ_SUCCESS) {
+        update_topic_cache(username);
+        {
+            mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+            auto it = topic_cache_.user_permissions.find(from_mqtt_string(username));
+            if (it != topic_cache_.user_permissions.end()) {
+                permissions = it->second;
+                ret = MQ_SUCCESS;
+            }
+        }
+    }
+
+    return ret;
+}
+
 int SQLiteAuthProvider::create_tables() {
     auto conn = connection_pool_->acquire_connection();
     if (!conn) {

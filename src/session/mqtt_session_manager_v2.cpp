@@ -1317,10 +1317,16 @@ int GlobalSessionManager::get_client_subscriptions(const MQTTString& client_id,
     return MQ_ERR_INTERNAL;
   }
 
-  int ret = topic_tree_->get_client_subscriptions(client_id, subscriptions);
+  TopicTreeLevelVector owned_subscriptions{TopicTreeAllocator<MQTTString>(global_allocator_)};
+  int ret = topic_tree_->get_client_subscriptions(client_id, owned_subscriptions);
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to get client subscriptions: {}", ret);
     return ret;
+  }
+
+  subscriptions.reserve(owned_subscriptions.size());
+  for (const auto& subscription : owned_subscriptions) {
+    subscriptions.push_back(subscription);
   }
 
   return MQ_SUCCESS;
@@ -1336,7 +1342,7 @@ int GlobalSessionManager::find_topic_subscribers(const MQTTString& topic,
     return MQ_ERR_INTERNAL;
   }
 
-  TopicMatchResult result(nullptr);
+  TopicMatchResult result(global_allocator_);
   int ret = topic_tree_->find_subscribers(topic, result);
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to find topic subscribers: {}", ret);
@@ -1548,7 +1554,60 @@ void GlobalSessionManager::trigger_publish_event(const MQTTString& client_id,
 void GlobalSessionManager::set_router_client(std::unique_ptr<MQTTRouterRpcClient> router_client)
 {
   router_client_ = std::move(router_client);
+  if (router_client_.get() != NULL) {
+    (void)router_client_->set_cluster_config(cluster_config_);
+  }
   LOG_INFO("Router client set for GlobalSessionManager");
+}
+
+int GlobalSessionManager::set_cluster_config(const ClusterConfig& cluster_config)
+{
+  int ret = MQ_SUCCESS;
+  cluster_config_ = cluster_config;
+
+  if (router_client_.get() != NULL) {
+    ret = router_client_->set_cluster_config(cluster_config_);
+  }
+
+  if (MQ_SUCCESS == ret && !cluster_config_.server_id.empty()) {
+    server_id_ = to_mqtt_string(cluster_config_.server_id, global_allocator_);
+  }
+
+  if (MQ_SUCCESS == ret) {
+    if (cluster_config_.cluster_enabled) {
+      if (!forwarding_client_) {
+        ForwardingConnectionPool::Config pool_config;
+        pool_config.pool_size_per_target = cluster_config_.forwarding_pool_size;
+        pool_config.idle_timeout_ms      = cluster_config_.forwarding_idle_timeout_ms;
+        forwarding_pool_.reset(new ForwardingConnectionPool(global_allocator_, pool_config));
+        forwarding_client_.reset(
+            new MQTTForwardingRpcClient(global_allocator_, forwarding_pool_.get()));
+      }
+      if (forwarding_service_) {
+        (void)forwarding_service_->stop();
+        forwarding_service_.reset(nullptr);
+      }
+      forwarding_service_.reset(new MQTTForwardingService(global_allocator_,
+                                                          this,
+                                                          cluster_config_.forwarding_host,
+                                                          cluster_config_.forwarding_port));
+      ret = forwarding_service_->start();
+      if (MQ_FAIL(ret)) {
+        forwarding_service_.reset(nullptr);
+        forwarding_client_.reset(nullptr);
+        forwarding_pool_.reset(nullptr);
+      }
+    } else {
+      if (forwarding_service_) {
+        (void)forwarding_service_->stop();
+        forwarding_service_.reset(nullptr);
+      }
+      forwarding_client_.reset(nullptr);
+      forwarding_pool_.reset(nullptr);
+    }
+  }
+
+  return ret;
 }
 
 MQTTRouterRpcClient* GlobalSessionManager::get_router_client() const
@@ -1569,18 +1628,47 @@ const MQTTString& GlobalSessionManager::get_server_id() const
 
 int GlobalSessionManager::register_with_router()
 {
-  if (!router_client_) {
-    LOG_DEBUG("No router client available for registration");
-    return MQ_ERR_INVALID_STATE;
+  int ret = MQ_SUCCESS;
+  bool is_connected = false;
+  MQTTRouterRpcClient::NodeAuthRequest request(global_allocator_);
+  MQTTRouterRpcClient::NodeAuthResponse response(global_allocator_);
+
+  if (!cluster_config_.cluster_enabled) {
+    ret = MQ_SUCCESS;
+  } else if (router_client_.get() == NULL) {
+    ret = MQ_ERR_INVALID_STATE;
+  } else if (MQ_FAIL(router_client_->get_connection_state(is_connected))) {
+  } else if (!is_connected) {
+    ret = MQ_ERR_ROUTER_NOT_CONNECTED;
+  } else {
+    request.server_id = to_mqtt_string(cluster_config_.server_id, global_allocator_);
+    request.token = to_mqtt_string(cluster_config_.server_token, global_allocator_);
+    request.timestamp_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    request.nonce = to_mqtt_string(
+        cluster_config_.server_id + "-" + std::to_string(request.timestamp_ms), global_allocator_);
+    request.host = to_mqtt_string(cluster_config_.forwarding_host, global_allocator_);
+    request.port = cluster_config_.router_port;
+    request.forwarding_port = cluster_config_.forwarding_port;
+    ret = router_client_->authenticate_node(request, response);
   }
-  
-  if (!router_client_->is_connected()) {
-    LOG_ERROR("Router client is not connected");
-    return MQ_ERR_CONNECT;
+
+  return ret;
+}
+
+int GlobalSessionManager::heartbeat_with_router()
+{
+  int ret = MQ_SUCCESS;
+
+  if (!cluster_config_.cluster_enabled) {
+    ret = MQ_SUCCESS;
+  } else if (router_client_.get() == NULL) {
+    ret = MQ_ERR_INVALID_STATE;
+  } else {
+    ret = router_client_->heartbeat();
   }
-  
-  LOG_INFO("Server registered with router successfully");
-  return MQ_SUCCESS;
+
+  return ret;
 }
 
 int GlobalSessionManager::notify_router_client_connect(const MQTTString& client_id,
@@ -1589,129 +1677,213 @@ int GlobalSessionManager::notify_router_client_connect(const MQTTString& client_
                                                       uint32_t keep_alive,
                                                       bool clean_session)
 {
-  if (!router_client_) {
-    return MQ_SUCCESS;  // 路由器不可用，但不影响本地功能
-  }
-  
+  int ret = MQ_SUCCESS;
   MQTTRouterRpcClient::ClientConnectRequest request(global_allocator_);
-  request.server_id = server_id_;
-  request.client_id = client_id;
-  request.username = username;
-  request.protocol_version = protocol_version;
-  request.keep_alive = keep_alive;
-  request.clean_session = clean_session;
-  
-  int result = router_client_->client_connect_async(request);
-  if (result != MQ_SUCCESS) {
-    LOG_WARN("Failed to notify router about client connect: {}", from_mqtt_string(client_id));
+
+  if (router_client_.get() == NULL) {
+    ret = MQ_SUCCESS;
+  } else {
+    request.server_id = server_id_;
+    request.client_id = client_id;
+    request.username = username;
+    request.protocol_version = protocol_version;
+    request.keep_alive = keep_alive;
+    request.clean_session = clean_session;
+    ret = router_client_->client_connect_async(request);
   }
-  
-  return result;
+
+  return ret;
 }
 
 int GlobalSessionManager::notify_router_client_disconnect(const MQTTString& client_id,
                                                          const MQTTString& disconnect_reason)
 {
-  if (!router_client_) {
-    return MQ_SUCCESS;  // 路由器不可用，但不影响本地功能
-  }
-  
+  int ret = MQ_SUCCESS;
   MQTTRouterRpcClient::ClientDisconnectRequest request(global_allocator_);
-  request.server_id = server_id_;
-  request.client_id = client_id;
-  request.disconnect_reason = disconnect_reason;
-  
-  int result = router_client_->client_disconnect_async(request);
-  if (result != MQ_SUCCESS) {
-    LOG_WARN("Failed to notify router about client disconnect: {}", from_mqtt_string(client_id));
+
+  if (router_client_.get() == NULL) {
+    ret = MQ_SUCCESS;
+  } else {
+    request.server_id = server_id_;
+    request.client_id = client_id;
+    request.disconnect_reason = disconnect_reason;
+    ret = router_client_->client_disconnect_async(request);
   }
-  
-  return result;
+
+  return ret;
 }
 
 int GlobalSessionManager::subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos)
 {
-  // 先进行本地订阅
-  int local_result = subscribe_topic(topic_filter, client_id, qos);
-  if (local_result != MQ_SUCCESS) {
-    return local_result;
-  }
-  
-  // 然后通知路由器
-  if (router_client_) {
-    MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
+  int ret = MQ_SUCCESS;
+  ret = subscribe_topic_cluster(topic_filter, client_id, qos);
+  return ret;
+}
+
+int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter,
+                                                  const MQTTString& client_id,
+                                                  uint8_t qos)
+{
+  int ret = MQ_SUCCESS;
+  MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
+  bool strict_cluster_mode = false;
+
+  if (MQ_FAIL(subscribe_topic(topic_filter, client_id, qos))) {
+  } else if (router_client_.get() == NULL) {
+    ret = MQ_SUCCESS;
+  } else {
+    strict_cluster_mode = cluster_config_.cluster_enabled;
     request.server_id = server_id_;
     request.client_id = client_id;
     request.topic_filter = topic_filter;
     request.qos = qos;
-    
-    int router_result = router_client_->subscribe_async(request);
-    if (router_result != MQ_SUCCESS) {
-      LOG_WARN("Failed to notify router about subscription: {} -> {}", 
-               from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+    if (strict_cluster_mode) {
+      ret = router_client_->subscribe(request);
+    } else {
+      ret = router_client_->subscribe_async(request);
+    }
+    if (MQ_SUCCESS != ret && strict_cluster_mode) {
+      (void)unsubscribe_topic(topic_filter, client_id);
     }
   }
-  
-  return MQ_SUCCESS;
+
+  return ret;
 }
 
 int GlobalSessionManager::unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id)
 {
-  // 先进行本地取消订阅
-  int local_result = unsubscribe_topic(topic_filter, client_id);
-  if (local_result != MQ_SUCCESS) {
-    return local_result;
-  }
-  
-  // 然后通知路由器
-  if (router_client_) {
-    MQTTRouterRpcClient::UnsubscribeRequest request(global_allocator_);
+  int ret = MQ_SUCCESS;
+  ret = unsubscribe_topic_cluster(topic_filter, client_id);
+  return ret;
+}
+
+int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filter, const MQTTString& client_id)
+{
+  int ret = MQ_SUCCESS;
+  MQTTRouterRpcClient::UnsubscribeRequest request(global_allocator_);
+  bool strict_cluster_mode = false;
+  bool local_unsubscribed = false;
+  uint8_t subscribed_qos = 0;
+
+  if (router_client_.get() == NULL) {
+    ret = unsubscribe_topic(topic_filter, client_id);
+  } else {
+    strict_cluster_mode = cluster_config_.cluster_enabled;
     request.server_id = server_id_;
     request.client_id = client_id;
     request.topic_filter = topic_filter;
-    
-    int router_result = router_client_->unsubscribe_async(request);
-    if (router_result != MQ_SUCCESS) {
-      LOG_WARN("Failed to notify router about unsubscription: {} -> {}", 
-               from_mqtt_string(client_id), from_mqtt_string(topic_filter));
+    if (strict_cluster_mode) {
+      std::vector<SubscriberInfo> subscribers;
+      int find_ret = find_topic_subscribers(topic_filter, subscribers);
+
+      if (MQ_FAIL(find_ret)) {
+        ret = find_ret;
+      } else {
+        for (size_t i = 0; i < subscribers.size(); ++i) {
+          if (subscribers[i].client_id == client_id) {
+            subscribed_qos = subscribers[i].qos;
+            break;
+          }
+        }
+        ret = unsubscribe_topic(topic_filter, client_id);
+        if (MQ_SUCC(ret)) {
+          local_unsubscribed = true;
+          ret = router_client_->unsubscribe(request);
+          if (MQ_FAIL(ret)) {
+            int restore_ret = subscribe_topic(topic_filter, client_id, subscribed_qos);
+            if (MQ_FAIL(restore_ret)) {
+              LOG_WARN("Failed to restore local subscription after router unsubscribe failure, topic={}, client_id={}, restore_ret={}",
+                       from_mqtt_string(topic_filter), from_mqtt_string(client_id), restore_ret);
+            }
+          }
+        }
+      }
+    } else {
+      ret = router_client_->unsubscribe_async(request);
+      if (MQ_SUCC(ret)) {
+        ret = unsubscribe_topic(topic_filter, client_id);
+      }
+    }
+    if (MQ_FAIL(ret) && !strict_cluster_mode && local_unsubscribed) {
+      local_unsubscribed = false;
     }
   }
-  
-  return MQ_SUCCESS;
+
+  return ret;
 }
 
 int GlobalSessionManager::forward_publish_via_router(const MQTTString& topic, const PublishPacket& packet,
                                                     const MQTTString& sender_client_id)
 {
-  // 先进行本地转发
-  int local_count = forward_publish_by_topic(topic, packet, sender_client_id);
-  
-  // 然后查询路由器获取远程订阅者
-  if (router_client_) {
-    MQTTRouterRpcClient::RoutePublishRequest request(global_allocator_);
+  int ret = MQ_SUCCESS;
+  int delivered_count = 0;
+  ret = forward_publish_cluster(topic, packet, sender_client_id, delivered_count);
+  return ret;
+}
+
+int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
+                                                  const PublishPacket& packet,
+                                                  const MQTTString& sender_client_id,
+                                                  int& delivered_count)
+{
+  int ret = MQ_SUCCESS;
+  MQTTRouterRpcClient::RoutePublishRequest request(global_allocator_);
+  MQTTRouterRpcClient::RouteTargetVector targets{
+      MQTTSTLAllocator<MQTTRouterRpcClient::RouteTarget>(global_allocator_)};
+  bool router_enabled = false;
+  bool strict_cluster_mode = false;
+
+  delivered_count = forward_publish_by_topic(topic, packet, sender_client_id);
+  router_enabled = (router_client_.get() != NULL);
+  strict_cluster_mode = cluster_config_.cluster_enabled;
+  if (!router_enabled) {
+    ret = delivered_count;
+  } else {
     request.topic = topic;
     request.qos = packet.qos;
     request.retain = packet.retain;
     request.publisher_server_id = server_id_;
     request.publisher_client_id = sender_client_id;
-    
-    // 复制payload
+    request.message_id = 0;
+    request.trace_id = to_mqtt_string(from_mqtt_string(server_id_) + ":" + from_mqtt_string(sender_client_id),
+                                      global_allocator_);
     if (!packet.payload.empty()) {
       request.payload = packet.payload;
     }
-    
-    MQTTRouterRpcClient::RouteTargetVector targets{MQTTSTLAllocator<MQTTRouterRpcClient::RouteTarget>(global_allocator_)};
-    int router_result = router_client_->route_publish(request, targets);
-    
-    if (router_result == MQ_SUCCESS) {
-      LOG_DEBUG("Router returned {} remote targets for topic: {}", targets.size(), from_mqtt_string(topic));
-      // 这里可以进一步处理远程路由目标，比如通过其他RPC调用转发到远程服务器
-    } else {
-      LOG_DEBUG("Failed to query router for remote targets: {}", router_result);
+    ret = router_client_->route_publish(request, targets);
+    if (MQ_ERR_ROUTER_ROUTE_EMPTY == ret) {
+      ret = delivered_count;
+    } else if (MQ_SUCCESS == ret) {
+      for (size_t i = 0; MQ_SUCCESS == ret && i < targets.size(); ++i) {
+        int remote_delivered_count = 0;
+        if (forwarding_client_.get() == NULL) {
+          if (strict_cluster_mode) {
+            ret = MQ_ERR_FORWARD_TARGET_INVALID;
+          }
+        } else {
+          ret = forwarding_client_->forward_publish(from_mqtt_string(targets[i].host),
+                                                    targets[i].forwarding_port,
+                                                    server_id_,
+                                                    sender_client_id,
+                                                    topic,
+                                                    packet.payload,
+                                                    packet.qos,
+                                                    packet.retain,
+                                                    request.message_id,
+                                                    request.trace_id,
+                                                    remote_delivered_count);
+          if (MQ_SUCCESS == ret) {
+            delivered_count += remote_delivered_count;
+          }
+        }
+      }
+      if (MQ_SUCCESS == ret) {
+        ret = delivered_count;
+      }
     }
   }
-  
-  return local_count;
+
+  return ret;
 }
 
 bool GlobalSessionManager::is_router_available() const

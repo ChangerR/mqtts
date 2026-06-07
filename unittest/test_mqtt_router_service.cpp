@@ -5,6 +5,7 @@
 #include "mqtt_router_service.h"
 #include "mqtt_allocator.h"
 #include "mqtt_memory_tags.h"
+#include "logger.h"
 
 class MQTTRouterServiceTest : public ::testing::Test {
 protected:
@@ -222,6 +223,166 @@ TEST_F(MQTTPersistentTopicTreeTest, UnsubscribeAll) {
     ASSERT_EQ(targets.size(), 0);
 }
 
+class RouterNodeRegistryTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+        test_allocator_ = root_allocator->create_child("test_router_registry", MQTTMemoryTag::MEM_TAG_ROOT);
+        registry_.reset(new RouterNodeRegistry(test_allocator_));
+        ASSERT_EQ(registry_->initialize(50), MQ_SUCCESS);
+    }
+
+    void TearDown() override {
+        registry_.reset();
+        if (test_allocator_ && test_allocator_->get_parent()) {
+            test_allocator_->get_parent()->remove_child("test_router_registry");
+        }
+    }
+
+    uint64_t current_time_ms() const {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    MQTTAllocator* test_allocator_;
+    std::unique_ptr<RouterNodeRegistry> registry_;
+};
+
+TEST_F(RouterNodeRegistryTest, ExpiredNodeShouldBecomeInactive) {
+    ServerInfo server_info(test_allocator_);
+    ServerInfo loaded_server_info(test_allocator_);
+    ServerInfoMap active_nodes{MQTTSTLAllocator<std::pair<const MQTTString, ServerInfo> >(test_allocator_)};
+
+    server_info.server_id = MQTTString("expired_server", MQTTStrAllocator(test_allocator_));
+    server_info.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    server_info.port = 1883;
+    server_info.forwarding_port = 2883;
+    server_info.is_active = true;
+    server_info.last_heartbeat_ms = current_time_ms() - 500;
+
+    ASSERT_EQ(registry_->upsert_node(server_info), MQ_SUCCESS);
+    ASSERT_EQ(registry_->get_node(server_info.server_id, loaded_server_info), MQ_ERR_ROUTER_NODE_INACTIVE);
+    ASSERT_EQ(registry_->get_active_nodes(active_nodes), MQ_SUCCESS);
+    ASSERT_TRUE(active_nodes.empty());
+}
+
+class RouterAuthStoreTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+        test_allocator_ = root_allocator->create_child("test_router_auth", MQTTMemoryTag::MEM_TAG_ROOT);
+        auth_store_.reset(new RouterAuthStore(test_allocator_));
+        config_.auth_timestamp_tolerance_ms = 30000;
+        config_.node_session_ttl_ms = 12345;
+        config_.node_token_map["server_auth"] = "token_auth";
+        ASSERT_EQ(auth_store_->initialize(config_), MQ_SUCCESS);
+    }
+
+    void TearDown() override {
+        auth_store_.reset();
+        if (test_allocator_ && test_allocator_->get_parent()) {
+            test_allocator_->get_parent()->remove_child("test_router_auth");
+        }
+    }
+
+    uint64_t current_time_ms() const {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    MQTTAllocator* test_allocator_;
+    MQTTRouterConfig config_;
+    std::unique_ptr<RouterAuthStore> auth_store_;
+};
+
+TEST_F(RouterAuthStoreTest, NonceReplayShouldBeRejectedAndExpiryShouldUseConfig) {
+    MQTTRouterRpcClient::NodeAuthRequest request(test_allocator_);
+    MQTTString session_id{MQTTStrAllocator(test_allocator_)};
+    uint64_t expires_at_ms = 0;
+
+    request.server_id = MQTTString("server_auth", MQTTStrAllocator(test_allocator_));
+    request.token = MQTTString("token_auth", MQTTStrAllocator(test_allocator_));
+    request.nonce = MQTTString("nonce_auth", MQTTStrAllocator(test_allocator_));
+    request.timestamp_ms = current_time_ms();
+
+    ASSERT_EQ(auth_store_->validate_node_token(request, session_id), MQ_SUCCESS);
+    ASSERT_FALSE(session_id.empty());
+    ASSERT_EQ(auth_store_->validate_node_token(request, session_id), MQ_ERR_AUTH_NONCE_REPLAY);
+    ASSERT_EQ(auth_store_->get_session_expires_at_ms(1000, expires_at_ms), MQ_SUCCESS);
+    ASSERT_EQ(expires_at_ms, static_cast<uint64_t>(1000 + config_.node_session_ttl_ms));
+}
+
+class MQTTRouterRpcHandlerRouteTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        MQTTAllocator* root_allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+        test_allocator_ = root_allocator->create_child("test_router_handler", MQTTMemoryTag::MEM_TAG_ROOT);
+        topic_tree_.reset(new MQTTPersistentTopicTree(test_allocator_));
+        node_registry_.reset(new RouterNodeRegistry(test_allocator_));
+        ASSERT_EQ(node_registry_->initialize(50), MQ_SUCCESS);
+        handler_.reset(new MQTTRouterRpcHandler(topic_tree_.get(), node_registry_.get(), NULL, NULL, test_allocator_));
+    }
+
+    void TearDown() override {
+        handler_.reset();
+        node_registry_.reset();
+        topic_tree_.reset();
+        if (test_allocator_ && test_allocator_->get_parent()) {
+            test_allocator_->get_parent()->remove_child("test_router_handler");
+        }
+    }
+
+    uint64_t current_time_ms() const {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    MQTTAllocator* test_allocator_;
+    std::unique_ptr<MQTTPersistentTopicTree> topic_tree_;
+    std::unique_ptr<RouterNodeRegistry> node_registry_;
+    std::unique_ptr<MQTTRouterRpcHandler> handler_;
+};
+
+TEST_F(MQTTRouterRpcHandlerRouteTest, PublishRouteShouldSkipExpiredNodes) {
+    MQTTString topic_filter("cluster/topic", MQTTStrAllocator(test_allocator_));
+    MQTTString publish_topic("cluster/topic", MQTTStrAllocator(test_allocator_));
+    MQTTString active_server_id("server_active", MQTTStrAllocator(test_allocator_));
+    MQTTString stale_server_id("server_stale", MQTTStrAllocator(test_allocator_));
+    MQTTString active_client_id("client_active", MQTTStrAllocator(test_allocator_));
+    MQTTString stale_client_id("client_stale", MQTTStrAllocator(test_allocator_));
+    ServerInfo active_server(test_allocator_);
+    ServerInfo stale_server(test_allocator_);
+    MQTTRouterRpcHandler::PublishRequest request(test_allocator_);
+    MQTTRouterRpcHandler::RouteResponse response(test_allocator_);
+
+    ASSERT_EQ(topic_tree_->subscribe(active_server_id, topic_filter, active_client_id, 1), MQ_SUCCESS);
+    ASSERT_EQ(topic_tree_->subscribe(stale_server_id, topic_filter, stale_client_id, 1), MQ_SUCCESS);
+
+    active_server.server_id = active_server_id;
+    active_server.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    active_server.port = 1883;
+    active_server.forwarding_port = 2883;
+    active_server.is_active = true;
+    active_server.last_heartbeat_ms = current_time_ms();
+    ASSERT_EQ(node_registry_->upsert_node(active_server), MQ_SUCCESS);
+
+    stale_server.server_id = stale_server_id;
+    stale_server.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    stale_server.port = 1884;
+    stale_server.forwarding_port = 2884;
+    stale_server.is_active = true;
+    stale_server.last_heartbeat_ms = current_time_ms() - 500;
+    ASSERT_EQ(node_registry_->upsert_node(stale_server), MQ_SUCCESS);
+
+    request.topic = publish_topic;
+    request.publisher_server_id = MQTTString("publisher", MQTTStrAllocator(test_allocator_));
+    ASSERT_EQ(handler_->handle_publish_route(request, response), MQ_SUCCESS);
+    ASSERT_EQ(response.targets.size(), 1);
+    ASSERT_EQ(response.targets[0].server_id, active_server_id);
+    ASSERT_EQ(response.targets[0].client_id, active_client_id);
+    ASSERT_EQ(response.targets[0].forwarding_port, active_server.forwarding_port);
+}
+
 class MQTTRedoLogManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -434,5 +595,6 @@ TEST_F(MQTTRouterPerformanceTest, LargeScaleSubscriptions) {
 // 主函数
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    SingletonLogger::instance().log_->set_level(spdlog::level::err);
     return RUN_ALL_TESTS();
 }

@@ -212,7 +212,8 @@ public:
    * @param permissions 输出权限列表
    * @return MQ_SUCCESS成功，其他值失败
    */
-  int get_user_permissions(const MQTTString& username, std::vector<TopicPermission>& permissions);
+  int get_user_permissions(const MQTTString& username,
+                          std::vector<TopicPermission>& permissions) override;
   
   /**
    * @brief 批量设置用户权限

@@ -110,6 +110,21 @@ public:
         return AuthResult::TOPIC_ACCESS_DENIED;
     }
 
+    int get_user_permissions(const MQTTString& username,
+                             std::vector<TopicPermission>& permissions) override {
+        int ret = MQ_ERR_NOT_FOUND_V2;
+        std::string user_str = from_mqtt_string(username);
+        auto it = test_permissions_.find(user_str);
+
+        permissions.clear();
+        if (it != test_permissions_.end()) {
+            permissions = it->second;
+            ret = MQ_SUCCESS;
+        }
+
+        return ret;
+    }
+
     bool is_super_user(const MQTTString& username) override {
         std::string user_str = from_mqtt_string(username);
         auto it = test_users_.find(user_str);
@@ -130,6 +145,23 @@ public:
 
     bool is_healthy() const override {
         return initialized_;
+    }
+
+    void remove_test_user(const std::string& username) {
+        test_users_.erase(username);
+    }
+
+    void clear_permissions(const std::string& username) {
+        test_permissions_.erase(username);
+    }
+
+    void add_permission(const std::string& username,
+                        const std::string& topic_pattern,
+                        Permission permission) {
+        TopicPermission perm(allocator_);
+        perm.topic_pattern = MQTTString(topic_pattern.c_str(), MQTTStrAllocator(allocator_));
+        perm.permission = permission;
+        test_permissions_[username].push_back(perm);
     }
 
 private:
@@ -338,6 +370,55 @@ void test_auth_manager_cache() {
     std::cout << "✓ AuthManager cache functionality test passed" << std::endl;
 }
 
+void test_auth_manager_client_auth_context() {
+    std::cout << "Testing AuthManager client auth context..." << std::endl;
+
+    MQTTAllocator* allocator = MQTTMemoryManager::get_instance().get_root_allocator();
+    AuthManager auth_manager(allocator);
+    AuthResult auth_result = AuthResult::INTERNAL_ERROR;
+    ClientAuthContext auth_context(allocator);
+
+    auth_manager.set_cache_enabled(true, 60);
+    auth_manager.initialize();
+
+    auto provider1 = std::make_unique<MockAuthProvider>("provider_without_user", allocator);
+    provider1->remove_test_user("user1");
+    provider1->clear_permissions("user1");
+    provider1->add_permission("user1", "wrong/#", Permission::READWRITE);
+
+    auto provider2 = std::make_unique<MockAuthProvider>("provider_with_user", allocator);
+    provider2->clear_permissions("user1");
+    provider2->add_permission("user1", "cluster/+", Permission::READ);
+
+    auth_manager.add_provider(std::move(provider1), 5);
+    auth_manager.add_provider(std::move(provider2), 10);
+
+    MQTTString username("user1", MQTTStrAllocator(allocator));
+    MQTTString password("user1_password", MQTTStrAllocator(allocator));
+    MQTTString client_id("cluster_client", MQTTStrAllocator(allocator));
+    MQTTString client_ip("127.0.0.1", MQTTStrAllocator(allocator));
+
+    int ret = auth_manager.authenticate_user(
+        username, password, client_id, client_ip, 1883, auth_result, auth_context);
+    assert(ret == MQ_SUCCESS);
+    assert(auth_result == AuthResult::SUCCESS);
+    assert(auth_context.acl_rules.size() == 1);
+    assert(from_mqtt_string(auth_context.acl_rules[0].topic_pattern) == "cluster/+");
+    assert(auth_context.expires_at_ms > 0);
+
+    MQTTString allowed_topic("cluster/node1", MQTTStrAllocator(allocator));
+    MQTTString denied_topic("wrong/data", MQTTStrAllocator(allocator));
+    ret = auth_manager.check_topic_access(auth_context, allowed_topic, Permission::READ, auth_result);
+    assert(ret == MQ_SUCCESS);
+    assert(auth_result == AuthResult::SUCCESS);
+    ret = auth_manager.check_topic_access(auth_context, denied_topic, Permission::READ, auth_result);
+    assert(ret == MQ_SUCCESS);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
+
+    auth_manager.cleanup();
+    std::cout << "✓ AuthManager client auth context test passed" << std::endl;
+}
+
 void test_auth_manager_error_handling() {
     std::cout << "Testing AuthManager error handling..." << std::endl;
     
@@ -389,6 +470,7 @@ int main() {
         test_auth_manager_topic_access();
         test_auth_manager_multiple_providers();
         test_auth_manager_cache();
+        test_auth_manager_client_auth_context();
         test_auth_manager_error_handling();
         
         std::cout << "All AuthManager tests passed!" << std::endl;

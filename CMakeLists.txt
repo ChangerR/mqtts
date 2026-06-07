@@ -64,6 +64,7 @@ set(MQTTS_INCLUDE_DIRS
     "${MQTTS_SRC_DIR}/common"
     "${MQTTS_SRC_DIR}/core"
     "${MQTTS_SRC_DIR}/events"
+    "${MQTTS_SRC_DIR}/forwarding"
     "${MQTTS_SRC_DIR}/http"
     "${MQTTS_SRC_DIR}/memory"
     "${MQTTS_SRC_DIR}/protocol"
@@ -77,6 +78,7 @@ include_directories(
 	"${THIRD_PART_DIR}/spdlog/include"
 	"${THIRD_PART_DIR}/libco"
 	"${THIRD_PART_DIR}/gperftools/src"
+    "${CMAKE_CURRENT_BINARY_DIR}"
     ${MQTTS_INCLUDE_DIRS}
 )
 
@@ -92,6 +94,24 @@ set(gperftools_build_minimal ON CACHE BOOL "Build gperftools minimal")
 set(GPERFTOOLS_BUILD_TESTING OFF CACHE BOOL "Build gperftools testing")
 add_subdirectory(3rd/gperftools)
 add_subdirectory(3rd EXCLUDE_FROM_ALL)
+
+# 查找认证相关依赖
+find_package(PkgConfig REQUIRED)
+find_package(Protobuf REQUIRED)
+
+protobuf_generate_cpp(MQTT_ROUTER_PROTO_SRCS MQTT_ROUTER_PROTO_HDRS src/router/mqtt_router.proto)
+protobuf_generate_cpp(MQTT_FORWARDING_PROTO_SRCS MQTT_FORWARDING_PROTO_HDRS src/forwarding/mqtt_forwarding.proto)
+
+add_library(mqtt_proto STATIC
+    ${MQTT_ROUTER_PROTO_SRCS}
+    ${MQTT_FORWARDING_PROTO_SRCS}
+)
+
+target_link_libraries(mqtt_proto PUBLIC protobuf::libprotobuf)
+target_include_directories(mqtt_proto PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    ${MQTTS_INCLUDE_DIRS}
+)
 
 # 添加mqtt_parser库
 add_library(mqtt_parser STATIC
@@ -110,6 +130,9 @@ add_library(mqtt_parser STATIC
 	src/events/mqtt_event_forwarding_queue.cpp
 	src/events/mqtt_event_rpc_client.cpp
 	src/events/mqtt_event_forwarding_service.cpp
+    src/forwarding/forwarding_connection_pool.cpp
+    src/forwarding/mqtt_forwarding_rpc_client.cpp
+    src/forwarding/mqtt_forwarding_service.cpp
 	src/websocket/websocket_frame.cpp
 	src/websocket/websocket_protocol_handler.cpp
 	src/websocket/websocket_mqtt_bridge.cpp
@@ -122,6 +145,9 @@ add_library(mqtt_parser STATIC
 add_library(mqtt_router STATIC
     src/router/mqtt_router_service.cpp
     src/router/mqtt_router_rpc_client.cpp
+    src/router/router_auth_store.cpp
+    src/router/router_node_registry.cpp
+    src/core/mqtt_socket.cpp
     src/memory/mqtt_allocator.cpp
     src/common/mqtt_string_utils.cpp
     src/common/logger.cpp
@@ -131,9 +157,11 @@ add_library(mqtt_router STATIC
 
 # mqtt_parser 依赖 logger.cpp 中的协程局部存储接口
 target_link_libraries(mqtt_parser colib_static)
+target_link_libraries(mqtt_parser mqtt_proto)
 
 # mqtt_router 需要链接 colib_static，因为 mqtt_router_service.cpp 使用了 libco 功能
 target_link_libraries(mqtt_router colib_static)
+target_link_libraries(mqtt_router mqtt_proto)
 
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
@@ -145,9 +173,6 @@ add_library(mqtt_auth STATIC
     src/common/logger.cpp
     src/common/mqtt_buffer.cpp
 )
-
-# 查找认证相关依赖
-find_package(PkgConfig REQUIRED)
 
 # 查找SQLite3 (可选)
 find_package(SQLite3 QUIET)
@@ -176,7 +201,6 @@ if(OpenSSL_FOUND)
 endif()
 
 # 查找yaml-cpp库的静态版本
-find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
 
 pkg_check_modules(LLHTTP REQUIRED llhttp)

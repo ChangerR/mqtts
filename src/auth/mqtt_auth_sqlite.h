@@ -177,6 +177,9 @@ public:
    */
   int clear_user_permissions(const MQTTString& username);
 
+  int get_user_permissions(const MQTTString& username,
+                           std::vector<TopicPermission>& permissions) override;
+
 private:
   SQLiteAuthConfig config_;
   MQTTAllocator* allocator_;

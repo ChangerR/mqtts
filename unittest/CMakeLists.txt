@@ -67,6 +67,9 @@ add_executable(test_session_manager_stress test_session_manager_stress.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 
+# 添加转发连接池测试
+add_executable(test_mqtt_forwarding_pool test_mqtt_forwarding_pool.cpp)
+
 # 添加路由器测试
 add_executable(test_mqtt_router_service test_mqtt_router_service.cpp)
 add_executable(test_mqtt_router_rpc_client test_mqtt_router_rpc_client.cpp)
@@ -111,6 +114,9 @@ target_include_directories(test_mqtt_auth_manager PRIVATE ${TEST_INCLUDE_DIRS} $
 # target_include_directories(test_mqtt_auth_sqlite PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 # target_include_directories(test_mqtt_auth_redis PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 
+# 转发连接池测试的头文件搜索路径
+target_include_directories(test_mqtt_forwarding_pool PRIVATE ${TEST_INCLUDE_DIRS})
+
 # 路由器测试的头文件搜索路径
 target_include_directories(test_mqtt_router_service PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 target_include_directories(test_mqtt_router_rpc_client PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
@@ -147,6 +153,9 @@ target_link_libraries(test_mqtt_auth_manager PRIVATE mqtt_auth colib_static tcma
 # target_link_libraries(test_mqtt_auth_sqlite PRIVATE mqtt_auth colib_static tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 # target_link_libraries(test_mqtt_auth_redis PRIVATE mqtt_auth colib_static tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 
+# 转发连接池测试的链接库
+target_link_libraries(test_mqtt_forwarding_pool PRIVATE colib_static mqtt_parser mqtt_router tcmalloc_minimal gtest pthread dl)
+
 # 路由器测试的链接库
 target_link_libraries(test_mqtt_router_service PRIVATE colib_static mqtt_router tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 target_link_libraries(test_mqtt_router_rpc_client PRIVATE colib_static mqtt_router tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
@@ -177,6 +186,9 @@ add_test(NAME test_mqtt_session_manager_optimization COMMAND test_mqtt_session_m
 add_test(NAME test_mqtt_session_manager_memory COMMAND test_mqtt_session_manager_memory)
 add_test(NAME test_session_manager_allocator COMMAND test_session_manager_allocator)
 add_test(NAME test_session_manager_stress COMMAND test_session_manager_stress)
+
+# 添加转发连接池测试
+add_test(NAME test_mqtt_forwarding_pool COMMAND test_mqtt_forwarding_pool)
 
 # 添加路由器测试
 add_test(NAME test_mqtt_router_service COMMAND test_mqtt_router_service)

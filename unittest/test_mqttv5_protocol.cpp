@@ -61,6 +61,11 @@ class MQTTv5ProtocolTest : public ::testing::Test
     return to_mqtt_string(str, test_allocator);
   }
 
+  TopicTreeLevelVector create_subscription_list()
+  {
+    return TopicTreeLevelVector(TopicTreeAllocator<MQTTString>(test_allocator));
+  }
+
  protected:
   MQTTAllocator* test_allocator;
   std::unique_ptr<MQTTParser> parser;
@@ -312,7 +317,7 @@ TEST_F(MQTTv5ProtocolTest, SubscriptionIdentifiers)
   EXPECT_EQ(topic_tree->subscribe(create_mqtt_string("test/subid/2"), client_id, 1), MQ_SUCCESS);
 
   // Get client subscriptions
-  std::vector<MQTTString> subscriptions;
+  TopicTreeLevelVector subscriptions = create_subscription_list();
   EXPECT_EQ(topic_tree->get_client_subscriptions(client_id, subscriptions), MQ_SUCCESS);
   EXPECT_EQ(subscriptions.size(), 2);
 

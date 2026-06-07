@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package mqtt.forwarding;
+
+message ForwardPublishRequest {
+  string origin_server_id = 1;
+  string origin_client_id = 2;
+  string topic = 3;
+  bytes payload = 4;
+  uint32 qos = 5;
+  bool retain = 6;
+  uint64 message_id = 7;
+  string trace_id = 8;
+  uint32 hop_count = 9;
+}
+
+message ForwardPublishResponse {
+  int32 error_code = 1;
+  string error_message = 2;
+  uint32 delivered_count = 3;
+}
+
+message ForwardingEnvelope {
+  uint64 request_id = 1;
+  oneof body {
+    ForwardPublishRequest forward_publish_request = 10;
+    ForwardPublishResponse forward_publish_response = 11;
+  }
+}

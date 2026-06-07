@@ -42,6 +42,7 @@
 #define MQ_ERR_PUBLISH_PAYLOAD -402
 #define MQ_ERR_PUBLISH_QOS -403
 #define MQ_ERR_PUBLISH_RETAIN -404
+#define MQ_ERR_PUBLISH_NOT_AUTHORIZED -405
 
 // MQTT Subscribe error codes (-500 to -599)
 #define MQ_ERR_SUBSCRIBE -500
@@ -71,6 +72,9 @@
 #define MQ_ERR_INVALID_STATE -707
 #define MQ_ERR_AUTH -708
 #define MQ_ERR_DATABASE -709
+#define MQ_ERR_AUTH_TOKEN_INVALID -710
+#define MQ_ERR_AUTH_TOKEN_EXPIRED -711
+#define MQ_ERR_AUTH_NONCE_REPLAY -712
 
 // Topic Tree error codes (-800 to -899)
 #define MQ_ERR_TOPIC_TREE -800
@@ -82,6 +86,28 @@
 #define MQ_ERR_TOPIC_TREE_SUBSCRIBER_EXISTS -806
 #define MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND -807
 #define MQ_ERR_TOPIC_TREE_CONCURRENT -808
+
+// Router error codes (-900 to -919)
+#define MQ_ERR_ROUTER -900
+#define MQ_ERR_ROUTER_NOT_ENABLED -901
+#define MQ_ERR_ROUTER_NOT_CONNECTED -902
+#define MQ_ERR_ROUTER_AUTH_FAILED -903
+#define MQ_ERR_ROUTER_SESSION_INVALID -904
+#define MQ_ERR_ROUTER_SERVER_ID_MISMATCH -905
+#define MQ_ERR_ROUTER_NODE_NOT_FOUND -906
+#define MQ_ERR_ROUTER_NODE_INACTIVE -907
+#define MQ_ERR_ROUTER_PROTOCOL -908
+#define MQ_ERR_ROUTER_ROUTE_EMPTY -909
+#define MQ_ERR_ROUTER_SNAPSHOT -910
+#define MQ_ERR_ROUTER_REDO -911
+
+// Forwarding error codes (-920 to -939)
+#define MQ_ERR_FORWARD -920
+#define MQ_ERR_FORWARD_CONNECT -921
+#define MQ_ERR_FORWARD_SEND -922
+#define MQ_ERR_FORWARD_RECV -923
+#define MQ_ERR_FORWARD_LOOP -924
+#define MQ_ERR_FORWARD_TARGET_INVALID -925
 
 #define MQ_LIKELY(x) __builtin_expect(!!(x), !!1)
 #define MQ_UNLIKELY(x) __builtin_expect(!!(x), !!0)
@@ -103,6 +129,8 @@
 #define MQ_IS_ERR_SESSION(code) (code <= MQ_ERR_SESSION && code > MQ_ERR_SESSION_MANAGER_NOT_READY)
 #define MQ_IS_ERR_TOPIC_TREE(code) \
   (code <= MQ_ERR_TOPIC_TREE && code > MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND)
+#define MQ_IS_ERR_ROUTER(code) (code <= MQ_ERR_ROUTER && code > MQ_ERR_ROUTER_REDO)
+#define MQ_IS_ERR_FORWARD(code) (code <= MQ_ERR_FORWARD && code > MQ_ERR_FORWARD_TARGET_INVALID)
 
 // Error code to string conversion
 static inline const char* mqtt_error_string(int error_code)
@@ -180,6 +208,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Invalid QoS";
     case MQ_ERR_PUBLISH_RETAIN:
       return "Invalid retain flag";
+    case MQ_ERR_PUBLISH_NOT_AUTHORIZED:
+      return "Not authorized to publish";
 
     // Subscribe errors
     case MQ_ERR_SUBSCRIBE:
@@ -226,6 +256,12 @@ static inline const char* mqtt_error_string(int error_code)
       return "Authentication failed";
     case MQ_ERR_DATABASE:
       return "Database operation failed";
+    case MQ_ERR_AUTH_TOKEN_INVALID:
+      return "Token is invalid";
+    case MQ_ERR_AUTH_TOKEN_EXPIRED:
+      return "Token has expired";
+    case MQ_ERR_AUTH_NONCE_REPLAY:
+      return "Token nonce replay detected";
 
     // Topic tree errors
     case MQ_ERR_TOPIC_TREE:
@@ -244,6 +280,42 @@ static inline const char* mqtt_error_string(int error_code)
       return "Subscriber already exists";
     case MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND:
       return "Subscriber not found";
+    case MQ_ERR_ROUTER:
+      return "Router error";
+    case MQ_ERR_ROUTER_NOT_ENABLED:
+      return "Router is not enabled";
+    case MQ_ERR_ROUTER_NOT_CONNECTED:
+      return "Router is not connected";
+    case MQ_ERR_ROUTER_AUTH_FAILED:
+      return "Router authentication failed";
+    case MQ_ERR_ROUTER_SESSION_INVALID:
+      return "Router session is invalid";
+    case MQ_ERR_ROUTER_SERVER_ID_MISMATCH:
+      return "Router server id mismatch";
+    case MQ_ERR_ROUTER_NODE_NOT_FOUND:
+      return "Router node not found";
+    case MQ_ERR_ROUTER_NODE_INACTIVE:
+      return "Router node is inactive";
+    case MQ_ERR_ROUTER_PROTOCOL:
+      return "Router protocol error";
+    case MQ_ERR_ROUTER_ROUTE_EMPTY:
+      return "Router route target is empty";
+    case MQ_ERR_ROUTER_SNAPSHOT:
+      return "Router snapshot error";
+    case MQ_ERR_ROUTER_REDO:
+      return "Router redo log error";
+    case MQ_ERR_FORWARD:
+      return "Forwarding error";
+    case MQ_ERR_FORWARD_CONNECT:
+      return "Forwarding connect error";
+    case MQ_ERR_FORWARD_SEND:
+      return "Forwarding send error";
+    case MQ_ERR_FORWARD_RECV:
+      return "Forwarding receive error";
+    case MQ_ERR_FORWARD_LOOP:
+      return "Forwarding loop detected";
+    case MQ_ERR_FORWARD_TARGET_INVALID:
+      return "Forwarding target is invalid";
 
     default:
       return "Unknown error";

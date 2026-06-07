@@ -61,7 +61,8 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       write_lock_condition_(),
       session_manager_(nullptr),
       auth_manager_(nullptr),
-      current_user_info_(nullptr)
+      current_user_info_(nullptr),
+      current_auth_context_(nullptr)
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -101,6 +102,10 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
   if (current_user_info_) {
     current_user_info_->~UserInfo();
     allocator_->deallocate(current_user_info_, sizeof(auth::UserInfo));
+  }
+  if (current_auth_context_) {
+    current_auth_context_->~ClientAuthContext();
+    allocator_->deallocate(current_auth_context_, sizeof(auth::ClientAuthContext));
   }
 }
 
@@ -491,158 +496,221 @@ int MQTTProtocolHandler::parse_packet()
   return ret;
 }
 
-int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
+int MQTTProtocolHandler::ensure_auth_state()
 {
-  LOG_DEBUG("Processing CONNECT from client {}:{} (protocol: v{}, client_id: {}, clean_start: {})",
-            client_ip_.c_str(), client_port_, packet->protocol_version,
-            from_mqtt_string(packet->client_id), packet->flags.clean_start);
+  int ret = MQ_SUCCESS;
 
-  auto reject_connect = [this, packet](ReasonCode reason_code, int err_code) -> int {
-    uint8_t response_version = 5;
-    if (packet->protocol_version == 3 || packet->protocol_version == 4) {
-      response_version = packet->protocol_version;
-    }
-    negotiated_protocol_version_ = response_version;
-    parser_->set_protocol_version_hint(response_version);
-    int send_ret = send_connack(reason_code, false);
-    connected_ = false;
-    if (socket_) {
-      socket_->close();
-    }
-    if (send_ret != MQ_SUCCESS) {
-      return send_ret;
-    }
-    return err_code;
-  };
-
-  if (!is_supported_protocol_name_version(packet->protocol_name, packet->protocol_version)) {
-    LOG_ERROR("Unsupported protocol name/version combination: name='{}', version={} from client {}:{}",
-              from_mqtt_string(packet->protocol_name), packet->protocol_version,
-              client_ip_.c_str(), client_port_);
-    return reject_connect(ReasonCode::UnsupportedProtocolVersion, MQ_ERR_CONNECT_PROTOCOL);
-  }
-
-  if ((packet->protocol_version == 3 || packet->protocol_version == 4) && !allow_mqtt3x_) {
-    LOG_ERROR("MQTT 3.x is disabled, rejecting client {}:{} using version {}", client_ip_.c_str(),
-              client_port_, packet->protocol_version);
-    return reject_connect(ReasonCode::UnsupportedProtocolVersion, MQ_ERR_CONNECT_PROTOCOL);
-  }
-
-  negotiated_protocol_version_ = packet->protocol_version;
-  parser_->set_protocol_version_hint(negotiated_protocol_version_);
-
-  // Check if client ID is valid
-  if (packet->client_id.empty()) {
-    LOG_ERROR("Empty client ID from client {}:{}", client_ip_.c_str(), client_port_);
-    return reject_connect(ReasonCode::ClientIdentifierNotValid, MQ_ERR_CONNECT_CLIENT_ID);
-  }
-
-  // Perform authentication if auth manager is available
-  if (auth_manager_) {
-    // Allocate user info if not already allocated
-    if (!current_user_info_) {
-      current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
-      if (!current_user_info_) {
-        LOG_ERROR("Failed to allocate memory for user info");
-        return reject_connect(ReasonCode::ServerUnavailable, MQ_ERR_MEMORY_ALLOC);
-      }
+  if (nullptr == current_user_info_) {
+    current_user_info_ = static_cast<auth::UserInfo*>(allocator_->allocate(sizeof(auth::UserInfo)));
+    if (nullptr == current_user_info_) {
+      LOG_ERROR("Failed to allocate memory for user info");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
       new (current_user_info_) auth::UserInfo(allocator_);
     }
+  }
 
-    // Extract authentication credentials
-    MQTTString username = packet->username.empty() ? 
-        MQTTString("", MQTTStrAllocator(allocator_)) : packet->username;
-    MQTTString password = packet->password.empty() ? 
-        MQTTString("", MQTTStrAllocator(allocator_)) : packet->password;
-
-    // Perform authentication
-    auth::AuthResult auth_result = auth_manager_->authenticate_user(
-        username, password, packet->client_id, client_ip_, client_port_, *current_user_info_);
-
-    switch (auth_result) {
-      case auth::AuthResult::SUCCESS:
-        LOG_INFO("Client {}:{} authenticated successfully as user '{}'", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(current_user_info_->username));
-        break;
-      case auth::AuthResult::INVALID_CREDENTIALS:
-        LOG_WARN("Client {}:{} authentication failed: invalid credentials for user '{}'", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
-      case auth::AuthResult::USER_NOT_FOUND:
-        LOG_WARN("Client {}:{} authentication failed: user '{}' not found", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return reject_connect(ReasonCode::BadUserNameOrPassword, MQ_ERR_CONNECT_CREDENTIALS);
-      case auth::AuthResult::ACCESS_DENIED:
-        LOG_WARN("Client {}:{} authentication failed: access denied for user '{}'", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return reject_connect(ReasonCode::NotAuthorized, MQ_ERR_CONNECT_NOT_AUTHORIZED);
-      case auth::AuthResult::RATE_LIMITED:
-        LOG_WARN("Client {}:{} authentication failed: rate limited for user '{}'", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return reject_connect(ReasonCode::ConnectionRateExceeded, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
-      default:
-        LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'", 
-                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
-        return reject_connect(ReasonCode::ServerUnavailable, MQ_ERR_CONNECT_SERVER_UNAVAILABLE);
+  if (MQ_SUCC(ret) && nullptr == current_auth_context_) {
+    current_auth_context_ =
+        static_cast<auth::ClientAuthContext*>(allocator_->allocate(sizeof(auth::ClientAuthContext)));
+    if (nullptr == current_auth_context_) {
+      LOG_ERROR("Failed to allocate memory for auth context");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      new (current_auth_context_) auth::ClientAuthContext(allocator_);
     }
+  }
+
+  return ret;
+}
+
+int MQTTProtocolHandler::reject_connect_request(uint8_t protocol_version, ReasonCode reason_code,
+                                                int err_code)
+{
+  int ret = err_code;
+  uint8_t response_version = 5;
+
+  if (3 == protocol_version || 4 == protocol_version) {
+    response_version = protocol_version;
+  }
+
+  negotiated_protocol_version_ = response_version;
+  parser_->set_protocol_version_hint(response_version);
+
+  int send_ret = send_connack(reason_code, false);
+  connected_ = false;
+  if (socket_) {
+    socket_->close();
+  }
+
+  if (MQ_SUCC(send_ret)) {
+    ret = err_code;
   } else {
-    LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}", 
+    ret = send_ret;
+  }
+
+  return ret;
+}
+
+int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
+{
+  int ret = MQ_SUCCESS;
+  bool need_reject = false;
+  bool session_present = false;
+  ReasonCode reject_reason = ReasonCode::Success;
+  auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
+  MQTTString username{MQTTStrAllocator(allocator_)};
+  MQTTString password{MQTTStrAllocator(allocator_)};
+
+  if (nullptr == packet) {
+    LOG_ERROR("Invalid CONNECT packet from client {}:{}", client_ip_.c_str(), client_port_);
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    LOG_DEBUG(
+        "Processing CONNECT from client {}:{} (protocol: v{}, client_id: {}, clean_start: {})",
+        client_ip_.c_str(), client_port_, packet->protocol_version,
+        from_mqtt_string(packet->client_id), packet->flags.clean_start);
+  }
+
+  if (MQ_SUCC(ret) &&
+      !is_supported_protocol_name_version(packet->protocol_name, packet->protocol_version)) {
+    LOG_ERROR(
+        "Unsupported protocol name/version combination: name='{}', version={} from client {}:{}",
+        from_mqtt_string(packet->protocol_name), packet->protocol_version, client_ip_.c_str(),
+        client_port_);
+    reject_reason = ReasonCode::UnsupportedProtocolVersion;
+    ret = MQ_ERR_CONNECT_PROTOCOL;
+    need_reject = true;
+  }
+
+  if (MQ_SUCC(ret) && (packet->protocol_version == 3 || packet->protocol_version == 4) &&
+      !allow_mqtt3x_) {
+    LOG_ERROR("MQTT 3.x is disabled, rejecting client {}:{} using version {}", client_ip_.c_str(),
+              client_port_, packet->protocol_version);
+    reject_reason = ReasonCode::UnsupportedProtocolVersion;
+    ret = MQ_ERR_CONNECT_PROTOCOL;
+    need_reject = true;
+  }
+
+  if (MQ_SUCC(ret)) {
+    negotiated_protocol_version_ = packet->protocol_version;
+    parser_->set_protocol_version_hint(negotiated_protocol_version_);
+  }
+
+  if (MQ_SUCC(ret) && packet->client_id.empty()) {
+    LOG_ERROR("Empty client ID from client {}:{}", client_ip_.c_str(), client_port_);
+    reject_reason = ReasonCode::ClientIdentifierNotValid;
+    ret = MQ_ERR_CONNECT_CLIENT_ID;
+    need_reject = true;
+  }
+
+  if (MQ_SUCC(ret) && auth_manager_) {
+    ret = ensure_auth_state();
+    if (MQ_FAIL(ret)) {
+      reject_reason = ReasonCode::ServerUnavailable;
+      need_reject = true;
+    } else {
+      username = packet->username.empty() ? MQTTString("", MQTTStrAllocator(allocator_))
+                                          : packet->username;
+      password = packet->password.empty() ? MQTTString("", MQTTStrAllocator(allocator_))
+                                          : packet->password;
+
+      ret = auth_manager_->authenticate_user(username, password, packet->client_id, client_ip_,
+                                             client_port_, auth_result, *current_auth_context_);
+      if (MQ_SUCC(ret)) {
+        *current_user_info_ = current_auth_context_->user_info;
+      } else {
+        auth_result = auth::AuthResult::INTERNAL_ERROR;
+      }
+
+      if (auth::AuthResult::SUCCESS == auth_result) {
+        LOG_INFO("Client {}:{} authenticated successfully as user '{}'", client_ip_.c_str(),
+                 client_port_, from_mqtt_string(current_user_info_->username));
+        ret = MQ_SUCCESS;
+      } else if (auth::AuthResult::INVALID_CREDENTIALS == auth_result ||
+                 auth::AuthResult::USER_NOT_FOUND == auth_result) {
+        LOG_WARN("Client {}:{} authentication failed for user '{}'", client_ip_.c_str(),
+                 client_port_, from_mqtt_string(username));
+        reject_reason = ReasonCode::BadUserNameOrPassword;
+        ret = MQ_ERR_CONNECT_CREDENTIALS;
+        need_reject = true;
+      } else if (auth::AuthResult::ACCESS_DENIED == auth_result) {
+        LOG_WARN("Client {}:{} authentication denied for user '{}'", client_ip_.c_str(),
+                 client_port_, from_mqtt_string(username));
+        reject_reason = ReasonCode::NotAuthorized;
+        ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        need_reject = true;
+      } else if (auth::AuthResult::RATE_LIMITED == auth_result) {
+        LOG_WARN("Client {}:{} authentication rate limited for user '{}'", client_ip_.c_str(),
+                 client_port_, from_mqtt_string(username));
+        reject_reason = ReasonCode::ConnectionRateExceeded;
+        ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+        need_reject = true;
+      } else {
+        LOG_ERROR("Client {}:{} authentication failed: internal error for user '{}'",
+                  client_ip_.c_str(), client_port_, from_mqtt_string(username));
+        reject_reason = ReasonCode::ServerUnavailable;
+        ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+        need_reject = true;
+      }
+    }
+  } else if (MQ_SUCC(ret)) {
+    LOG_WARN("No authentication manager configured, allowing unauthenticated access for client {}:{}",
              client_ip_.c_str(), client_port_);
   }
 
-  // Update session state - 使用拷贝构造
-  client_id_ =
-      MQTTString(packet->client_id.begin(), packet->client_id.end(), MQTTStrAllocator(allocator_));
-  connected_ = true;
+  if (MQ_SUCC(ret)) {
+    client_id_ =
+        MQTTString(packet->client_id.begin(), packet->client_id.end(), MQTTStrAllocator(allocator_));
+    connected_ = true;
 
-  LOG_DEBUG("Client {}:{} connected successfully with client_id: {}", client_ip_.c_str(),
-            client_port_, from_mqtt_string(client_id_));
+    LOG_DEBUG("Client {}:{} connected successfully with client_id: {}", client_ip_.c_str(),
+              client_port_, from_mqtt_string(client_id_));
 
-  // Register this handler with the session manager
-  int ret = register_session_with_manager();
-  if (ret != 0) {
-    connected_ = false;
-    return ret;
-  }
-
-  // Determine session_present based on MQTT v5.0 specification:
-  // - If Clean Start is 1, Session Present must be 0
-  // - If Clean Start is 0, Session Present indicates whether a session existed before
-  bool session_present = false;
-  if (packet->flags.clean_start == 0) {
-    // Clean Start is 0, check if a session existed
-    // For now, we assume no persistent session exists (simple implementation)
-    // In a full implementation, this would check if session state was preserved
-    session_present = false;
-    LOG_DEBUG("Clean Start is 0, but no persistent session found for client {}:{}", 
-              client_ip_.c_str(), client_port_);
-  } else {
-    // Clean Start is 1, Session Present must be 0
-    session_present = false;
-    LOG_DEBUG("Clean Start is 1, setting session_present to false for client {}:{}", 
-              client_ip_.c_str(), client_port_);
-  }
-
-  // 通知路由器客户端连接
-  if (session_manager_) {
-    MQTTString username{MQTTStrAllocator(allocator_)};
-    if (!packet->username.empty()) {
-      username = packet->username;
+    ret = register_session_with_manager();
+    if (MQ_FAIL(ret)) {
+      connected_ = false;
     }
-    
-    int router_ret = session_manager_->notify_router_client_connect(
-        client_id_, username, packet->protocol_version, packet->keep_alive, packet->flags.clean_start);
-    if (router_ret != MQ_SUCCESS) {
-      LOG_DEBUG("Failed to notify router about client connect: {}, error: {}", 
-                from_mqtt_string(client_id_), router_ret);
+  }
+
+  if (MQ_SUCC(ret)) {
+    if (0 == packet->flags.clean_start) {
+      session_present = false;
+      LOG_DEBUG("Clean Start is 0, but no persistent session found for client {}:{}",
+                client_ip_.c_str(), client_port_);
     } else {
-      LOG_DEBUG("Successfully notified router about client connect: {}", 
-                from_mqtt_string(client_id_));
+      session_present = false;
+      LOG_DEBUG("Clean Start is 1, setting session_present to false for client {}:{}",
+                client_ip_.c_str(), client_port_);
     }
   }
 
-  // Send CONNACK
-  return send_connack(ReasonCode::Success, session_present);
+  if (MQ_SUCC(ret) && session_manager_) {
+    MQTTString router_username{MQTTStrAllocator(allocator_)};
+    if (!packet->username.empty()) {
+      router_username = packet->username;
+    }
+
+    int router_ret =
+        session_manager_->notify_router_client_connect(client_id_, router_username,
+                                                       packet->protocol_version, packet->keep_alive,
+                                                       packet->flags.clean_start);
+    if (MQ_SUCC(router_ret)) {
+      LOG_DEBUG("Successfully notified router about client connect: {}",
+                from_mqtt_string(client_id_));
+    } else {
+      LOG_DEBUG("Failed to notify router about client connect: {}, error: {}",
+                from_mqtt_string(client_id_), router_ret);
+    }
+  }
+
+  if (MQ_SUCC(ret)) {
+    ret = send_connack(ReasonCode::Success, session_present);
+  } else if (need_reject && nullptr != packet) {
+    ret = reject_connect_request(packet->protocol_version, reject_reason, ret);
+  }
+
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)
@@ -672,79 +740,83 @@ int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)
 
 int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
 {
-  LOG_DEBUG("Processing PUBLISH from client {}:{} (topic: {}, qos: {}, retain: {})",
-            client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name), packet->qos,
-            packet->retain);
+  int ret = MQ_SUCCESS;
+  bool auth_denied = false;
+  auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
 
-  if (!connected_) {
+  if (nullptr == packet) {
+    LOG_ERROR("Invalid PUBLISH packet from client {}:{}", client_ip_.c_str(), client_port_);
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    LOG_DEBUG("Processing PUBLISH from client {}:{} (topic: {}, qos: {}, retain: {})",
+              client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name), packet->qos,
+              packet->retain);
+  }
+
+  if (MQ_SUCC(ret) && !connected_) {
     LOG_ERROR("Client {}:{} not connected", client_ip_.c_str(), client_port_);
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
-  // Check if topic is valid
-  if (packet->topic_name.empty()) {
+  if (MQ_SUCC(ret) && packet->topic_name.empty()) {
     LOG_ERROR("Empty topic name from client {}:{}", client_ip_.c_str(), client_port_);
-    return MQ_ERR_PUBLISH_TOPIC;
+    ret = MQ_ERR_PUBLISH_TOPIC;
   }
 
-  // Check topic publish permission
-  if (auth_manager_ && current_user_info_) {
-    auth::AuthResult auth_result = auth_manager_->check_topic_access(
-        *current_user_info_, packet->topic_name, auth::Permission::WRITE);
-    
-    if (auth_result != auth::AuthResult::SUCCESS) {
-      LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions", 
+  if (MQ_SUCC(ret) && auth_manager_ && current_auth_context_) {
+    (void)auth_manager_->check_topic_access(*current_auth_context_, packet->topic_name,
+                                            auth::Permission::WRITE, auth_result);
+
+    if (auth::AuthResult::SUCCESS != auth_result) {
+      LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions",
                client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
-      
-      // For QoS > 0, we should send a PUBACK/PUBREC with Not Authorized reason code
-      if (packet->qos == 1) {
-        return send_puback(packet->packet_id, ReasonCode::NotAuthorized);
-      } else if (packet->qos == 2) {
-        return send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
+      auth_denied = true;
+      if (1 == packet->qos) {
+        ret = send_puback(packet->packet_id, ReasonCode::NotAuthorized);
+      } else if (2 == packet->qos) {
+        ret = send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
+      } else {
+        ret = MQ_SUCCESS;
       }
-      // For QoS 0, we just drop the message silently
-      return MQ_SUCCESS;
+    } else {
+      LOG_DEBUG("Client {}:{} authorized to publish to topic: {}", client_ip_.c_str(),
+                client_port_, from_mqtt_string(packet->topic_name));
     }
-    LOG_DEBUG("Client {}:{} authorized to publish to topic: {}", 
-              client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
   }
 
-  // Check QoS level
-  if (packet->qos > 2) {
+  if (MQ_SUCC(ret) && !auth_denied && packet->qos > 2) {
     LOG_ERROR("Invalid QoS level: {} from client {}:{}", packet->qos, client_ip_.c_str(),
               client_port_);
-    return MQ_ERR_PACKET_QOS;
+    ret = MQ_ERR_PACKET_QOS;
   }
 
-  LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
-            client_ip_.c_str(), client_port_, packet->payload.size());
+  if (MQ_SUCC(ret) && !auth_denied) {
+    LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
+              client_ip_.c_str(), client_port_, packet->payload.size());
 
-  // 转发消息给订阅者（包括路由到远程订阅者）
-  if (session_manager_) {
-    int ret = session_manager_->forward_publish_via_router(packet->topic_name, *packet, client_id_);
-    if (ret >= 0) {
-      LOG_DEBUG("Successfully forwarded PUBLISH message to {} subscribers for topic: {}", 
-                ret, from_mqtt_string(packet->topic_name));
+    if (session_manager_) {
+      int forward_ret =
+          session_manager_->forward_publish_via_router(packet->topic_name, *packet, client_id_);
+      if (forward_ret >= 0) {
+        LOG_DEBUG("Successfully forwarded PUBLISH message to {} subscribers for topic: {}",
+                  forward_ret, from_mqtt_string(packet->topic_name));
+      } else {
+        LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}",
+                 from_mqtt_string(packet->topic_name), forward_ret);
+      }
     } else {
-      LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}", 
-               from_mqtt_string(packet->topic_name), ret);
+      LOG_WARN("Session manager not available, cannot forward PUBLISH message for topic: {}",
+               from_mqtt_string(packet->topic_name));
     }
-  } else {
-    LOG_WARN("Session manager not available, cannot forward PUBLISH message for topic: {}", 
-             from_mqtt_string(packet->topic_name));
+
+    if (1 == packet->qos) {
+      ret = send_puback(packet->packet_id, ReasonCode::Success);
+    } else if (2 == packet->qos) {
+      ret = send_pubrec(packet->packet_id, ReasonCode::Success);
+    }
   }
 
-  // Send PUBACK for QoS 1
-  if (packet->qos == 1) {
-    return send_puback(packet->packet_id, ReasonCode::Success);
-  }
-  
-  // Send PUBREC for QoS 2
-  if (packet->qos == 2) {
-    return send_pubrec(packet->packet_id, ReasonCode::Success);
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_puback(const PubAckPacket* packet)
@@ -955,68 +1027,96 @@ int MQTTProtocolHandler::handle_auth(const AuthPacket* packet)
 
 int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 {
-  LOG_DEBUG("Processing SUBSCRIBE from client {}:{} (packet_id: {})", client_ip_.c_str(),
-            client_port_, packet->packet_id);
-
-  if (!packet) {
-    LOG_ERROR("Invalid SUBSCRIBE packet from client {}:{}", client_ip_.c_str(), client_port_);
-    return MQ_ERR_PACKET_INVALID;
-  }
-
-  // 处理订阅请求
+  int ret = MQ_SUCCESS;
   std::vector<ReasonCode> reason_codes;
-  for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
-    const MQTTString& topic = subscription.first;
-    uint8_t qos = subscription.second;
 
-    LOG_DEBUG("Client {}:{} subscribing to topic: {} with QoS: {}", client_ip_.c_str(),
-              client_port_, from_mqtt_string(topic), qos);
-
-    // Check topic subscription permission
-    if (auth_manager_ && current_user_info_) {
-      auth::AuthResult auth_result = auth_manager_->check_topic_access(
-          *current_user_info_, topic, auth::Permission::READ);
-      
-      if (auth_result != auth::AuthResult::SUCCESS) {
-        LOG_WARN("Client {}:{} denied subscription to topic '{}': insufficient permissions", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(topic));
-        reason_codes.push_back(ReasonCode::NotAuthorized);
-        continue;
-      }
-      LOG_DEBUG("Client {}:{} authorized to subscribe to topic: {}", 
-                client_ip_.c_str(), client_port_, from_mqtt_string(topic));
-    }
-
-    // 验证QoS级别
-    if (qos > 2) {
-      LOG_WARN("Unsupported QoS level {} for topic {} from client {}:{}", qos,
-               from_mqtt_string(topic), client_ip_.c_str(), client_port_);
-      reason_codes.push_back(ReasonCode::QoSNotSupported);
-      continue;
-    }
-
-    // 添加订阅到本地存储
-    add_subscription(topic);
-    
-    // 注册到全局session manager的topic tree（包括路由器）
-    if (session_manager_) {
-      int ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
-      if (ret != MQ_SUCCESS) {
-        LOG_WARN("Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}", 
-                 client_ip_.c_str(), client_port_, from_mqtt_string(topic), ret);
-      } else {
-        LOG_DEBUG("Successfully registered subscription with session manager for client {}:{}, topic: {}", 
-                  client_ip_.c_str(), client_port_, from_mqtt_string(topic));
-      }
-    }
-    
-    reason_codes.push_back(static_cast<ReasonCode>(qos));
-    LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}", client_ip_.c_str(),
-              client_port_, from_mqtt_string(topic), qos);
+  if (nullptr == packet) {
+    LOG_ERROR("Invalid SUBSCRIBE packet from client {}:{}", client_ip_.c_str(), client_port_);
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    LOG_DEBUG("Processing SUBSCRIBE from client {}:{} (packet_id: {})", client_ip_.c_str(),
+              client_port_, packet->packet_id);
   }
 
-  // 发送SUBACK响应
-  return send_suback(packet->packet_id, reason_codes);
+  if (MQ_SUCC(ret)) {
+    for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
+      const MQTTString& topic = subscription.first;
+      uint8_t qos = subscription.second;
+      int add_ret = MQ_SUCCESS;
+      int subscribe_ret = MQ_SUCCESS;
+      int rollback_ret = MQ_SUCCESS;
+      bool local_added = false;
+      ReasonCode reason_code = ReasonCode::UnspecifiedError;
+      auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
+
+      LOG_DEBUG("Client {}:{} subscribing to topic: {} with QoS: {}", client_ip_.c_str(),
+                client_port_, from_mqtt_string(topic), qos);
+
+      if (auth_manager_ && current_auth_context_) {
+        (void)auth_manager_->check_topic_access(*current_auth_context_, topic,
+                                                auth::Permission::READ, auth_result);
+        if (auth::AuthResult::SUCCESS != auth_result) {
+          LOG_WARN("Client {}:{} denied subscription to topic '{}': insufficient permissions",
+                   client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+          reason_code = ReasonCode::NotAuthorized;
+        } else {
+          LOG_DEBUG("Client {}:{} authorized to subscribe to topic: {}", client_ip_.c_str(),
+                    client_port_, from_mqtt_string(topic));
+        }
+      } else {
+        auth_result = auth::AuthResult::SUCCESS;
+      }
+
+      if (auth::AuthResult::SUCCESS == auth_result) {
+        if (qos > 2) {
+          LOG_WARN("Unsupported QoS level {} for topic {} from client {}:{}", qos,
+                   from_mqtt_string(topic), client_ip_.c_str(), client_port_);
+          reason_code = ReasonCode::QoSNotSupported;
+        } else {
+          add_ret = add_subscription(topic);
+          if (MQ_SUCC(add_ret)) {
+            local_added = true;
+            reason_code = static_cast<ReasonCode>(qos);
+          } else {
+            LOG_WARN("Failed to add local subscription for client {}:{}, topic: {}, error: {}",
+                     client_ip_.c_str(), client_port_, from_mqtt_string(topic), add_ret);
+            reason_code = ReasonCode::UnspecifiedError;
+          }
+        }
+      }
+
+      if (local_added && session_manager_) {
+        subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
+        if (MQ_SUCC(subscribe_ret)) {
+          LOG_DEBUG(
+              "Successfully registered subscription with session manager for client {}:{}, topic: {}",
+              client_ip_.c_str(), client_port_, from_mqtt_string(topic));
+        } else {
+          LOG_WARN(
+              "Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}",
+              client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
+          reason_code = ReasonCode::UnspecifiedError;
+          rollback_ret = remove_subscription(topic);
+          if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
+            LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
+                     client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);
+          }
+        }
+      }
+
+      reason_codes.push_back(reason_code);
+      if (static_cast<ReasonCode>(qos) == reason_code) {
+        LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}",
+                  client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos);
+      }
+    }
+  }
+
+  if (MQ_SUCC(ret)) {
+    ret = send_suback(packet->packet_id, reason_codes);
+  }
+
+  return ret;
 }
 
 int MQTTProtocolHandler::send_data_with_lock(const char* data, size_t size, int timeout_ms)

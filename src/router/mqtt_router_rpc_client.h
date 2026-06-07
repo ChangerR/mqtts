@@ -5,27 +5,94 @@
 #include <string>
 #include <vector>
 #include <atomic>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <queue>
 #include "mqtt_allocator.h"
+#include "mqtt_coroutine_utils.h"
+#include "mqtt_define.h"
 #include "mqtt_string_utils.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_socket.h"
 #include "co_routine.h"
 
 using namespace mqtt;
 
+struct ClusterConfig {
+    bool cluster_enabled;
+    std::string server_id;
+    std::string server_token;
+    std::string router_host;
+    int router_port;
+    std::string forwarding_host;
+    int forwarding_port;
+    int heartbeat_interval_ms;
+    int request_timeout_ms;
+    int max_inflight_forward_requests;
+    int forwarding_pool_size;        // 每个远端保持的连接数，默认 4
+    int forwarding_idle_timeout_ms;  // 连接空闲超时（毫秒），默认 30000
+
+    ClusterConfig()
+        : cluster_enabled(false)
+        , server_id()
+        , server_token()
+        , router_host("127.0.0.1")
+        , router_port(9090)
+        , forwarding_host("127.0.0.1")
+        , forwarding_port(10090)
+        , heartbeat_interval_ms(30000)
+        , request_timeout_ms(10000)
+        , max_inflight_forward_requests(1024)
+        , forwarding_pool_size(4)
+        , forwarding_idle_timeout_ms(30000)
+    {}
+};
+
 class MQTTRouterRpcClient {
 public:
+    struct NodeAuthRequest {
+        MQTTString server_id;
+        MQTTString token;
+        uint64_t timestamp_ms;
+        MQTTString nonce;
+        MQTTString host;
+        int port;
+        int forwarding_port;
+
+        explicit NodeAuthRequest(MQTTAllocator* allocator = nullptr)
+            : server_id(MQTTStrAllocator(allocator))
+            , token(MQTTStrAllocator(allocator))
+            , timestamp_ms(0)
+            , nonce(MQTTStrAllocator(allocator))
+            , host(MQTTStrAllocator(allocator))
+            , port(0)
+            , forwarding_port(0)
+        {}
+    };
+
+    struct NodeAuthResponse {
+        int error_code;
+        MQTTString session_id;
+        uint64_t expires_at_ms;
+
+        explicit NodeAuthResponse(MQTTAllocator* allocator = nullptr)
+            : error_code(MQ_SUCCESS)
+            , session_id(MQTTStrAllocator(allocator))
+            , expires_at_ms(0)
+        {}
+    };
+
     struct RouteTarget {
         MQTTString server_id;
         MQTTString client_id;
+        MQTTString host;
+        int port;
+        int forwarding_port;
         uint8_t qos;
         
         RouteTarget(MQTTAllocator* allocator = nullptr)
             : server_id(MQTTStrAllocator(allocator))
             , client_id(MQTTStrAllocator(allocator))
+            , host(MQTTStrAllocator(allocator))
+            , port(0)
+            , forwarding_port(0)
             , qos(0)
         {}
     };
@@ -95,6 +162,8 @@ public:
         bool retain;
         MQTTString publisher_server_id;
         MQTTString publisher_client_id;
+        uint64_t message_id;
+        MQTTString trace_id;
         
         RoutePublishRequest(MQTTAllocator* allocator = nullptr)
             : topic(MQTTStrAllocator(allocator))
@@ -103,6 +172,8 @@ public:
             , retain(false)
             , publisher_server_id(MQTTStrAllocator(allocator))
             , publisher_client_id(MQTTStrAllocator(allocator))
+            , message_id(0)
+            , trace_id(MQTTStrAllocator(allocator))
         {}
     };
     
@@ -157,14 +228,17 @@ public:
     virtual int initialize();
     virtual int connect();
     virtual int disconnect();
+    virtual int set_cluster_config(const ClusterConfig& config);
+    virtual int authenticate_node(const NodeAuthRequest& request, NodeAuthResponse& response);
+    virtual int heartbeat();
     
     // 同步调用
-    int subscribe(const SubscribeRequest& request);
-    int unsubscribe(const UnsubscribeRequest& request);
-    int client_connect(const ClientConnectRequest& request);
-    int client_disconnect(const ClientDisconnectRequest& request);
+    virtual int subscribe(const SubscribeRequest& request);
+    virtual int unsubscribe(const UnsubscribeRequest& request);
+    virtual int client_connect(const ClientConnectRequest& request);
+    virtual int client_disconnect(const ClientDisconnectRequest& request);
     virtual int route_publish(const RoutePublishRequest& request, RouteTargetVector& targets);
-    int get_statistics(RouterStatistics& stats);
+    virtual int get_statistics(RouterStatistics& stats);
     
     // 异步调用
     virtual int subscribe_async(const SubscribeRequest& request);
@@ -178,6 +252,7 @@ public:
     
     // 连接状态管理
     virtual bool is_connected() const;
+    virtual int get_connection_state(bool& is_connected) const;
     uint64_t get_last_error_time() const;
     int get_last_error_code() const;
     const MQTTString& get_last_error_message() const;
@@ -189,15 +264,16 @@ public:
     
 private:
     enum class MessageType : uint8_t {
-        SUBSCRIBE = 1,
-        UNSUBSCRIBE = 2,
-        CLIENT_CONNECT = 3,
-        CLIENT_DISCONNECT = 4,
-        ROUTE_PUBLISH = 5,
-        BATCH_SUBSCRIBE = 6,
-        BATCH_UNSUBSCRIBE = 7,
-        GET_STATISTICS = 8,
-        HEARTBEAT = 9
+        AUTHENTICATE_NODE = 1,
+        SUBSCRIBE = 2,
+        UNSUBSCRIBE = 3,
+        CLIENT_CONNECT = 4,
+        CLIENT_DISCONNECT = 5,
+        ROUTE_PUBLISH = 6,
+        BATCH_SUBSCRIBE = 7,
+        BATCH_UNSUBSCRIBE = 8,
+        GET_STATISTICS = 9,
+        HEARTBEAT = 10
     };
     
     struct RpcMessage {
@@ -214,39 +290,16 @@ private:
         {}
     };
     
-    struct PendingRequest {
-        uint32_t request_id;
-        MessageType type;
-        std::chrono::steady_clock::time_point timestamp;
-        std::condition_variable* cv;
-        std::mutex* mutex;
-        bool completed;
-        int error_code;
-        MQTTByteVector response_payload;
-        
-        PendingRequest(MQTTAllocator* allocator = nullptr)
-            : request_id(0)
-            , type(MessageType::SUBSCRIBE)
-            , cv(nullptr)
-            , mutex(nullptr)
-            , completed(false)
-            , error_code(0)
-            , response_payload(MQTTSTLAllocator<uint8_t>(allocator))
-        {}
-    };
-    
-    using PendingRequestMap = MQTTMap<uint32_t, std::shared_ptr<PendingRequest>>;
-    
     int connect_to_server();
+    void destroy_socket();
     int send_message(const RpcMessage& message);
     int receive_message(RpcMessage& message);
     
     int send_request(MessageType type, const MQTTByteVector& payload, MQTTByteVector& response);
     int send_request_async(MessageType type, const MQTTByteVector& payload);
     
-    void connection_thread_func();
-    void heartbeat_thread_func();
-    void cleanup_expired_requests();
+    static void* heartbeat_routine(void* arg);
+    void heartbeat_coroutine_main();
     
     uint32_t generate_request_id();
     
@@ -255,34 +308,37 @@ private:
     int serialize_client_connect_request(const ClientConnectRequest& request, MQTTByteVector& payload);
     int serialize_client_disconnect_request(const ClientDisconnectRequest& request, MQTTByteVector& payload);
     int serialize_route_publish_request(const RoutePublishRequest& request, MQTTByteVector& payload);
+    int serialize_authenticate_node_request(const NodeAuthRequest& request, MQTTByteVector& payload);
     
     int deserialize_route_targets(const MQTTByteVector& payload, RouteTargetVector& targets);
     int deserialize_statistics(const MQTTByteVector& payload, RouterStatistics& stats);
+    int deserialize_authenticate_node_response(const MQTTByteVector& payload, NodeAuthResponse& response);
     
     MQTTAllocator* allocator_;
     RpcClientConfig config_;
     
-    int socket_fd_;
+    MQTTSocket* socket_;
     std::atomic<bool> connected_;
     std::atomic<bool> should_stop_;
-    
-    std::thread connection_thread_;
-    std::thread heartbeat_thread_;
+    stCoRoutine_t* heartbeat_coroutine_;
+    CoroCondition heartbeat_cond_;
     
     std::atomic<uint32_t> next_request_id_;
-    PendingRequestMap pending_requests_;
-    std::mutex pending_requests_mutex_;
+    CoroMutex request_mutex_;
     
     std::atomic<uint64_t> last_error_time_;
     std::atomic<int> last_error_code_;
     MQTTString last_error_message_;
-    std::mutex error_mutex_;
     
     std::atomic<uint64_t> total_requests_;
     std::atomic<uint64_t> successful_requests_;
     std::atomic<uint64_t> failed_requests_;
     
     MQTTString server_id_;
+    MQTTString server_token_;
+    MQTTString forwarding_host_;
+    MQTTString session_id_;
+    int forwarding_port_;
 };
 
 #endif // MQTT_ROUTER_RPC_CLIENT_H

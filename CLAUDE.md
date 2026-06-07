@@ -2,45 +2,57 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build Commands
+## Container-First Development
 
-### Primary Build Process
+**The target environment is Linux.** All compilation, testing, and validation must run inside Docker containers, not natively on macOS. The primary entry point is:
+
 ```bash
-# Build the project
-mkdir -p build && cd build
-cmake .. && make -j$(nproc)
-
-# Build and run all tests
-cd build && make test
-# Or run with ctest:
-ctest --output-on-failure
+./bin/container-validate.sh all   # build image + compile + run all tests
 ```
 
-### Running Individual Tests
+### Step-by-step Container Commands
 ```bash
-./build/unittest/test_mqtt_parser              # MQTT packet parsing
-./build/unittest/test_mqtt_allocator           # Memory allocation
-./build/unittest/test_mqtt_topic_tree          # Topic matching
-./build/unittest/test_websocket_frame          # WebSocket frame handling
-./build/unittest/test_mqtt_router_service      # Router service
-./build/unittest/test_mqtt_router_rpc_client   # Router RPC client
-./build/unittest/test_mqtt_auth_manager        # Auth manager
-./build/unittest/test_session_manager_stress   # Stress tests
+./bin/container-validate.sh image      # build dev image only
+./bin/container-validate.sh configure  # cmake configure only
+./bin/container-validate.sh build      # compile only
+./bin/container-validate.sh test       # run ctest only
+./bin/container-validate.sh shell      # interactive shell in dev container
+./bin/container-validate.sh run        # start mqtts server container (port 1883)
 ```
 
-### Quick Development
+### Running a Specific Test
 ```bash
-# Run the main MQTT server with default config
-./build/bin/mqtts mqtts.yaml
+TEST_REGEX=test_mqtt_parser ./bin/container-validate.sh test
+```
 
-# Run with custom parameters
-./build/bin/mqtts -c config/custom.yaml -i 0.0.0.0 -p 1883
+### Useful Environment Variables
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUILD_TYPE` | `RelWithDebInfo` | CMake build type (Debug, Release, etc.) |
+| `JOBS` | CPU count | Parallel compile jobs |
+| `BUILD_DIR` | `build-container` | Build output directory |
+| `CTEST_TIMEOUT` | `120` | Test timeout in seconds |
+| `TEST_REGEX` | (none) | ctest filter regex |
 
-# Run the standalone router service
-./build/bin/mqtt_router_service -c mqtt_router.yaml
+Example: `BUILD_TYPE=Debug JOBS=8 ./bin/container-validate.sh all`
 
-# Run the auth admin tool
-./build/bin/auth_admin -c mqtts_with_auth.yaml
+### Available Test Binaries (inside container at `build-container/unittest/`)
+```
+test_mqtt_parser              # MQTT packet parsing
+test_mqtt_allocator           # Memory allocation
+test_mqtt_topic_tree          # Topic matching
+test_websocket_frame          # WebSocket frame handling
+test_mqtt_router_service      # Router service
+test_mqtt_router_rpc_client   # Router RPC client
+test_mqtt_auth_manager        # Auth manager
+test_session_manager_stress   # Stress tests
+```
+
+### Running the Server
+```bash
+./bin/container-validate.sh run   # starts mqtts container, maps port 1883
+docker logs -f mqtts              # follow logs
+docker rm -f mqtts                # stop and remove
 ```
 
 ## Architecture Overview
@@ -85,6 +97,17 @@ ctest --output-on-failure
 - `MQTTAuthManager` coordinates provider chain
 - Password hashing via OpenSSL
 
+**Event Forwarding (`src/events/`)**
+- `MQTTEventForwardingService` / `MQTTEventForwardingQueue`: Async forwarding of lifecycle events (login, logout, publish) to an external RPC endpoint
+- Events are batched for efficiency; configured via `event_forwarding` section in YAML
+
+**Forwarding Service (`src/forwarding/`)**
+- `MQTTForwardingService`: Accepts inbound forwarded messages from remote MQTT broker instances
+- `MQTTForwardingRpcClient`: Sends messages to remote brokers; used by cluster deployments alongside the Router Service
+
+**HTTP Parser (`src/http/`)**
+- `HttpParser` / `HttpMessage`: Lightweight HTTP/1.1 request-response handling, used internally for WebSocket upgrade handshakes
+
 ### Dependencies
 - **libco**: Coroutine library for async I/O (included in 3rd/)
 - **spdlog**: High-performance logging (included in 3rd/)
@@ -111,6 +134,10 @@ The server uses a hybrid threading + coroutine model:
 - **Producer-Consumer**: Async message queues between threads
 - **Read-Write Lock**: RWMutex for client index (read-heavy workload)
 - **Copy-on-Write**: `ConcurrentTopicTree` for lock-free reads
+
+### Protocol Support
+- Primary: MQTT v5.0
+- MQTT 3.1 / 3.1.1 compatibility is **enabled by default** via `mqtt.allow_mqtt3x: true` in `mqtts.yaml`; set to `false` to restrict to v5.0 only
 
 ### Configuration
 - Default config: `mqtts.yaml`

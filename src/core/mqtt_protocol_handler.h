@@ -166,12 +166,17 @@ class MQTTProtocolHandler
 
   // Current authenticated user info
   auth::UserInfo* current_user_info_;
+  auth::ClientAuthContext* current_auth_context_;
 
   // Helper method to unregister from session manager
   void cleanup_session_registration(const char* context = nullptr);
 
   // Helper method to register with session manager
   int register_session_with_manager();
+
+  // Helper methods for CONNECT auth/reject flow
+  int ensure_auth_state();
+  int reject_connect_request(uint8_t protocol_version, ReasonCode reason_code, int err_code);
 };
 
 }  // namespace mqtt

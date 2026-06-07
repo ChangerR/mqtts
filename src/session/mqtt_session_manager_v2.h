@@ -21,6 +21,9 @@
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
 #include "mqtt_event_forwarding_service.h"
+#include "forwarding_connection_pool.h"
+#include "mqtt_forwarding_rpc_client.h"
+#include "mqtt_forwarding_service.h"
 #include "mqtt_router_rpc_client.h"
 
 namespace mqtt {
@@ -454,6 +457,13 @@ class GlobalSessionManager
   void set_router_client(std::unique_ptr<MQTTRouterRpcClient> router_client);
 
   /**
+   * @brief 设置集群配置
+   * @param cluster_config 集群配置
+   * @return MQ_SUCCESS成功，其他值失败
+   */
+  int set_cluster_config(const ClusterConfig& cluster_config);
+
+  /**
    * @brief 获取路由RPC客户端
    * @return 路由RPC客户端指针
    */
@@ -476,6 +486,7 @@ class GlobalSessionManager
    * @return MQ_SUCCESS成功，其他值失败
    */
   int register_with_router();
+  int heartbeat_with_router();
 
   /**
    * @brief 通知路由器客户端连接
@@ -509,6 +520,7 @@ class GlobalSessionManager
    * @return MQ_SUCCESS成功，其他值失败
    */
   int subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+  int subscribe_topic_cluster(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
 
   /**
    * @brief 通过路由器取消订阅主题
@@ -517,6 +529,7 @@ class GlobalSessionManager
    * @return MQ_SUCCESS成功，其他值失败
    */
   int unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id);
+  int unsubscribe_topic_cluster(const MQTTString& topic_filter, const MQTTString& client_id);
 
   /**
    * @brief 通过路由器转发PUBLISH消息
@@ -527,6 +540,10 @@ class GlobalSessionManager
    */
   int forward_publish_via_router(const MQTTString& topic, const PublishPacket& packet,
                                 const MQTTString& sender_client_id);
+  int forward_publish_cluster(const MQTTString& topic,
+                              const PublishPacket& packet,
+                              const MQTTString& sender_client_id,
+                              int& delivered_count);
 
   /**
    * @brief 检查路由器是否可用
@@ -566,7 +583,11 @@ class GlobalSessionManager
 
   // 路由RPC客户端
   std::unique_ptr<MQTTRouterRpcClient> router_client_;
+  std::unique_ptr<ForwardingConnectionPool> forwarding_pool_;
+  std::unique_ptr<MQTTForwardingRpcClient> forwarding_client_;
+  std::unique_ptr<MQTTForwardingService> forwarding_service_;
   MQTTString server_id_;
+  ClusterConfig cluster_config_;
 
   // 线程本地缓存（避免重复查找）
   thread_local static GlobalSessionManager* cached_manager_owner_;
