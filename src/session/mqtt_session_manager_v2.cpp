@@ -1788,13 +1788,15 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
         ret = unsubscribe_topic(topic_filter, client_id);
         if (MQ_SUCC(ret)) {
           local_unsubscribed = true;
-          ret = router_client_->unsubscribe(request);
-          if (MQ_FAIL(ret)) {
+          int router_ret = router_client_->unsubscribe(request);
+          ret = router_ret;
+          if (MQ_FAIL(router_ret)) {
             int restore_ret = subscribe_topic(topic_filter, client_id, subscribed_qos);
             if (MQ_FAIL(restore_ret)) {
               LOG_WARN("Failed to restore local subscription after router unsubscribe failure, topic={}, client_id={}, restore_ret={}",
                        from_mqtt_string(topic_filter), from_mqtt_string(client_id), restore_ret);
             }
+            ret = router_ret;
           }
         }
       }

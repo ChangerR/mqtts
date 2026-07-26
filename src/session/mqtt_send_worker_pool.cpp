@@ -38,11 +38,8 @@ int SendWorkerPool::start()
 
   should_stop_.store(false);
 
-  // 创建Worker协程
+  // 创建Worker协程任务
   for (size_t i = 0; i < worker_count_; ++i) {
-    stCoRoutineAttr_t attr;
-    attr.stack_size = 128 * 1024;  // 128KB栈空间
-
     // 创建Worker上下文结构
     struct WorkerContext
     {
@@ -52,30 +49,33 @@ int SendWorkerPool::start()
 
     WorkerContext* ctx = new WorkerContext{this, i};
 
-    int ret = co_create(
-        &workers_[i]->worker_coroutine, &attr,
+    workers_[i]->worker_task = runtime::current_runtime().spawn(
         [](void* arg) -> void* {
           WorkerContext* ctx = static_cast<WorkerContext*>(arg);
           ctx->pool->worker_main(ctx->worker_id);
           delete ctx;
           return nullptr;
         },
-        ctx);
+        ctx, 128 * 1024);
 
-    if (ret != 0) {
-      LOG_ERROR("Failed to create worker coroutine {}: {}", i, ret);
+    if (!workers_[i]->worker_task.is_valid()) {
+      LOG_ERROR("Failed to create worker task {}", i);
       delete ctx;
-      stop();
+      should_stop_.store(true);
+      for (size_t j = 0; j <= i && j < worker_count_; ++j) {
+        workers_[j]->task_available.broadcast();
+      }
+      for (size_t j = 0; j <= i && j < worker_count_; ++j) {
+        if (workers_[j]->worker_task.is_valid()) {
+          workers_[j]->worker_task.join(1000);
+          workers_[j]->worker_task.release();
+        }
+      }
       return MQ_ERR_MEMORY_ALLOC;
     }
   }
 
   running_.store(true);
-
-  // 启动所有Worker协程
-  for (size_t i = 0; i < worker_count_; ++i) {
-    co_resume(workers_[i]->worker_coroutine);
-  }
 
   LOG_INFO("SendWorkerPool started with {} workers", worker_count_);
   return MQ_SUCCESS;
@@ -83,7 +83,15 @@ int SendWorkerPool::start()
 
 void SendWorkerPool::stop()
 {
-  if (!running_.load()) {
+  bool has_worker_tasks = false;
+  for (size_t i = 0; i < worker_count_; ++i) {
+    if (workers_[i]->worker_task.is_valid()) {
+      has_worker_tasks = true;
+      break;
+    }
+  }
+
+  if (!running_.load() && !has_worker_tasks) {
     return;
   }
 
@@ -96,10 +104,10 @@ void SendWorkerPool::stop()
 
   // 等待所有Worker协程结束
   for (size_t i = 0; i < worker_count_; ++i) {
-    if (workers_[i]->worker_coroutine) {
-      co_release(workers_[i]->worker_coroutine);
-      workers_[i]->worker_coroutine = nullptr;
+    if (workers_[i]->worker_task.is_valid() && workers_[i]->worker_task.join(1000) != 0) {
+      LOG_WARN("Worker {} did not stop before timeout; detaching task", i);
     }
+    workers_[i]->worker_task.release();
   }
 
   // 清空所有队列

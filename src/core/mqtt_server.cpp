@@ -62,8 +62,7 @@ static std::string generate_session_trace_id(const std::string& client_ip, int c
 }  // namespace
 
 MQTTServer::MQTTServer(const std::string& host, int port)
-    : accept_co_(NULL),
-      server_socket_(NULL),
+    : server_socket_(NULL),
       running_(false),
       host_(host),
       port_(port),
@@ -80,8 +79,7 @@ MQTTServer::MQTTServer(const std::string& host, int port)
 
 MQTTServer::MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config,
                        const mqtt::MQTTProtocolConfig& mqtt_protocol_config)
-    : accept_co_(NULL),
-      server_socket_(NULL),
+    : server_socket_(NULL),
       running_(false),
       host_(config.bind_address),
       port_(config.port),
@@ -174,18 +172,21 @@ void MQTTServer::run()
     return;
   }
 
-  // Create accept coroutine
-  co_create(&accept_co_, NULL, accept_routine, this);
-  co_resume(accept_co_);
+  mqtt::runtime::TaskHandle accept_task =
+      mqtt::runtime::current_runtime().spawn(accept_routine, this);
+  if (!accept_task.is_valid()) {
+    LOG_ERROR("Failed to create accept task");
+    return;
+  }
 
   LOG_INFO("MQTT Server running on {}:{}", host_, port_);
 
   // Use eventloop with callback for pending message processing
-  co_eventloop(co_get_epoll_ct(), eventloop_callback, this);
+  mqtt::runtime::current_runtime().run_event_loop(eventloop_callback, this);
 
-  if (MQ_NOT_NULL(accept_co_)) {
-    co_release(accept_co_);
-    accept_co_ = NULL;
+  {
+    std::lock_guard<std::mutex> lock(client_tasks_mutex_);
+    client_tasks_.clear();
   }
 }
 
@@ -226,18 +227,11 @@ void* MQTTServer::accept_routine(void* arg)
     if (!server->can_accept_connection()) {
       LOG_WARN("达到最大连接数限制 ({}), 等待连接释放", server->server_config_.max_connections);
       // 等待一段时间后继续检查
-      struct pollfd pf = {0};
-      pf.fd = server->server_socket_->get_fd();
-      pf.events = (POLLIN | POLLERR | POLLHUP);
-      co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 1秒超时
+      mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
       continue;
     }
 
-    // Use co_poll to wait for new connection
-    struct pollfd pf = {0};
-    pf.fd = server->server_socket_->get_fd();
-    pf.events = (POLLIN | POLLERR | POLLHUP);
-    co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // 100ms timeout
+    mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
     // Check if socket is still valid
     if (!server->server_socket_->is_connected()) {
       LOG_WARN("Server socket disconnected");
@@ -299,10 +293,25 @@ void* MQTTServer::accept_routine(void* arg)
     ctx->trace_id = generate_session_trace_id(ctx->client_ip, ctx->client_port);
     ctx->allocator = client_allocator;
 
-    // Create client coroutine
-    stCoRoutine_t* co = NULL;
-    co_create(&co, NULL, client_routine, ctx);
-    co_resume(co);
+    mqtt::runtime::TaskHandle client_task =
+        mqtt::runtime::current_runtime().spawn(client_routine, ctx);
+    if (!client_task.is_valid()) {
+      LOG_ERROR("Failed to create client task for {}:{}", ctx->client_ip, ctx->client_port);
+      if (MQ_NOT_NULL(client)) {
+        client->close();
+        client->~MQTTSocket();
+        root->deallocate(client, sizeof(MQTTSocket));
+      }
+      server->remove_connection();
+      ctx->~ClientContext();
+      client_allocator->deallocate(ctx, sizeof(ClientContext));
+      root->remove_child(client_id);
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(server->client_tasks_mutex_);
+      server->client_tasks_.push_back(std::move(client_task));
+    }
   }
 
   return NULL;

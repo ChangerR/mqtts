@@ -10,8 +10,8 @@
 #include "mqtt_define.h"
 #include "mqtt_string_utils.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_runtime.h"
 #include "mqtt_socket.h"
-#include "co_routine.h"
 
 using namespace mqtt;
 
@@ -320,7 +320,7 @@ private:
     MQTTSocket* socket_;
     std::atomic<bool> connected_;
     std::atomic<bool> should_stop_;
-    stCoRoutine_t* heartbeat_coroutine_;
+    mqtt::runtime::TaskHandle heartbeat_task_;
     CoroCondition heartbeat_cond_;
     
     std::atomic<uint32_t> next_request_id_;

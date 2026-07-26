@@ -7,6 +7,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include "mqtt_allocator.h"
@@ -15,7 +16,7 @@
 #include "mqtt_event_types.h"
 #include "mqtt_string_utils.h"
 #include "mqtt_stl_allocator.h"
-#include "co_routine.h"
+#include "mqtt_runtime.h"
 #include "mqtt_router_rpc_client.h"
 
 using namespace mqtt;
@@ -373,7 +374,6 @@ private:
         MQTTRouterService* service;
         int client_fd;
         int thread_id;
-        stCoRoutine_t* coroutine;
         MQTTAllocator* allocator;
         RouterConnectionContext connection_ctx;
         
@@ -381,7 +381,6 @@ private:
             : service(svc)
             , client_fd(fd)
             , thread_id(tid)
-            , coroutine(nullptr)
             , allocator(alloc)
             , connection_ctx(alloc)
         {}
@@ -396,6 +395,8 @@ private:
     std::unique_ptr<MQTTRouterRpcHandler> rpc_handler_;
     
     std::vector<std::thread> worker_threads_;
+    std::mutex client_tasks_mutex_;
+    std::vector<mqtt::runtime::TaskHandle> client_tasks_;
     std::thread snapshot_thread_;
     std::atomic<bool> should_stop_;
     

@@ -931,6 +931,11 @@ int MQTTRouterService::stop()
     }
     worker_threads_.clear();
 
+    {
+        std::lock_guard<std::mutex> lock(client_tasks_mutex_);
+        client_tasks_.clear();
+    }
+
     if (snapshot_thread_.joinable()) {
         snapshot_thread_.join();
     }
@@ -973,8 +978,15 @@ void MQTTRouterService::snapshot_thread_func()
 void MQTTRouterService::handle_client_connection(int client_fd)
 {
     ClientContext* context = new ClientContext(this, client_fd, 0, thread_local_allocator_);
-    co_create(&context->coroutine, NULL, client_coroutine_func, context);
-    co_resume(context->coroutine);
+    mqtt::runtime::TaskHandle task =
+        mqtt::runtime::current_runtime().spawn(client_coroutine_func, context);
+    if (!task.is_valid()) {
+        ::close(client_fd);
+        delete context;
+    } else {
+        std::lock_guard<std::mutex> lock(client_tasks_mutex_);
+        client_tasks_.push_back(std::move(task));
+    }
 }
 
 void* MQTTRouterService::client_coroutine_func(void* arg)

@@ -91,7 +91,6 @@ MQTTForwardingService::MQTTForwardingService(MQTTAllocator* allocator,
     , host_(host)
     , port_(port)
     , server_socket_(NULL)
-    , accept_coroutine_(NULL)
     , should_stop_(false)
     , running_(false)
     , worker_thread_()
@@ -166,12 +165,11 @@ void MQTTForwardingService::destroy_server_socket()
 void MQTTForwardingService::worker_main()
 {
   if (MQ_NOT_NULL(server_socket_)) {
-    (void)co_create(&accept_coroutine_, NULL, accept_routine, this);
-    if (MQ_NOT_NULL(accept_coroutine_)) {
-      co_resume(accept_coroutine_);
-      co_eventloop(co_get_epoll_ct(), eventloop_callback, this);
-      co_release(accept_coroutine_);
-      accept_coroutine_ = NULL;
+    accept_task_ = runtime::current_runtime().spawn(accept_routine, this);
+    if (accept_task_.is_valid()) {
+      runtime::current_runtime().run_event_loop(eventloop_callback, this);
+      client_tasks_.clear();
+      accept_task_.release();
     }
   }
 }
@@ -186,12 +184,9 @@ void* MQTTForwardingService::accept_routine(void* arg)
   }
 
   while (MQ_SUCC(ret) && !service->should_stop_.load()) {
-    struct pollfd pf = {0};
     MQTTSocket* client = NULL;
 
-    pf.fd = service->server_socket_->get_fd();
-    pf.events = (POLLIN | POLLERR | POLLHUP);
-    (void)co_poll(co_get_epoll_ct(), &pf, 1, 1000);
+    (void)runtime::current_runtime().wait_readable(service->server_socket_->get_fd(), 1000);
 
     if (service->should_stop_.load() || !service->server_socket_->is_connected()) {
       break;
@@ -204,8 +199,6 @@ void* MQTTForwardingService::accept_routine(void* arg)
       LOG_WARN("Forwarding service accept failed, ret={}", ret);
     } else {
       ForwardingClientContext* ctx = NULL;
-      stCoRoutine_t* client_co = NULL;
-
       ctx = static_cast<ForwardingClientContext*>(service->allocator_->allocate(
           sizeof(ForwardingClientContext)));
       if (MQ_ISNULL(ctx)) {
@@ -214,13 +207,13 @@ void* MQTTForwardingService::accept_routine(void* arg)
       } else {
         ctx->service = service;
         ctx->client = client;
-        (void)co_create(&client_co, NULL, client_routine, ctx);
-        if (MQ_ISNULL(client_co)) {
+        runtime::TaskHandle client_task = runtime::current_runtime().spawn(client_routine, ctx);
+        if (!client_task.is_valid()) {
           service->allocator_->deallocate(ctx, sizeof(ForwardingClientContext));
           destroy_client_socket(client);
           ret = MQ_ERR_MEMORY_ALLOC;
         } else {
-          co_resume(client_co);
+          service->client_tasks_.push_back(std::move(client_task));
           ret = MQ_SUCCESS;
         }
       }

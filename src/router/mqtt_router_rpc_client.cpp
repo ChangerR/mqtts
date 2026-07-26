@@ -66,7 +66,6 @@ MQTTRouterRpcClient::MQTTRouterRpcClient(MQTTAllocator* allocator, const RpcClie
     , socket_(NULL)
     , connected_(false)
     , should_stop_(false)
-    , heartbeat_coroutine_(NULL)
     , next_request_id_(1)
     , last_error_time_(0)
     , last_error_code_(MQ_SUCCESS)
@@ -112,9 +111,6 @@ int MQTTRouterRpcClient::set_cluster_config(const ClusterConfig& config)
 int MQTTRouterRpcClient::connect()
 {
     int ret = MQ_SUCCESS;
-    stCoRoutineAttr_t attr;
-    std::memset(&attr, 0, sizeof(attr));
-
     if (connected_.load()) {
         ret = MQ_SUCCESS;
     } else if (MQ_FAIL(connect_to_server())) {
@@ -122,16 +118,13 @@ int MQTTRouterRpcClient::connect()
     } else {
         connected_.store(true);
         should_stop_.store(false);
-        if (config_.enable_heartbeat && NULL == heartbeat_coroutine_) {
-            attr.stack_size = 128 * 1024;
-            ret = co_create(&heartbeat_coroutine_, &attr, heartbeat_routine, this);
-            if (MQ_FAIL(ret)) {
-                LOG_ERROR("Failed to create router heartbeat coroutine, ret={}", ret);
+        if (config_.enable_heartbeat && !heartbeat_task_.is_valid()) {
+            heartbeat_task_ = mqtt::runtime::current_runtime().spawn(heartbeat_routine, this, 128 * 1024);
+            if (!heartbeat_task_.is_valid()) {
+                LOG_ERROR("Failed to create router heartbeat task");
                 ret = MQ_ERR_MEMORY_ALLOC;
                 connected_.store(false);
                 destroy_socket();
-            } else {
-                co_resume(heartbeat_coroutine_);
             }
         }
     }
@@ -149,10 +142,7 @@ int MQTTRouterRpcClient::disconnect()
 
     destroy_socket();
 
-    if (NULL != heartbeat_coroutine_) {
-        co_release(heartbeat_coroutine_);
-        heartbeat_coroutine_ = NULL;
-    }
+    heartbeat_task_.release();
 
     return ret;
 }

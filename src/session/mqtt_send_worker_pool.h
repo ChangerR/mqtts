@@ -66,10 +66,10 @@ struct WorkerSendTask
 };
 
 /**
- * @brief 协程友好的发送Worker池
+ * @brief 协程友好的发送调度池
  *
  * 专门负责执行实际的消息发送操作，避免在主事件循环中阻塞
- * 使用协程锁和协程同步原语，完全协程友好
+ * 使用运行时抽象的协程任务和同步原语；不是OS线程池。
  */
 class SendWorkerPool
 {
@@ -140,7 +140,7 @@ class SendWorkerPool
     CoroCondition task_available;
     std::atomic<size_t> processed_count{0};
     std::atomic<size_t> failed_count{0};
-    stCoRoutine_t* worker_coroutine = nullptr;
+    runtime::TaskHandle worker_task;
   };
 
   /**

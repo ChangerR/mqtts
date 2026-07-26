@@ -2,8 +2,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <openssl/sha.h>
@@ -315,6 +318,21 @@ public:
     }
 
 private:
+    static std::string lowercase(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    }
+
+    static std::string trim_header_value(std::string value) {
+        while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
+                                  value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
+        }
+        size_t first = value.find_first_not_of(" \t");
+        return first == std::string::npos ? "" : value.substr(first);
+    }
+
     bool perform_handshake() {
         // Generate WebSocket key
         std::string ws_key = generate_websocket_key();
@@ -354,7 +372,24 @@ private:
 
         // Verify accept key
         std::string expected_accept = compute_accept_key(ws_key);
-        if (response.find("Sec-WebSocket-Accept: " + expected_accept) == std::string::npos) {
+        bool found_accept = false;
+        std::istringstream response_stream(response);
+        std::string line;
+        while (std::getline(response_stream, line)) {
+            size_t separator = line.find(':');
+            if (separator == std::string::npos) {
+                continue;
+            }
+
+            std::string name = lowercase(line.substr(0, separator));
+            std::string value = trim_header_value(line.substr(separator + 1));
+            if (name == "sec-websocket-accept" && value == expected_accept) {
+                found_accept = true;
+                break;
+            }
+        }
+
+        if (!found_accept) {
             std::cerr << "Invalid accept key in handshake response" << std::endl;
             return false;
         }
