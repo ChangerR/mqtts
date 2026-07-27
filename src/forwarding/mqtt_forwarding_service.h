@@ -35,6 +35,7 @@ class MQTTForwardingService
   void worker_main();
   int handle_client(MQTTSocket* client);
   void destroy_server_socket();
+  void release_finished_client_tasks();
 
   MQTTAllocator* allocator_;
   GlobalSessionManager* session_manager_;

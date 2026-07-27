@@ -1789,7 +1789,6 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
         if (MQ_SUCC(ret)) {
           local_unsubscribed = true;
           int router_ret = router_client_->unsubscribe(request);
-          ret = router_ret;
           if (MQ_FAIL(router_ret)) {
             int restore_ret = subscribe_topic(topic_filter, client_id, subscribed_qos);
             if (MQ_FAIL(restore_ret)) {

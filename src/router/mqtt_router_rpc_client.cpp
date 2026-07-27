@@ -142,6 +142,11 @@ int MQTTRouterRpcClient::disconnect()
 
     destroy_socket();
 
+    // join() only succeeds on the thread that spawned the heartbeat; from any
+    // other thread the task is detached instead of being torn down under it.
+    if (heartbeat_task_.is_valid() && heartbeat_task_.join(2000) != 0) {
+        LOG_WARN("Router heartbeat task did not stop before timeout; detaching it");
+    }
     heartbeat_task_.release();
 
     return ret;

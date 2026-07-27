@@ -162,14 +162,37 @@ void MQTTForwardingService::destroy_server_socket()
   }
 }
 
+// Client tasks are created and reclaimed on this service's worker thread only.
+void MQTTForwardingService::release_finished_client_tasks()
+{
+  size_t kept = 0;
+  for (size_t i = 0; i < client_tasks_.size(); ++i) {
+    if (client_tasks_[i].is_finished()) {
+      client_tasks_[i].release();
+    } else {
+      if (kept != i) {
+        client_tasks_[kept] = std::move(client_tasks_[i]);
+      }
+      ++kept;
+    }
+  }
+  client_tasks_.resize(kept);
+}
+
 void MQTTForwardingService::worker_main()
 {
   if (MQ_NOT_NULL(server_socket_)) {
     accept_task_ = runtime::current_runtime().spawn(accept_routine, this);
     if (accept_task_.is_valid()) {
       runtime::current_runtime().run_event_loop(eventloop_callback, this);
-      client_tasks_.clear();
+
+      // The accept coroutine observes should_stop_ once its poll wakes up, so it
+      // is given a bounded chance to unwind before the handle is dropped.
+      if (accept_task_.join(2000) != 0) {
+        LOG_WARN("Forwarding accept task did not stop before timeout; detaching it");
+      }
       accept_task_.release();
+      client_tasks_.clear();
     }
   }
 }
@@ -213,6 +236,7 @@ void* MQTTForwardingService::accept_routine(void* arg)
           destroy_client_socket(client);
           ret = MQ_ERR_MEMORY_ALLOC;
         } else {
+          service->release_finished_client_tasks();
           service->client_tasks_.push_back(std::move(client_task));
           ret = MQ_SUCCESS;
         }
@@ -241,8 +265,11 @@ int MQTTForwardingService::eventloop_callback(void* arg)
   MQTTForwardingService* service = static_cast<MQTTForwardingService*>(arg);
   int ret = 0;
 
-  if (NULL != service && service->should_stop_.load()) {
-    ret = -1;
+  if (NULL != service) {
+    service->release_finished_client_tasks();
+    if (service->should_stop_.load()) {
+      ret = -1;
+    }
   }
 
   return ret;

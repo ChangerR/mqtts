@@ -37,6 +37,7 @@ int SendWorkerPool::start()
   }
 
   should_stop_.store(false);
+  owner_thread_ = std::this_thread::get_id();
 
   // 创建Worker协程任务
   for (size_t i = 0; i < worker_count_; ++i) {
@@ -61,16 +62,9 @@ int SendWorkerPool::start()
     if (!workers_[i]->worker_task.is_valid()) {
       LOG_ERROR("Failed to create worker task {}", i);
       delete ctx;
-      should_stop_.store(true);
-      for (size_t j = 0; j <= i && j < worker_count_; ++j) {
-        workers_[j]->task_available.broadcast();
-      }
-      for (size_t j = 0; j <= i && j < worker_count_; ++j) {
-        if (workers_[j]->worker_task.is_valid()) {
-          workers_[j]->worker_task.join(1000);
-          workers_[j]->worker_task.release();
-        }
-      }
+      // spawn() already started the previous workers, so they have to be shut
+      // down explicitly: running_ is still false and stop() cannot do it.
+      shutdown_workers();
       return MQ_ERR_MEMORY_ALLOC;
     }
   }
@@ -79,6 +73,36 @@ int SendWorkerPool::start()
 
   LOG_INFO("SendWorkerPool started with {} workers", worker_count_);
   return MQ_SUCCESS;
+}
+
+void SendWorkerPool::shutdown_workers()
+{
+  should_stop_.store(true);
+
+  // 协程条件变量和协程栈都只能由创建它们的线程操作：从其他线程唤醒会把Worker协程
+  // 调度到错误的线程上，释放协程栈则会与归属线程竞争。因此跨线程停止时只设置停止
+  // 标志并放弃句柄，由归属线程的事件循环收尾。
+  const bool on_owner_thread = (owner_thread_ == std::this_thread::get_id());
+  if (!on_owner_thread) {
+    for (size_t i = 0; i < worker_count_; ++i) {
+      workers_[i]->worker_task.release();
+    }
+    LOG_WARN("SendWorkerPool stopped from a foreign thread; worker tasks were detached");
+    return;
+  }
+
+  // 通知所有Worker停止
+  for (size_t i = 0; i < worker_count_; ++i) {
+    workers_[i]->task_available.broadcast();
+  }
+
+  // 等待所有Worker协程结束
+  for (size_t i = 0; i < worker_count_; ++i) {
+    if (workers_[i]->worker_task.is_valid() && workers_[i]->worker_task.join(1000) != 0) {
+      LOG_WARN("Worker {} did not stop before timeout; detaching task", i);
+    }
+    workers_[i]->worker_task.release();
+  }
 }
 
 void SendWorkerPool::stop()
@@ -95,20 +119,7 @@ void SendWorkerPool::stop()
     return;
   }
 
-  should_stop_.store(true);
-
-  // 通知所有Worker停止
-  for (size_t i = 0; i < worker_count_; ++i) {
-    workers_[i]->task_available.broadcast();
-  }
-
-  // 等待所有Worker协程结束
-  for (size_t i = 0; i < worker_count_; ++i) {
-    if (workers_[i]->worker_task.is_valid() && workers_[i]->worker_task.join(1000) != 0) {
-      LOG_WARN("Worker {} did not stop before timeout; detaching task", i);
-    }
-    workers_[i]->worker_task.release();
-  }
+  shutdown_workers();
 
   // 清空所有队列
   for (size_t i = 0; i < worker_count_; ++i) {

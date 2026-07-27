@@ -395,8 +395,6 @@ private:
     std::unique_ptr<MQTTRouterRpcHandler> rpc_handler_;
     
     std::vector<std::thread> worker_threads_;
-    std::mutex client_tasks_mutex_;
-    std::vector<mqtt::runtime::TaskHandle> client_tasks_;
     std::thread snapshot_thread_;
     std::atomic<bool> should_stop_;
     
@@ -405,6 +403,9 @@ private:
     // Thread-local data
     static thread_local std::vector<ClientContext*> thread_local_clients_;
     static thread_local MQTTAllocator* thread_local_allocator_;
+    // Client coroutines may only be reclaimed by the worker thread that spawned
+    // them, so their handles never leave that thread.
+    static thread_local std::vector<mqtt::runtime::TaskHandle> thread_local_client_tasks_;
 };
 
 #endif // MQTT_ROUTER_SERVICE_H

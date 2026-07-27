@@ -2,6 +2,7 @@
 #define MQTT_SESSION_INFO_H
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include "mqtt_coroutine_utils.h"
 
@@ -42,14 +43,22 @@ struct SessionInfo
    */
   bool wait_for_zero_refs(int timeout_ms = 5000) const
   {
+    // 底层无法区分"被唤醒"和"超时"，因此这里自己维护截止时间，否则唤醒后引用计数
+    // 仍未归零时会无限循环。
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
     while (ref_count.load() > 0) {
-      // 使用协程信号量等待
-      int result = zero_refs_cond.wait(timeout_ms);
-      if (result != 0) {
-        // 超时或出错
+      const int64_t remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    deadline - std::chrono::steady_clock::now())
+                                    .count();
+      if (remaining <= 0) {
         return false;
       }
-      // 被唤醒后再次检查引用计数
+
+      if (zero_refs_cond.wait(static_cast<int>(remaining)) != 0) {
+        return false;
+      }
     }
     return true;
   }

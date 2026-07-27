@@ -154,7 +154,11 @@ int MQTTSocket::send(const uint8_t* buf, int len)
         if (errno == EINTR)
           continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          mqtt::runtime::current_runtime().wait_writable(fd_, -1);
+          if (mqtt::runtime::current_runtime().wait_writable(fd_, -1) < 0) {
+            LOG_ERROR("Failed to wait for socket to become writable - {}", strerror(errno));
+            connected_ = false;
+            ret = MQ_ERR_SOCKET_SEND;
+          }
           continue;
         } else {
           LOG_ERROR("Failed to send data - {}", strerror(errno));
@@ -198,7 +202,11 @@ int MQTTSocket::recv(char* buf, int& len)
         if (errno == EINTR) {
           continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          mqtt::runtime::current_runtime().wait_readable(fd_, 1000);
+          if (mqtt::runtime::current_runtime().wait_readable(fd_, 1000) < 0) {
+            LOG_ERROR("Failed to wait for socket to become readable - {}", strerror(errno));
+            connected_ = false;
+            ret = MQ_ERR_SOCKET_RECV;
+          }
           continue;
         } else {
           LOG_ERROR("Failed to receive data - {}", strerror(errno));

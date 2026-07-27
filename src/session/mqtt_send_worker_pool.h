@@ -5,6 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <queue>
+#include <thread>
 #include <vector>
 
 #include "mqtt_coroutine_utils.h"
@@ -163,11 +164,18 @@ class SendWorkerPool
    */
   size_t select_worker() const;
 
+  /**
+   * @brief 停止并回收所有Worker协程，必须在创建它们的线程上调用
+   */
+  void shutdown_workers();
+
  private:
   size_t worker_count_;
   size_t max_queue_size_;
   std::atomic<bool> running_;
   std::atomic<bool> should_stop_;
+  // 创建Worker协程的线程，只有该线程可以唤醒和回收它们
+  std::thread::id owner_thread_;
 
   std::vector<std::unique_ptr<WorkerData>> workers_;
 

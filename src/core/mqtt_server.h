@@ -65,6 +65,4 @@ class MQTTServer
 
   // 连接管理
   std::atomic<int> current_connections_;
-  std::mutex client_tasks_mutex_;
-  std::vector<mqtt::runtime::TaskHandle> client_tasks_;
 };

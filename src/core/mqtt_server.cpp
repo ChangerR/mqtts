@@ -45,6 +45,32 @@ static uint32_t encode_client_ip(const std::string& ip)
   return static_cast<uint32_t>(std::hash<std::string>{}(ip));
 }
 
+// Client tasks belong to the thread that accepted them: every worker thread runs
+// its own accept coroutine and event loop, and a libco coroutine may only be
+// reclaimed by its owning thread.
+static std::vector<mqtt::runtime::TaskHandle>& thread_client_tasks()
+{
+  static thread_local std::vector<mqtt::runtime::TaskHandle> tasks;
+  return tasks;
+}
+
+static void release_finished_client_tasks()
+{
+  std::vector<mqtt::runtime::TaskHandle>& tasks = thread_client_tasks();
+  size_t kept = 0;
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    if (tasks[i].is_finished()) {
+      tasks[i].release();
+    } else {
+      if (kept != i) {
+        tasks[kept] = std::move(tasks[i]);
+      }
+      ++kept;
+    }
+  }
+  tasks.resize(kept);
+}
+
 static std::string generate_session_trace_id(const std::string& client_ip, int client_port)
 {
   const uint64_t ts_us =
@@ -184,10 +210,7 @@ void MQTTServer::run()
   // Use eventloop with callback for pending message processing
   mqtt::runtime::current_runtime().run_event_loop(eventloop_callback, this);
 
-  {
-    std::lock_guard<std::mutex> lock(client_tasks_mutex_);
-    client_tasks_.clear();
-  }
+  thread_client_tasks().clear();
 }
 
 void MQTTServer::stop()
@@ -308,10 +331,9 @@ void* MQTTServer::accept_routine(void* arg)
       root->remove_child(client_id);
       continue;
     }
-    {
-      std::lock_guard<std::mutex> lock(server->client_tasks_mutex_);
-      server->client_tasks_.push_back(std::move(client_task));
-    }
+
+    release_finished_client_tasks();
+    thread_client_tasks().push_back(std::move(client_task));
   }
 
   return NULL;
@@ -462,6 +484,8 @@ void MQTTServer::handle_client(ClientContext* ctx)
 int MQTTServer::eventloop_callback(void* arg)
 {
   MQTTServer* server = (MQTTServer*)arg;
+
+  release_finished_client_tasks();
 
   // Only process if server is still running
   if (!server->running_) {
