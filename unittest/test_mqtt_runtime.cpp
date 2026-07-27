@@ -458,6 +458,53 @@ TEST_F(RuntimeTest, TasksOwnedByEachThreadRunIndependently)
   }
 }
 
+// Waking a coroutine from another thread would queue it on that thread's run
+// list, so the wakeup has to be dropped instead.
+TEST_F(RuntimeTest, ForeignThreadWakeupsAreDropped)
+{
+  mqtt::runtime::AsyncMutex mutex;
+  std::string order;
+  MutexContext contexts[2] = {{&mutex, &order, "a", 50, false},
+                              {&mutex, &order, "b", 0, false}};
+
+  mqtt::runtime::TaskHandle first =
+      mqtt::runtime::current_runtime().spawn(mutex_task, &contexts[0], 64 * 1024);
+  mqtt::runtime::TaskHandle second =
+      mqtt::runtime::current_runtime().spawn(mutex_task, &contexts[1], 64 * 1024);
+  ASSERT_TRUE(first.is_valid());
+  ASSERT_TRUE(second.is_valid());
+  ASSERT_EQ("a", order);
+
+  // The second task is queued on this thread's mutex; a foreign unlock/broadcast
+  // must leave it there instead of resuming it.
+  mqtt::runtime::AsyncCondition condition;
+  ConditionContext condition_ctx = {&condition, -1, false};
+  mqtt::runtime::TaskHandle waiter =
+      mqtt::runtime::current_runtime().spawn(condition_wait_task, &condition_ctx, 64 * 1024);
+  ASSERT_TRUE(waiter.is_valid());
+  ASSERT_FALSE(condition_ctx.woken);
+
+  std::thread foreign([&mutex, &condition]() {
+    mutex.unlock();
+    condition.broadcast();
+    condition.signal();
+  });
+  foreign.join();
+
+  EXPECT_FALSE(contexts[1].done);
+  EXPECT_FALSE(condition_ctx.woken);
+  EXPECT_EQ("a", order);
+
+  // Undo the foreign unlock so the owning thread can still drain both tasks.
+  mutex.lock();
+  mqtt::runtime::current_runtime().run_event_loop(stop_when_both_done, contexts);
+  EXPECT_EQ("ab", order);
+  mutex.unlock();
+
+  mqtt::runtime::current_runtime().run_event_loop(stop_when_woken, &condition_ctx);
+  EXPECT_TRUE(condition_ctx.woken);
+}
+
 // A libco coroutine may only be resumed or freed by the thread that created it,
 // so a foreign join is rejected and a foreign release only drops the handle.
 TEST_F(RuntimeTest, ForeignThreadCannotJoinOrReclaimTask)

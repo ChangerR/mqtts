@@ -165,7 +165,8 @@ class SendWorkerPool
   size_t select_worker() const;
 
   /**
-   * @brief 停止并回收所有Worker协程，必须在创建它们的线程上调用
+   * @brief 停止Worker协程。在创建它们的线程上会唤醒、等待并回收；
+   *        在其他线程上只放弃句柄，由归属线程收尾。
    */
   void shutdown_workers();
 

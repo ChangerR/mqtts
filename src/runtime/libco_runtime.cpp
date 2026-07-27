@@ -169,17 +169,29 @@ int join_eventloop_callback(void* arg)
 struct MutexState
 {
   stCoCond_t* cond;
-  int wait_count;
+  std::atomic<int> hold_count;
+  std::atomic<void*> waiter_env;
 };
 
 struct ConditionState
 {
   stCoCond_t* cond;
-  // Thread that last suspended on this condition. Waking a coroutine from any
-  // other thread would move it onto that thread's run list, so such wakeups are
-  // dropped instead.
   std::atomic<void*> waiter_env;
 };
+
+// libco queues a woken coroutine on the current thread's run list, so a wakeup
+// issued from any thread other than the waiter's would run that coroutine on the
+// wrong thread. Such wakeups are dropped instead.
+bool can_wake_waiter(const std::atomic<void*>& waiter_env)
+{
+  void* env = co_get_curr_thread_env();
+  if (!env) {
+    return false;
+  }
+
+  void* waiter = waiter_env.load();
+  return !waiter || waiter == env;
+}
 
 }  // namespace
 
@@ -282,7 +294,8 @@ AsyncMutex::AsyncMutex() : impl_(nullptr)
 {
   MutexState* state = new MutexState();
   state->cond = co_cond_alloc();
-  state->wait_count = 0;
+  state->hold_count.store(0);
+  state->waiter_env.store(nullptr);
   if (!state->cond) {
     delete state;
     throw std::runtime_error("Failed to allocate coroutine mutex");
@@ -307,15 +320,15 @@ void AsyncMutex::lock()
     return;
   }
 
-  if (state->wait_count > 0 && is_coroutine_context()) {
-    ++state->wait_count;
+  // Each unlock() hands the mutex to exactly one queued waiter, so the count of
+  // holders plus waiters is enough to decide whether this caller has to queue.
+  if (state->hold_count.fetch_add(1) > 0 && is_coroutine_context()) {
+    state->waiter_env.store(co_get_curr_thread_env());
     co_cond_timedwait(state->cond, -1);
-    return;
   }
 
   // Outside a coroutine there is nothing to yield to, so a contended lock is
   // taken without waiting rather than corrupting libco's call stack.
-  ++state->wait_count;
 }
 
 void AsyncMutex::unlock()
@@ -325,8 +338,10 @@ void AsyncMutex::unlock()
     return;
   }
 
-  --state->wait_count;
-  co_cond_signal(state->cond);
+  state->hold_count.fetch_sub(1);
+  if (can_wake_waiter(state->waiter_env)) {
+    co_cond_signal(state->cond);
+  }
 }
 
 AsyncLockGuard::AsyncLockGuard(AsyncMutex* mutex) : mutex_(mutex)
@@ -408,21 +423,10 @@ int AsyncCondition::wait(int timeout_ms)
   return co_cond_timedwait(state->cond, timeout_ms);
 }
 
-// Wakeups only reach waiters registered on the current thread's event loop.
 bool AsyncCondition::can_wake() const
 {
   const ConditionState* state = static_cast<const ConditionState*>(impl_);
-  if (!state) {
-    return false;
-  }
-
-  void* env = co_get_curr_thread_env();
-  if (!env) {
-    return false;
-  }
-
-  void* waiter_env = state->waiter_env.load();
-  return !waiter_env || waiter_env == env;
+  return state && can_wake_waiter(state->waiter_env);
 }
 
 void AsyncCondition::signal()
