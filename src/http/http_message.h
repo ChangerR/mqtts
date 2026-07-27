@@ -34,12 +34,18 @@ struct HttpResponse {
   int status_code;
   mqtt::MQTTString reason;
   mqtt::MQTTString version;
+  // Keyed by the lowercased header name so lookups and de-duplication are case
+  // insensitive.
   HeaderMap headers;
   mqtt::MQTTBuffer body;
 
   void reset();
   void set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value);
   mqtt::MQTTString serialize() const;
+
+ private:
+  // Lowercased name -> the casing the caller asked for, used when serializing.
+  HeaderMap header_names_;
 };
 
 mqtt::MQTTString to_lower_ascii(const mqtt::MQTTString& value, MQTTAllocator* allocator);

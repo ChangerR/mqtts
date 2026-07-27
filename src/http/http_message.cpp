@@ -58,7 +58,9 @@ HttpResponse::HttpResponse(MQTTAllocator* in_allocator)
       version("HTTP/1.1", mqtt::MQTTStrAllocator(in_allocator)),
       headers(0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
               mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator)),
-      body(in_allocator) {
+      body(in_allocator),
+      header_names_(0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
+                    mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator)) {
   reason.assign("OK");
 }
 
@@ -67,12 +69,16 @@ void HttpResponse::reset() {
   reason.assign("OK");
   version.assign("HTTP/1.1");
   headers.clear();
+  header_names_.clear();
   body.clear();
 }
 
 void HttpResponse::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value) {
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   headers[key_lower] = value;
+  // Header names are case insensitive on the wire, but clients that compare them
+  // literally are common enough that the caller's casing is worth preserving.
+  header_names_[key_lower] = key;
 }
 
 mqtt::MQTTString HttpResponse::serialize() const {
@@ -93,8 +99,10 @@ mqtt::MQTTString HttpResponse::serialize() const {
   }
 
   for (HeaderMap::const_iterator it = headers.begin(); it != headers.end(); ++it) {
-    if (!buffer.append_string(it->first) || !buffer.append_cstr(": ") || !buffer.append_string(it->second) ||
-        !buffer.append_cstr("\r\n")) {
+    HeaderMap::const_iterator name = header_names_.find(it->first);
+    const mqtt::MQTTString& header_name = (name == header_names_.end()) ? it->first : name->second;
+    if (!buffer.append_string(header_name) || !buffer.append_cstr(": ") ||
+        !buffer.append_string(it->second) || !buffer.append_cstr("\r\n")) {
       return mqtt::MQTTString(mqtt::MQTTStrAllocator(allocator));
     }
   }

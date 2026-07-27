@@ -370,10 +370,20 @@ private:
             return false;
         }
 
-        // Verify accept key
+        // Only scan the header section: anything after it is already frame data.
+        size_t headers_end = response.find("\r\n\r\n");
+        if (headers_end == std::string::npos) {
+            std::cerr << "Incomplete handshake response" << std::endl;
+            return false;
+        }
+
+        // Header names are case insensitive, but the accept key itself is base64
+        // and must match exactly.
         std::string expected_accept = compute_accept_key(ws_key);
         bool found_accept = false;
-        std::istringstream response_stream(response);
+        bool found_upgrade = false;
+        bool found_connection = false;
+        std::istringstream response_stream(response.substr(0, headers_end));
         std::string line;
         while (std::getline(response_stream, line)) {
             size_t separator = line.find(':');
@@ -383,14 +393,22 @@ private:
 
             std::string name = lowercase(line.substr(0, separator));
             std::string value = trim_header_value(line.substr(separator + 1));
-            if (name == "sec-websocket-accept" && value == expected_accept) {
-                found_accept = true;
-                break;
+            if (name == "sec-websocket-accept") {
+                found_accept = (value == expected_accept);
+            } else if (name == "upgrade") {
+                found_upgrade = (lowercase(value) == "websocket");
+            } else if (name == "connection") {
+                found_connection = (lowercase(value).find("upgrade") != std::string::npos);
             }
         }
 
         if (!found_accept) {
             std::cerr << "Invalid accept key in handshake response" << std::endl;
+            return false;
+        }
+
+        if (!found_upgrade || !found_connection) {
+            std::cerr << "Missing Upgrade/Connection headers in handshake response" << std::endl;
             return false;
         }
 
