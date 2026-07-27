@@ -1,12 +1,11 @@
 #include "mqtt_runtime.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 #include <vector>
-#include "co_comm.h"
 #include "co_routine.h"
 #include "co_routine_inner.h"
 
@@ -17,57 +16,60 @@ namespace runtime {
 
 namespace {
 
+// A libco coroutine may only be resumed or freed by the thread that created it,
+// and its stack stays live until it has yielded for the last time. The lifecycle
+// state below encodes who is allowed to reclaim the coroutine so that the stack
+// is never freed while libco can still touch it.
+enum TaskLifecycle
+{
+  kTaskRunning = 0,   // entry has not returned yet, the handle owns the state
+  kTaskFinished = 1,  // entry returned, the handle is still responsible
+  kTaskDetached = 2,  // handle gave up ownership, the task reclaims itself
+  kTaskReaped = 3     // reclaim has been claimed, nobody else may free it
+};
+
 struct TaskState
 {
   stCoRoutine_t* task;
+  stCoRoutineEnv_t* owner_env;
   TaskEntry entry;
   void* arg;
-  bool finished;
-  bool detached;
+  std::atomic<int> lifecycle;
 
   TaskState(TaskEntry task_entry, void* task_arg)
       : task(nullptr),
+        owner_env(nullptr),
         entry(task_entry),
         arg(task_arg),
-        finished(false),
-        detached(false)
+        lifecycle(kTaskRunning)
   {
   }
 };
 
-std::mutex& reap_mutex()
-{
-  static std::mutex mutex;
-  return mutex;
-}
-
+// Intentionally never destroyed: tasks can be reclaimed from static destructors,
+// which would otherwise run after a thread_local container is already gone.
 std::vector<TaskState*>& reap_queue()
 {
-  static std::vector<TaskState*> queue;
-  return queue;
+  static thread_local std::vector<TaskState*>* queue = new std::vector<TaskState*>();
+  return *queue;
 }
 
-void enqueue_reap(TaskState* state)
+void destroy_task_state(TaskState* state)
 {
-  std::lock_guard<std::mutex> lock(reap_mutex());
-  reap_queue().push_back(state);
+  co_release(state->task);
+  delete state;
 }
 
+// Only ever holds tasks owned by this thread whose entry has already returned,
+// so by the time the queue is drained the coroutine has performed its final
+// yield and its stack is no longer referenced by libco.
 void reap_finished_tasks()
 {
-  std::vector<TaskState*> ready;
-  {
-    std::lock_guard<std::mutex> lock(reap_mutex());
-    ready.swap(reap_queue());
-  }
-
-  for (TaskState* state : ready) {
-    if (state && state->finished) {
-      co_release(state->task);
-      delete state;
-    } else if (state) {
-      enqueue_reap(state);
-    }
+  std::vector<TaskState*>& queue = reap_queue();
+  while (!queue.empty()) {
+    TaskState* state = queue.back();
+    queue.pop_back();
+    destroy_task_state(state);
   }
 }
 
@@ -75,10 +77,15 @@ void* task_trampoline(void* arg)
 {
   TaskState* state = static_cast<TaskState*>(arg);
   void* result = state->entry(state->arg);
-  state->finished = true;
-  if (state->detached) {
-    enqueue_reap(state);
+
+  int expected = kTaskRunning;
+  if (!state->lifecycle.compare_exchange_strong(expected, kTaskFinished)) {
+    // The handle was released while this task was still running, so the task is
+    // now responsible for handing its state back to the owning thread.
+    state->lifecycle.store(kTaskReaped);
+    reap_queue().push_back(state);
   }
+
   return result;
 }
 
@@ -91,6 +98,30 @@ bool is_coroutine_context()
 {
   stCoRoutine_t* self = co_self();
   return self && !self->cIsMain;
+}
+
+bool is_owner_thread(const TaskState* state)
+{
+  return state->owner_env == co_get_curr_thread_env();
+}
+
+// libco interposes poll() and turns it into a coroutine yield whenever the hook
+// is active, which is not usable outside a coroutine. Disabling the hook around
+// the call routes it to the real system poll().
+int poll_without_hook(struct pollfd* fds, nfds_t nfds, int timeout_ms)
+{
+  const bool hook_enabled = co_is_enable_sys_hook();
+  if (hook_enabled) {
+    co_disable_hook_sys();
+  }
+
+  int ret = ::poll(fds, nfds, timeout_ms);
+
+  if (hook_enabled) {
+    co_enable_hook_sys();
+  }
+
+  return ret;
 }
 
 struct EventLoopContext
@@ -114,28 +145,41 @@ struct JoinContext
   TaskState* state;
   int timeout_ms;
   std::chrono::steady_clock::time_point start;
-  bool timed_out;
 };
 
 int join_eventloop_callback(void* arg)
 {
   JoinContext* ctx = static_cast<JoinContext*>(arg);
   reap_finished_tasks();
-  if (ctx->state->finished) {
+  if (ctx->state->lifecycle.load() != kTaskRunning) {
     return -1;
   }
 
-  if (ctx->timeout_ms >= 0) {
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+  if (ctx->timeout_ms > 0) {
+    std::chrono::milliseconds elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - ctx->start);
     if (elapsed.count() >= ctx->timeout_ms) {
-      ctx->timed_out = true;
       return -1;
     }
   }
 
   return 0;
 }
+
+struct MutexState
+{
+  stCoCond_t* cond;
+  int wait_count;
+};
+
+struct ConditionState
+{
+  stCoCond_t* cond;
+  // Thread that last suspended on this condition. Waking a coroutine from any
+  // other thread would move it onto that thread's run list, so such wakeups are
+  // dropped instead.
+  std::atomic<void*> waiter_env;
+};
 
 }  // namespace
 
@@ -165,70 +209,124 @@ TaskHandle& TaskHandle::operator=(TaskHandle&& other) noexcept
 
 void TaskHandle::release()
 {
-  reap_finished_tasks();
-
   TaskState* state = as_state(task_);
+  task_ = nullptr;
   if (!state) {
     return;
   }
 
-  if (!state->finished) {
-    state->detached = true;
-    if (!state->finished) {
-      task_ = nullptr;
-      return;
-    }
+  if (!is_owner_thread(state)) {
+    // Freeing the coroutine from here could race with its owning thread, so the
+    // task is abandoned. It is reclaimed by the task itself if that thread is
+    // still pumping an event loop, and leaked otherwise.
+    int expected = kTaskRunning;
+    state->lifecycle.compare_exchange_strong(expected, kTaskDetached);
+    return;
   }
 
-  co_release(state->task);
-  delete state;
-  task_ = nullptr;
+  reap_finished_tasks();
+
+  int expected = kTaskRunning;
+  if (state->lifecycle.compare_exchange_strong(expected, kTaskDetached)) {
+    return;
+  }
+
+  if (expected == kTaskFinished &&
+      state->lifecycle.compare_exchange_strong(expected, kTaskReaped)) {
+    destroy_task_state(state);
+  }
 }
 
 bool TaskHandle::is_finished() const
 {
-  TaskState* state = as_state(task_);
-  return !state || state->finished;
+  const TaskState* state = as_state(task_);
+  return !state || state->lifecycle.load() != kTaskRunning;
 }
 
 int TaskHandle::join(int timeout_ms)
 {
   TaskState* state = as_state(task_);
-  if (!state || state->finished) {
+  if (!state || state->lifecycle.load() != kTaskRunning) {
     return 0;
   }
 
-  if (timeout_ms == 0) {
-    errno = ETIMEDOUT;
+  if (!is_owner_thread(state)) {
+    errno = EPERM;
     return -1;
   }
 
-  JoinContext ctx = {state, timeout_ms, std::chrono::steady_clock::now(), false};
+  if (is_coroutine_context()) {
+    // A nested event loop would starve the outer loop's callback, so waiting for
+    // another task from inside a coroutine is rejected instead.
+    errno = EPERM;
+    return -1;
+  }
+
+  if (timeout_ms == 0) {
+    errno = EBUSY;
+    return -1;
+  }
+
+  JoinContext ctx = {state, timeout_ms, std::chrono::steady_clock::now()};
   co_eventloop(co_get_epoll_ct(), join_eventloop_callback, &ctx);
-  if (!state->finished) {
-    errno = ctx.timed_out ? ETIMEDOUT : EAGAIN;
+
+  if (state->lifecycle.load() == kTaskRunning) {
+    errno = ETIMEDOUT;
     return -1;
   }
 
   return 0;
 }
 
-AsyncMutex::AsyncMutex() : impl_(new clsCoMutex()) {}
+AsyncMutex::AsyncMutex() : impl_(nullptr)
+{
+  MutexState* state = new MutexState();
+  state->cond = co_cond_alloc();
+  state->wait_count = 0;
+  if (!state->cond) {
+    delete state;
+    throw std::runtime_error("Failed to allocate coroutine mutex");
+  }
+  impl_ = state;
+}
 
 AsyncMutex::~AsyncMutex()
 {
-  delete static_cast<clsCoMutex*>(impl_);
-  impl_ = nullptr;
+  MutexState* state = static_cast<MutexState*>(impl_);
+  if (state) {
+    co_cond_free(state->cond);
+    delete state;
+    impl_ = nullptr;
+  }
 }
 
 void AsyncMutex::lock()
 {
-  static_cast<clsCoMutex*>(impl_)->CoLock();
+  MutexState* state = static_cast<MutexState*>(impl_);
+  if (!state) {
+    return;
+  }
+
+  if (state->wait_count > 0 && is_coroutine_context()) {
+    ++state->wait_count;
+    co_cond_timedwait(state->cond, -1);
+    return;
+  }
+
+  // Outside a coroutine there is nothing to yield to, so a contended lock is
+  // taken without waiting rather than corrupting libco's call stack.
+  ++state->wait_count;
 }
 
 void AsyncMutex::unlock()
 {
-  static_cast<clsCoMutex*>(impl_)->CoUnLock();
+  MutexState* state = static_cast<MutexState*>(impl_);
+  if (!state) {
+    return;
+  }
+
+  --state->wait_count;
+  co_cond_signal(state->cond);
 }
 
 AsyncLockGuard::AsyncLockGuard(AsyncMutex* mutex) : mutex_(mutex)
@@ -245,17 +343,24 @@ AsyncLockGuard::~AsyncLockGuard()
   }
 }
 
-AsyncCondition::AsyncCondition() : impl_(co_cond_alloc())
+AsyncCondition::AsyncCondition() : impl_(nullptr)
 {
-  if (!impl_) {
+  ConditionState* state = new ConditionState();
+  state->cond = co_cond_alloc();
+  state->waiter_env.store(nullptr);
+  if (!state->cond) {
+    delete state;
     throw std::runtime_error("Failed to allocate coroutine condition variable");
   }
+  impl_ = state;
 }
 
 AsyncCondition::~AsyncCondition()
 {
-  if (impl_) {
-    co_cond_free(static_cast<stCoCond_t*>(impl_));
+  ConditionState* state = static_cast<ConditionState*>(impl_);
+  if (state) {
+    co_cond_free(state->cond);
+    delete state;
     impl_ = nullptr;
   }
 }
@@ -268,8 +373,10 @@ AsyncCondition::AsyncCondition(AsyncCondition&& other) noexcept : impl_(other.im
 AsyncCondition& AsyncCondition::operator=(AsyncCondition&& other) noexcept
 {
   if (this != &other) {
-    if (impl_) {
-      co_cond_free(static_cast<stCoCond_t*>(impl_));
+    ConditionState* state = static_cast<ConditionState*>(impl_);
+    if (state) {
+      co_cond_free(state->cond);
+      delete state;
     }
     impl_ = other.impl_;
     other.impl_ = nullptr;
@@ -279,20 +386,56 @@ AsyncCondition& AsyncCondition::operator=(AsyncCondition&& other) noexcept
 
 int AsyncCondition::wait(int timeout_ms)
 {
-  return impl_ ? co_cond_timedwait(static_cast<stCoCond_t*>(impl_), timeout_ms) : -1;
+  ConditionState* state = static_cast<ConditionState*>(impl_);
+  if (!state) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (!is_coroutine_context()) {
+    // There is no coroutine to suspend here. A bounded wait still honours its
+    // timeout by sleeping, which matches what libco reports for a timed out
+    // wait; an unbounded one would never be woken up.
+    if (timeout_ms > 0) {
+      poll_without_hook(nullptr, 0, timeout_ms);
+      return 0;
+    }
+    errno = EPERM;
+    return -1;
+  }
+
+  state->waiter_env.store(co_get_curr_thread_env());
+  return co_cond_timedwait(state->cond, timeout_ms);
+}
+
+// Wakeups only reach waiters registered on the current thread's event loop.
+bool AsyncCondition::can_wake() const
+{
+  const ConditionState* state = static_cast<const ConditionState*>(impl_);
+  if (!state) {
+    return false;
+  }
+
+  void* env = co_get_curr_thread_env();
+  if (!env) {
+    return false;
+  }
+
+  void* waiter_env = state->waiter_env.load();
+  return !waiter_env || waiter_env == env;
 }
 
 void AsyncCondition::signal()
 {
-  if (impl_) {
-    co_cond_signal(static_cast<stCoCond_t*>(impl_));
+  if (can_wake()) {
+    co_cond_signal(static_cast<ConditionState*>(impl_)->cond);
   }
 }
 
 void AsyncCondition::broadcast()
 {
-  if (impl_) {
-    co_cond_broadcast(static_cast<stCoCond_t*>(impl_));
+  if (can_wake()) {
+    co_cond_broadcast(static_cast<ConditionState*>(impl_)->cond);
   }
 }
 
@@ -334,18 +477,22 @@ IoWaiter& LibcoRuntime::io_waiter()
 
 TaskHandle LibcoRuntime::spawn(TaskEntry entry, void* arg, size_t stack_size)
 {
+  if (!entry) {
+    return TaskHandle();
+  }
+
   reap_finished_tasks();
 
   stCoRoutine_t* task = nullptr;
-  TaskState* state = new TaskState(entry, arg);
   stCoRoutineAttr_t attr;
   std::memset(&attr, 0, sizeof(attr));
   stCoRoutineAttr_t* attr_ptr = nullptr;
   if (stack_size > 0) {
-    attr.stack_size = stack_size;
+    attr.stack_size = static_cast<int>(stack_size);
     attr_ptr = &attr;
   }
 
+  TaskState* state = new TaskState(entry, arg);
   int ret = co_create(&task, attr_ptr, task_trampoline, state);
   if (ret != 0 || !task) {
     delete state;
@@ -353,7 +500,12 @@ TaskHandle LibcoRuntime::spawn(TaskEntry entry, void* arg, size_t stack_size)
   }
 
   state->task = task;
+  state->owner_env = task->env;
+
+  // The entry runs until its first yield point before co_resume() returns, so
+  // the lifecycle state has to be fully initialized before this point.
   co_resume(task);
+
   return TaskHandle(state);
 }
 
@@ -365,6 +517,12 @@ int LibcoRuntime::run_event_loop(EventLoopCallback callback, void* arg)
   return 0;
 }
 
+int LibcoRuntime::reap_tasks()
+{
+  reap_finished_tasks();
+  return 0;
+}
+
 int LibcoRuntime::wait(int fd, short events, int timeout_ms)
 {
   struct pollfd pf;
@@ -372,13 +530,10 @@ int LibcoRuntime::wait(int fd, short events, int timeout_ms)
   pf.fd = fd;
   pf.events = events;
 
-  if (timeout_ms == 0) {
-    return ::poll(&pf, 1, 0);
-  }
-
-  if (!is_coroutine_context()) {
-    errno = EINVAL;
-    return -1;
+  // libco's co_poll() dereferences a null poll function for a zero timeout and
+  // cannot suspend outside a coroutine, so both cases go through a real poll().
+  if (timeout_ms == 0 || !is_coroutine_context()) {
+    return poll_without_hook(&pf, 1, timeout_ms);
   }
 
   return co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
@@ -401,11 +556,19 @@ int LibcoRuntime::accept(int fd, struct sockaddr* addr, socklen_t* len)
 
 void* LibcoRuntime::get_specific(pthread_key_t key)
 {
+  if (key >= kMaxTaskLocalKeys) {
+    return nullptr;
+  }
   return co_getspecific(key);
 }
 
 int LibcoRuntime::set_specific(pthread_key_t key, const void* value)
 {
+  // libco indexes a fixed-size per-coroutine array without validating the key.
+  if (key >= kMaxTaskLocalKeys) {
+    errno = EINVAL;
+    return -1;
+  }
   return co_setspecific(key, value);
 }
 

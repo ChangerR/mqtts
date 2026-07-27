@@ -109,9 +109,12 @@ add_library(mqtt_runtime STATIC
 
 target_include_directories(mqtt_runtime PUBLIC
     ${MQTTS_INCLUDE_DIRS}
+    ${THIRD_PART_DIR}/libco
 )
 
-target_link_libraries(mqtt_runtime PUBLIC colib_static pthread)
+# libco resolves the syscalls it interposes through dlsym, so consumers of the
+# runtime facade need the dynamic loader library as well.
+target_link_libraries(mqtt_runtime PUBLIC colib_static pthread ${CMAKE_DL_LIBS})
 
 add_library(mqtt_proto STATIC
     ${MQTT_ROUTER_PROTO_SRCS}
