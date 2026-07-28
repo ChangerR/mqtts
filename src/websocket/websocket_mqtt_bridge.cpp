@@ -713,13 +713,14 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
     // Forward to MQTT broker via session manager
     mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic, allocator_);
     mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-    int ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
-
-    if (ret == MQ_SUCCESS) {
-        stats_.mqtt_messages_sent++;
+    // 非负返回值是投递成功的订阅者数量，不是错误码。
+    int delivered_count = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
+    if (delivered_count < 0) {
+        return delivered_count;
     }
 
-    return ret;
+    stats_.mqtt_messages_sent += delivered_count;
+    return MQ_SUCCESS;
 }
 
 // MQTT packet handlers (for binary protocol mode)

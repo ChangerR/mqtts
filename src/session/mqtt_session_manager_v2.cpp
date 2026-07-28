@@ -973,18 +973,14 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   int ret = find_topic_subscribers(topic, subscribers);
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
-    return 0;
+    return ret;
   }
 
   int forwarded_count = 0;
 
-  std::string sender_id = from_mqtt_string(sender_client_id);
+  // 发布者自己订阅了该主题时同样要收到消息：MQTT 3.1.1 没有例外，MQTT 5 也只有在
+  // 订阅时显式设置 No Local 才不投递，而当前订阅选项里还没有解析 No Local。
   for (const SubscriberInfo& subscriber : subscribers) {
-    // 避免回环
-    if (from_mqtt_string(subscriber.client_id) == sender_id) {
-      continue;
-    }
-
     if (forward_publish(subscriber.client_id, packet, sender_client_id) == MQ_SUCCESS) {
       forwarded_count++;
     }
@@ -993,7 +989,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   LOG_DEBUG("Forwarded PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
 
-  return ret;
+  return forwarded_count;
 }
 
 int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic,
@@ -1009,7 +1005,7 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
   int ret = find_topic_subscribers(topic, subscribers);
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
-    return 0;
+    return ret;
   }
 
   if (subscribers.empty()) {
@@ -1017,24 +1013,15 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
     return 0;
   }
 
-  // 过滤掉发送者自己（避免回环）
-  std::vector<MQTTString> filtered_subscribers;
-  std::string sender_id = from_mqtt_string(content->sender_client_id);
-
+  // 与 forward_publish_by_topic 一致：发布者自己也在订阅者之列时照常投递。
+  std::vector<MQTTString> target_subscribers;
+  target_subscribers.reserve(subscribers.size());
   for (const SubscriberInfo& subscriber : subscribers) {
-    if (from_mqtt_string(subscriber.client_id) != sender_id) {
-      filtered_subscribers.push_back(subscriber.client_id);
-    }
-  }
-
-  if (filtered_subscribers.empty()) {
-    LOG_DEBUG("No valid subscribers found for topic: {} (after filtering sender)",
-              from_mqtt_string(topic));
-    return 0;
+    target_subscribers.push_back(subscriber.client_id);
   }
 
   // 使用批量转发优化
-  int forwarded_count = batch_forward_publish(filtered_subscribers, content);
+  int forwarded_count = batch_forward_publish(target_subscribers, content);
 
   LOG_DEBUG("Forwarded shared PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
@@ -1835,6 +1822,10 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
   bool strict_cluster_mode = false;
 
   delivered_count = forward_publish_by_topic(topic, packet, sender_client_id);
+  if (delivered_count < 0) {
+    return delivered_count;
+  }
+
   router_enabled = (router_client_.get() != NULL);
   strict_cluster_mode = cluster_config_.cluster_enabled;
   if (!router_enabled) {

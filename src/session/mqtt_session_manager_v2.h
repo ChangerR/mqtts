@@ -245,12 +245,18 @@ class GlobalSessionManager
 
   /**
    * @brief 转发PUBLISH消息到订阅指定主题的所有客户端
+   *
+   * 发布者自己订阅了该主题时也在投递范围内。
+   *
+   * @return 非负数为投递成功的客户端数量，负数为错误码。
    */
   int forward_publish_by_topic(const MQTTString& topic, const PublishPacket& packet,
                                const MQTTString& sender_client_id);
 
   /**
    * @brief 转发PUBLISH消息到订阅指定主题的所有客户端（使用共享内容，内存优化版本）
+   *
+   * @return 非负数为投递成功的客户端数量，负数为错误码。
    */
   int forward_publish_by_topic_shared(const MQTTString& topic,
                                       const SharedMessageContentPtr& content);
