@@ -60,7 +60,7 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
   }
 
   if (MQ_SUCC(ret)) {
-    mqtt::runtime::current_runtime().enable_hook();
+    mqtt::runtime::current_runtime().enable_async_syscalls();
     LOG_INFO("Socket listening on {}:{} (backlog: {})", ip, port, backlog);
   }
 

@@ -1,5 +1,6 @@
 #include "mqtt_runtime.h"
 
+#include <pthread.h>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -15,6 +16,9 @@ namespace mqtt {
 namespace runtime {
 
 namespace {
+
+// Size of the per-coroutine slot array libco indexes with a pthread key value.
+const pthread_key_t kMaxTaskLocalKeys = 1024;
 
 // A libco coroutine may only be resumed or freed by the thread that created it,
 // and its stack stays live until it has yielded for the last time. The lifecycle
@@ -290,7 +294,7 @@ int TaskHandle::join(int timeout_ms)
   return 0;
 }
 
-AsyncMutex::AsyncMutex() : impl_(nullptr)
+CoroutineMutex::CoroutineMutex() : impl_(nullptr)
 {
   MutexState* state = new MutexState();
   state->cond = co_cond_alloc();
@@ -303,7 +307,7 @@ AsyncMutex::AsyncMutex() : impl_(nullptr)
   impl_ = state;
 }
 
-AsyncMutex::~AsyncMutex()
+CoroutineMutex::~CoroutineMutex()
 {
   MutexState* state = static_cast<MutexState*>(impl_);
   if (state) {
@@ -313,7 +317,7 @@ AsyncMutex::~AsyncMutex()
   }
 }
 
-void AsyncMutex::lock()
+void CoroutineMutex::lock()
 {
   MutexState* state = static_cast<MutexState*>(impl_);
   if (!state) {
@@ -331,7 +335,7 @@ void AsyncMutex::lock()
   // taken without waiting rather than corrupting libco's call stack.
 }
 
-void AsyncMutex::unlock()
+void CoroutineMutex::unlock()
 {
   MutexState* state = static_cast<MutexState*>(impl_);
   if (!state) {
@@ -344,21 +348,21 @@ void AsyncMutex::unlock()
   }
 }
 
-AsyncLockGuard::AsyncLockGuard(AsyncMutex* mutex) : mutex_(mutex)
+CoroutineLockGuard::CoroutineLockGuard(CoroutineMutex* mutex) : mutex_(mutex)
 {
   if (mutex_) {
     mutex_->lock();
   }
 }
 
-AsyncLockGuard::~AsyncLockGuard()
+CoroutineLockGuard::~CoroutineLockGuard()
 {
   if (mutex_) {
     mutex_->unlock();
   }
 }
 
-AsyncCondition::AsyncCondition() : impl_(nullptr)
+CoroutineCondition::CoroutineCondition() : impl_(nullptr)
 {
   ConditionState* state = new ConditionState();
   state->cond = co_cond_alloc();
@@ -370,7 +374,7 @@ AsyncCondition::AsyncCondition() : impl_(nullptr)
   impl_ = state;
 }
 
-AsyncCondition::~AsyncCondition()
+CoroutineCondition::~CoroutineCondition()
 {
   ConditionState* state = static_cast<ConditionState*>(impl_);
   if (state) {
@@ -380,12 +384,12 @@ AsyncCondition::~AsyncCondition()
   }
 }
 
-AsyncCondition::AsyncCondition(AsyncCondition&& other) noexcept : impl_(other.impl_)
+CoroutineCondition::CoroutineCondition(CoroutineCondition&& other) noexcept : impl_(other.impl_)
 {
   other.impl_ = nullptr;
 }
 
-AsyncCondition& AsyncCondition::operator=(AsyncCondition&& other) noexcept
+CoroutineCondition& CoroutineCondition::operator=(CoroutineCondition&& other) noexcept
 {
   if (this != &other) {
     ConditionState* state = static_cast<ConditionState*>(impl_);
@@ -399,7 +403,7 @@ AsyncCondition& AsyncCondition::operator=(AsyncCondition&& other) noexcept
   return *this;
 }
 
-int AsyncCondition::wait(int timeout_ms)
+int CoroutineCondition::wait(int timeout_ms)
 {
   ConditionState* state = static_cast<ConditionState*>(impl_);
   if (!state) {
@@ -423,63 +427,43 @@ int AsyncCondition::wait(int timeout_ms)
   return co_cond_timedwait(state->cond, timeout_ms);
 }
 
-bool AsyncCondition::can_wake() const
+bool CoroutineCondition::can_wake() const
 {
   const ConditionState* state = static_cast<const ConditionState*>(impl_);
   return state && can_wake_waiter(state->waiter_env);
 }
 
-void AsyncCondition::signal()
+void CoroutineCondition::signal()
 {
   if (can_wake()) {
     co_cond_signal(static_cast<ConditionState*>(impl_)->cond);
   }
 }
 
-void AsyncCondition::broadcast()
+void CoroutineCondition::broadcast()
 {
   if (can_wake()) {
     co_cond_broadcast(static_cast<ConditionState*>(impl_)->cond);
   }
 }
 
-int IoWaiter::wait(int fd, short events, int timeout_ms)
+Runtime& Runtime::instance()
 {
-  return current_runtime().wait(fd, events, timeout_ms);
-}
-
-int IoWaiter::wait_readable(int fd, int timeout_ms)
-{
-  return current_runtime().wait_readable(fd, timeout_ms);
-}
-
-int IoWaiter::wait_writable(int fd, int timeout_ms)
-{
-  return current_runtime().wait_writable(fd, timeout_ms);
-}
-
-LibcoRuntime& LibcoRuntime::instance()
-{
-  static LibcoRuntime runtime;
+  static Runtime runtime;
   return runtime;
 }
 
-void LibcoRuntime::enable_hook()
+void Runtime::enable_async_syscalls()
 {
   co_enable_hook_sys();
 }
 
-void LibcoRuntime::disable_hook()
+void Runtime::disable_async_syscalls()
 {
   co_disable_hook_sys();
 }
 
-IoWaiter& LibcoRuntime::io_waiter()
-{
-  return io_waiter_;
-}
-
-TaskHandle LibcoRuntime::spawn(TaskEntry entry, void* arg, size_t stack_size)
+TaskHandle Runtime::spawn(TaskEntry entry, void* arg, size_t stack_size)
 {
   if (!entry) {
     return TaskHandle();
@@ -513,7 +497,7 @@ TaskHandle LibcoRuntime::spawn(TaskEntry entry, void* arg, size_t stack_size)
   return TaskHandle(state);
 }
 
-int LibcoRuntime::run_event_loop(EventLoopCallback callback, void* arg)
+int Runtime::run_event_loop(EventLoopCallback callback, void* arg)
 {
   EventLoopContext ctx = {callback, arg};
   co_eventloop(co_get_epoll_ct(), eventloop_trampoline, &ctx);
@@ -521,13 +505,13 @@ int LibcoRuntime::run_event_loop(EventLoopCallback callback, void* arg)
   return 0;
 }
 
-int LibcoRuntime::reap_tasks()
+int Runtime::reap_tasks()
 {
   reap_finished_tasks();
   return 0;
 }
 
-int LibcoRuntime::wait(int fd, short events, int timeout_ms)
+int Runtime::wait(int fd, short events, int timeout_ms)
 {
   struct pollfd pf;
   std::memset(&pf, 0, sizeof(pf));
@@ -543,42 +527,68 @@ int LibcoRuntime::wait(int fd, short events, int timeout_ms)
   return co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
 }
 
-int LibcoRuntime::wait_readable(int fd, int timeout_ms)
+int Runtime::wait_readable(int fd, int timeout_ms)
 {
   return wait(fd, POLLIN | POLLERR | POLLHUP, timeout_ms);
 }
 
-int LibcoRuntime::wait_writable(int fd, int timeout_ms)
+int Runtime::wait_writable(int fd, int timeout_ms)
 {
   return wait(fd, POLLOUT | POLLERR | POLLHUP, timeout_ms);
 }
 
-int LibcoRuntime::accept(int fd, struct sockaddr* addr, socklen_t* len)
+int Runtime::accept(int fd, struct sockaddr* addr, socklen_t* len)
 {
   return co_accept(fd, addr, len);
 }
 
-void* LibcoRuntime::get_specific(pthread_key_t key)
+int Runtime::create_task_local_key(TaskLocalKey* key)
 {
-  if (key >= kMaxTaskLocalKeys) {
-    return nullptr;
-  }
-  return co_getspecific(key);
-}
-
-int LibcoRuntime::set_specific(pthread_key_t key, const void* value)
-{
-  // libco indexes a fixed-size per-coroutine array without validating the key.
-  if (key >= kMaxTaskLocalKeys) {
+  if (!key) {
     errno = EINVAL;
     return -1;
   }
-  return co_setspecific(key, value);
+
+  pthread_key_t native_key = 0;
+  int ret = pthread_key_create(&native_key, nullptr);
+  if (ret != 0) {
+    errno = ret;
+    return -1;
+  }
+
+  // libco indexes a fixed-size per-coroutine array with the raw key value and
+  // never validates it, so a key beyond that array is unusable here.
+  if (native_key >= kMaxTaskLocalKeys) {
+    pthread_key_delete(native_key);
+    errno = EINVAL;
+    return -1;
+  }
+
+  key->slot_ = static_cast<unsigned int>(native_key);
+  key->valid_ = true;
+  return 0;
 }
 
-LibcoRuntime& current_runtime()
+void* Runtime::get_task_local(const TaskLocalKey& key)
 {
-  return LibcoRuntime::instance();
+  if (!key.is_valid()) {
+    return nullptr;
+  }
+  return co_getspecific(static_cast<pthread_key_t>(key.slot_));
+}
+
+int Runtime::set_task_local(const TaskLocalKey& key, const void* value)
+{
+  if (!key.is_valid()) {
+    errno = EINVAL;
+    return -1;
+  }
+  return co_setspecific(static_cast<pthread_key_t>(key.slot_), value);
+}
+
+Runtime& current_runtime()
+{
+  return Runtime::instance();
 }
 
 }  // namespace runtime
