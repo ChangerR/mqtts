@@ -1,8 +1,8 @@
 #include "logger.h"
 #include <iostream>
 #include <pthread.h>
-#include "co_routine.h"
 #include "mqtt_config.h"
+#include "mqtt_runtime.h"
 #include "version.h"
 
 namespace mqtt_log_ctx {
@@ -21,7 +21,8 @@ void make_trace_id_key()
 const std::string* get_trace_id_ptr()
 {
   pthread_once(&g_trace_id_once, make_trace_id_key);
-  return static_cast<const std::string*>(co_getspecific(g_trace_id_key));
+  return static_cast<const std::string*>(
+      mqtt::runtime::current_runtime().get_specific(g_trace_id_key));
 }
 }  // namespace
 
@@ -35,13 +36,13 @@ void bind_trace_id(const std::string& trace_id)
 {
   pthread_once(&g_trace_id_once, make_trace_id_key);
   const std::string& non_empty_trace_id = trace_id.empty() ? g_default_trace_id : trace_id;
-  (void)co_setspecific(g_trace_id_key, &non_empty_trace_id);
+  (void)mqtt::runtime::current_runtime().set_specific(g_trace_id_key, &non_empty_trace_id);
 }
 
 void clear_trace_id()
 {
   pthread_once(&g_trace_id_once, make_trace_id_key);
-  (void)co_setspecific(g_trace_id_key, NULL);
+  (void)mqtt::runtime::current_runtime().set_specific(g_trace_id_key, NULL);
 }
 
 const std::string& current_trace_id()

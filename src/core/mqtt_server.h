@@ -4,12 +4,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "co_routine.h"
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_config.h"
 #include "mqtt_define.h"
 #include "mqtt_parser.h"
+#include "mqtt_runtime.h"
 #include "mqtt_socket.h"
 
 class MQTTServer;
@@ -53,7 +53,6 @@ class MQTTServer
   static int eventloop_callback(void* arg);
 
  private:
-  stCoRoutine_t* accept_co_;
   MQTTSocket* server_socket_;
   mutable bool running_;
   std::string host_;

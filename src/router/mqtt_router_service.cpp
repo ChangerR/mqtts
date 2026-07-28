@@ -12,6 +12,7 @@
 
 thread_local std::vector<MQTTRouterService::ClientContext*> MQTTRouterService::thread_local_clients_;
 thread_local MQTTAllocator* MQTTRouterService::thread_local_allocator_ = nullptr;
+thread_local std::vector<mqtt::runtime::TaskHandle> MQTTRouterService::thread_local_client_tasks_;
 
 namespace
 {
@@ -957,6 +958,8 @@ void MQTTRouterService::worker_thread_func(int thread_id)
             handle_client_connection(client_fd);
         }
     }
+
+    thread_local_client_tasks_.clear();
 }
 
 void MQTTRouterService::snapshot_thread_func()
@@ -973,8 +976,26 @@ void MQTTRouterService::snapshot_thread_func()
 void MQTTRouterService::handle_client_connection(int client_fd)
 {
     ClientContext* context = new ClientContext(this, client_fd, 0, thread_local_allocator_);
-    co_create(&context->coroutine, NULL, client_coroutine_func, context);
-    co_resume(context->coroutine);
+    mqtt::runtime::TaskHandle task =
+        mqtt::runtime::current_runtime().spawn(client_coroutine_func, context);
+    if (!task.is_valid()) {
+        ::close(client_fd);
+        delete context;
+    } else {
+        size_t kept = 0;
+        for (size_t i = 0; i < thread_local_client_tasks_.size(); ++i) {
+            if (thread_local_client_tasks_[i].is_finished()) {
+                thread_local_client_tasks_[i].release();
+            } else {
+                if (kept != i) {
+                    thread_local_client_tasks_[kept] = std::move(thread_local_client_tasks_[i]);
+                }
+                ++kept;
+            }
+        }
+        thread_local_client_tasks_.resize(kept);
+        thread_local_client_tasks_.push_back(std::move(task));
+    }
 }
 
 void* MQTTRouterService::client_coroutine_func(void* arg)

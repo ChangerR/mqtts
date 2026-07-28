@@ -5,6 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <queue>
+#include <thread>
 #include <vector>
 
 #include "mqtt_coroutine_utils.h"
@@ -66,10 +67,10 @@ struct WorkerSendTask
 };
 
 /**
- * @brief 协程友好的发送Worker池
+ * @brief 协程友好的发送调度池
  *
  * 专门负责执行实际的消息发送操作，避免在主事件循环中阻塞
- * 使用协程锁和协程同步原语，完全协程友好
+ * 使用运行时抽象的协程任务和同步原语；不是OS线程池。
  */
 class SendWorkerPool
 {
@@ -140,7 +141,7 @@ class SendWorkerPool
     CoroCondition task_available;
     std::atomic<size_t> processed_count{0};
     std::atomic<size_t> failed_count{0};
-    stCoRoutine_t* worker_coroutine = nullptr;
+    runtime::TaskHandle worker_task;
   };
 
   /**
@@ -163,11 +164,19 @@ class SendWorkerPool
    */
   size_t select_worker() const;
 
+  /**
+   * @brief 停止Worker协程。在创建它们的线程上会唤醒、等待并回收；
+   *        在其他线程上只放弃句柄，由归属线程收尾。
+   */
+  void shutdown_workers();
+
  private:
   size_t worker_count_;
   size_t max_queue_size_;
   std::atomic<bool> running_;
   std::atomic<bool> should_stop_;
+  // 创建Worker协程的线程，只有该线程可以唤醒和回收它们
+  std::thread::id owner_thread_;
 
   std::vector<std::unique_ptr<WorkerData>> workers_;
 

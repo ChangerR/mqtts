@@ -14,9 +14,7 @@
 #include <unistd.h>
 #include <limits>
 
-#include "co_routine.h"
-
-int co_accept(int fd, struct sockaddr* addr, socklen_t* len);
+#include "mqtt_runtime.h"
 
 int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
 {
@@ -62,7 +60,7 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
   }
 
   if (MQ_SUCC(ret)) {
-    co_enable_hook_sys();
+    mqtt::runtime::current_runtime().enable_hook();
     LOG_INFO("Socket listening on {}:{} (backlog: {})", ip, port, backlog);
   }
 
@@ -76,7 +74,7 @@ int MQTTSocket::accept(MQTTSocket*& client)
   socklen_t len = sizeof(struct sockaddr);
 
   while (true) {
-    int fd = co_accept(fd_, (struct sockaddr*)&addr, &len);
+    int fd = mqtt::runtime::current_runtime().accept(fd_, (struct sockaddr*)&addr, &len);
 
     if (fd < 0) {
       if (errno == EINTR) {
@@ -156,12 +154,12 @@ int MQTTSocket::send(const uint8_t* buf, int len)
         if (errno == EINTR)
           continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // Use co_poll to wait for buffer space
-          struct pollfd pf = {0};
-          pf.fd = fd_;
-          pf.events = (POLLOUT | POLLERR | POLLHUP);
-          co_poll(co_get_epoll_ct(), &pf, 1, -1);  // Wait indefinitely
-          continue;                                // Try sending again after poll
+          if (mqtt::runtime::current_runtime().wait_writable(fd_, -1) < 0) {
+            LOG_ERROR("Failed to wait for socket to become writable - {}", strerror(errno));
+            connected_ = false;
+            ret = MQ_ERR_SOCKET_SEND;
+          }
+          continue;
         } else {
           LOG_ERROR("Failed to send data - {}", strerror(errno));
           connected_ = false;  // Mark socket as disconnected
@@ -204,11 +202,11 @@ int MQTTSocket::recv(char* buf, int& len)
         if (errno == EINTR) {
           continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // Use co_poll to wait for data
-          struct pollfd pf = {0};
-          pf.fd = fd_;
-          pf.events = (POLLIN | POLLERR | POLLHUP);
-          co_poll(co_get_epoll_ct(), &pf, 1, 1000);  // Wait indefinitely
+          if (mqtt::runtime::current_runtime().wait_readable(fd_, 1000) < 0) {
+            LOG_ERROR("Failed to wait for socket to become readable - {}", strerror(errno));
+            connected_ = false;
+            ret = MQ_ERR_SOCKET_RECV;
+          }
           continue;
         } else {
           LOG_ERROR("Failed to receive data - {}", strerror(errno));
@@ -282,10 +280,7 @@ bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
     return false;
   }
 
-  struct pollfd pf = {0};
-  pf.fd = fd;
-  pf.events = POLLIN;
-  int poll_ret = co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
+  int poll_ret = mqtt::runtime::current_runtime().wait_readable(fd, timeout_ms);
   if (poll_ret <= 0) {
     return false;
   }

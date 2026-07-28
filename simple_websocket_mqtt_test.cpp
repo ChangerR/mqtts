@@ -2,8 +2,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <openssl/sha.h>
@@ -315,6 +318,21 @@ public:
     }
 
 private:
+    static std::string lowercase(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    }
+
+    static std::string trim_header_value(std::string value) {
+        while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
+                                  value.back() == ' ' || value.back() == '\t')) {
+            value.pop_back();
+        }
+        size_t first = value.find_first_not_of(" \t");
+        return first == std::string::npos ? "" : value.substr(first);
+    }
+
     bool perform_handshake() {
         // Generate WebSocket key
         std::string ws_key = generate_websocket_key();
@@ -352,10 +370,45 @@ private:
             return false;
         }
 
-        // Verify accept key
+        // Only scan the header section: anything after it is already frame data.
+        size_t headers_end = response.find("\r\n\r\n");
+        if (headers_end == std::string::npos) {
+            std::cerr << "Incomplete handshake response" << std::endl;
+            return false;
+        }
+
+        // Header names are case insensitive, but the accept key itself is base64
+        // and must match exactly.
         std::string expected_accept = compute_accept_key(ws_key);
-        if (response.find("Sec-WebSocket-Accept: " + expected_accept) == std::string::npos) {
+        bool found_accept = false;
+        bool found_upgrade = false;
+        bool found_connection = false;
+        std::istringstream response_stream(response.substr(0, headers_end));
+        std::string line;
+        while (std::getline(response_stream, line)) {
+            size_t separator = line.find(':');
+            if (separator == std::string::npos) {
+                continue;
+            }
+
+            std::string name = lowercase(line.substr(0, separator));
+            std::string value = trim_header_value(line.substr(separator + 1));
+            if (name == "sec-websocket-accept") {
+                found_accept = (value == expected_accept);
+            } else if (name == "upgrade") {
+                found_upgrade = (lowercase(value) == "websocket");
+            } else if (name == "connection") {
+                found_connection = (lowercase(value).find("upgrade") != std::string::npos);
+            }
+        }
+
+        if (!found_accept) {
             std::cerr << "Invalid accept key in handshake response" << std::endl;
+            return false;
+        }
+
+        if (!found_upgrade || !found_connection) {
+            std::cerr << "Missing Upgrade/Connection headers in handshake response" << std::endl;
             return false;
         }
 

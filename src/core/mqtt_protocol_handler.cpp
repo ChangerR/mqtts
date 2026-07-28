@@ -2,12 +2,12 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
-#include "co_routine.h"
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_memory_tags.h"
 #include "mqtt_parser.h"
+#include "mqtt_runtime.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_socket.h"
 namespace mqtt {
@@ -226,17 +226,13 @@ int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
 
 int MQTTProtocolHandler::read_packet()
 {
-  // Use co_poll to wait for read event
-  struct pollfd pf = {0};
   // Check if socket is still valid
   if (!socket_->is_connected()) {
     LOG_WARN("Client {}:{} disconnected", client_ip_.c_str(), client_port_);
     return MQ_ERR_SOCKET;
   }
 
-  pf.fd = socket_->get_fd();
-  pf.events = (POLLIN | POLLERR | POLLHUP);
-  co_poll(co_get_epoll_ct(), &pf, 1, 100);   // 100ms timeout
+  mqtt::runtime::current_runtime().wait_readable(socket_->get_fd(), 100);
 
   // Try to receive data
   int len = bytes_needed_;

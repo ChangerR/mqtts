@@ -7,6 +7,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include "mqtt_allocator.h"
@@ -15,7 +16,7 @@
 #include "mqtt_event_types.h"
 #include "mqtt_string_utils.h"
 #include "mqtt_stl_allocator.h"
-#include "co_routine.h"
+#include "mqtt_runtime.h"
 #include "mqtt_router_rpc_client.h"
 
 using namespace mqtt;
@@ -373,7 +374,6 @@ private:
         MQTTRouterService* service;
         int client_fd;
         int thread_id;
-        stCoRoutine_t* coroutine;
         MQTTAllocator* allocator;
         RouterConnectionContext connection_ctx;
         
@@ -381,7 +381,6 @@ private:
             : service(svc)
             , client_fd(fd)
             , thread_id(tid)
-            , coroutine(nullptr)
             , allocator(alloc)
             , connection_ctx(alloc)
         {}
@@ -404,6 +403,9 @@ private:
     // Thread-local data
     static thread_local std::vector<ClientContext*> thread_local_clients_;
     static thread_local MQTTAllocator* thread_local_allocator_;
+    // Client coroutines may only be reclaimed by the worker thread that spawned
+    // them, so their handles never leave that thread.
+    static thread_local std::vector<mqtt::runtime::TaskHandle> thread_local_client_tasks_;
 };
 
 #endif // MQTT_ROUTER_SERVICE_H
