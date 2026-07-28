@@ -67,6 +67,12 @@ add_executable(test_session_manager_stress test_session_manager_stress.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
+add_executable(test_session_publish_routing test_session_publish_routing.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/mqtt_session_manager_v2.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/mqtt_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
 
 # 添加转发连接池测试
 add_executable(test_mqtt_forwarding_pool test_mqtt_forwarding_pool.cpp)
@@ -110,6 +116,7 @@ target_include_directories(test_mqtt_session_manager_memory PRIVATE ${TEST_INCLU
 target_include_directories(test_simple_memory PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 target_include_directories(test_session_manager_allocator PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 target_include_directories(test_session_manager_stress PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_include_directories(test_session_publish_routing PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
 
 # 认证系统测试的头文件搜索路径
 target_include_directories(test_mqtt_auth_manager PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
@@ -150,6 +157,7 @@ target_link_libraries(test_mqtt_session_manager_memory PRIVATE mqtt_runtime mqtt
 target_link_libraries(test_simple_memory PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 target_link_libraries(test_session_manager_allocator PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 target_link_libraries(test_session_manager_stress PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+target_link_libraries(test_session_publish_routing PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 
 # 认证系统测试的链接库
 target_link_libraries(test_mqtt_auth_manager PRIVATE mqtt_auth mqtt_runtime tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
@@ -190,6 +198,7 @@ add_test(NAME test_mqtt_session_manager_optimization COMMAND test_mqtt_session_m
 add_test(NAME test_mqtt_session_manager_memory COMMAND test_mqtt_session_manager_memory)
 add_test(NAME test_session_manager_allocator COMMAND test_session_manager_allocator)
 add_test(NAME test_session_manager_stress COMMAND test_session_manager_stress)
+add_test(NAME test_session_publish_routing COMMAND test_session_publish_routing)
 
 # 添加转发连接池测试
 add_test(NAME test_mqtt_forwarding_pool COMMAND test_mqtt_forwarding_pool)
