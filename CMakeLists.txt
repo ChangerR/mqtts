@@ -232,7 +232,7 @@ target_link_libraries(mqtt_parser
     -Wl,-Bdynamic
     OpenSSL::SSL
     OpenSSL::Crypto
-    ${LLHTTP_LIBRARIES}
+    ${LLHTTP_LINK_LIBRARIES}
 )
 
 # 添加主程序
@@ -320,15 +320,14 @@ target_include_directories(simple_websocket_mqtt_test PUBLIC
     ${MQTTS_INCLUDE_DIRS}
 )
 
+# OpenSSL 与 llhttp 由 mqtt_parser 传播过来；在这里重复声明会让链接器把它们排到
+# mqtt_parser 的 -Wl,-Bstatic 区间里，从而尝试静态链接只有动态版本的 llhttp。
 target_link_libraries(simple_websocket_mqtt_test
     mqtt_parser
     mqtt_runtime
     tcmalloc_minimal
     pthread
     dl
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ${LLHTTP_LIBRARIES}
 )
 
 # 启用测试
