@@ -35,6 +35,29 @@ std::string base64_encode(const unsigned char* input, size_t length) {
     return result;
 }
 
+// Base64 decode
+std::string base64_decode(const std::string& encoded) {
+    if (encoded.empty()) {
+        return std::string();
+    }
+
+    BIO* bio = BIO_new_mem_buf(encoded.data(), static_cast<int>(encoded.size()));
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    bio = BIO_push(b64, bio);
+
+    std::string result(encoded.size(), '\0');
+    int decoded_length = BIO_read(bio, &result[0], static_cast<int>(result.size()));
+    BIO_free_all(bio);
+
+    if (decoded_length <= 0) {
+        return std::string();
+    }
+
+    result.resize(decoded_length);
+    return result;
+}
+
 // Compute WebSocket accept key
 std::string compute_accept_key(const std::string& key) {
     const char* GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -97,8 +120,13 @@ std::vector<uint8_t> create_websocket_frame(uint8_t opcode, const std::string& p
     return frame;
 }
 
-// Parse WebSocket frame
-bool parse_websocket_frame(const uint8_t* data, size_t len, uint8_t& opcode, std::string& payload) {
+// Parse one WebSocket frame from the front of a byte stream.
+// Returns false when the buffer does not hold a complete frame yet; on success
+// frame_len tells the caller how many bytes to drop from the buffer, because a
+// single read can carry several frames.
+bool parse_websocket_frame(const uint8_t* data, size_t len, uint8_t& opcode, std::string& payload,
+                           size_t& frame_len) {
+    frame_len = 0;
     if (len < 2) {
         return false;
     }
@@ -146,6 +174,7 @@ bool parse_websocket_frame(const uint8_t* data, size_t len, uint8_t& opcode, std
         payload.push_back(byte);
     }
 
+    frame_len = offset + payload_len;
     return fin;
 }
 
@@ -257,55 +286,62 @@ public:
             return false;
         }
 
-        // Set timeout
-        struct timeval tv;
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        // The server may pack several frames into one read, so frames are taken
+        // from a persistent buffer and the socket is only read when that buffer
+        // has no complete frame left.
+        for (;;) {
+            uint8_t opcode = 0;
+            std::string frame_payload;
+            size_t frame_len = 0;
+            while (!recv_buffer_.empty() &&
+                   parse_websocket_frame(recv_buffer_.data(), recv_buffer_.size(), opcode,
+                                         frame_payload, frame_len)) {
+                recv_buffer_.erase(recv_buffer_.begin(), recv_buffer_.begin() + frame_len);
 
-        // Read data
-        uint8_t buffer[65536];
-        ssize_t n = recv(sockfd_, buffer, sizeof(buffer), 0);
+                if (opcode == 0x01) {  // TEXT frame
+                    topic.clear();
+                    payload.clear();
 
-        if (n <= 0) {
-            return false;
-        }
+                    size_t topic_pos = frame_payload.find("\"topic\":\"");
+                    if (topic_pos != std::string::npos) {
+                        topic_pos += 9;
+                        size_t topic_end = frame_payload.find("\"", topic_pos);
+                        topic = frame_payload.substr(topic_pos, topic_end - topic_pos);
+                    }
 
-        // Parse WebSocket frame
-        uint8_t opcode;
-        std::string frame_payload;
-        if (!parse_websocket_frame(buffer, n, opcode, frame_payload)) {
-            std::cerr << "Failed to parse frame" << std::endl;
-            return false;
-        }
+                    size_t payload_pos = frame_payload.find("\"payload\":\"");
+                    if (payload_pos != std::string::npos) {
+                        payload_pos += 11;
+                        size_t payload_end = frame_payload.find("\"", payload_pos);
+                        // The bridge base64-encodes payloads on the way out.
+                        payload = base64_decode(
+                            frame_payload.substr(payload_pos, payload_end - payload_pos));
+                    }
 
-        // Handle different frame types
-        if (opcode == 0x01) {  // TEXT frame
-            // Parse JSON
-            size_t topic_pos = frame_payload.find("\"topic\":\"");
-            if (topic_pos != std::string::npos) {
-                topic_pos += 9;
-                size_t topic_end = frame_payload.find("\"", topic_pos);
-                topic = frame_payload.substr(topic_pos, topic_end - topic_pos);
+                    std::cout << "Received message on topic '" << topic << "': " << payload
+                              << std::endl;
+                    return true;
+                }
+
+                if (opcode == 0x09) {  // PING
+                    std::vector<uint8_t> pong = create_websocket_frame(0x0A, frame_payload);
+                    send(sockfd_, pong.data(), pong.size(), 0);
+                }
             }
 
-            size_t payload_pos = frame_payload.find("\"payload\":\"");
-            if (payload_pos != std::string::npos) {
-                payload_pos += 11;
-                size_t payload_end = frame_payload.find("\"", payload_pos);
-                payload = frame_payload.substr(payload_pos, payload_end - payload_pos);
+            struct timeval tv;
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            uint8_t buffer[65536];
+            ssize_t n = recv(sockfd_, buffer, sizeof(buffer), 0);
+            if (n <= 0) {
+                return false;
             }
 
-            std::cout << "Received message on topic '" << topic << "': " << payload << std::endl;
-            return true;
-        } else if (opcode == 0x09) {  // PING
-            // Send PONG
-            std::vector<uint8_t> pong = create_websocket_frame(0x0A, frame_payload);
-            send(sockfd_, pong.data(), pong.size(), 0);
-            return receive_message(topic, payload, timeout_ms);
+            recv_buffer_.insert(recv_buffer_.end(), buffer, buffer + n);
         }
-
-        return false;
     }
 
     bool send_ping() {
@@ -412,6 +448,13 @@ private:
             return false;
         }
 
+        // Anything the same read picked up after the header block is frame data.
+        size_t body_start = headers_end + 4;
+        if (static_cast<size_t>(n) > body_start) {
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(buffer);
+            recv_buffer_.insert(recv_buffer_.end(), bytes + body_start, bytes + n);
+        }
+
         std::cout << "WebSocket handshake successful" << std::endl;
         return true;
     }
@@ -420,6 +463,7 @@ private:
     int port_;
     int sockfd_;
     bool connected_;
+    std::vector<uint8_t> recv_buffer_;
 };
 
 // Test functions
