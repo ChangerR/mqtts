@@ -25,7 +25,7 @@ struct WaitContext
 
 struct MutexContext
 {
-  mqtt::runtime::AsyncMutex* mutex;
+  mqtt::runtime::CoroutineMutex* mutex;
   std::string* order;
   const char* label;
   int hold_ms;
@@ -34,7 +34,7 @@ struct MutexContext
 
 struct ConditionContext
 {
-  mqtt::runtime::AsyncCondition* condition;
+  mqtt::runtime::CoroutineCondition* condition;
   int wait_result;
   bool woken;
 };
@@ -45,6 +45,12 @@ struct JoinAttemptContext
   int join_result;
   int join_errno;
   bool done;
+};
+
+struct TaskLocalContext
+{
+  mqtt::runtime::TaskLocalKey* key;
+  void* observed;
 };
 
 struct ThreadTaskResult
@@ -65,7 +71,7 @@ void* increment_task(void* arg)
 void* wait_readable_task(void* arg)
 {
   WaitContext* ctx = static_cast<WaitContext*>(arg);
-  ctx->result = mqtt::runtime::current_runtime().io_waiter().wait_readable(ctx->fd, 10);
+  ctx->result = mqtt::runtime::current_runtime().wait_readable(ctx->fd, 10);
   ctx->done = true;
   return nullptr;
 }
@@ -97,6 +103,14 @@ void* condition_wait_task(void* arg)
   ConditionContext* ctx = static_cast<ConditionContext*>(arg);
   ctx->wait_result = ctx->condition->wait(5000);
   ctx->woken = true;
+  return nullptr;
+}
+
+void* task_local_roundtrip_task(void* arg)
+{
+  TaskLocalContext* ctx = static_cast<TaskLocalContext*>(arg);
+  mqtt::runtime::current_runtime().set_task_local(*ctx->key, "inner");
+  ctx->observed = mqtt::runtime::current_runtime().get_task_local(*ctx->key);
   return nullptr;
 }
 
@@ -143,7 +157,7 @@ void drain_pipe_waiter(int write_fd, WaitContext* ctx)
 class RuntimeTest : public ::testing::Test
 {
  protected:
-  void SetUp() override { mqtt::runtime::current_runtime().enable_hook(); }
+  void SetUp() override { mqtt::runtime::current_runtime().enable_async_syscalls(); }
 };
 
 TEST_F(RuntimeTest, SpawnRunsTaskAndTracksFinishedState)
@@ -194,10 +208,10 @@ TEST_F(RuntimeTest, ZeroTimeoutUsesNonBlockingPollOutsideCoroutine)
   int fds[2] = {-1, -1};
   ASSERT_EQ(0, pipe(fds));
 
-  EXPECT_EQ(0, mqtt::runtime::current_runtime().io_waiter().wait_readable(fds[0], 0));
+  EXPECT_EQ(0, mqtt::runtime::current_runtime().wait_readable(fds[0], 0));
 
   ASSERT_EQ(1, write(fds[1], "x", 1));
-  EXPECT_EQ(1, mqtt::runtime::current_runtime().io_waiter().wait_readable(fds[0], 0));
+  EXPECT_EQ(1, mqtt::runtime::current_runtime().wait_readable(fds[0], 0));
 
   close(fds[0]);
   close(fds[1]);
@@ -211,7 +225,7 @@ TEST_F(RuntimeTest, BlockingWaitOutsideCoroutineFallsBackToRealPoll)
   // Without a coroutine to suspend, the wait must still block for its timeout
   // rather than fail, otherwise the socket layer's retry loops would spin.
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-  int wait_ret = mqtt::runtime::current_runtime().io_waiter().wait_readable(fds[0], 50);
+  int wait_ret = mqtt::runtime::current_runtime().wait_readable(fds[0], 50);
   int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - start)
                            .count();
@@ -347,7 +361,7 @@ TEST_F(RuntimeTest, DetachedTasksAreReclaimedRepeatedly)
 
 TEST_F(RuntimeTest, MutexSerializesContendingCoroutines)
 {
-  mqtt::runtime::AsyncMutex mutex;
+  mqtt::runtime::CoroutineMutex mutex;
   std::string order;
   MutexContext contexts[2] = {{&mutex, &order, "a", 50, false},
                               {&mutex, &order, "b", 0, false}};
@@ -371,7 +385,7 @@ TEST_F(RuntimeTest, MutexSerializesContendingCoroutines)
 
 TEST_F(RuntimeTest, ConditionWakesWaitingCoroutine)
 {
-  mqtt::runtime::AsyncCondition condition;
+  mqtt::runtime::CoroutineCondition condition;
   ASSERT_TRUE(condition.is_valid());
 
   ConditionContext ctx = {&condition, -1, false};
@@ -388,7 +402,7 @@ TEST_F(RuntimeTest, ConditionWakesWaitingCoroutine)
 
 TEST_F(RuntimeTest, ConditionWaitOutsideCoroutineHonoursTimeout)
 {
-  mqtt::runtime::AsyncCondition condition;
+  mqtt::runtime::CoroutineCondition condition;
 
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   EXPECT_EQ(0, condition.wait(50));
@@ -402,13 +416,39 @@ TEST_F(RuntimeTest, ConditionWaitOutsideCoroutineHonoursTimeout)
   EXPECT_EQ(EPERM, errno);
 }
 
-TEST_F(RuntimeTest, TaskLocalStorageRejectsOutOfRangeKeys)
+TEST_F(RuntimeTest, TaskLocalStorageRejectsUnallocatedKeys)
 {
+  mqtt::runtime::TaskLocalKey unallocated;
+  ASSERT_FALSE(unallocated.is_valid());
+
   errno = 0;
-  EXPECT_EQ(-1, mqtt::runtime::current_runtime().set_specific(mqtt::runtime::kMaxTaskLocalKeys, ""));
+  EXPECT_EQ(-1, mqtt::runtime::current_runtime().set_task_local(unallocated, ""));
   EXPECT_EQ(EINVAL, errno);
-  EXPECT_EQ(nullptr,
-            mqtt::runtime::current_runtime().get_specific(mqtt::runtime::kMaxTaskLocalKeys));
+  EXPECT_EQ(nullptr, mqtt::runtime::current_runtime().get_task_local(unallocated));
+
+  errno = 0;
+  EXPECT_EQ(-1, mqtt::runtime::current_runtime().create_task_local_key(nullptr));
+  EXPECT_EQ(EINVAL, errno);
+}
+
+TEST_F(RuntimeTest, TaskLocalStorageIsScopedToTheRunningTask)
+{
+  mqtt::runtime::TaskLocalKey key;
+  ASSERT_EQ(0, mqtt::runtime::current_runtime().create_task_local_key(&key));
+  ASSERT_TRUE(key.is_valid());
+
+  const char kOuterValue[] = "outer";
+  ASSERT_EQ(0, mqtt::runtime::current_runtime().set_task_local(key, kOuterValue));
+
+  TaskLocalContext ctx = {&key, nullptr};
+  mqtt::runtime::TaskHandle task =
+      mqtt::runtime::current_runtime().spawn(task_local_roundtrip_task, &ctx, 64 * 1024);
+  ASSERT_TRUE(task.is_valid());
+
+  // 任务有自己的槽位，写入不会覆盖调用方看到的值。
+  EXPECT_STREQ("inner", static_cast<const char*>(ctx.observed));
+  EXPECT_STREQ(kOuterValue,
+               static_cast<const char*>(mqtt::runtime::current_runtime().get_task_local(key)));
 }
 
 TEST_F(RuntimeTest, TasksOwnedByEachThreadRunIndependently)
@@ -420,7 +460,7 @@ TEST_F(RuntimeTest, TasksOwnedByEachThreadRunIndependently)
   for (int i = 0; i < kThreadCount; ++i) {
     ThreadTaskResult* result = &results[i];
     threads.push_back(std::thread([result]() {
-      mqtt::runtime::current_runtime().enable_hook();
+      mqtt::runtime::current_runtime().enable_async_syscalls();
 
       int fds[2] = {-1, -1};
       if (pipe(fds) != 0) {
@@ -462,7 +502,7 @@ TEST_F(RuntimeTest, TasksOwnedByEachThreadRunIndependently)
 // list, so the wakeup has to be dropped instead.
 TEST_F(RuntimeTest, ForeignThreadWakeupsAreDropped)
 {
-  mqtt::runtime::AsyncMutex mutex;
+  mqtt::runtime::CoroutineMutex mutex;
   std::string order;
   MutexContext contexts[2] = {{&mutex, &order, "a", 50, false},
                               {&mutex, &order, "b", 0, false}};
@@ -477,7 +517,7 @@ TEST_F(RuntimeTest, ForeignThreadWakeupsAreDropped)
 
   // The second task is queued on this thread's mutex; a foreign unlock/broadcast
   // must leave it there instead of resuming it.
-  mqtt::runtime::AsyncCondition condition;
+  mqtt::runtime::CoroutineCondition condition;
   ConditionContext condition_ctx = {&condition, -1, false};
   mqtt::runtime::TaskHandle waiter =
       mqtt::runtime::current_runtime().spawn(condition_wait_task, &condition_ctx, 64 * 1024);

@@ -8,14 +8,14 @@ namespace mqtt {
 /**
  * @brief 协程友好的锁类型。具体运行时实现隐藏在 runtime 层。
  */
-using CoroMutex = runtime::AsyncMutex;
+using CoroMutex = runtime::CoroutineMutex;
 
 /**
  * @brief 协程锁的RAII包装器。
  */
-using CoroLockGuard = runtime::AsyncLockGuard;
+using CoroLockGuard = runtime::CoroutineLockGuard;
 
-using CoroCondition = runtime::AsyncCondition;
+using CoroCondition = runtime::CoroutineCondition;
 
 }  // namespace mqtt
 

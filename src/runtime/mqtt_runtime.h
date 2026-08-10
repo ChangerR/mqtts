@@ -1,6 +1,5 @@
 #pragma once
 
-#include <pthread.h>
 #include <sys/socket.h>
 #include <poll.h>
 #include <cstddef>
@@ -11,8 +10,7 @@ namespace runtime {
 typedef void* (*TaskEntry)(void*);
 typedef int (*EventLoopCallback)(void*);
 
-// Upper bound of the per-task local storage slots offered by the backend.
-const pthread_key_t kMaxTaskLocalKeys = 1024;
+class Runtime;
 
 /**
  * @brief 协程任务句柄。
@@ -52,7 +50,7 @@ class TaskHandle
   void release();
 
  private:
-  friend class LibcoRuntime;
+  friend class Runtime;
 
   explicit TaskHandle(void* task);
 
@@ -64,14 +62,14 @@ class TaskHandle
  *
  * 非协程上下文没有可让出的目标，此时 lock() 不会等待而直接进入临界区。
  */
-class AsyncMutex
+class CoroutineMutex
 {
  public:
-  AsyncMutex();
-  ~AsyncMutex();
+  CoroutineMutex();
+  ~CoroutineMutex();
 
-  AsyncMutex(const AsyncMutex&) = delete;
-  AsyncMutex& operator=(const AsyncMutex&) = delete;
+  CoroutineMutex(const CoroutineMutex&) = delete;
+  CoroutineMutex& operator=(const CoroutineMutex&) = delete;
 
   void lock();
   void unlock();
@@ -80,17 +78,17 @@ class AsyncMutex
   void* impl_;
 };
 
-class AsyncLockGuard
+class CoroutineLockGuard
 {
  public:
-  explicit AsyncLockGuard(AsyncMutex* mutex);
-  ~AsyncLockGuard();
+  explicit CoroutineLockGuard(CoroutineMutex* mutex);
+  ~CoroutineLockGuard();
 
-  AsyncLockGuard(const AsyncLockGuard&) = delete;
-  AsyncLockGuard& operator=(const AsyncLockGuard&) = delete;
+  CoroutineLockGuard(const CoroutineLockGuard&) = delete;
+  CoroutineLockGuard& operator=(const CoroutineLockGuard&) = delete;
 
  private:
-  AsyncMutex* mutex_;
+  CoroutineMutex* mutex_;
 };
 
 /**
@@ -98,17 +96,17 @@ class AsyncLockGuard
  *
  * 移动操作只搬移内部指针，存在等待者时移动是未定义行为。
  */
-class AsyncCondition
+class CoroutineCondition
 {
  public:
-  AsyncCondition();
-  ~AsyncCondition();
+  CoroutineCondition();
+  ~CoroutineCondition();
 
-  AsyncCondition(const AsyncCondition&) = delete;
-  AsyncCondition& operator=(const AsyncCondition&) = delete;
+  CoroutineCondition(const CoroutineCondition&) = delete;
+  CoroutineCondition& operator=(const CoroutineCondition&) = delete;
 
-  AsyncCondition(AsyncCondition&& other) noexcept;
-  AsyncCondition& operator=(AsyncCondition&& other) noexcept;
+  CoroutineCondition(CoroutineCondition&& other) noexcept;
+  CoroutineCondition& operator=(CoroutineCondition&& other) noexcept;
 
   /**
    * @brief 挂起当前协程直到被唤醒或超时。
@@ -132,25 +130,42 @@ class AsyncCondition
   void* impl_;
 };
 
-class IoWaiter
+/**
+ * @brief 任务本地存储的键，只能由 Runtime::create_task_local_key() 分配。
+ *
+ * 默认构造出来的键是无效的，用它读写会失败。键的可用数量由运行时决定，
+ * 分配后不会回收，因此适合进程级的长生命周期用途。
+ */
+class TaskLocalKey
 {
  public:
-  // timeout_ms == 0 或调用方不在协程上下文时退化为真实的 ::poll()。
-  int wait(int fd, short events, int timeout_ms);
-  int wait_readable(int fd, int timeout_ms);
-  int wait_writable(int fd, int timeout_ms);
+  constexpr TaskLocalKey() : slot_(0), valid_(false) {}
+
+  bool is_valid() const { return valid_; }
+
+ private:
+  friend class Runtime;
+
+  unsigned int slot_;
+  bool valid_;
 };
 
-class LibcoRuntime
+/**
+ * @brief 协程运行时。所有协程相关能力都从这里获取，后端实现不对外暴露。
+ */
+class Runtime
 {
  public:
-  static LibcoRuntime& instance();
+  static Runtime& instance();
 
-  // 系统调用拦截只对当前协程生效，每个需要它的协程都要自行开启。
-  void enable_hook();
-  void disable_hook();
-
-  IoWaiter& io_waiter();
+  /**
+   * @brief 让当前任务里的阻塞式系统调用（read/write/connect/poll 等）自动改为
+   *        挂起任务、就绪后恢复。
+   *
+   * 该开关只对调用它的任务生效，每个需要它的任务都要自行开启。
+   */
+  void enable_async_syscalls();
+  void disable_async_syscalls();
 
   /**
    * @brief 在当前线程创建并立即启动一个任务。
@@ -170,24 +185,27 @@ class LibcoRuntime
   int wait_writable(int fd, int timeout_ms);
   int accept(int fd, struct sockaddr* addr, socklen_t* len);
 
-  void* get_specific(pthread_key_t key);
-  int set_specific(pthread_key_t key, const void* value);
+  /**
+   * @brief 分配一个任务本地存储键。
+   * @return 0 表示成功；-1 并设置 errno，键的数量超出运行时上限时为 EINVAL。
+   */
+  int create_task_local_key(TaskLocalKey* key);
+
+  // 读写当前任务的本地存储。非协程上下文回退为线程本地存储。
+  void* get_task_local(const TaskLocalKey& key);
+  int set_task_local(const TaskLocalKey& key, const void* value);
 
  private:
-  LibcoRuntime() = default;
-  ~LibcoRuntime() = default;
+  Runtime() = default;
+  ~Runtime() = default;
 
-  LibcoRuntime(const LibcoRuntime&) = delete;
-  LibcoRuntime& operator=(const LibcoRuntime&) = delete;
-
-  IoWaiter io_waiter_;
+  Runtime(const Runtime&) = delete;
+  Runtime& operator=(const Runtime&) = delete;
 };
 
-using Runtime = LibcoRuntime;
-
-// 进程级单例。libco 的调度状态本身是线程本地的，因此同一个 Runtime 对象在不同
-// 线程上操作的是各自线程的事件循环。
-LibcoRuntime& current_runtime();
+// 进程级单例。运行时的调度状态是线程本地的，因此同一个 Runtime 对象在不同线程上
+// 操作的是各自线程的事件循环。
+Runtime& current_runtime();
 
 }  // namespace runtime
 }  // namespace mqtt
