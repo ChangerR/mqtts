@@ -136,6 +136,18 @@ class ThreadLocalSessionManager
   int cleanup_invalid_handlers();
 
   /**
+   * @brief 设置等待引用归零后再移除/替换 session 的超时（毫秒）
+   *
+   * 生产默认 3000ms。超时后不擦除仍被 SafeHandlerRef 持有的 SessionInfo。
+   */
+  void set_session_removal_timeout_ms(int timeout_ms)
+  {
+    session_removal_timeout_ms_ = timeout_ms < 0 ? 0 : timeout_ms;
+  }
+
+  int get_session_removal_timeout_ms() const { return session_removal_timeout_ms_; }
+
+  /**
    * @brief 配置Worker池
    * @param worker_count Worker数量
    * @param max_queue_size 每个Worker最大队列长度
@@ -157,6 +169,7 @@ class ThreadLocalSessionManager
   std::thread::id thread_id_;
   MQTTAllocator* allocator_;
   bool initialized_;
+  int session_removal_timeout_ms_;
   mutable CoroMutex sessions_mutex_;
   std::unordered_map<std::string, std::unique_ptr<SessionInfo>> sessions_;
 
@@ -171,7 +184,7 @@ class ThreadLocalSessionManager
   std::unique_ptr<SendWorkerPool> worker_pool_;
 
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
-  void safe_remove_session(const std::string& client_id, SessionInfo* info);
+  int safe_remove_session(const std::string& client_id, SessionInfo* info);
   int internal_process_messages(int max_process_count);
 };
 

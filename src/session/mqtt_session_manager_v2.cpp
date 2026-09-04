@@ -15,7 +15,11 @@ namespace mqtt {
 //==============================================================================
 
 ThreadLocalSessionManager::ThreadLocalSessionManager(std::thread::id thread_id, MQTTAllocator* allocator)
-    : thread_id_(thread_id), allocator_(allocator), initialized_(false), has_new_messages_(false)
+    : thread_id_(thread_id),
+      allocator_(allocator),
+      initialized_(false),
+      session_removal_timeout_ms_(3000),
+      has_new_messages_(false)
 {
   // 构造函数只做简单的成员变量初始化
   // 复杂的初始化逻辑移到init()方法中
@@ -116,14 +120,17 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
   if (existing != sessions_.end()) {
     LOG_WARN("Client ID already exists in thread, replacing: {}", client_id_str);
 
-    // 安全移除旧session
+    // 安全移除旧session：引用未归零时拒绝替换，避免 UAF
     SessionInfo* old_info = existing->second.get();
     old_info->is_valid.store(false);
     old_info->pending_removal.store(true);
 
-    // 协程安全的等待所有对旧session的引用释放
-    if (!old_info->wait_for_zero_refs(3000)) {
-      LOG_WARN("Timeout waiting for old session references: {}", client_id_str);
+    if (!old_info->wait_for_zero_refs(session_removal_timeout_ms_)) {
+      LOG_WARN("Timeout waiting for old session references, keeping existing handler: {}",
+               client_id_str);
+      old_info->is_valid.store(true);
+      old_info->pending_removal.store(false);
+      return MQ_ERR_TIMEOUT_V2;
     }
   }
 
@@ -149,8 +156,14 @@ int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
     return MQ_ERR_NOT_FOUND_V2;
   }
 
-  // 安全移除session
-  safe_remove_session(client_id_str, it->second.get());
+  // 安全移除session：引用未归零时保留 SessionInfo，避免 UAF
+  int remove_ret = safe_remove_session(client_id_str, it->second.get());
+  if (remove_ret != MQ_SUCCESS) {
+    LOG_WARN("Failed to unregister handler, session retained: {} (error: {})", client_id_str,
+             remove_ret);
+    return remove_ret;
+  }
+
   sessions_.erase(it);
 
   LOG_INFO("Handler unregistered from thread: {} (remaining sessions: {})", client_id_str,
@@ -159,18 +172,22 @@ int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
   return MQ_SUCCESS;
 }
 
-void ThreadLocalSessionManager::safe_remove_session(const std::string& client_id, SessionInfo* info)
+int ThreadLocalSessionManager::safe_remove_session(const std::string& client_id, SessionInfo* info)
 {
   // 标记为无效和等待移除
   info->is_valid.store(false);
   info->pending_removal.store(true);
 
   // 协程安全的等待所有引用释放
-  if (!info->wait_for_zero_refs(3000)) {
+  if (!info->wait_for_zero_refs(session_removal_timeout_ms_)) {
     LOG_WARN("Timeout waiting for session references during removal: {}", client_id);
+    info->is_valid.store(true);
+    info->pending_removal.store(false);
+    return MQ_ERR_TIMEOUT_V2;
   }
 
   LOG_DEBUG("Session safely removed: {}", client_id);
+  return MQ_SUCCESS;
 }
 
 SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& client_id)
@@ -541,8 +558,12 @@ int ThreadLocalSessionManager::cleanup_invalid_handlers()
     if (!is_handler_valid(it->second->handler)) {
       LOG_INFO("Cleaning up invalid handler: {}", it->first);
 
-      // 安全移除session
-      safe_remove_session(it->first, it->second.get());
+      // 引用未归零时跳过擦除，避免 UAF
+      int remove_ret = safe_remove_session(it->first, it->second.get());
+      if (remove_ret != MQ_SUCCESS) {
+        ++it;
+        continue;
+      }
       it = sessions_.erase(it);
       cleaned_count++;
     } else {
