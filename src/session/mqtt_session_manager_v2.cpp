@@ -1762,7 +1762,6 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
   int ret = MQ_SUCCESS;
   MQTTRouterRpcClient::UnsubscribeRequest request(global_allocator_);
   bool strict_cluster_mode = false;
-  bool local_unsubscribed = false;
   uint8_t subscribed_qos = 0;
 
   if (router_client_.get() == NULL) {
@@ -1774,11 +1773,8 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
     request.topic_filter = topic_filter;
     if (strict_cluster_mode) {
       std::vector<SubscriberInfo> subscribers;
-      int find_ret = find_topic_subscribers(topic_filter, subscribers);
-
-      if (MQ_FAIL(find_ret)) {
-        ret = find_ret;
-      } else {
+      ret = find_topic_subscribers(topic_filter, subscribers);
+      if (MQ_SUCCESS == ret) {
         for (size_t i = 0; i < subscribers.size(); ++i) {
           if (subscribers[i].client_id == client_id) {
             subscribed_qos = subscribers[i].qos;
@@ -1786,27 +1782,22 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
           }
         }
         ret = unsubscribe_topic(topic_filter, client_id);
-        if (MQ_SUCC(ret)) {
-          local_unsubscribed = true;
-          int router_ret = router_client_->unsubscribe(request);
-          if (MQ_FAIL(router_ret)) {
+        if (MQ_SUCCESS == ret) {
+          ret = router_client_->unsubscribe(request);
+          if (MQ_SUCCESS != ret) {
             int restore_ret = subscribe_topic(topic_filter, client_id, subscribed_qos);
-            if (MQ_FAIL(restore_ret)) {
+            if (MQ_SUCCESS != restore_ret) {
               LOG_WARN("Failed to restore local subscription after router unsubscribe failure, topic={}, client_id={}, restore_ret={}",
                        from_mqtt_string(topic_filter), from_mqtt_string(client_id), restore_ret);
             }
-            ret = router_ret;
           }
         }
       }
     } else {
       ret = router_client_->unsubscribe_async(request);
-      if (MQ_SUCC(ret)) {
+      if (MQ_SUCCESS == ret) {
         ret = unsubscribe_topic(topic_filter, client_id);
       }
-    }
-    if (MQ_FAIL(ret) && !strict_cluster_mode && local_unsubscribed) {
-      local_unsubscribed = false;
     }
   }
 

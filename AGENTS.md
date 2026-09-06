@@ -33,13 +33,6 @@ ctest --test-dir build-container --output-on-failure --timeout 120
   modified working tree — that is expected; do not commit the submodule change.
 - The linker prints harmless `coctx_swap.S.o: missing .note.GNU-stack section` warnings.
 
-### Known pre-existing test failure
-`ctest` reports 50/51 passing. `test_mqtt_session_manager_router` fails on
-`GlobalSessionManagerRouterTest.StrictClusterUnsubscribeRollbackOnRouterFailure`
-(`unsubscribe_topic_with_router` returns `MQ_SUCCESS` where the test expects
-`MQ_ERR_ROUTER_PROTOCOL`). It is deterministic, uses an in-process mock (no external service),
-and is unrelated to environment setup — treat it as a pre-existing product/test issue.
-
 ### MQTT client gotcha
 The broker rejects connections with an empty/auto-generated Client Identifier
 (`Client Identifier not valid`). Always pass an explicit client id, e.g.
