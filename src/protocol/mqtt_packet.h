@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <new>
 #include <string>
 #include <vector>
 #include "mqtt_stl_allocator.h"
@@ -396,6 +397,72 @@ struct PingReqPacket : public Packet
 struct PingRespPacket : public Packet
 {
   PingRespPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
+};
+
+/**
+ * RAII owner for a packet constructed with placement-new on MQTTAllocator memory.
+ * Always runs ~T() before deallocate so nested Properties / MQTTString /
+ * MQTTByteVector / MQTTVector buffers are released. Move-only.
+ */
+template <typename T>
+class AllocatedPacket
+{
+ public:
+  explicit AllocatedPacket(MQTTAllocator* allocator) : allocator_(allocator), packet_(nullptr)
+  {
+    if (!allocator_) {
+      return;
+    }
+    void* mem = allocator_->allocate(sizeof(T));
+    if (!mem) {
+      return;
+    }
+    packet_ = new (mem) T(allocator_);
+  }
+
+  ~AllocatedPacket() { destroy(); }
+
+  AllocatedPacket(const AllocatedPacket&) = delete;
+  AllocatedPacket& operator=(const AllocatedPacket&) = delete;
+
+  AllocatedPacket(AllocatedPacket&& other) noexcept
+      : allocator_(other.allocator_), packet_(other.packet_)
+  {
+    other.allocator_ = nullptr;
+    other.packet_ = nullptr;
+  }
+
+  AllocatedPacket& operator=(AllocatedPacket&& other) noexcept
+  {
+    if (this != &other) {
+      destroy();
+      allocator_ = other.allocator_;
+      packet_ = other.packet_;
+      other.allocator_ = nullptr;
+      other.packet_ = nullptr;
+    }
+    return *this;
+  }
+
+  T* get() const { return packet_; }
+  T* operator->() const { return packet_; }
+  T& operator*() const { return *packet_; }
+  explicit operator bool() const { return packet_ != nullptr; }
+
+ private:
+  void destroy()
+  {
+    if (packet_) {
+      packet_->~T();
+      if (allocator_) {
+        allocator_->deallocate(packet_, sizeof(T));
+      }
+      packet_ = nullptr;
+    }
+  }
+
+  MQTTAllocator* allocator_;
+  T* packet_;
 };
 
 }  // namespace mqtt

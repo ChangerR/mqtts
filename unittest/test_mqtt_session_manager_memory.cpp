@@ -207,6 +207,62 @@ TEST_F(SessionManagerMemoryTest, MemoryTagReporting) {
     LOG_INFO("Session manager tag usage: {} bytes", session_manager_usage);
 }
 
+TEST_F(SessionManagerMemoryTest, UnregisterAndReplaceRefusedWhileSafeHandlerRefLive)
+{
+    if (!is_coroutine_available()) {
+        GTEST_SKIP() << "Skipping test due to coroutine initialization requirements";
+        return;
+    }
+
+    std::thread::id thread_id = std::this_thread::get_id();
+    ThreadLocalSessionManager* thread_manager = manager_->register_thread_manager(thread_id);
+    if (thread_manager == nullptr) {
+        GTEST_SKIP() << "ThreadLocalSessionManager creation failed despite coroutine initialization";
+        return;
+    }
+
+    int result = manager_->finalize_thread_registration();
+    ASSERT_EQ(result, MQ_SUCCESS);
+
+    thread_manager->set_session_removal_timeout_ms(0);
+    EXPECT_EQ(thread_manager->get_session_removal_timeout_ms(), 0);
+
+    auto handler = create_mock_handler("live_ref_client");
+    auto replacement = create_mock_handler("live_ref_client");
+    MQTTString client_id = to_mqtt_string("live_ref_client", thread_manager->get_allocator());
+
+    ASSERT_EQ(thread_manager->register_handler(client_id, handler.get()), MQ_SUCCESS);
+
+    SafeHandlerRef live_ref = thread_manager->get_safe_handler(client_id);
+    ASSERT_TRUE(live_ref.is_valid());
+    EXPECT_EQ(live_ref.get(), handler.get());
+
+    EXPECT_EQ(thread_manager->unregister_handler(client_id), MQ_ERR_TIMEOUT_V2);
+
+    SafeHandlerRef still_present = thread_manager->get_safe_handler(client_id);
+    ASSERT_TRUE(still_present.is_valid());
+    EXPECT_EQ(still_present.get(), handler.get());
+    still_present.release();
+
+    EXPECT_EQ(thread_manager->register_handler(client_id, replacement.get()), MQ_ERR_TIMEOUT_V2);
+    SafeHandlerRef after_refused_replace = thread_manager->get_safe_handler(client_id);
+    ASSERT_TRUE(after_refused_replace.is_valid());
+    EXPECT_EQ(after_refused_replace.get(), handler.get());
+    after_refused_replace.release();
+
+    live_ref.release();
+
+    EXPECT_EQ(thread_manager->register_handler(client_id, replacement.get()), MQ_SUCCESS);
+    SafeHandlerRef replaced = thread_manager->get_safe_handler(client_id);
+    ASSERT_TRUE(replaced.is_valid());
+    EXPECT_EQ(replaced.get(), replacement.get());
+    replaced.release();
+
+    EXPECT_EQ(thread_manager->unregister_handler(client_id), MQ_SUCCESS);
+    SafeHandlerRef gone = thread_manager->get_safe_handler(client_id);
+    EXPECT_FALSE(gone.is_valid());
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include "mqtt_allocator.h"
+#include "mqtt_packet.h"
+#include "mqtt_stl_allocator.h"
 
 // Test fixture for allocator tests
 class MQTTAllocatorTest : public ::testing::Test
@@ -129,6 +131,30 @@ TEST_F(MQTTAllocatorTest, ChildAllocator)
   // Clean up child allocator
   allocator->remove_child("child_test");
   SUCCEED();
+}
+
+TEST_F(MQTTAllocatorTest, AllocatedPacketNestedPublishReturnsToBaseline)
+{
+  const size_t baseline = allocator->get_memory_usage();
+
+  {
+    mqtt::AllocatedPacket<mqtt::PublishPacket> packet(allocator.get());
+    ASSERT_TRUE(static_cast<bool>(packet));
+    EXPECT_GT(allocator->get_memory_usage(), baseline);
+
+    const std::string topic = "sensors/temperature/living-room/zone-alpha";
+    const std::string payload(256, 'P');
+    packet->topic_name =
+        mqtt::MQTTString(topic.begin(), topic.end(), mqtt::MQTTStrAllocator(allocator.get()));
+    packet->payload = mqtt::MQTTByteVector(payload.begin(), payload.end(),
+                                           mqtt::MQTTSTLAllocator<uint8_t>(allocator.get()));
+    packet->qos = 1;
+    packet->packet_id = 42;
+
+    EXPECT_GT(allocator->get_memory_usage(), baseline + sizeof(mqtt::PublishPacket));
+  }
+
+  EXPECT_EQ(allocator->get_memory_usage(), baseline);
 }
 
 // Google Test main function
