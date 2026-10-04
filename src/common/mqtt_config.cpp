@@ -47,6 +47,33 @@ int ConfigManager::load_from_file(const std::string& config_file)
                "请将宿主机 WebSocket 端口转发到容器 server.port。");
     }
 
+    if (root["persistence"]) {
+      const auto p = root["persistence"];
+      if (p["enabled"])
+        config_.persistence.enabled = p["enabled"].as<bool>();
+      if (p["path"])
+        config_.persistence.path = p["path"].as<std::string>();
+      if (p["max_session_expiry_seconds"])
+        config_.persistence.max_session_expiry_seconds =
+            p["max_session_expiry_seconds"].as<uint32_t>();
+      if (p["max_sessions"])
+        config_.persistence.max_sessions = p["max_sessions"].as<size_t>();
+      if (p["max_subscriptions_per_session"])
+        config_.persistence.max_subscriptions_per_session =
+            p["max_subscriptions_per_session"].as<size_t>();
+      if (p["max_messages"])
+        config_.persistence.max_messages = p["max_messages"].as<size_t>();
+      if (p["max_messages_per_session"])
+        config_.persistence.max_messages_per_session = p["max_messages_per_session"].as<size_t>();
+      if (p["max_bytes"])
+        config_.persistence.max_bytes = p["max_bytes"].as<size_t>();
+      if (p["max_requests"])
+        config_.persistence.max_requests = p["max_requests"].as<size_t>();
+      if (p["max_request_bytes"])
+        config_.persistence.max_request_bytes = p["max_request_bytes"].as<size_t>();
+      if (p["max_inflight"])
+        config_.persistence.max_inflight = p["max_inflight"].as<size_t>();
+    }
     // 验证配置
     int ret = validate();
     if (ret != 0) {
@@ -68,6 +95,15 @@ int ConfigManager::load_from_file(const std::string& config_file)
 
 int ConfigManager::validate() const
 {
+  const auto& p = config_.persistence;
+  if (p.enabled &&
+      (p.path.empty() || !p.max_session_expiry_seconds || !p.max_sessions ||
+       !p.max_subscriptions_per_session || !p.max_messages || !p.max_messages_per_session ||
+       !p.max_bytes || !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
+       !p.max_inflight || p.max_inflight > 65535)) {
+    LOG_ERROR("Invalid bounded persistence configuration");
+    return -1;
+  }
   // 验证服务器配置
   if (config_.server.port == 0 || config_.server.port > 65535) {
     LOG_ERROR("无效的端口号: {}", config_.server.port);

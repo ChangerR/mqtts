@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -154,7 +155,17 @@ int MQTTSocket::send(const uint8_t* buf, int len)
         if (errno == EINTR)
           continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          if (mqtt::runtime::current_runtime().wait_writable(fd_, -1) < 0) {
+          // libco permits one epoll waiter per descriptor. The receive
+          // coroutine may already be waiting on fd_; a second registration
+          // can lose the write wakeup and stall until its timeout. A duplicate
+          // descriptor gives the send coroutine an independent poll entry.
+          // libco does not forward F_DUPFD_CLOEXEC in its fcntl hook.
+          int write_poll = static_cast<int>(::syscall(SYS_fcntl, fd_, F_DUPFD_CLOEXEC, 0));
+          int ready =
+              write_poll < 0 ? -1 : mqtt::runtime::current_runtime().wait_writable(write_poll, 100);
+          if (write_poll >= 0)
+            ::close(write_poll);
+          if (ready < 0) {
             LOG_ERROR("Failed to wait for socket to become writable - {}", strerror(errno));
             connected_ = false;
             ret = MQ_ERR_SOCKET_SEND;

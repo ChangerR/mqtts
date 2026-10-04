@@ -162,6 +162,7 @@ add_library(mqtt_parser STATIC
     src/common/logger.cpp
     src/common/mqtt_buffer.cpp
     src/common/mqtt_config.cpp
+    src/session/mqtt_durable_store.cpp
     src/session/mqtt_session_manager_v2.cpp
 	src/session/mqtt_session_info.cpp
     src/topic/mqtt_topic_tree.cpp
@@ -218,7 +219,8 @@ add_library(mqtt_auth STATIC
 target_link_libraries(mqtt_auth mqtt_authz_proto)
 
 # 查找SQLite3 (可选)
-find_package(SQLite3 QUIET)
+find_package(SQLite3 REQUIRED)
+target_link_libraries(mqtt_parser SQLite::SQLite3)
 
 # 查找hiredis (Redis client, 可选)
 pkg_check_modules(HIREDIS hiredis)

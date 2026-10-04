@@ -68,15 +68,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false -d /app mqtts \
-  && mkdir -p /app/bin /app/lib /app/config /app/logs \
-  && chown -R mqtts:mqtts /app
+  && mkdir -p /app/bin /app/lib /app/config /app/logs /data \
+  && chown -R mqtts:mqtts /app /data
 
 COPY --from=builder /src/build/mqtts /app/bin/mqtts
 COPY --from=builder /usr/local/lib/libllhttp.so* /app/lib/
 COPY mqtts.yaml /app/config/mqtts.yaml
 
 RUN chmod +x /app/bin/mqtts \
-  && chown -R mqtts:mqtts /app
+  && chown -R mqtts:mqtts /app /data
 
 ENV LD_LIBRARY_PATH=/app/lib
 

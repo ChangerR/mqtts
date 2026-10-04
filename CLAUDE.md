@@ -115,7 +115,7 @@ docker rm -f mqtts                # stop and remove
 - **spdlog**: High-performance logging (included in 3rd/)
 - **tcmalloc**: Memory allocator from gperftools (included in 3rd/)
 - **yaml-cpp**: Configuration file parsing
-- **SQLite3**: Optional, for SQLite auth provider
+- **SQLite3**: Required for optional broker persistence and SQLite auth provider
 - **hiredis**: Optional, for Redis auth provider
 - **OpenSSL**: For password hashing
 - **CMake 3.22+**: Build system

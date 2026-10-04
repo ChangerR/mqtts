@@ -891,8 +891,11 @@ void GlobalSessionManager::update_client_index(const std::string& client_id,
 
 void GlobalSessionManager::remove_client_index(const std::string& client_id)
 {
+  auto* local = get_thread_manager();
   WriteLockGuard lock(client_index_mutex_);
-  client_to_manager_.erase(client_id);
+  auto found = client_to_manager_.find(client_id);
+  if (found != client_to_manager_.end() && found->second == local)
+    client_to_manager_.erase(found);
 }
 
 int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
@@ -990,6 +993,51 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
 {
+  std::vector<std::string> persisted_targets;
+  if (durable_store_) {
+    if (packet.qos > 1)
+      return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
+    if (packet.properties.has_message_expiry_interval &&
+        packet.properties.message_expiry_interval == 0)
+      return 0;
+    if (packet.qos == 1 && durable_store_->has_subscriptions()) {
+      try {
+        MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                     4 * 1024 * 1024);
+        MQTTParser serializer(&wire_allocator);
+        serializer.set_protocol_version_hint(5);
+        PublishPacket copy(&wire_allocator);
+        copy.type = PacketType::PUBLISH;
+        copy.topic_name = packet.topic_name;
+        copy.payload = packet.payload;
+        copy.qos = 1;
+        copy.packet_id = 1;
+        copy.retain = false;
+        copy.dup = false;
+        copy.properties = Properties(packet.properties, &wire_allocator);
+        copy.properties.topic_alias = 0;
+        MQTTBuffer wire(&wire_allocator);
+        if (serializer.serialize_publish(&copy, wire) != MQ_SUCCESS)
+          return MQ_ERR_INTERNAL;
+        int64_t expires =
+            packet.properties.message_expiry_interval
+                ? DurableStore::now_ms() + int64_t(packet.properties.message_expiry_interval) * 1000
+                : 0;
+        auto result = durable_store_->publish(
+            from_mqtt_string(topic),
+            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()),
+            from_mqtt_string(sender_client_id), expires);
+        if (!result.ok) {
+          LOG_WARN("Persistent publish refused: {}", result.error);
+          return MQ_ERR_INTERNAL;
+        }
+        persisted_targets = std::move(result.targets);
+      } catch (const std::exception& error) {
+        LOG_WARN("Persistent publish failed: {}", error.what());
+        return MQ_ERR_INTERNAL;
+      }
+    }
+  }
   // 使用高性能主题匹配树查找订阅者
   std::vector<SubscriberInfo> subscribers;
   int ret = find_topic_subscribers(topic, subscribers);
@@ -998,8 +1046,9 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
     return 0;
   }
 
-  if (subscribers.empty()) return 0;
-  int forwarded_count = 0;
+  if (subscribers.empty())
+    return int(persisted_targets.size());
+  int forwarded_count = int(persisted_targets.size());
   try {
     // Previously every recipient copied the payload using the publisher's
     // 1-MiB allocator. A single 4-KiB publish to 500 recipients could exhaust
@@ -1010,8 +1059,18 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         packet.properties, sender_client_id, global_allocator_));
     const std::string sender_id = from_mqtt_string(sender_client_id);
     for (const SubscriberInfo& subscriber : subscribers) {
-      if (from_mqtt_string(subscriber.client_id) == sender_id) continue;
-      if (forward_publish_shared(subscriber.client_id, content) == MQ_SUCCESS) ++forwarded_count;
+      const std::string target = from_mqtt_string(subscriber.client_id);
+      if (target == sender_id ||
+          std::binary_search(persisted_targets.begin(), persisted_targets.end(), target))
+        continue;
+      if (subscriber.qos == 0 && packet.qos != 0) {
+        SharedMessageContentPtr downgraded(
+            new SharedMessageContent(packet.topic_name, packet.payload, 0, false, false,
+                                     packet.properties, sender_client_id, global_allocator_));
+        if (forward_publish_shared(subscriber.client_id, downgraded) == MQ_SUCCESS)
+          ++forwarded_count;
+      } else if (forward_publish_shared(subscriber.client_id, content) == MQ_SUCCESS)
+        ++forwarded_count;
     }
   } catch (const std::bad_alloc&) {
     LOG_WARN("Insufficient memory while queuing PUBLISH fanout");

@@ -40,6 +40,10 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O1 -g0 -UNDEBUG' -DCMAKE_C_FLAGS_RELEASE='-O1 -g0 -UNDEBUG'
       - run: cmake --build build --parallel 3
       - run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Durable QoS 1 concurrency and cached authorization outage
+        run: |
+          python3 unittest/durable_concurrency.py --broker "$PWD/build/mqtts" --pairs 128 --messages 64 --report build/unittest/mqtt-durable-concurrency-report.json
+          python3 unittest/durable_concurrency.py --broker "$PWD/build/mqtts" --pairs 128 --messages 64 --fan-in --report build/unittest/mqtt-durable-fanin-report.json
       - name: Real gRPC service and MQTT concurrency
         run: |
           go -C modules/authz build -o "$RUNNER_TEMP/mqtts-authz-fixture" ./integration/fixture
@@ -52,6 +56,8 @@ jobs:
         with:
           name: mqtt-http-authorization-benchmarks
           path: |
+            build/unittest/mqtt-durable-concurrency-report.json
+            build/unittest/mqtt-durable-fanin-report.json
             build/unittest/mqtt-http-cache-report.json
             build/unittest/mqtt-http-concurrency-report.json
             build/unittest/mqtt-grpc-concurrency-report.json
@@ -102,7 +108,7 @@ jobs:
           pathlib.Path('runtime/metadata.json').write_text(json.dumps({
               'schema_version': 1, 'source_revision': revision,
               'image': 'mqtts:sha-' + revision, 'platform': 'linux/amd64',
-              'http_auth_contract': 1, 'grpc_auth_contract': 1,
+              'http_auth_contract': 1, 'grpc_auth_contract': 1, 'durable_sessions_contract': 1,
               'authz_image': 'mqtts-authz:sha-' + revision,
               'authz_proto_sha256': hashlib.sha256(pathlib.Path('modules/authz/proto/authorization.proto').read_bytes()).hexdigest(),
           }) + '\n')

@@ -214,3 +214,10 @@ add_test(NAME mqtt_http_auth_cache_integration COMMAND ${Python3_EXECUTABLE} ${C
 set_tests_properties(mqtt_http_auth_cache_integration PROPERTIES TIMEOUT 90)
 add_test(NAME mqtt_http_auth_concurrency COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/http_auth_concurrency.py --broker $<TARGET_FILE:mqtts> --payload-bytes 4096 --report ${CMAKE_CURRENT_BINARY_DIR}/mqtt-http-concurrency-report.json)
 set_tests_properties(mqtt_http_auth_concurrency PROPERTIES TIMEOUT 90)
+
+add_executable(test_mqtt_durable_store test_mqtt_durable_store.cpp ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
+target_include_directories(test_mqtt_durable_store PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_mqtt_durable_store PRIVATE mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)
+add_test(NAME test_mqtt_durable_store COMMAND test_mqtt_durable_store)
+add_test(NAME mqtt_durable_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/durable_integration.py --broker $<TARGET_FILE:mqtts>)
+set_tests_properties(mqtt_durable_integration PROPERTIES TIMEOUT 90)

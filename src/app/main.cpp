@@ -23,6 +23,9 @@ int run_mqtt_server(const mqtt::Config& config)
   // 初始化全局会话管理器
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
 
+  try { session_manager.configure_persistence(config.persistence); }
+  catch (const std::exception& error) { LOG_ERROR("Persistence initialization failed: {}", error.what()); return 1; }
+
   // 预注册线程数量和预期客户端数量
   session_manager.pre_register_threads(config.server.thread_count, config.server.max_connections);
 

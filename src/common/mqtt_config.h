@@ -16,6 +16,20 @@ namespace mqtt {
 /**
  * @brief 服务器配置
  */
+struct PersistenceConfig {
+  bool enabled = false;
+  std::string path = "mqtts-sessions.db";
+  uint32_t max_session_expiry_seconds = 86400;
+  size_t max_sessions = 10000;
+  size_t max_subscriptions_per_session = 128;
+  size_t max_messages = 100000;
+  size_t max_messages_per_session = 100000;
+  size_t max_bytes = 256 * 1024 * 1024;
+  size_t max_requests = 1024;
+  size_t max_request_bytes = 16 * 1024 * 1024;
+  size_t max_inflight = 32;
+};
+
 struct ServerConfig
 {
   std::string bind_address = "0.0.0.0";  // 绑定地址
@@ -181,6 +195,7 @@ struct AuthConfig
  */
 struct Config
 {
+  PersistenceConfig persistence;
   ServerConfig server;
   MQTTProtocolConfig mqtt;
   MemoryConfig memory;

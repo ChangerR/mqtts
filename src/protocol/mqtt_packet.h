@@ -44,6 +44,7 @@ struct Properties
 {
   // 会话相关属性
   uint32_t session_expiry_interval = 0;
+  bool has_session_expiry_interval = false;
   uint16_t receive_maximum = 0;
   uint32_t maximum_packet_size = 0;
   uint16_t topic_alias_maximum = 0;
@@ -68,6 +69,7 @@ struct Properties
   // 发布相关属性 - 使用自定义分配器
   uint8_t payload_format_indicator = 0;
   uint32_t message_expiry_interval = 0;
+  bool has_message_expiry_interval = false;
   MQTTString content_type;
   MQTTString response_topic;
   MQTTByteVector correlation_data;
@@ -99,6 +101,7 @@ struct Properties
   // 拷贝构造函数
   Properties(const Properties& other, MQTTAllocator* allocator = nullptr)
       : session_expiry_interval(other.session_expiry_interval),
+        has_session_expiry_interval(other.has_session_expiry_interval),
         receive_maximum(other.receive_maximum),
         maximum_packet_size(other.maximum_packet_size),
         topic_alias_maximum(other.topic_alias_maximum),
@@ -122,6 +125,7 @@ struct Properties
                       MQTTStrAllocator(allocator)),
         payload_format_indicator(other.payload_format_indicator),
         message_expiry_interval(other.message_expiry_interval),
+        has_message_expiry_interval(other.has_message_expiry_interval),
         content_type(other.content_type.begin(), other.content_type.end(),
                      MQTTStrAllocator(allocator)),
         response_topic(other.response_topic.begin(), other.response_topic.end(),

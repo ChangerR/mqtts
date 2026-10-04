@@ -78,7 +78,7 @@ public:
 
     // Publish MQTT message
     int publish_message(const std::string& client_id, const std::string& topic,
-                       const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false);
+                       const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false, const mqtt::Properties& properties = mqtt::Properties());
 
     // Configuration
     void set_message_format(MessageFormat format) { format_ = format; }

@@ -109,13 +109,17 @@ class Fixture:
                         http_queue_capacity=4, failure_cooldown_ms=200)
         settings.update(self.settings)
         server_threads = settings.pop('server_threads', 1)
+        max_connections = settings.pop('max_connections', 2048)
+        persistence = settings.pop('persistence', None)
         if settings.pop('version_feed', False):
             settings.update(cache_version_url=url+'/version', cache_version_interval_ms=100)
         if not settings['cache_ttl_ms']:
             settings.pop('publish_cache_ignored_fields')
-        config = dict(server=dict(bind_address='127.0.0.1', port=self.port, thread_count=server_threads),
+        config = dict(server=dict(bind_address='127.0.0.1', port=self.port, thread_count=server_threads, max_connections=max_connections),
                       monitoring=dict(enabled=False), log=dict(level='warn'),
                       auth=dict(enabled=True, allow_anonymous=False, providers=[dict(type='http', settings=settings)]))
+        if persistence is not None:
+            config['persistence'] = dict(enabled=True, path=str(self.root/'sessions.db'), **persistence)
         (self.root/'config.json').write_text(json.dumps(config))
         self.log = (self.root/'broker.log').open('w')
         self.proc = subprocess.Popen([self.binary, '-c', str(self.root/'config.json')], stdout=self.log, stderr=self.log)
