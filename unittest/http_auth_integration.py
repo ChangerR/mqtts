@@ -106,8 +106,7 @@ class Client:
         assert header == 0x90
         return result[-1]
 
-    def publish(self, topic, payload, sender=None):
-        payload = json.dumps({'from': {'type': 'user', 'id': sender or self.name}, 'body': payload.decode()}).encode()
+    def publish(self, topic, payload):
         self.send(packet(0x30, utf(topic) + (b'\x00' if self.version == 5 else b'') + payload))
 
     def message(self):
@@ -118,7 +117,7 @@ class Client:
         if self.version == 5:
             assert result[offset] == 0
             offset += 1
-        return result[2:2+length].decode(), json.loads(result[offset:])['body'].encode()
+        return result[2:2+length].decode(), result[offset:]
 
     def no_message(self):
         self.sock.settimeout(.3)
@@ -134,7 +133,7 @@ class Client:
         self.sock.close()
 
 
-def run(binary):
+def run(binary, include_payload):
     token = secrets.token_hex(32)
     state = {'revoked': set(), 'mode': 'normal'}
     class Callback(http.server.BaseHTTPRequestHandler):
@@ -149,9 +148,18 @@ def run(binary):
             if self.path == '/authentication':
                 allowed &= req.get('password') == ('p"\\word' if name.startswith('quoted') else 'test-password')
             elif self.path == '/authorization':
-                allowed &= req.get('topic') == 'chat/allowed' and req.get('action') in ('subscribe', 'publish')
+                allowed &= req.get('topic') == 'sensors/allowed' and req.get('action') in ('subscribe', 'publish')
                 if req.get('action') == 'publish':
-                    allowed &= req.get('message', {}).get('from', {}).get('id') == name
+                    if include_payload:
+                        assert req.get('payload_encoding') == 'base64'
+                        raw = base64.b64decode(req['payload'], validate=True)
+                        assert len(raw) <= 1024
+                        # A fixture policy, independent of any application schema.
+                        allowed &= raw != b'forbidden-by-policy'
+                    else:
+                        assert 'payload' not in req and 'payload_encoding' not in req
+                else:
+                    assert 'payload' not in req and 'payload_encoding' not in req
                 if name.startswith('reader'):
                     allowed &= req.get('action') == 'subscribe'
             else:
@@ -180,7 +188,9 @@ def run(binary):
             port = probe.getsockname()[1]
         config = {'server': {'bind_address': '127.0.0.1', 'port': port, 'thread_count': 2}, 'monitoring': {'enabled': False}, 'log': {'level': 'warn'},
                   'auth': {'enabled': True, 'allow_anonymous': False, 'cache_enabled': True, 'providers': [{'type': 'http', 'settings': {
-                      'authentication_url': f'http://127.0.0.1:{httpd.server_port}/authentication', 'authorization_url': f'http://127.0.0.1:{httpd.server_port}/authorization', 'token_file': str(root / 'token'), 'timeout_ms': 500, 'message_identity_prefix': 'chat/'}}]}}
+                      'authentication_url': f'http://127.0.0.1:{httpd.server_port}/authentication', 'authorization_url': f'http://127.0.0.1:{httpd.server_port}/authorization', 'token_file': str(root / 'token'), 'timeout_ms': 500, 'max_payload_bytes': 1024}}]}}
+        if include_payload:
+            config['auth']['providers'][0]['settings']['publish_payload'] = 'base64'
         (root / 'config.json').write_text(json.dumps(config))
         with (root / 'broker.log').open('w') as log:
             proc = subprocess.Popen([binary, '-c', str(root / 'config.json')], stdout=log, stderr=log)
@@ -208,23 +218,28 @@ def run(binary):
                     reader, writer = client(version, websocket), client(version, websocket)
                     assert reader.connect('reader-' + tag) == 0
                     assert writer.connect('writer-' + tag) == 0
-                    assert reader.subscribe('chat/#') >= 128
-                    assert reader.subscribe('chat/allowed') == 0
-                    writer.publish('chat/allowed', b'permitted')
-                    assert reader.message() == ('chat/allowed', b'permitted')
-                    spoof = client(version, websocket)
-                    assert spoof.connect('writer-spoof-' + tag) == 0
-                    spoof.publish('chat/allowed', b'forged sender', sender='someone-else')
-                    reader.no_message()
+                    assert reader.subscribe('sensors/#') >= 128
+                    assert reader.subscribe('sensors/allowed') == 0
+                    writer.publish('sensors/allowed', b'permitted')
+                    assert reader.message() == ('sensors/allowed', b'permitted')
+                    for payload in [b'', bytes(range(256)), b'not-json\x00\xff', b'x' * 1024]:
+                        writer.publish('sensors/allowed', payload)
+                        assert reader.message() == ('sensors/allowed', payload)
+                    if include_payload:
+                        for payload in [b'forbidden-by-policy', b'x' * 1025]:
+                            denied = client(version, websocket)
+                            assert denied.connect('writer-denied-' + tag + '-' + str(len(payload))) == 0
+                            denied.publish('sensors/allowed', payload)
+                            reader.no_message()
                     state['revoked'].add('reader-' + tag)
-                    writer.publish('chat/allowed', b'revoked reader')
+                    writer.publish('sensors/allowed', b'revoked reader')
                     reader.no_message()
-                    # Existing subscriptions are checked again after role/membership changes.
+                    # Existing subscriptions are checked again after policy changes.
                     state['revoked'].remove('reader-' + tag)
                     state['revoked'].add('writer-' + tag)
-                    writer.publish('chat/allowed', b'revoked writer')
+                    writer.publish('sensors/allowed', b'revoked writer')
                     reader.no_message()
-                    print(f'PASS MQTT {version}, websocket={websocket}: credentials, client binding, ACL, sender identity, live revocation')
+                    print(f'PASS MQTT {version}, websocket={websocket}, payload={include_payload}: credentials, ACL, opaque binary payload, live revocation')
                 assert client(5).connect('quoted-user', 'p"\\word') == 0
                 for mode in ['broken', 'oversized', 'expired', 'offline']:
                     state['mode'] = mode
@@ -233,17 +248,17 @@ def run(binary):
                 state['mode'] = 'short-lived'
                 expiring = client(5, True)
                 assert expiring.connect('reader-expiring') == 0
-                assert expiring.subscribe('chat/allowed') == 0
+                assert expiring.subscribe('sensors/allowed') == 0
                 state['mode'] = 'normal'
                 time.sleep(2.1)
                 active = client(5)
                 assert active.connect('writer-active') == 0
-                active.publish('chat/allowed', b'after session expiry')
+                active.publish('sensors/allowed', b'after session expiry')
                 expiring.no_message()
                 # Deny legacy JSON/text commands before MQTT authentication.
                 legacy = client(5, True)
                 mask = b'abcd'
-                data = b'{"type":"subscribe","topic":"chat/allowed"}'
+                data = b'{"type":"subscribe","topic":"sensors/allowed"}'
                 legacy.sock.sendall(bytes([0x81, 0x80 | len(data)]) + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(data)))
                 legacy.no_message()
                 print('PASS fail-closed callbacks, expired credentials, JSON escaping, legacy WebSocket denial')
@@ -258,7 +273,15 @@ def run(binary):
                 httpd.shutdown()
         # Enabled authentication must never open an anonymous listener when
         # configuration is incomplete or the callback secret is absent.
-        for broken_auth in [dict(enabled=True, allow_anonymous=False, providers=[]),
+        valid_auth = config['auth']
+        invalid_settings = []
+        for setting, value in [('publish_payload', 'json'), ('max_payload_bytes', '-1'),
+                               ('max_payload_bytes', '1024oops'), ('max_payload_bytes', 0),
+                               ('max_payload_bytes', 16777217), ('unsupported_option', True)]:
+            invalid = json.loads(json.dumps(valid_auth))
+            invalid['providers'][0]['settings'][setting] = value
+            invalid_settings.append(invalid)
+        for broken_auth in invalid_settings + [dict(enabled=True, allow_anonymous=False, providers=[]),
                             dict(enabled=True, allow_anonymous=True, providers=[]),
                             dict(enabled=True, allow_anonymous=False, providers=[{'type': 'http', 'settings': {}}])]:
             config['auth'] = broken_auth
@@ -268,7 +291,54 @@ def run(binary):
         print('PASS credential expiry on existing subscriptions and fail-closed startup')
 
 
+def standalone(binary):
+    """No HTTP service or application process exists during this smoke test."""
+    with tempfile.TemporaryDirectory(prefix='mqtts-standalone-') as directory:
+        root = Path(directory)
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        config = {'server': {'bind_address': '127.0.0.1', 'port': port, 'thread_count': 2},
+                  'monitoring': {'enabled': False}, 'log': {'level': 'warn'},
+                  'auth': {'enabled': False}}
+        (root / 'config.json').write_text(json.dumps(config))
+        clients = []
+        with (root / 'broker.log').open('w') as log:
+            proc = subprocess.Popen([binary, '-c', str(root / 'config.json')], stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 8
+                while True:
+                    if proc.poll() is not None:
+                        raise AssertionError((root / 'broker.log').read_text())
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                            break
+                    except OSError:
+                        assert time.monotonic() < deadline, 'standalone broker did not start'
+                        time.sleep(.05)
+                reader, writer = Client(port, 5, True), Client(port, 4)
+                clients.extend([reader, writer])
+                assert reader.connect('standalone-reader') == 0
+                assert writer.connect('standalone-writer') == 0
+                assert reader.subscribe('independent/#') == 0
+                data = bytes(range(256))
+                writer.publish('independent/bytes', data)
+                assert reader.message() == ('independent/bytes', data)
+                print('PASS standalone TCP-to-WebSocket delivery without HTTP or application services')
+            finally:
+                for item in clients:
+                    item.close()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--broker', required=True)
-    run(str(Path(parser.parse_args().broker).resolve()))
+    binary = str(Path(parser.parse_args().broker).resolve())
+    run(binary, include_payload=False)
+    run(binary, include_payload=True)
+    standalone(binary)

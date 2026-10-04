@@ -7,9 +7,9 @@
 namespace mqtt {
 namespace auth {
 
-// A trusted application makes both authentication and authorization decisions.
-// No successful decision is cached: membership and account changes take effect
-// on the next publish, subscribe, or outbound delivery.
+// An optional external policy service makes authentication and authorization
+// decisions. No successful decision is cached. Payload bytes remain opaque;
+// this provider has no application-specific topics, fields, or dependencies.
 class HttpAuthProvider : public IAuthProvider {
 public:
   explicit HttpAuthProvider(const std::map<std::string, std::string>& settings);
@@ -31,6 +31,8 @@ private:
   std::map<std::string, std::string> settings_;
   std::string token_;
   long timeout_ms_ = 2000;
+  bool include_payload_ = false;
+  size_t max_payload_bytes_ = 1024 * 1024;
   std::atomic<bool> initialized_{false};
   mutable std::mutex stats_mutex_;
   AuthStats stats_;

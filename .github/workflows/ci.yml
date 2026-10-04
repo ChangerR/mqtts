@@ -1,5 +1,7 @@
 name: Broker validation
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   native:
     runs-on: ubuntu-24.04
@@ -23,6 +25,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Record independently built revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - run: docker build -t mqtts:acceptance .
       - name: Runtime starts with shared library dependencies present
         run: |
@@ -33,3 +38,43 @@ jobs:
           done
           docker logs mqtts-acceptance
           exit 1
+      - name: Export versioned runtime image
+        env:
+          SOURCE_REVISION: ${{ steps.revision.outputs.sha }}
+        run: |
+          mkdir -p runtime
+          docker tag mqtts:acceptance "mqtts:sha-$SOURCE_REVISION"
+          docker save "mqtts:sha-$SOURCE_REVISION" | gzip > runtime/mqtts-image.tar.gz
+          (cd runtime && sha256sum mqtts-image.tar.gz > SHA256SUMS)
+          python3 - <<'PYTHON'
+          import json, os, pathlib
+          revision = os.environ['SOURCE_REVISION']
+          pathlib.Path('runtime/metadata.json').write_text(json.dumps({
+              'schema_version': 1, 'source_revision': revision,
+              'image': 'mqtts:sha-' + revision, 'platform': 'linux/amd64',
+              'http_auth_contract': 1,
+          }) + '\n')
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mqtts-image-${{ steps.revision.outputs.sha }}-linux-amd64
+          path: runtime/
+          retention-days: 90
+          compression-level: 0
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: [native, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mqtts-image-*-linux-amd64
+          path: runtime
+          merge-multiple: true
+      - name: Publish tested standalone runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes runtime/mqtts-image.tar.gz runtime/SHA256SUMS runtime/metadata.json

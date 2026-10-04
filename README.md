@@ -3,7 +3,8 @@
 MQTTS 是一个基于 C++ 的 MQTT 服务端实现，支持 MQTT v5.0，并兼容 MQTT 3.1 / 3.1.1（默认开启）。
 
 支持 TCP / WebSocket 统一 HTTP 认证、发布/订阅及每次投递权限检查。
-OpenClaw 接入、配置示例和回归测试见 [HTTP 认证说明](docs/http-auth.md)。
+HTTP provider 是可选的通用扩展；Broker 不依赖任何聊天项目或业务数据库。
+独立部署、接口契约和回归测试见 [HTTP 认证说明](docs/http-auth.md)。
 
 ## 容器优先约定（重要）
 

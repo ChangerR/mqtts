@@ -2,6 +2,8 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <algorithm>
+#include <openssl/evp.h>
 #include <fstream>
 #include <limits>
 
@@ -32,11 +34,28 @@ HttpAuthProvider::HttpAuthProvider(const std::map<std::string, std::string>& set
 
 int HttpAuthProvider::initialize()
 {
+  static const std::vector<std::string> supported = {"authentication_url", "authorization_url",
+    "token_file", "token_env", "ca_file", "timeout_ms", "publish_payload", "max_payload_bytes"};
+  for (const auto& setting : settings_) {
+    if (std::find(supported.begin(), supported.end(), setting.first) == supported.end())
+      return MQ_ERR_INVALID_ARGS;
+  }
   static const CURLcode curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT);
   if (curl_ready != CURLE_OK || !valid_url(settings_["authentication_url"])
       || !valid_url(settings_["authorization_url"])) return MQ_ERR_INVALID_ARGS;
   try {
     if (settings_.count("timeout_ms")) timeout_ms_ = std::stol(settings_["timeout_ms"]);
+    const auto mode = settings_.find("publish_payload");
+    if (mode != settings_.end() && mode->second != "none" && mode->second != "base64")
+      return MQ_ERR_INVALID_ARGS;
+    include_payload_ = mode != settings_.end() && mode->second == "base64";
+    if (settings_.count("max_payload_bytes")) {
+      size_t consumed = 0;
+      const auto value = std::stoul(settings_["max_payload_bytes"], &consumed);
+      if (consumed != settings_["max_payload_bytes"].size() || value == 0 || value > 16 * 1024 * 1024)
+        return MQ_ERR_INVALID_ARGS;
+      max_payload_bytes_ = value;
+    }
     if (!settings_["token_file"].empty()) {
       std::ifstream file(settings_["token_file"]);
       std::getline(file, token_);
@@ -58,7 +77,7 @@ AuthResult HttpAuthProvider::request(const std::string& url, const std::string& 
                                       uint64_t& expires_at_ms)
 {
   expires_at_ms = 0;
-  if (!initialized_ || body.size() > 8192) return AuthResult::ACCESS_DENIED;
+  if (!initialized_ || body.size() > 8192 + (include_payload_ ? 4 * ((max_payload_bytes_ + 2) / 3) : 0)) return AuthResult::ACCESS_DENIED;
   CURL* curl = curl_easy_init();
   if (!curl) return AuthResult::INTERNAL_ERROR;
   std::string response;
@@ -145,23 +164,29 @@ AuthStats HttpAuthProvider::get_stats() const { std::lock_guard<std::mutex> lock
 
 AuthResult HttpAuthProvider::check_publish(const UserInfo& user, const MQTTString& topic, const MQTTByteVector& payload)
 {
-  const auto name = from_mqtt_string(topic);
-  const auto setting = settings_.find("message_identity_prefix");
-  if (setting == settings_.end() || setting->second.empty()
-      || name.compare(0, setting->second.size(), setting->second) != 0)
-    return check_topic_access(user, topic, Permission::WRITE);
-  try {
-    const auto message = nlohmann::json::parse(payload.begin(), payload.end());
-    if (!message.is_object()) return AuthResult::ACCESS_DENIED;
-    nlohmann::json identity = nlohmann::json::object();
-    for (const auto* field : {"from", "sender_type", "sender_id", "conversation_id", "topic"}) {
-      if (message.contains(field)) identity[field] = message[field];
-    }
-    const nlohmann::json body = {{"username", from_mqtt_string(user.username)}, {"clientid", from_mqtt_string(user.client_id)},
-      {"action", "publish"}, {"topic", name}, {"message", identity}};
-    uint64_t expiry = 0;
-    return request(settings_.at("authorization_url"), body.dump(), expiry);
-  } catch (...) { return AuthResult::ACCESS_DENIED; }
+  if (!include_payload_) return check_topic_access(user, topic, Permission::WRITE);
+  AuthResult result = AuthResult::ACCESS_DENIED;
+  if (payload.size() <= max_payload_bytes_) {
+    try {
+      // Transport bytes are opaque to the broker. Only the external policy
+      // service knows their format or application-specific meaning.
+      std::string encoded(4 * ((payload.size() + 2) / 3) + 1, '\0');
+      const auto length = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(&encoded[0]),
+          payload.data(), static_cast<int>(payload.size()));
+      if (length >= 0) {
+        encoded.resize(static_cast<size_t>(length));
+        const nlohmann::json body = {{"username", from_mqtt_string(user.username)},
+          {"clientid", from_mqtt_string(user.client_id)}, {"action", "publish"},
+          {"topic", from_mqtt_string(topic)}, {"payload_encoding", "base64"}, {"payload", encoded}};
+        uint64_t expiry = 0;
+        result = request(settings_.at("authorization_url"), body.dump(), expiry);
+      }
+    } catch (...) {}
+  }
+  std::lock_guard<std::mutex> lock(stats_mutex_);
+  ++stats_.total_topic_checks;
+  if (result == AuthResult::SUCCESS) ++stats_.topic_access_granted; else ++stats_.topic_access_denied;
+  return result;
 }
 
 void HttpAuthProvider::reset_stats() { std::lock_guard<std::mutex> lock(stats_mutex_); stats_ = AuthStats(); }

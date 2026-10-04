@@ -1,59 +1,108 @@
-# HTTP authentication and live authorization
+# Optional HTTP authentication and authorization (contract v1)
 
-`auth.enabled: true` now initializes the configured providers before opening the
-listener. Missing, unknown, disabled, or unhealthy providers stop startup.
-Anonymous fallback is disallowed on authenticated listeners. With authentication
-disabled the existing unauthenticated development behavior is unchanged.
+MQTTS is a standalone MQTT broker. It builds and runs without any application
+repository, application database, or HTTP service. Its default development
+configuration has authentication disabled; SQLite and Redis providers can enforce
+local credentials and topic ACLs. HTTP is an optional policy provider, chosen by
+the operator. Applications own their users, roles, resources and message formats.
+The broker does not interpret application JSON or reserve application topic names.
 
-Use [config-examples/openclaw.yaml](../config-examples/openclaw.yaml) for
-[OpenClaw Bot Chat](https://github.com/WorkClawDev/openclaw-bot-chat). TCP MQTT
+## Configuration
+
+See [config-examples/http-auth.yaml](../config-examples/http-auth.yaml). TCP MQTT
 and MQTT over WebSocket share port 1883; browsers use `/mqtt`. Both MQTT 3.1.1
 and MQTT 5 authenticate CONNECT and authorize SUBSCRIBE, PUBLISH, and **every
 outbound delivery**, including an already established subscription. Legacy
 JSON/text WebSocket commands are rejected when authentication is enabled.
 
-Set `BROKER_SECURITY_CALLBACK_TOKEN` from a protected secret, at least 32
-characters, matching the backend. Alternatively use `token_file` to load its
-first line from a mounted secret. Do not commit that file. Configure callback
-URLs on a private network. HTTPS verifies the server certificate and hostname;
-`ca_file` adds a custom trust bundle. Redirects are not followed.
+`auth.enabled: true` initializes configured providers before opening the listener.
+Missing, unknown or invalid providers stop startup. Anonymous fallback is disallowed
+on authenticated listeners. The HTTP endpoint may start later; it must be reachable
+before clients can authenticate or exchange authorized traffic. An application
+outage affects clients using that policy provider, not the broker's ability to start.
 
-The callback contract uses POST JSON and `X-Broker-Token`:
+Set the variable named by `token_env` (the example uses `MQTTS_HTTP_AUTH_TOKEN`)
+to a protected secret of at least 32 characters, matching the policy service.
+Alternatively use `token_file` to load its first line from a mounted secret. Do not
+commit secrets. Configure callbacks on a private network. HTTPS verifies the
+server certificate and hostname; `ca_file` adds a custom trust bundle. Redirects
+are not followed. `timeout_ms` defaults to 2000 and permits 100–10000 milliseconds.
+Unknown settings and invalid payload modes/limits fail startup.
 
-| Endpoint | Request | Successful response |
+## Contract
+
+The callback uses POST JSON and the `X-Broker-Token` header. The URLs are entirely
+configurable; the broker assumes no application routes. This document defines
+version 1 of the contract. Additive optional fields do not change existing topic-only
+clients; incompatible changes require a new contract version and consumer opt-in.
+
+| Request | Fields | Successful response |
 | --- | --- | --- |
 | Authentication | `username`, `password`, `clientid` | HTTP 200, `{"result":"allow","expire_at":<Unix seconds>}` |
 | Authorization | `username`, `clientid`, `action` (`publish`/`subscribe`), `topic` | HTTP 200, `{"result":"allow"}` |
 
-`expire_at` is optional for server identities. When present, expiration blocks
-further authorization and delivery on the existing connection; it does not
-promise an immediate TCP disconnect. Clients must renew their scoped session
-through the application and reconnect. The provider never grants superuser
-status and never caches authorization. Timeout, malformed/oversized response,
-non-200 status, unavailable callback, and expired credentials deny access.
-`timeout_ms` defaults to 2000 and permits 100–10000 milliseconds. Callback
-responses and requests are bounded to 8192 bytes.
+Outbound delivery uses `action: subscribe` with the concrete destination topic.
+`expire_at` is optional. When present, expiration blocks further authorization
+and delivery on the existing connection; it does not promise an immediate TCP
+disconnect. Clients renew credentials with their own identity service and reconnect.
+The provider never grants superuser status and never caches authorization.
+Timeout, malformed/oversized response, non-200 status, unavailable callback and
+expired credentials deny access. Responses are bounded to 8192 bytes.
 
-For OpenClaw set `message_identity_prefix: "chat/"`. For those topics the
-payload must be a JSON object. The broker extracts only `from`, `sender_type`,
-`sender_id`, `conversation_id`, and `topic` into the authorization request's
-`message` field, allowing the backend to bind the claimed author to CONNECT
-credentials. Content is not forwarded to the authorization endpoint. This
-payload validation is opt-in; other MQTT applications can omit the prefix to
-keep arbitrary binary payloads.
+### Optional opaque publish payload
+
+The default `publish_payload: none` sends only MQTT identity, action and topic.
+Arbitrary binary payloads pass through unchanged, subject to the returned ACL.
+
+For an application that needs content-based policy, set `publish_payload: base64`.
+PUBLISH callbacks additionally carry `payload_encoding: "base64"` and `payload`,
+the standard padded Base64 encoding of the **entire original byte sequence**.
+Empty payloads encode to `""`. SUBSCRIBE/delivery/authentication callbacks never
+contain payload bytes. MQTTS does not parse JSON, extract sender fields, or assume
+any topic namespace. Only the external policy service decides what bytes mean.
+
+`max_payload_bytes` defaults to 1048576 and accepts 1–16777216. Oversized publishes
+are denied rather than truncated or authorized without payload. Request capacity
+is 8192 bytes of metadata plus the configured Base64 capacity. In topic-only mode
+the request limit stays 8192 and this payload limit does not apply to MQTT data.
+Enable payload forwarding only when the selected policy service needs the message
+content; protect that endpoint and avoid logging callback bodies or credentials.
+Base64 adds roughly one third to payload size, so include that cost in capacity tests.
+
+## Independent build and distribution
+
+The broker's CI builds/tests this repository alone and exports a Docker-loadable
+`mqtts-image-<source-sha>-linux-amd64` artifact. It contains `mqtts-image.tar.gz`,
+`SHA256SUMS` and `metadata.json` with the source revision and image name. Consumers
+can download a chosen artifact, verify the checksum and use `docker load`; no
+broker source checkout or C++ toolchain is needed in their repository. CI artifacts
+expire after 90 days. For durable distribution, a `v*` Git tag triggers a GitHub
+release with the same files **after native tests and the container smoke test pass**.
+An operator can also tag/push the built image to their own registry.
+
+```sh
+# In this repository only; no application checkout is needed.
+docker build -t mqtts:my-version .
+# In any deployment directory, after downloading the release or CI artifact:
+sha256sum -c SHA256SUMS
+docker load --input mqtts-image.tar.gz
+# Use the image name in metadata.json or retag/push it to your registry.
+```
+
+Applications own their integration config, adapters, compatibility tests and
+chosen broker version. Updating an application does not rebuild or release MQTTS;
+updating MQTTS does not require changes to an application if contract v1 is preserved.
 
 Public deployments need a TLS terminator in front of the native TCP/WS listener,
 with a publicly trusted certificate for the advertised `mqtts://` / `wss://`
-hostname. The native listener does not terminate TLS. Keep its plain port
-private and preserve the WebSocket upgrade. Do not disable certificate checks.
+hostname. The native listener does not terminate TLS. Keep its plain port private
+and preserve the WebSocket upgrade. Do not disable certificate checks.
 
-Build prerequisites now include libcurl development headers and
-`nlohmann-json3-dev`, in addition to protobuf, yaml-cpp, SQLite, hiredis,
-OpenSSL, llhttp, CMake, Ninja, and a C++ compiler. Clone recursive submodules.
-If the distribution does not package llhttp, `bash bin/install-llhttp.sh
-/absolute/prefix` installs the same pinned release as the runtime image; add
-that prefix's `lib/pkgconfig` and `lib` to `PKG_CONFIG_PATH` and
-`LD_LIBRARY_PATH` respectively.
+Build prerequisites include libcurl development headers and `nlohmann-json3-dev`,
+in addition to protobuf, yaml-cpp, SQLite, hiredis, OpenSSL, llhttp, CMake, Ninja and
+a C++ compiler. Clone recursive submodules. If the distribution does not package
+llhttp, `bash bin/install-llhttp.sh /absolute/prefix` installs the pinned release;
+add its `lib/pkgconfig` and `lib` to `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`.
 On a Linux cloud VM build natively (see AGENTS.md):
 
 ```sh
@@ -62,12 +111,10 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_FLAGS_RELEASE='-O1 -g0 -UNDEBUG'
 cmake --build build --parallel 3
 ctest --test-dir build --output-on-failure --timeout 120
-python3 unittest/http_auth_integration.py --broker build/mqtts
 ```
 
-Assertions remain enabled for the repository's assert-based tests. Integration
-tests start a real broker with a local HTTP fixture and use actual TCP/WS
-packets; they cover credential/client binding, wildcard isolation, sender
-forgery, live revocation, expiry, and fail-closed startup. OpenClaw's companion
-acceptance script additionally checks real PostgreSQL/Redis account and group
-changes through the application API.
+Assertions remain enabled for assert-based tests. A local HTTP fixture exercises
+MQTT 3.1.1/5 over TCP/WS: credential/client binding, wildcard isolation, byte-for-byte
+binary forwarding, opt-in payload callbacks, payload limits, online revocation,
+expiry and fail-closed startup/callback failures. No application code or database
+is required by these tests.

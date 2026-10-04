@@ -92,7 +92,8 @@ docker rm -f mqtts                # stop and remove
 - Server heartbeat and client connect/disconnect tracking
 
 **Authentication System**
-- Pluggable auth providers: SQLite, Redis (configurable priority)
+- Pluggable auth providers: SQLite, Redis, HTTP (configurable priority)
+- HTTP is an optional external policy contract; never add application-specific topics or payload fields to the broker
 - Auth caching with TTL support
 - `MQTTAuthManager` coordinates provider chain
 - Password hashing via OpenSSL
