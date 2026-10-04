@@ -27,6 +27,15 @@ def distribution(values):
             for name, q in [('p50_ms', .5), ('p95_ms', .95), ('p99_ms', .99), ('max_ms', 1)]}
 
 
+def optional_limit(path):
+    # Hosted runners need not mount cgroup v2. Missing quota metadata means
+    # unknown, not unlimited, and must not prevent exercising the workload.
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
 def rpc_stats(url, control=None):
     request = urllib.request.Request(url + ('/control' if control is not None else ''),
                                      data=json.dumps(control).encode() if control is not None else None,
@@ -312,8 +321,8 @@ def main():
     assert 1 <= args.queue_capacity <= 4096
     report = dict(settings=vars(args), transport='loopback TCP MQTT + plaintext gRPC',
                   mqtt_threads=2, rpc_workers=4, rpc_queue_capacity=args.queue_capacity, cache_ttl_ms=10000,
-                  cpu_max=Path('/sys/fs/cgroup/cpu.max').read_text().strip(),
-                  memory_max=Path('/sys/fs/cgroup/memory.max').read_text().strip(), phases=[])
+                  cpu_max=optional_limit('/sys/fs/cgroup/cpu.max'),
+                  memory_max=optional_limit('/sys/fs/cgroup/memory.max'), phases=[])
     def emit(row):
         report['phases'].append(row)
         Path(args.report).write_text(json.dumps(report, indent=2)+'\n')
