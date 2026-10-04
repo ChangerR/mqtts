@@ -94,7 +94,8 @@ binary payloads are opaque. No business field names are hardcoded in this module
 The store uses bbolt for serialized durable writes, then atomically publishes
 immutable records to concurrent in-memory readers. Reads do not wait for disk
 transactions. Expired client records are pruned. Limits: 4 MiB RPC messages,
-1 MiB payload/item, 256 KiB/session, bounded admissions and 2-second query /
+1 MiB payload/item, 1 MiB/session, 4096 rules and 256 KiB source context/session,
+bounded admissions and 2-second query /
 5-second management execution contexts. Transport clients must also set deadlines.
 
 This implementation has **one authoritative service/store**, supporting many

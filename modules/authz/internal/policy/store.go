@@ -139,7 +139,7 @@ func (s *Store) List(namespace, after string, limit int) ([]*pb.Session, string,
 }
 
 func Validate(row *pb.Session, now uint64) error {
-	if row == nil || row.Username == "" || row.ClientId == "" || len(row.Username) > 256 || len(row.ClientId) > 256 || strings.ContainsAny(row.Username+row.ClientId, "\x00\r\n") || len(row.PasswordSha256) != 32 || row.Namespace == "" || len(row.Namespace) > 128 || len(row.SourceContext) > 65536 || len(row.Permissions) > 1024 || proto.Size(row) > MaxSessionBytes {
+	if row == nil || row.Username == "" || row.ClientId == "" || len(row.Username) > 256 || len(row.ClientId) > 256 || strings.ContainsAny(row.Username+row.ClientId, "\x00\r\n") || len(row.PasswordSha256) != 32 || row.Namespace == "" || len(row.Namespace) > 128 || len(row.SourceContext) > 262144 || len(row.Permissions) > 4096 || proto.Size(row) > MaxSessionBytes {
 		return ErrInvalid
 	}
 	if row.PolicyValidUntilMs <= now || row.PolicyValidUntilMs > now+300000 || (row.ExpiresAtMs != 0 && (row.ExpiresAtMs <= now || row.ExpiresAtMs > now+300000)) {

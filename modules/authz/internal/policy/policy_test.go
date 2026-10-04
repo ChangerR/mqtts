@@ -2,6 +2,7 @@ package policy
 
 import (
 	"crypto/sha256"
+	"fmt"
 	pb "github.com/ChangerR/mqtts/modules/authz/api/authzv1"
 	"path/filepath"
 	"sync"
@@ -182,5 +183,32 @@ func TestNewConnectionsDoNotStarveRevocationCAS(t *testing.T) {
 	row.Enabled = false
 	if _, _, err = s.Apply(&pb.ApplyRequest{ExpectedVersion: version, Upserts: []*pb.Session{row}}); err != nil {
 		t.Fatal("login burst blocked revocation", err)
+	}
+}
+
+func TestLargePolicyStillFitsBoundedManagementPages(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "auth.db"), 10, 4*MaxSessionBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	row := record("large")
+	row.Permissions = nil
+	row.SourceContext = make([]byte, 128*1024)
+	for i := 0; i < 700; i++ {
+		topic := fmt.Sprintf("devices/%04d/events", i)
+		row.Permissions = append(row.Permissions, &pb.Permission{Action: pb.Action_SUBSCRIBE, TopicFilter: topic}, &pb.Permission{Action: pb.Action_PUBLISH, TopicFilter: topic, PayloadPolicy: &pb.PayloadPolicy{Bindings: []*pb.JsonBinding{{Paths: []string{"/identity/id"}, EqualsString: "sender", RequiredAny: true}}}})
+	}
+	if _, _, err = s.Apply(&pb.ApplyRequest{CreateOnly: true, Upserts: []*pb.Session{row}}); err != nil {
+		t.Fatal("legitimate large policy denied", err)
+	}
+	rows, _, _ := s.List("test", "", 128)
+	if len(rows) != 1 || len(rows[0].Permissions) != 1400 {
+		t.Fatal("management page truncated policy")
+	}
+	row.Username = "too-large"
+	row.SourceContext = make([]byte, 262145)
+	if _, _, err = s.Apply(&pb.ApplyRequest{CreateOnly: true, Upserts: []*pb.Session{row}}); err != ErrInvalid {
+		t.Fatal("source metadata bound not enforced")
 	}
 }

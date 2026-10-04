@@ -15,7 +15,7 @@ const (
 	MaxPayload      = 1024 * 1024
 	MaxBatch        = 64
 	MaxRPCBytes     = 4 * 1024 * 1024
-	MaxSessionBytes = 256 * 1024
+	MaxSessionBytes = 1024 * 1024
 )
 
 func ValidTopic(value string, filter bool) bool {
