@@ -21,8 +21,10 @@ jobs:
       - run: ctest --test-dir build --output-on-failure --timeout 120
       - uses: actions/upload-artifact@v4
         with:
-          name: mqtt-http-cache-benchmark
-          path: build/unittest/mqtt-http-cache-report.json
+          name: mqtt-http-authorization-benchmarks
+          path: |
+            build/unittest/mqtt-http-cache-report.json
+            build/unittest/mqtt-http-concurrency-report.json
   container:
     runs-on: ubuntu-24.04
     steps:

@@ -362,6 +362,26 @@ int AuthManager::check_topic_access(const ClientAuthContext& auth_context,
     return ret;
 }
 
+int AuthManager::check_delivery(const ClientAuthContext& context, const MQTTString& topic,
+                                std::shared_ptr<AuthorizationRequest>& pending, AuthResult& result) {
+    result = AuthResult::ACCESS_DENIED;
+    const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    if (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms) {
+        pending.reset();
+        return MQ_SUCCESS;
+    }
+    for (const auto& entry : providers_snapshot()) {
+        if (context.user_info.provider_name == entry.provider->get_provider_name()
+            && entry.provider->requires_online_authorization()) {
+            if (entry.provider->is_healthy()) result = entry.provider->check_delivery_access(context.user_info, topic, pending);
+            return MQ_SUCCESS;
+        }
+    }
+    pending.reset();
+    return check_topic_access(context, topic, Permission::READ, result);
+}
+
 std::map<std::string, AuthStats> AuthManager::get_all_stats() const {
     std::map<std::string, AuthStats> all_stats;
     

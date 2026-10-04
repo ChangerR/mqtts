@@ -23,6 +23,7 @@ namespace mqtt {
 namespace auth {
 namespace {
 using Json = nlohmann::json;
+std::atomic<uint64_t> next_authorization_session{1};
 uint64_t monotonic_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -70,10 +71,23 @@ struct Job {
   std::string url, body;
   uint64_t started = monotonic_ms(), deadline = 0;
   std::function<Decision(Decision)> complete;
+  std::function<bool()> current;
   std::mutex mutex;
   bool finished = false;
   Decision decision;
   std::vector<std::shared_ptr<Signal>> waiters;
+
+  Decision poll() {
+    if (current && !current()) return Decision();
+    std::lock_guard<std::mutex> lock(mutex);
+    if (finished) {
+      if (decision.expires_at && decision.expires_at <= wall_ms()) return Decision();
+      return decision;
+    }
+    Decision value;
+    if (monotonic_ms() < deadline) value.result = AuthResult::PENDING;
+    return value;
+  }
 
   void finish(Decision value) {
     try { if (complete) value = complete(std::move(value)); }
@@ -108,6 +122,22 @@ struct Job {
     return finished ? decision : Decision();
   }
 };
+
+struct PendingDelivery : AuthorizationRequest {
+  std::shared_ptr<Job> job;
+  uint64_t session;
+  std::string username, client_id, topic;
+  PendingDelivery(std::shared_ptr<Job> value, const UserInfo& user, const MQTTString& destination)
+      : job(std::move(value)), session(user.authorization_session),
+        username(from_mqtt_string(user.username)), client_id(from_mqtt_string(user.client_id)),
+        topic(from_mqtt_string(destination)) {}
+  AuthResult poll(const UserInfo& user, const MQTTString& destination) override {
+    if (session != user.authorization_session || username != from_mqtt_string(user.username)
+        || client_id != from_mqtt_string(user.client_id) || topic != from_mqtt_string(destination)
+        || (user.expires_at_ms && user.expires_at_ms <= wall_ms())) return AuthResult::ACCESS_DENIED;
+    return job->poll().result;
+  }
+};
 }
 
 struct HttpAuthProvider::Impl {
@@ -120,7 +150,7 @@ struct HttpAuthProvider::Impl {
   bool include_payload = false;
   std::vector<std::string> ignored_fields;
   std::atomic<bool> initialized{false}, stopping{false};
-  std::atomic<uint64_t> session_sequence{1}, epoch{0};
+  std::shared_ptr<std::atomic<uint64_t>> epoch = std::make_shared<std::atomic<uint64_t>>(0);
   std::shared_ptr<const std::string> revision = std::make_shared<const std::string>();
 
   struct Counters {
@@ -280,7 +310,7 @@ struct HttpAuthProvider::Impl {
     const auto before = std::atomic_load(&revision);
     if (*before == value) return;
     std::atomic_store(&revision, std::make_shared<const std::string>(value));
-    ++epoch;
+    ++*epoch;
     for (auto& shard : shards) {
       std::lock_guard<std::mutex> lock(shard.mutex);
       stats.evictions += shard.entries.size();
@@ -302,11 +332,21 @@ struct HttpAuthProvider::Impl {
     }
     if (curl) curl_easy_cleanup(curl);
   }
-  Decision fetch(const std::string& url, const std::string& body) {
+  Decision await_job(const std::shared_ptr<Job>& job, std::shared_ptr<Job>* deferred) {
+    if (!deferred) return job->wait();
+    *deferred = job;
+    return job->poll();
+  }
+  Decision fetch(const std::string& url, const std::string& body, std::shared_ptr<Job>* deferred = nullptr) {
     if (!initialized || body.size() > 8192 + (include_payload ? 4 * ((payload_limit + 2) / 3) : 0)) return Decision();
     const auto job = std::make_shared<Job>();
     job->url = url; job->body = body; job->deadline = job->started + timeout;
-    return enqueue(job) ? job->wait() : Decision();
+    if (deferred) {
+      const auto generation = epoch;
+      const auto captured_epoch = generation->load();
+      job->current = [generation, captured_epoch] { return generation->load() == captured_epoch; };
+    }
+    return enqueue(job) ? await_job(job, deferred) : Decision();
   }
   std::string payload_key(const MQTTByteVector& payload) {
     if (!ignored_fields.empty()) {
@@ -332,7 +372,8 @@ struct HttpAuthProvider::Impl {
     }
     return digest(payload.data(), payload.size());
   }
-  Decision authorize(const UserInfo& user, const std::string& topic, const char* action, const MQTTByteVector* payload) {
+  Decision authorize(const UserInfo& user, const std::string& topic, const char* action, const MQTTByteVector* payload,
+                     std::shared_ptr<Job>* deferred = nullptr) {
     Decision rejected;
     if (!initialized || (user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
         (payload && payload->size() > payload_limit)) return rejected;
@@ -341,7 +382,7 @@ struct HttpAuthProvider::Impl {
       if (payload) { value["payload_encoding"] = "base64"; value["payload"] = base64(*payload); }
       return value.dump();
     };
-    if (!fresh_limit) return fetch(settings.at("authorization_url"), body());
+    if (!fresh_limit) return fetch(settings.at("authorization_url"), body(), deferred);
     std::string key = Json::array({user.authorization_session, from_mqtt_string(user.username), from_mqtt_string(user.client_id), action, topic}).dump();
     if (payload) key += payload_key(*payload);
     key = digest(key);
@@ -350,12 +391,12 @@ struct HttpAuthProvider::Impl {
     Decision cached;
     bool hit = false, create = false;
     const auto now = monotonic_ms();
-    const auto captured_epoch = epoch.load();
+    const auto captured_epoch = epoch->load();
     {
       std::lock_guard<std::mutex> lock(shard.mutex);
       auto found = shard.entries.find(key);
       if (found != shard.entries.end()) {
-        if (now < found->second.expires && found->second.epoch == epoch.load()) {
+        if (now < found->second.expires && found->second.epoch == epoch->load()) {
           hit = true; cached = found->second.decision;
           shard.lru.splice(shard.lru.begin(), shard.lru, found->second.lru);
           ++stats.hits;
@@ -369,6 +410,8 @@ struct HttpAuthProvider::Impl {
       if (pending != shard.pending.end()) job = pending->second;
       else if (shard.pending.size() < queue_capacity + worker_count) {
         job = std::make_shared<Job>(); job->deadline = job->started + timeout;
+        const auto generation = epoch;
+        job->current = [generation, captured_epoch] { return generation->load() == captured_epoch; };
         shard.pending.emplace(key, job); create = true;
       }
     }
@@ -381,7 +424,7 @@ struct HttpAuthProvider::Impl {
       job->complete = [this, &shard, key, captured_epoch, session_expiry, started](Decision result) {
         std::lock_guard<std::mutex> lock(shard.mutex);
         shard.pending.erase(key);
-        if (captured_epoch != epoch.load()) return Decision();
+        if (captured_epoch != epoch->load()) return Decision();
         auto existing = shard.entries.find(key);
         if (!result.authoritative) {
           if (existing != shard.entries.end()) existing->second.retry_after = monotonic_ms() + cooldown;
@@ -410,7 +453,7 @@ struct HttpAuthProvider::Impl {
       try { job->body = body(); } catch (...) { job->finish(Decision()); return hit ? cached : rejected; }
       if (job->body.size() > 8192 + (payload ? 4 * ((payload_limit + 2) / 3) : 0) || !enqueue(job)) job->finish(Decision());
     }
-    return hit ? cached : job->wait();
+    return hit ? cached : await_job(job, deferred);
   }
 };
 
@@ -463,6 +506,7 @@ int HttpAuthProvider::initialize() {
 void HttpAuthProvider::cleanup() {
   auto& p = *impl_;
   p.initialized = false; p.stopping = true; p.work_ready.notify_all();
+  ++*p.epoch;
   if (p.version_worker.joinable()) p.version_worker.join();
   for (auto& worker : p.workers) if (worker.joinable()) worker.join();
   p.workers.clear();
@@ -482,7 +526,7 @@ AuthResult HttpAuthProvider::authenticate_user(const MQTTString& username, const
   if (result.result == AuthResult::SUCCESS) {
     ++p.stats.successes;
     user.username = username; user.client_id = client_id; user.client_ip = client_ip; user.client_port = client_port;
-    user.is_super_user = false; user.expires_at_ms = result.expires_at; user.authorization_session = p.session_sequence++;
+    user.is_super_user = false; user.expires_at_ms = result.expires_at; user.authorization_session = next_authorization_session++;
   }
   return result.result;
 }
@@ -500,6 +544,26 @@ AuthResult HttpAuthProvider::check_publish(const UserInfo& user, const MQTTStrin
   try { result = p.authorize(user, from_mqtt_string(topic), "publish", p.include_payload ? &payload : nullptr); } catch (...) {}
   if (result.result == AuthResult::SUCCESS) ++p.stats.allowed;
   return result.result;
+}
+AuthResult HttpAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
+                                                   std::shared_ptr<AuthorizationRequest>& pending) {
+  auto& p = *impl_;
+  if (!p.initialized) { pending.reset(); return AuthResult::ACCESS_DENIED; }
+  AuthResult result = AuthResult::ACCESS_DENIED;
+  try {
+    if (pending) result = pending->poll(user, topic);
+    else {
+      ++p.stats.checks;
+      std::shared_ptr<Job> job;
+      result = p.authorize(user, from_mqtt_string(topic), "subscribe", nullptr, &job).result;
+      if (result == AuthResult::PENDING) pending = std::make_shared<PendingDelivery>(job, user, topic);
+    }
+  } catch (...) { result = AuthResult::ACCESS_DENIED; }
+  if (result != AuthResult::PENDING) {
+    pending.reset();
+    if (result == AuthResult::SUCCESS) ++p.stats.allowed;
+  }
+  return result;
 }
 AuthStats HttpAuthProvider::get_stats() const {
   const auto& s = impl_->stats;

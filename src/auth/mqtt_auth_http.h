@@ -18,6 +18,8 @@ public:
                                const MQTTString&, uint16_t, UserInfo&) override;
   AuthResult check_topic_access(const UserInfo&, const MQTTString&, Permission) override;
   AuthResult check_publish(const UserInfo&, const MQTTString&, const MQTTByteVector&) override;
+  AuthResult check_delivery_access(const UserInfo&, const MQTTString&,
+                                   std::shared_ptr<AuthorizationRequest>&) override;
   bool is_super_user(const MQTTString&) override { return false; }
   bool requires_online_authorization() const override { return true; }
   const char* get_provider_name() const override { return "HTTP"; }

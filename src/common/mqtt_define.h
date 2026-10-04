@@ -75,6 +75,7 @@
 #define MQ_ERR_AUTH_TOKEN_INVALID -710
 #define MQ_ERR_AUTH_TOKEN_EXPIRED -711
 #define MQ_ERR_AUTH_NONCE_REPLAY -712
+#define MQ_ERR_AUTH_PENDING -713
 
 // Topic Tree error codes (-800 to -899)
 #define MQ_ERR_TOPIC_TREE -800
@@ -262,6 +263,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Token has expired";
     case MQ_ERR_AUTH_NONCE_REPLAY:
       return "Token nonce replay detected";
+    case MQ_ERR_AUTH_PENDING:
+      return "Authorization pending";
 
     // Topic tree errors
     case MQ_ERR_TOPIC_TREE:

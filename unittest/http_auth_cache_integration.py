@@ -23,10 +23,13 @@ class Fixture:
         self.binary, self.settings = binary, settings
         self.token = secrets.token_hex(32)
         self.counts, self.revoked = Counter(), set()
+        self.requests_by_user = Counter()
         self.revision = 'initial'
         self.delay, self.mode, self.consent = 0, 'normal', True
         self.fresh, self.age, self.expiry = 60000, 300000, 0
         self.active, self.peak = 0, 0
+        self.wildcards = False
+        self.delayed_users = None
         self.lock, self.seen = threading.Lock(), threading.Event()
         self.clients = []
 
@@ -46,11 +49,12 @@ class Fixture:
                     fixture.counts[self.path] += 1
                     revision, mode, delay = fixture.revision, fixture.mode, fixture.delay
                     name, topic = req.get('username', ''), req.get('topic', '')
+                    fixture.requests_by_user[(self.path, name)] += 1
                     allowed = name not in fixture.revoked
                     if self.path == '/authentication':
                         allowed &= req.get('password') == 'test-password'
                     elif self.path == '/authorization':
-                        allowed &= topic.startswith('fixture/') and '#' not in topic and '+' not in topic
+                        allowed &= topic.startswith('fixture/') and ((fixture.wildcards and req.get('action') == 'subscribe') or ('#' not in topic and '+' not in topic))
                         if req.get('action') == 'publish':
                             raw = base64.b64decode(req['payload'], validate=True)
                             try:
@@ -70,6 +74,8 @@ class Fixture:
                         body = {'cache_revision': revision}
                         delay = 0
                     else:
+                        if fixture.delayed_users is not None and name not in fixture.delayed_users:
+                            delay = 0
                         fixture.active += 1
                         fixture.peak = max(fixture.peak, fixture.active)
                         fixture.seen.set()
@@ -102,11 +108,12 @@ class Fixture:
                         publish_cache_ignored_fields='["nonce","data"]', http_workers=2,
                         http_queue_capacity=4, failure_cooldown_ms=200)
         settings.update(self.settings)
+        server_threads = settings.pop('server_threads', 1)
         if settings.pop('version_feed', False):
             settings.update(cache_version_url=url+'/version', cache_version_interval_ms=100)
         if not settings['cache_ttl_ms']:
             settings.pop('publish_cache_ignored_fields')
-        config = dict(server=dict(bind_address='127.0.0.1', port=self.port, thread_count=1),
+        config = dict(server=dict(bind_address='127.0.0.1', port=self.port, thread_count=server_threads),
                       monitoring=dict(enabled=False), log=dict(level='warn'),
                       auth=dict(enabled=True, allow_anonymous=False, providers=[dict(type='http', settings=settings)]))
         (self.root/'config.json').write_text(json.dumps(config))

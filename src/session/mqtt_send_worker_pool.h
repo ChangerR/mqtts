@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "mqtt_coroutine_utils.h"
@@ -15,6 +17,8 @@
 #include "mqtt_stl_allocator.h"
 
 namespace mqtt {
+
+namespace auth { class AuthorizationRequest; }
 
 // 前向声明
 class ThreadLocalSessionManager;
@@ -33,6 +37,9 @@ struct WorkerSendTask
 
   // 任务时间戳
   std::chrono::steady_clock::time_point enqueue_time;
+  std::chrono::steady_clock::time_point retry_after;
+  std::shared_ptr<auth::AuthorizationRequest> authorization;
+  uint64_t ticket = 0;
 
   WorkerSendTask() : enqueue_time(std::chrono::steady_clock::now()) {}
 
@@ -141,6 +148,10 @@ class SendWorkerPool
     CoroCondition task_available;
     std::atomic<size_t> processed_count{0};
     std::atomic<size_t> failed_count{0};
+    std::atomic<size_t> pending_count{0};
+    uint64_t next_ticket = 0;
+    // Ticket order also covers messages arriving while the head is deferred.
+    std::unordered_map<std::string, std::deque<uint64_t>> client_order;
     runtime::TaskHandle worker_task;
   };
 
@@ -154,15 +165,15 @@ class SendWorkerPool
    * @brief 处理单个发送任务
    * @param task 任务
    * @param worker_id Worker ID
-   * @return true成功，false失败
+   * @return MQ_SUCCESS, MQ_ERR_AUTH_PENDING, or a terminal error
    */
-  bool process_send_task(const WorkerSendTask& task, size_t worker_id);
+  int process_send_task(WorkerSendTask& task, size_t worker_id);
 
   /**
-   * @brief 选择负载最少的Worker
+   * @brief 同一客户端固定到同一Worker，保持发送顺序
    * @return Worker索引
    */
-  size_t select_worker() const;
+  size_t select_worker(const MQTTString& client_id) const;
 
   /**
    * @brief 停止Worker协程。在创建它们的线程上会唤醒、等待并回收；

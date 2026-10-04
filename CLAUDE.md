@@ -74,7 +74,7 @@ docker rm -f mqtts                # stop and remove
 
 **Message Processing**
 - `MQTTMessageQueue`: Thread-safe message queuing with shared content references
-- `MQTTSendWorkerPool`: Asynchronous message sending with worker threads
+- `MQTTSendWorkerPool`: Four send coroutines per MQTT event thread; deferred HTTP authorization lets other recipients progress while preserving each client's order
 - `ConcurrentTopicTree`: Lock-free topic matching with wildcard support and copy-on-write
 - Coroutine-based I/O using libco for high concurrency
 

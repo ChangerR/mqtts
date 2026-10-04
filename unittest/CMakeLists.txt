@@ -209,3 +209,5 @@ add_test(NAME mqtt_http_auth_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_C
 set_tests_properties(mqtt_http_auth_integration PROPERTIES TIMEOUT 60)
 add_test(NAME mqtt_http_auth_cache_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/http_auth_cache_integration.py --broker $<TARGET_FILE:mqtts> --messages 10000 --report ${CMAKE_CURRENT_BINARY_DIR}/mqtt-http-cache-report.json)
 set_tests_properties(mqtt_http_auth_cache_integration PROPERTIES TIMEOUT 90)
+add_test(NAME mqtt_http_auth_concurrency COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/http_auth_concurrency.py --broker $<TARGET_FILE:mqtts> --payload-bytes 4096 --report ${CMAKE_CURRENT_BINARY_DIR}/mqtt-http-concurrency-report.json)
+set_tests_properties(mqtt_http_auth_concurrency PROPERTIES TIMEOUT 90)

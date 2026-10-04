@@ -194,13 +194,16 @@ int MQTTProtocolHandler::process()
 
 int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
 {
+  if (needed_size > MAX_BUFFER_SIZE || bytes_read_ > MAX_BUFFER_SIZE - needed_size) {
+    LOG_ERROR("Packet exceeds {} byte limit from client {}:{}", MAX_BUFFER_SIZE,
+              client_ip_.c_str(), client_port_);
+    return MQ_ERR_PACKET_TOO_LARGE;
+  }
   if (bytes_read_ + needed_size > current_buffer_size_) {
-    size_t new_size = std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE);
-    if (bytes_read_ + needed_size > new_size) {
-      LOG_ERROR("Packet too large from client {}:{} (needed: {}, max: {})", client_ip_.c_str(),
-                client_port_, bytes_read_ + needed_size, MAX_BUFFER_SIZE);
-      return MQ_ERR_PACKET_TOO_LARGE;
-    }
+    // Remaining Length reveals the complete body size at once. It may need
+    // more than a single doubling even when it is well below the packet cap.
+    const size_t new_size = std::max(bytes_read_ + needed_size,
+                                    std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE));
 
     // Allocate new buffer
     char* new_buffer = (char*)allocator_->allocate(new_size);
@@ -1577,7 +1580,8 @@ int MQTTProtocolHandler::register_session_with_manager()
 
 int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVector& payload,
                                       uint8_t qos, bool retain, bool dup,
-                                      const Properties& properties)
+                                      const Properties& properties,
+                                      std::shared_ptr<auth::AuthorizationRequest>* pending)
 {
   LOG_DEBUG("Sending PUBLISH to client {}:{} (topic: {}, qos: {}, retain: {}, dup: {})",
             client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos, retain, dup);
@@ -1592,7 +1596,11 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
   // removed group member must not keep receiving through a stale subscription.
   if (auth_manager_) {
     auth::AuthResult allowed = auth::AuthResult::ACCESS_DENIED;
-    if (current_auth_context_) auth_manager_->check_topic_access(*current_auth_context_, topic, auth::Permission::READ, allowed);
+    if (current_auth_context_) {
+      if (pending) auth_manager_->check_delivery(*current_auth_context_, topic, *pending, allowed);
+      else auth_manager_->check_topic_access(*current_auth_context_, topic, auth::Permission::READ, allowed);
+    }
+    if (allowed == auth::AuthResult::PENDING) return MQ_ERR_AUTH_PENDING;
     if (allowed != auth::AuthResult::SUCCESS) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
   }
 

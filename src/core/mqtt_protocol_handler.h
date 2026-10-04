@@ -84,7 +84,8 @@ class MQTTProtocolHandler
   // Publish message sender
   virtual int send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos = 0,
                    bool retain = false, bool dup = false,
-                   const Properties& properties = Properties());
+                   const Properties& properties = Properties(),
+                   std::shared_ptr<auth::AuthorizationRequest>* pending = nullptr);
   virtual int send_publish(const PublishPacket& packet);
 
   // Session management

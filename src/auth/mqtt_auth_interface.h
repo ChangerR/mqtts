@@ -25,7 +25,8 @@ enum class AuthResult {
   TOPIC_ACCESS_DENIED,   // 主题访问被拒绝
   INTERNAL_ERROR,        // 内部错误
   TIMEOUT,               // 超时
-  RATE_LIMITED          // 频率限制
+  RATE_LIMITED,         // 频率限制
+  PENDING               // 异步授权尚未完成，不是允许或拒绝
 };
 
 /**
@@ -133,6 +134,12 @@ struct AuthStats {
  * 3. 用户权限管理
  * 4. 性能统计
  */
+class AuthorizationRequest {
+public:
+  virtual ~AuthorizationRequest() = default;
+  virtual AuthResult poll(const UserInfo&, const MQTTString& topic) = 0;
+};
+
 class IAuthProvider {
 public:
   virtual ~IAuthProvider() = default;
@@ -179,6 +186,11 @@ public:
                                    const MQTTByteVector& payload) {
     (void)payload;
     return check_topic_access(user_info, topic, Permission::WRITE);
+  }
+  virtual AuthResult check_delivery_access(const UserInfo& user, const MQTTString& topic,
+                                           std::shared_ptr<AuthorizationRequest>& pending) {
+    pending.reset();
+    return check_topic_access(user, topic, Permission::READ);
   }
 
   virtual int get_user_permissions(const MQTTString& username,
@@ -299,6 +311,8 @@ public:
                          Permission permission,
                          AuthResult& auth_result);
   int check_publish(const ClientAuthContext&, const MQTTString&, const MQTTByteVector&, AuthResult&);
+  int check_delivery(const ClientAuthContext&, const MQTTString&,
+                     std::shared_ptr<AuthorizationRequest>&, AuthResult&);
 
   /**
    * @brief 获取所有提供者的统计信息

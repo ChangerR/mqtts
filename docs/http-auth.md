@@ -111,8 +111,12 @@ CONNECT expiry applies. Omitting `cache_max_age_ms` in a response permits only t
 fresh interval, with no extra stale window. Queue waiting counts against
 `timeout_ms`; overflow is denied. A circuit opens after three unavailable/malformed
 HTTP responses and admits one recovery probe after cooldown. Workers reuse HTTP
-connections, and coroutine waiters yield through the runtime; slow cold requests
-do not block unrelated MQTT traffic. The revision feed has a reserved worker.
+connections. CONNECT/SUBSCRIBE/PUBLISH waits yield their connection coroutine.
+Cold outbound authorization returns a pending handle to the send queue instead
+of occupying a send coroutine. The queue checks completion every five milliseconds
+and continues with other recipients, preserving submission order for each client.
+Pending deliveries count against the queue limit and still check session expiry
+and the authorization generation before sending. The revision feed has a reserved worker.
 `get_stats()` exposes hit/miss/stale/eviction, HTTP request/failure/rejection,
 refresh and circuit counters.
 
@@ -147,6 +151,43 @@ python3 unittest/http_auth_cache_integration.py --broker build/mqtts \
 It checks actual delivered bytes, HTTP request counts, original expiry, revocation,
 LRU eviction and a single MQTT event thread under slow cold requests. Reported
 latencies are local sequential QoS 0 round trips, not maximum broker capacity.
+
+### Concurrency and capacity checks
+
+`server.thread_count` controls MQTT event **OS threads**. Each accepted connection
+runs in a coroutine on its event thread. Each event thread also has four send
+coroutines; these are not four extra OS threads. HTTP policy work runs on the
+separate, bounded `http_workers` OS threads, plus one thread when the version feed
+is enabled. Cache lookups use 16 shards and do not perform network I/O.
+
+Each send coroutine accepts at most 1000 unfinished deliveries, including deferred
+authorization. A client consistently maps to one send coroutine so a later cached
+topic cannot overtake an earlier cold topic. There is also a bounded ingress queue
+per event thread. Queue saturation and slow socket writes can still delay traffic;
+this isolation does not provide unlimited throughput or per-tenant reservations.
+HTTP overload denies new grants. A global version change intentionally invalidates
+all leases and can cause a cold burst; clients must back off when denied and retry
+after policy recovery. Size the worker, cache and queue limits for the deployment.
+
+Run a real multi-connection MQTT 5 QoS 1 workload with:
+
+```sh
+python3 unittest/http_auth_concurrency.py --broker build/mqtts \
+  --pairs 500 --messages 128 --window 4 --payload-bytes 256 \
+  --mqtt-threads 2 --report /tmp/mqtt-concurrency-report.json
+```
+
+`--pairs 500` means 1000 connected clients and 500 concurrent publishers, each
+with a distinct reader. Setup is paced to eight simultaneous pairs; it does not
+benchmark connection storms. Every measured publish is acknowledged and its
+opposite peer's topic, identity, nonce and full payload are checked. The report
+includes delivered throughput and P50/P95/P99 latency with healthy/offline policy
+services after warmup. CI uses 32 pairs with 4 KiB content. The test also covers slow wildcard
+recipients alongside a cached recipient, late-arrival ordering, an in-flight
+revocation, and 128 concurrent cold scopes after invalidation with bounded HTTP
+work and fail-closed overload, plus receive-buffer growth and oversized headers.
+Same-host loopback results include the Python load
+generator and are not a production capacity/SLA measurement.
 
 ## Independent build and distribution
 
