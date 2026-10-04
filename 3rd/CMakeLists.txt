@@ -2,25 +2,22 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libco/CMakeLists.txt")
   message(FATAL_ERROR "libco submodule is missing. Please run: git submodule update --init --recursive")
 endif()
 
-# libco upstream CMakeLists misses co_comm.cpp in SOURCE_FILES on some revisions.
-# Apply local patch before add_subdirectory to guarantee consistent build.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libco.patch")
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_CURRENT_SOURCE_DIR}/libco apply --check ${CMAKE_CURRENT_SOURCE_DIR}/libco.patch
-    RESULT_VARIABLE LIBCO_PATCH_CHECK_RET
-    OUTPUT_QUIET
-    ERROR_QUIET
-  )
+add_subdirectory(libco)
 
-  if(LIBCO_PATCH_CHECK_RET EQUAL 0)
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_CURRENT_SOURCE_DIR}/libco apply ${CMAKE_CURRENT_SOURCE_DIR}/libco.patch
-      RESULT_VARIABLE LIBCO_PATCH_RET
-    )
-    if(NOT LIBCO_PATCH_RET EQUAL 0)
-      message(FATAL_ERROR "Failed to apply libco.patch")
+# Some upstream revisions omit co_comm.cpp. Add it to the targets instead of
+# mutating the checkout with git apply, which silently fails in Docker contexts
+# and source archives without .git metadata.
+foreach(target colib_static colib_shared)
+  if(TARGET ${target})
+    get_target_property(libco_sources ${target} SOURCES)
+    set(has_co_comm FALSE)
+    foreach(source ${libco_sources})
+      if(source MATCHES "(^|/)co_comm[.]cpp$")
+        set(has_co_comm TRUE)
+      endif()
+    endforeach()
+    if(NOT has_co_comm)
+      target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libco/co_comm.cpp")
     endif()
   endif()
-endif()
-
-add_subdirectory(libco)
+endforeach()

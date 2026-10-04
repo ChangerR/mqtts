@@ -6,14 +6,25 @@ project(mqtts)
 find_package(Git REQUIRED)
 execute_process(
 	COMMAND ${GIT_EXECUTABLE} describe --tags --always
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	ERROR_QUIET
 	OUTPUT_VARIABLE GIT_TAG
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 execute_process(
 	COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	ERROR_QUIET
 	OUTPUT_VARIABLE GIT_HASH
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+
+if(NOT GIT_TAG)
+    set(GIT_TAG "source-build")
+endif()
+if(NOT GIT_HASH)
+    set(GIT_HASH "unknown")
+endif()
 
 # 获取构建时间
 string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")

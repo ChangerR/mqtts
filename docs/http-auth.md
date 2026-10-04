@@ -50,6 +50,10 @@ private and preserve the WebSocket upgrade. Do not disable certificate checks.
 Build prerequisites now include libcurl development headers and
 `nlohmann-json3-dev`, in addition to protobuf, yaml-cpp, SQLite, hiredis,
 OpenSSL, llhttp, CMake, Ninja, and a C++ compiler. Clone recursive submodules.
+If the distribution does not package llhttp, `bash bin/install-llhttp.sh
+/absolute/prefix` installs the same pinned release as the runtime image; add
+that prefix's `lib/pkgconfig` and `lib` to `PKG_CONFIG_PATH` and
+`LD_LIBRARY_PATH` respectively.
 On a Linux cloud VM build natively (see AGENTS.md):
 
 ```sh
