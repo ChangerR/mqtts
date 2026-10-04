@@ -223,7 +223,7 @@ public:
 
 public:
     explicit MQTTRouterRpcClient(MQTTAllocator* allocator, const RpcClientConfig& config);
-    ~MQTTRouterRpcClient();
+    virtual ~MQTTRouterRpcClient();
     
     virtual int initialize();
     virtual int connect();

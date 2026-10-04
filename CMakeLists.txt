@@ -32,7 +32,7 @@ include_directories(${CMAKE_BINARY_DIR}/generated)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 设置静态链接
-set(BUILD_SHARED_LIBS OFF)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 
 # 设置编译器标志，包含调试信息
 set(CMAKE_CXX_STANDARD 11)
@@ -177,6 +177,8 @@ target_link_libraries(mqtt_router mqtt_proto)
 
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
+    src/auth/mqtt_auth_http.cpp
+    src/auth/mqtt_auth_factory.cpp
     src/auth/mqtt_auth_manager.cpp
     src/auth/mqtt_auth_sqlite.cpp
     src/auth/mqtt_auth_redis.cpp
@@ -202,7 +204,7 @@ if(SQLite3_FOUND)
 endif()
 
 if(HIREDIS_FOUND)
-    target_link_libraries(mqtt_auth ${HIREDIS_LIBRARIES})
+    target_link_libraries(mqtt_auth ${HIREDIS_LINK_LIBRARIES})
     target_include_directories(mqtt_auth PUBLIC ${HIREDIS_INCLUDE_DIRS})
     target_compile_definitions(mqtt_auth PRIVATE HAVE_HIREDIS)
 endif()
@@ -213,11 +215,18 @@ if(OpenSSL_FOUND)
 endif()
 
 target_link_libraries(mqtt_auth mqtt_runtime)
+find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
+target_link_libraries(mqtt_auth CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(mqtt_parser mqtt_auth)
 
 # 查找yaml-cpp库的静态版本
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
+foreach(target mqtt_parser mqtt_router mqtt_auth)
+    target_link_directories(${target} PUBLIC ${YAML_CPP_LIBRARY_DIRS})
+endforeach()
 
-pkg_check_modules(LLHTTP REQUIRED llhttp)
+pkg_search_module(LLHTTP REQUIRED llhttp libllhttp)
 
 target_include_directories(mqtt_parser PUBLIC
     ${MQTTS_INCLUDE_DIRS}

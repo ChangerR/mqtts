@@ -238,6 +238,7 @@ int WebSocketMQTTBridge::register_handler(const std::string& client_id, WebSocke
 
     handlers_[client_id] = handler;
     client_protocol_versions_.erase(client_id);
+    auth_contexts_.erase(client_id);
     LOG_INFO("Registered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -267,6 +268,7 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
     handlers_.erase(client_id);
     pending_binary_buffers_.erase(client_id);
     client_protocol_versions_.erase(client_id);
+    auth_contexts_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -279,6 +281,7 @@ WebSocketProtocolHandler* WebSocketMQTTBridge::get_handler(const std::string& cl
 
 int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, const std::string& message) {
     stats_.ws_messages_received++;
+    if (auth_manager_) return MQ_ERR_CONNECT_NOT_AUTHORIZED; // Authenticated mode uses MQTT CONNECT, never legacy text commands.
 
     LOG_DEBUG("Handling WebSocket text message from {}: {}", client_id, message);
 
@@ -594,6 +597,7 @@ int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqt
 
 int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet) {
     stats_.mqtt_messages_received++;
+    if (!topic_allowed(client_id, mqtt::from_mqtt_string(packet.topic_name), mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
 
     LOG_DEBUG("Forwarding MQTT publish to WebSocket client {}: topic={}, qos={}",
               client_id, packet.topic_name, packet.qos);
@@ -650,6 +654,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
 }
 
 int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos) {
+    if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
     if (!session_manager_) {
         LOG_ERROR("Session manager not initialized");
         return MQ_ERR_SESSION_MANAGER_NOT_READY;
@@ -694,6 +699,14 @@ int WebSocketMQTTBridge::unsubscribe_topic(const std::string& client_id, const s
 
 int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std::string& topic,
                                          const std::vector<uint8_t>& payload, uint8_t qos, bool retain) {
+    if (auth_manager_) {
+        const auto found = auth_contexts_.find(client_id);
+        if (found == auth_contexts_.end()) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        const auto context = found->second;
+        mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+        auth_manager_->check_publish(*context, mqtt::to_mqtt_string(topic, allocator_), mqtt::to_mqtt_bytes(payload, allocator_), result);
+        if (result != mqtt::auth::AuthResult::SUCCESS) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    }
     if (!session_manager_) {
         LOG_ERROR("Session manager not initialized");
         return MQ_ERR_SESSION_MANAGER_NOT_READY;
@@ -720,6 +733,17 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
     }
 
     return ret;
+}
+
+bool WebSocketMQTTBridge::topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission) {
+    if (!auth_manager_) return true;
+    const auto found = auth_contexts_.find(client_id);
+    if (found == auth_contexts_.end()) return false;
+    // Keep the context alive across coroutine-aware HTTP I/O.
+    const auto context = found->second;
+    mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+    auth_manager_->check_topic_access(*context, mqtt::to_mqtt_string(topic, allocator_), permission, result);
+    return result == mqtt::auth::AuthResult::SUCCESS;
 }
 
 // MQTT packet handlers (for binary protocol mode)
@@ -757,12 +781,30 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
     }
 
+    if (client_protocol_versions_.count(client_id)) return MQ_ERR_PROTOCOL;
     client_protocol_versions_[client_id] = packet->protocol_version;
-
     mqtt::ConnAckPacket connack(allocator_);
     connack.type = mqtt::PacketType::CONNACK;
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::Success;
+    if (packet->client_id.empty()) connack.reason_code = mqtt::ReasonCode::ClientIdentifierNotValid;
+    if (auth_manager_ && connack.reason_code == mqtt::ReasonCode::Success) {
+        auto context = std::make_shared<mqtt::auth::ClientAuthContext>(allocator_);
+        mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+        mqtt::MQTTString address{mqtt::MQTTStrAllocator(allocator_)};
+        const int authenticated = auth_manager_->authenticate_user(packet->username, packet->password, packet->client_id, address, 0, result, *context);
+        if (authenticated != MQ_SUCCESS || result != mqtt::auth::AuthResult::SUCCESS) {
+            connack.reason_code = mqtt::ReasonCode::NotAuthorized;
+        } else {
+            auth_contexts_[client_id] = std::move(context);
+        }
+    }
+    if (connack.reason_code != mqtt::ReasonCode::Success) {
+        send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        auth_contexts_.erase(client_id);
+        return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    }
     int ret = send_serialized_mqtt_packet(client_id, connack);
     if (ret != MQ_SUCCESS) {
         client_protocol_versions_.erase(client_id);
@@ -796,7 +838,7 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
                     break;
             }
         } else {
-            suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+            suback.reason_codes.push_back(sub_ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError);
         }
     }
 

@@ -1,0 +1,30 @@
+name: Broker validation
+on: [push, pull_request]
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config g++ libssl-dev libyaml-cpp-dev libsqlite3-dev libhiredis-dev protobuf-compiler libprotobuf-dev libcurl4-openssl-dev nlohmann-json3-dev libllhttp-dev python3
+      - name: Configure with assertions enabled
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O1 -g0 -UNDEBUG' -DCMAKE_C_FLAGS_RELEASE='-O1 -g0 -UNDEBUG'
+      - run: cmake --build build --parallel 3
+      - run: ctest --test-dir build --output-on-failure --timeout 120
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: docker build -t mqtts:acceptance .
+      - name: Runtime starts with shared library dependencies present
+        run: |
+          docker run -d --name mqtts-acceptance -p 127.0.0.1:1883:1883 mqtts:acceptance
+          for i in $(seq 1 30); do
+            if docker exec mqtts-acceptance nc -z 127.0.0.1 1883; then exit 0; fi
+            sleep 1
+          done
+          docker logs mqtts-acceptance
+          exit 1

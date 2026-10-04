@@ -396,6 +396,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketMQTTBridge)))
         websocket::WebSocketMQTTBridge(ctx->allocator, websocket::MessageFormat::JSON);
     bridge->set_allow_mqtt3x(ctx->server->mqtt_protocol_config_.allow_mqtt3x);
+    bridge->set_auth_manager(ctx->server->auth_manager_);
 
     // Create adapter to bridge WebSocket and MQTT protocol handlers
     websocket::WebSocketHandlerAdapter* adapter =
@@ -459,6 +460,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
     MQTTProtocolHandler* handler = new (ctx->allocator->allocate(sizeof(MQTTProtocolHandler)))
         MQTTProtocolHandler(ctx->allocator);
     handler->set_allow_mqtt3x(ctx->server->mqtt_protocol_config_.allow_mqtt3x);
+    handler->set_auth_manager(ctx->server->auth_manager_);
 
     // Initialize handler
     if (MQ_FAIL(handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {

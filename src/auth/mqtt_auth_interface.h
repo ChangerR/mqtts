@@ -6,6 +6,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
+#include <map>
 #include "mqtt_allocator.h"
 #include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
@@ -46,6 +47,8 @@ struct UserInfo {
   MQTTString client_ip;
   uint16_t client_port;
   bool is_super_user;
+  uint64_t expires_at_ms = 0;
+  std::string provider_name;
   
   UserInfo(MQTTAllocator* allocator) 
     : username(MQTTStrAllocator(allocator)),
@@ -164,6 +167,11 @@ public:
   virtual AuthResult check_topic_access(const UserInfo& user_info,
                                        const MQTTString& topic,
                                        Permission permission) = 0;
+  virtual AuthResult check_publish(const UserInfo& user_info, const MQTTString& topic,
+                                   const MQTTByteVector& payload) {
+    (void)payload;
+    return check_topic_access(user_info, topic, Permission::WRITE);
+  }
 
   virtual int get_user_permissions(const MQTTString& username,
                                    std::vector<TopicPermission>& permissions)
@@ -203,6 +211,7 @@ public:
    * @return true健康，false不健康
    */
   virtual bool is_healthy() const = 0;
+  virtual bool requires_online_authorization() const { return false; }
 };
 
 /**
@@ -281,6 +290,7 @@ public:
                          const MQTTString& topic,
                          Permission permission,
                          AuthResult& auth_result);
+  int check_publish(const ClientAuthContext&, const MQTTString&, const MQTTByteVector&, AuthResult&);
 
   /**
    * @brief 获取所有提供者的统计信息
@@ -297,7 +307,7 @@ public:
 
 private:
   struct ProviderEntry {
-    std::unique_ptr<IAuthProvider> provider;
+    std::shared_ptr<IAuthProvider> provider;
     int priority;
     
     ProviderEntry(std::unique_ptr<IAuthProvider> p, int prio) 
@@ -307,6 +317,7 @@ private:
   MQTTAllocator* allocator_;
   std::vector<ProviderEntry> providers_;
   mutable std::mutex providers_mutex_;
+  std::vector<ProviderEntry> providers_snapshot() const;
   
   // 缓存相关
   bool cache_enabled_;

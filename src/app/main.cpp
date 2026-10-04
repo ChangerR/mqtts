@@ -9,10 +9,16 @@
 #include "mqtt_server.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_process_monitor.h"
+#include "mqtt_auth_factory.h"
 
-void run_mqtt_server(const mqtt::Config& config)
+int run_mqtt_server(const mqtt::Config& config)
 {
   std::vector<std::thread> threads;
+  std::unique_ptr<mqtt::auth::AuthManager> auth_manager;
+  if (mqtt::auth::configure_auth(config.auth, MQ_MEM_MANAGER.get_root_allocator(), auth_manager) != MQ_SUCCESS) {
+    LOG_ERROR("Authentication configuration failed; refusing to open listener");
+    return 1;
+  }
 
   // 初始化全局会话管理器
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
@@ -24,13 +30,14 @@ void run_mqtt_server(const mqtt::Config& config)
            config.server.max_connections);
 
   MQTTServer server(config.server, config.memory, config.mqtt);
+  server.set_auth_manager(auth_manager.get());
 
   LOG_INFO("Starting MQTT server on {}:{}", config.server.bind_address, config.server.port);
 
   int ret = server.start();
   if (ret != MQ_SUCCESS) {
     LOG_ERROR("Failed to start MQTT server, error code: {}", ret);
-    return;
+    return 1;
   }
 
   if (config.server.thread_count > 1) {
@@ -111,6 +118,7 @@ void run_mqtt_server(const mqtt::Config& config)
   server.stop();
 
   LOG_INFO("MQTT server thread stopped");
+  return 0;
 }
 
 bool file_exists(const std::string& filename)
@@ -222,8 +230,8 @@ int main(int argc, char* argv[])
   LOG_INFO("  允许 MQTT 3.x: {}", config.mqtt.allow_mqtt3x ? "true" : "false");
   LOG_INFO("  客户端内存大小: {} MB", config.memory.client_max_size / (1024 * 1024));
 
-  run_mqtt_server(config);
+  int server_result = run_mqtt_server(config);
 
   LOG_INFO("MQTT服务器已停止");
-  return 0;
+  return server_result;
 }

@@ -760,14 +760,15 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   }
 
   if (MQ_SUCC(ret) && auth_manager_ && current_auth_context_) {
-    (void)auth_manager_->check_topic_access(*current_auth_context_, packet->topic_name,
-                                            auth::Permission::WRITE, auth_result);
+    (void)auth_manager_->check_publish(*current_auth_context_, packet->topic_name, packet->payload, auth_result);
 
     if (auth::AuthResult::SUCCESS != auth_result) {
       LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions",
                client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
       auth_denied = true;
-      if (1 == packet->qos) {
+      if (negotiated_protocol_version_ < 5 || packet->qos == 0) {
+        ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+      } else if (1 == packet->qos) {
         ret = send_puback(packet->packet_id, ReasonCode::NotAuthorized);
       } else if (2 == packet->qos) {
         ret = send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
@@ -1585,6 +1586,14 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
     LOG_ERROR("Cannot send PUBLISH: socket is null for client {}:{}", client_ip_.c_str(),
               client_port_);
     return MQ_ERR_SOCKET;
+  }
+
+  // Recheck an existing subscription before delivery. A revoked account or
+  // removed group member must not keep receiving through a stale subscription.
+  if (auth_manager_) {
+    auth::AuthResult allowed = auth::AuthResult::ACCESS_DENIED;
+    if (current_auth_context_) auth_manager_->check_topic_access(*current_auth_context_, topic, auth::Permission::READ, allowed);
+    if (allowed != auth::AuthResult::SUCCESS) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
   }
 
   AllocatedPacket<PublishPacket> packet(allocator_);

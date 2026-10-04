@@ -211,9 +211,11 @@ void test_auth_manager_basic() {
     auto provider1 = std::make_unique<MockAuthProvider>("mock1", allocator);
     auto provider2 = std::make_unique<MockAuthProvider>("mock2", allocator);
     
+    provider1->initialize();
     ret = auth_manager.add_provider(std::move(provider1), 10);
     assert(ret == MQ_SUCCESS);
     
+    provider2->initialize();
     ret = auth_manager.add_provider(std::move(provider2), 20);
     assert(ret == MQ_SUCCESS);
     
@@ -254,6 +256,7 @@ void test_auth_manager_topic_access() {
     auth_manager.initialize();
     
     auto provider = std::make_unique<MockAuthProvider>("test_provider", allocator);
+    provider->initialize();
     auth_manager.add_provider(std::move(provider), 10);
     
     // 测试超级用户权限
@@ -308,7 +311,9 @@ void test_auth_manager_multiple_providers() {
     auto provider1 = std::make_unique<MockAuthProvider>("high_priority", allocator);
     auto provider2 = std::make_unique<MockAuthProvider>("low_priority", allocator);
     
+    provider1->initialize();
     auth_manager.add_provider(std::move(provider1), 5);   // 高优先级
+    provider2->initialize();
     auth_manager.add_provider(std::move(provider2), 10);  // 低优先级
     
     // 测试认证会优先使用高优先级提供者
@@ -346,6 +351,7 @@ void test_auth_manager_cache() {
     auth_manager.initialize();
     
     auto provider = std::make_unique<MockAuthProvider>("cache_test", allocator);
+    provider->initialize();
     auth_manager.add_provider(std::move(provider), 10);
     
     MQTTString username("user1", MQTTStrAllocator(allocator));
@@ -363,6 +369,11 @@ void test_auth_manager_cache() {
     result = auth_manager.authenticate_user(username, password, client_id, client_ip, 1883, user_info2);
     assert(result == AuthResult::SUCCESS);
     
+    // A successful username/client-id lookup must not authorize a different password.
+    MQTTString wrong_password("wrong", MQTTStrAllocator(allocator));
+    result = auth_manager.authenticate_user(username, wrong_password, client_id, client_ip, 1883, user_info2);
+    assert(result == AuthResult::INVALID_CREDENTIALS);
+
     // 禁用缓存
     auth_manager.set_cache_enabled(false);
     
@@ -390,7 +401,9 @@ void test_auth_manager_client_auth_context() {
     provider2->clear_permissions("user1");
     provider2->add_permission("user1", "cluster/+", Permission::READ);
 
+    provider1->initialize();
     auth_manager.add_provider(std::move(provider1), 5);
+    provider2->initialize();
     auth_manager.add_provider(std::move(provider2), 10);
 
     MQTTString username("user1", MQTTStrAllocator(allocator));
@@ -415,6 +428,15 @@ void test_auth_manager_client_auth_context() {
     assert(ret == MQ_SUCCESS);
     assert(auth_result == AuthResult::ACCESS_DENIED);
 
+    MQTTString broader_filter("cluster/#", MQTTStrAllocator(allocator));
+    auth_manager.check_topic_access(auth_context, broader_filter, Permission::READ, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
+    MQTTString sibling_topic("other/node1", MQTTStrAllocator(allocator));
+    auth_manager.check_topic_access(auth_context, sibling_topic, Permission::READ, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
+    auth_context.user_info.expires_at_ms = 1;
+    auth_manager.check_topic_access(auth_context, allowed_topic, Permission::READ, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
     auth_manager.cleanup();
     std::cout << "✓ AuthManager client auth context test passed" << std::endl;
 }
@@ -445,11 +467,13 @@ void test_auth_manager_error_handling() {
     auto provider1 = std::make_unique<MockAuthProvider>("duplicate", allocator);
     auto provider2 = std::make_unique<MockAuthProvider>("duplicate", allocator);
     
+    provider1->initialize();
     ret = auth_manager.add_provider(std::move(provider1), 10);
     assert(ret == MQ_SUCCESS);
     
+    provider2->initialize();
     ret = auth_manager.add_provider(std::move(provider2), 10);
-    assert(ret == MQ_ERR_INTERNAL);
+    assert(ret == MQ_ERR_INVALID_ARGS);
     
     // 测试移除不存在的提供者
     ret = auth_manager.remove_provider("nonexistent");

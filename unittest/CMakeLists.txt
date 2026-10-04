@@ -172,6 +172,7 @@ target_link_libraries(test_http_parser PRIVATE mqtt_parser tcmalloc_minimal gtes
 
 # 启用测试
 enable_testing()
+add_test(NAME test_mqtt_auth_manager COMMAND test_mqtt_auth_manager)
 add_test(NAME test_connect COMMAND test_connect)
 add_test(NAME test_mqtt_allocator COMMAND test_mqtt_allocator)
 add_test(NAME test_mqtt_parser COMMAND test_mqtt_parser)
@@ -203,3 +204,6 @@ add_test(NAME test_mqtt_session_manager_router COMMAND test_mqtt_session_manager
 add_test(NAME test_websocket_frame COMMAND test_websocket_frame)
 add_test(NAME test_websocket_mqtt_bridge COMMAND test_websocket_mqtt_bridge)
 add_test(NAME test_http_parser COMMAND test_http_parser)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME mqtt_http_auth_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/http_auth_integration.py --broker $<TARGET_FILE:mqtts>)
+set_tests_properties(mqtt_http_auth_integration PROPERTIES TIMEOUT 60)
