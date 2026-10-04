@@ -245,6 +245,8 @@ def run(binary, include_payload):
                     state['mode'] = mode
                     assert client(5).connect('writer-failure') != 0, mode
                 state['mode'] = 'normal'
+                # Unavailable/malformed services open the bounded HTTP circuit.
+                time.sleep(1.1)
                 state['mode'] = 'short-lived'
                 expiring = client(5, True)
                 assert expiring.connect('reader-expiring') == 0
@@ -277,7 +279,11 @@ def run(binary, include_payload):
         invalid_settings = []
         for setting, value in [('publish_payload', 'json'), ('max_payload_bytes', '-1'),
                                ('max_payload_bytes', '1024oops'), ('max_payload_bytes', 0),
-                               ('max_payload_bytes', 16777217), ('unsupported_option', True)]:
+                               ('max_payload_bytes', 16777217), ('cache_max_age_ms', 300001),
+                               ('cache_ttl_ms', 300001), ('http_workers', 0),
+                               ('http_queue_capacity', 0), ('cache_max_entries', 15),
+                               ('cache_version_url', 'file:///tmp/policy'),
+                               ('publish_cache_ignored_fields', '["actor"]'), ('unsupported_option', True)]:
             invalid = json.loads(json.dumps(valid_auth))
             invalid['providers'][0]['settings'][setting] = value
             invalid_settings.append(invalid)

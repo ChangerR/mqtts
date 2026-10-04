@@ -49,6 +49,7 @@ struct UserInfo {
   bool is_super_user;
   uint64_t expires_at_ms = 0;
   std::string provider_name;
+  uint64_t authorization_session = 0;
   
   UserInfo(MQTTAllocator* allocator) 
     : username(MQTTStrAllocator(allocator)),
@@ -110,6 +111,13 @@ struct AuthStats {
   uint64_t topic_access_denied;
   uint64_t cache_hits;
   uint64_t cache_misses;
+  uint64_t cache_stale_hits = 0;
+  uint64_t cache_evictions = 0;
+  uint64_t http_requests = 0;
+  uint64_t http_failures = 0;
+  uint64_t http_rejected = 0;
+  uint64_t cache_refreshes = 0;
+  uint64_t circuit_opened = 0;
   
   AuthStats() : total_login_attempts(0), successful_logins(0), failed_logins(0),
                 total_topic_checks(0), topic_access_granted(0), topic_access_denied(0),
