@@ -135,9 +135,14 @@ class AsyncClient:
     async def connect(cls, port, name):
         reader, writer = await asyncio.open_connection('127.0.0.1', port)
         item = cls(reader, writer, name)
-        writer.write(packet(0x10, utf('MQTT')+bytes([5, 0xc2, 0, 60, 0])+utf(name)+utf(name)+utf('test-password')))
-        header, body = await item.read_packet()
-        assert header == 0x20 and body[1] == 0, ('connect', name, body)
+        try:
+            writer.write(packet(0x10, utf('MQTT')+bytes([5, 0xc2, 0, 60, 0])+utf(name)+utf(name)+utf('test-password')))
+            header, body = await asyncio.wait_for(item.read_packet(), 5)
+            assert header == 0x20 and body[1] == 0, ('connect', name, body)
+        except BaseException:
+            writer.close()
+            await writer.wait_closed()
+            raise
         item.task = asyncio.create_task(item.read_loop())
         return item
 

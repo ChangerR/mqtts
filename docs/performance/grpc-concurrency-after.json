@@ -1,0 +1,263 @@
+{
+  "settings": {
+    "broker": "/workspace/mqtts/build-native/mqtts",
+    "authz_fixture": "/tmp/mqtts-authz-fixture",
+    "pairs": 500,
+    "seconds": 60.0,
+    "outage_seconds": 15.0,
+    "rate": 4000,
+    "cold_seconds": 10.0,
+    "cold_rate": 1000,
+    "payload_bytes": 4096,
+    "fanout_messages": 100,
+    "queue_capacity": 1024,
+    "report": "/tmp/mqtt-grpc-stress-fixed-1000.json"
+  },
+  "transport": "loopback TCP MQTT + plaintext gRPC",
+  "mqtt_threads": 2,
+  "rpc_workers": 4,
+  "rpc_queue_capacity": 1024,
+  "cache_ttl_ms": 10000,
+  "cpu_max": "400000 100000",
+  "memory_max": "17179869184",
+  "phases": [
+    {
+      "scenario": "simultaneous CONNECT",
+      "attempted": 1000,
+      "accepted": 1000,
+      "rejected_or_failed": 0,
+      "elapsed_s": 1.291,
+      "accepted_latency": {
+        "p50_ms": 1069.724,
+        "p95_ms": 1262.819,
+        "p99_ms": 1266.027,
+        "max_ms": 1273.63
+      },
+      "examples": [],
+      "authentication_rpcs": 1000,
+      "connections_after_controlled_retry": 1000
+    },
+    {
+      "scenario": "sustained, including 10-second cache refresh",
+      "offered": 240000,
+      "offered_per_second": 4000,
+      "elapsed_s": 60.001,
+      "outcomes": {
+        "delivered": 240000
+      },
+      "errors": [],
+      "delivered_per_second": 3999.9,
+      "send_latency": {
+        "p50_ms": 0.557,
+        "p95_ms": 4.234,
+        "p99_ms": 15.168,
+        "max_ms": 102.316
+      },
+      "schedule_latency": {
+        "p50_ms": 1.082,
+        "p95_ms": 8.359,
+        "p99_ms": 27.989,
+        "max_ms": 114.69
+      },
+      "resources": {
+        "broker": {
+          "peak_rss_mib": 63.9,
+          "peak_fds": 1011,
+          "peak_threads": 18,
+          "cpu_cores": 0.567
+        },
+        "authz": {
+          "peak_rss_mib": 22.4,
+          "peak_fds": 10,
+          "peak_threads": 8,
+          "cpu_cores": 0.013
+        },
+        "generator": {
+          "peak_rss_mib": 56.2,
+          "peak_fds": 1008,
+          "peak_threads": 1,
+          "cpu_cores": 0.623
+        }
+      },
+      "authorization": {
+        "batches": 2003,
+        "items": 5206,
+        "max_batch": 32
+      }
+    },
+    {
+      "scenario": "authz paused beyond cache freshness",
+      "offered": 60000,
+      "offered_per_second": 4000,
+      "elapsed_s": 15.0,
+      "outcomes": {
+        "delivered": 60000
+      },
+      "errors": [],
+      "delivered_per_second": 3999.9,
+      "send_latency": {
+        "p50_ms": 0.508,
+        "p95_ms": 2.734,
+        "p99_ms": 7.042,
+        "max_ms": 33.489
+      },
+      "schedule_latency": {
+        "p50_ms": 1.053,
+        "p95_ms": 5.151,
+        "p99_ms": 13.69,
+        "max_ms": 33.712
+      },
+      "resources": {
+        "broker": {
+          "peak_rss_mib": 64.5,
+          "peak_fds": 1011,
+          "peak_threads": 18,
+          "cpu_cores": 0.571
+        },
+        "authz": {
+          "peak_rss_mib": 19.0,
+          "peak_fds": 10,
+          "peak_threads": 8,
+          "cpu_cores": 0.0
+        },
+        "generator": {
+          "peak_rss_mib": 43.9,
+          "peak_fds": 1008,
+          "peak_threads": 1,
+          "cpu_cores": 0.576
+        }
+      }
+    },
+    {
+      "scenario": "authorization recovery after resume",
+      "probe_denied": 0,
+      "elapsed_s": 1.204
+    },
+    {
+      "scenario": "every publish requires gRPC authorization",
+      "offered": 10000,
+      "offered_per_second": 1000,
+      "elapsed_s": 10.004,
+      "outcomes": {
+        "delivered": 10000
+      },
+      "errors": [],
+      "delivered_per_second": 999.6,
+      "send_latency": {
+        "p50_ms": 2.406,
+        "p95_ms": 4.193,
+        "p99_ms": 8.323,
+        "max_ms": 24.408
+      },
+      "schedule_latency": {
+        "p50_ms": 2.988,
+        "p95_ms": 5.869,
+        "p99_ms": 12.685,
+        "max_ms": 26.516
+      },
+      "resources": {
+        "broker": {
+          "peak_rss_mib": 67.7,
+          "peak_fds": 1014,
+          "peak_threads": 18,
+          "cpu_cores": 0.442
+        },
+        "authz": {
+          "peak_rss_mib": 20.1,
+          "peak_fds": 10,
+          "peak_threads": 8,
+          "cpu_cores": 0.298
+        },
+        "generator": {
+          "peak_rss_mib": 43.0,
+          "peak_fds": 1008,
+          "peak_threads": 1,
+          "cpu_cores": 0.266
+        }
+      },
+      "authorization": {
+        "batches": 9936,
+        "items": 10500,
+        "max_batch": 32
+      }
+    },
+    {
+      "scenario": "cold burst after revision change, 800 ms service delay",
+      "cold_attempted": 498,
+      "cold_outcomes": {
+        "publish_denied": 498
+      },
+      "elapsed_s": 2.035,
+      "authorization_batches": 6,
+      "authorization_items": 116,
+      "peak_service_rpcs": 5,
+      "warm": {
+        "scenario": "warm pair during slow cold authorization burst",
+        "offered": 200,
+        "offered_per_second": 100,
+        "elapsed_s": 1.993,
+        "outcomes": {
+          "delivered": 200
+        },
+        "errors": [],
+        "delivered_per_second": 100.4,
+        "send_latency": {
+          "p50_ms": 2.36,
+          "p95_ms": 3.493,
+          "p99_ms": 10.196,
+          "max_ms": 19.033
+        },
+        "schedule_latency": {
+          "p50_ms": 2.979,
+          "p95_ms": 7.492,
+          "p99_ms": 23.588,
+          "max_ms": 33.548
+        },
+        "resources": {
+          "broker": {
+            "peak_rss_mib": 70.9,
+            "peak_fds": 1509,
+            "peak_threads": 18,
+            "cpu_cores": 0.085
+          },
+          "authz": {
+            "peak_rss_mib": 22.6,
+            "peak_fds": 10,
+            "peak_threads": 8,
+            "cpu_cores": 0.01
+          },
+          "generator": {
+            "peak_rss_mib": 43.0,
+            "peak_fds": 1008,
+            "peak_threads": 1,
+            "cpu_cores": 0.095
+          }
+        }
+      }
+    },
+    {
+      "scenario": "recovery and revocation",
+      "recovered": true,
+      "revoked_subscribe_denied": true
+    },
+    {
+      "scenario": "group fanout",
+      "subscribers": 499,
+      "published": 100,
+      "delivered": 49900,
+      "elapsed_s": 2.189,
+      "delivered_per_second": 22794.4,
+      "latency": {
+        "p50_ms": 11.359,
+        "p95_ms": 23.775,
+        "p99_ms": 27.726,
+        "max_ms": 39.629
+      }
+    }
+  ],
+  "regression_checks_passed": true,
+  "connect_burst_lossless": true,
+  "measurement_date": "2026-10-04",
+  "runtime_base_revision": "34af4e169c2c2c75645070e430f64d3522443ab5",
+  "runtime_changes": "Shared owned per-publication fanout and WebSocket recipient-count normalization, included with this report."
+}

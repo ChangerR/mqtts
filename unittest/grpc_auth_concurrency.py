@@ -2,6 +2,7 @@
 """Real MQTT + C++ gRPC client + independently running Go authorization module."""
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,50 @@ async def load(port, authz, metrics_url, count, messages, size):
         await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
 
 
+@contextmanager
+def fixture(binary, authz_binary, pairs, cache_ttl_ms=60000, queue_capacity=256):
+    """Owned disposable processes only; never points at an existing broker."""
+    children = []
+    with tempfile.TemporaryDirectory(prefix='mqtts-grpc-') as directory:
+        root = Path(directory)
+        env = dict(os.environ, AUTHZ_QUERY_TOKEN=secrets.token_hex(32), AUTHZ_ADMIN_TOKEN=secrets.token_hex(32))
+        with (root/'runtime.log').open('w') as log:
+            try:
+                authz = subprocess.Popen([authz_binary, '--directory', directory, '--pairs', str(pairs), '--cache-ttl-ms', str(cache_ttl_ms)], env=env, stdout=log, stderr=log)
+                children.append(authz)
+                deadline = time.monotonic()+10
+                while not (root/'ports.json').exists():
+                    assert authz.poll() is None and time.monotonic() < deadline
+                    time.sleep(.02)
+                ports = json.loads((root/'ports.json').read_text())
+                with socket.socket() as probe:
+                    probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]
+                settings = dict(endpoint=ports['rpc'], insecure=True, token_env='AUTHZ_QUERY_TOKEN',
+                                timeout_ms=500, rpc_workers=4, rpc_queue_capacity=queue_capacity,
+                                cache_ttl_ms=cache_ttl_ms, cache_max_age_ms=300000, cache_max_entries=16384,
+                                publish_payload='bytes', publish_cache_ignored_fields='["nonce","data"]')
+                config = dict(server=dict(bind_address='127.0.0.1', port=port, thread_count=2, max_connections=2048),
+                              monitoring=dict(enabled=False), log=dict(level='warn'),
+                              auth=dict(enabled=True, allow_anonymous=False, providers=[dict(type='grpc', settings=settings)]))
+                (root/'broker.json').write_text(json.dumps(config))
+                broker = subprocess.Popen([binary, '-c', str(root/'broker.json')], env=env, stdout=log, stderr=log)
+                children.append(broker)
+                while True:
+                    assert broker.poll() is None and time.monotonic() < deadline
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=.1): break
+                    except OSError: time.sleep(.02)
+                yield port, authz, broker, 'http://'+ports['metrics']
+            except BaseException:
+                print((root/'runtime.log').read_text()[-4000:])
+                raise
+            finally:
+                for child in reversed(children):
+                    child.send_signal(signal.SIGCONT); child.terminate()
+                    try: child.wait(timeout=5)
+                    except subprocess.TimeoutExpired: child.kill(); child.wait()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--broker', required=True)
@@ -69,46 +114,9 @@ def main():
     parser.add_argument('--report')
     args = parser.parse_args()
     assert 1 <= args.pairs <= 512 and args.messages > 0 and 1 <= args.payload_bytes <= 65536
-    children = []
-    with tempfile.TemporaryDirectory(prefix='mqtts-grpc-') as directory:
-        root = Path(directory)
-        env = dict(os.environ, AUTHZ_QUERY_TOKEN=secrets.token_hex(32), AUTHZ_ADMIN_TOKEN=secrets.token_hex(32))
-        with (root/'runtime.log').open('w') as log:
-            try:
-                authz = subprocess.Popen([args.authz_fixture, '--directory', directory, '--pairs', str(args.pairs)], env=env, stdout=log, stderr=log)
-                children.append(authz)
-                deadline = time.monotonic()+10
-                while not (root/'ports.json').exists():
-                    assert authz.poll() is None and time.monotonic() < deadline
-                    time.sleep(.02)
-                ports = json.loads((root/'ports.json').read_text())
-                with socket.socket() as probe:
-                    probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]
-                settings = dict(endpoint=ports['rpc'], insecure=True, token_env='AUTHZ_QUERY_TOKEN',
-                                timeout_ms=500, rpc_workers=4, rpc_queue_capacity=256,
-                                cache_ttl_ms=60000, cache_max_age_ms=300000, cache_max_entries=16384,
-                                publish_payload='bytes', publish_cache_ignored_fields='["nonce","data"]')
-                config = dict(server=dict(bind_address='127.0.0.1', port=port, thread_count=2, max_connections=2048),
-                              monitoring=dict(enabled=False), log=dict(level='warn'),
-                              auth=dict(enabled=True, allow_anonymous=False, providers=[dict(type='grpc', settings=settings)]))
-                (root/'broker.json').write_text(json.dumps(config))
-                broker = subprocess.Popen([args.broker, '-c', str(root/'broker.json')], env=env, stdout=log, stderr=log)
-                children.append(broker)
-                while True:
-                    assert broker.poll() is None and time.monotonic() < deadline
-                    try:
-                        with socket.create_connection(('127.0.0.1', port), timeout=.1): break
-                    except OSError: time.sleep(.02)
-                result = asyncio.run(load(port, authz, 'http://'+ports['metrics'], args.pairs, args.messages, args.payload_bytes))
-                if args.report: Path(args.report).write_text(json.dumps(result, indent=2)+'\n')
-            except BaseException:
-                print((root/'runtime.log').read_text()[-4000:])
-                raise
-            finally:
-                for child in reversed(children):
-                    child.send_signal(signal.SIGCONT); child.terminate()
-                    try: child.wait(timeout=5)
-                    except subprocess.TimeoutExpired: child.kill(); child.wait()
+    with fixture(args.broker, args.authz_fixture, args.pairs) as (port, authz, broker, url):
+        result = asyncio.run(load(port, authz, url, args.pairs, args.messages, args.payload_bytes))
+        if args.report: Path(args.report).write_text(json.dumps(result, indent=2)+'\n')
 
 
 if __name__ == '__main__':

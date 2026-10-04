@@ -305,6 +305,43 @@ TEST_F(SessionManagerAllocatorTest, ManagerStateAndAllocator) {
              initial_usage, usage_after_prereg, usage_after_failed_prereg);
 }
 
+TEST_F(SessionManagerAllocatorTest, FanoutOwnsOnePayloadAfterPublisherDestruction) {
+    MQTTAllocator owner("fanout_owner", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 1024 * 1024);
+    SharedMessageContentPtr shared;
+    std::vector<PendingMessageInfo> recipients;
+    {
+        MQTTAllocator publisher("short_lived_publisher", MQTTMemoryTag::MEM_TAG_CLIENT, 1024 * 1024);
+        PublishPacket packet(&publisher);
+        packet.topic_name = to_mqtt_string(std::string(80, 't'), &publisher);
+        packet.payload.assign(65536, 'A');
+        packet.properties.user_properties.emplace_back(
+            to_mqtt_string(std::string(80, 'k'), &publisher),
+            to_mqtt_string(std::string(80, 'v'), &publisher));
+        packet.properties.correlation_data.assign(64, 'c');
+        auto sender = to_mqtt_string(std::string(80, 's'), &publisher);
+        const size_t before = publisher.get_memory_usage();
+        shared = SharedMessageContentPtr(new SharedMessageContent(packet.topic_name, packet.payload,
+            1, false, false, packet.properties, sender, &owner));
+        for (int i = 0; i < 500; ++i) {
+            recipients.emplace_back(shared, to_mqtt_string("recipient-" + std::to_string(i), &owner));
+        }
+        EXPECT_EQ(publisher.get_memory_usage(), before);
+        EXPECT_LT(owner.get_memory_usage(), 128 * 1024);
+        EXPECT_EQ(shared->properties.user_properties[0].first.get_allocator().get_allocator(), &owner);
+        EXPECT_EQ(shared->properties.user_properties[0].second.get_allocator().get_allocator(), &owner);
+    }
+    // Publisher allocator has been destroyed; read and release queued content.
+    for (const auto& recipient : recipients) {
+        EXPECT_EQ(recipient.content.get(), shared.get());
+        EXPECT_EQ(recipient.get_payload().size(), 65536u);
+        EXPECT_EQ(recipient.get_payload().back(), 'A');
+        EXPECT_EQ(recipient.get_properties().user_properties[0].second.size(), 80u);
+    }
+    recipients.clear();
+    shared.reset();
+    EXPECT_EQ(owner.get_memory_usage(), 0u);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

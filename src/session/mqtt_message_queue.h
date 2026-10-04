@@ -35,14 +35,24 @@ struct SharedMessageContent
   SharedMessageContent(const MQTTString& topic, const MQTTByteVector& msg_payload, uint8_t msg_qos,
                        bool msg_retain, bool msg_dup, const Properties& props,
                        const MQTTString& sender)
-      : topic_name(topic),
-        payload(msg_payload),
+      : SharedMessageContent(topic, msg_payload, msg_qos, msg_retain, msg_dup, props, sender,
+                             msg_payload.get_allocator().get_effective_allocator())
+  {
+  }
+
+  // Queued fanout outlives the publishing connection. Explicitly rebind every
+  // owned field to the session-manager allocator, and share only this publish.
+  SharedMessageContent(const MQTTString& topic, const MQTTByteVector& msg_payload, uint8_t msg_qos,
+                       bool msg_retain, bool msg_dup, const Properties& props,
+                       const MQTTString& sender, MQTTAllocator* allocator)
+      : topic_name(topic, MQTTStrAllocator(allocator)),
+        payload(msg_payload, MQTTSTLAllocator<uint8_t>(allocator)),
         dup(msg_dup),
         qos(msg_qos),
         retain(msg_retain),
-        properties(props),
+        properties(props, allocator),
         timestamp(std::chrono::steady_clock::now()),
-        sender_client_id(sender)
+        sender_client_id(sender, MQTTStrAllocator(allocator))
   {
     ref_count.store(0);  // 初始化为0，第一次被智能指针包装时会增加到1
   }

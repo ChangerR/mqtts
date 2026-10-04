@@ -44,13 +44,18 @@ jobs:
         run: |
           go -C modules/authz build -o "$RUNNER_TEMP/mqtts-authz-fixture" ./integration/fixture
           python3 unittest/grpc_auth_concurrency.py --broker "$PWD/build/mqtts" --authz-fixture "$RUNNER_TEMP/mqtts-authz-fixture" --pairs 128 --report build/unittest/mqtt-grpc-concurrency-report.json
+      - name: Sustained, cold, outage and group fanout regression
+        run: |
+          python3 unittest/grpc_auth_stress.py --broker "$PWD/build/mqtts" --authz-fixture "$RUNNER_TEMP/mqtts-authz-fixture" --pairs 128 --seconds 12 --outage-seconds 12 --rate 500 --cold-seconds 3 --cold-rate 300 --payload-bytes 16384 --fanout-messages 30 --report build/unittest/mqtt-grpc-stress-report.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: mqtt-http-authorization-benchmarks
           path: |
             build/unittest/mqtt-http-cache-report.json
             build/unittest/mqtt-http-concurrency-report.json
             build/unittest/mqtt-grpc-concurrency-report.json
+            build/unittest/mqtt-grpc-stress-report.json
   container:
     runs-on: ubuntu-24.04
     steps:

@@ -728,8 +728,9 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
     mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
     int ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
 
-    if (ret == MQ_SUCCESS) {
+    if (ret >= 0) {
         stats_.mqtt_messages_sent++;
+        return MQ_SUCCESS; // Session manager returns the recipient count.
     }
 
     return ret;

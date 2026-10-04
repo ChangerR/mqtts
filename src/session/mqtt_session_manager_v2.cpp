@@ -928,7 +928,8 @@ int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client
   }
 
   // 使用共享内容加入目标线程的队列
-  thread_manager->enqueue_shared_message(content, target_client_id);
+  const int ret = thread_manager->enqueue_shared_message(content, target_client_id);
+  if (ret != MQ_SUCCESS) return ret;
 
   LOG_DEBUG("Shared message forwarded to client: {}", from_mqtt_string(target_client_id));
   return MQ_SUCCESS;
@@ -997,24 +998,30 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
     return 0;
   }
 
+  if (subscribers.empty()) return 0;
   int forwarded_count = 0;
-
-  std::string sender_id = from_mqtt_string(sender_client_id);
-  for (const SubscriberInfo& subscriber : subscribers) {
-    // 避免回环
-    if (from_mqtt_string(subscriber.client_id) == sender_id) {
-      continue;
+  try {
+    // Previously every recipient copied the payload using the publisher's
+    // 1-MiB allocator. A single 4-KiB publish to 500 recipients could exhaust
+    // it and throw out of the MQTT coroutine. One owned snapshot per publish
+    // also survives the publishing connection being closed while delivery waits.
+    SharedMessageContentPtr content(new SharedMessageContent(
+        packet.topic_name, packet.payload, packet.qos, packet.retain, packet.dup,
+        packet.properties, sender_client_id, global_allocator_));
+    const std::string sender_id = from_mqtt_string(sender_client_id);
+    for (const SubscriberInfo& subscriber : subscribers) {
+      if (from_mqtt_string(subscriber.client_id) == sender_id) continue;
+      if (forward_publish_shared(subscriber.client_id, content) == MQ_SUCCESS) ++forwarded_count;
     }
-
-    if (forward_publish(subscriber.client_id, packet, sender_client_id) == MQ_SUCCESS) {
-      forwarded_count++;
-    }
+  } catch (const std::bad_alloc&) {
+    LOG_WARN("Insufficient memory while queuing PUBLISH fanout");
+    return MQ_ERR_MEMORY_ALLOC;
   }
 
   LOG_DEBUG("Forwarded PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
 
-  return ret;
+  return forwarded_count;
 }
 
 int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic,

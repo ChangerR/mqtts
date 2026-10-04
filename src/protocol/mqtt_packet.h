@@ -105,8 +105,7 @@ struct Properties
         topic_alias(other.topic_alias),
         request_response_information(other.request_response_information),
         request_problem_information(other.request_problem_information),
-        user_properties(other.user_properties.begin(), other.user_properties.end(),
-                        MQTTSTLAllocator<MQTTStringPair>(allocator)),
+        user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),
         authentication_method(other.authentication_method.begin(),
                               other.authentication_method.end(), MQTTStrAllocator(allocator)),
         authentication_data(other.authentication_data.begin(), other.authentication_data.end(),
@@ -137,6 +136,13 @@ struct Properties
         subscription_identifier_available(other.subscription_identifier_available),
         shared_subscription_available(other.shared_subscription_available)
   {
+    // A vector allocator does not propagate into strings inside std::pair.
+    // Deep-copy them too, so a queued message cannot retain a client allocator.
+    user_properties.reserve(other.user_properties.size());
+    for (const auto& property : other.user_properties) {
+      user_properties.emplace_back(MQTTString(property.first, MQTTStrAllocator(allocator)),
+                                   MQTTString(property.second, MQTTStrAllocator(allocator)));
+    }
   }
 };
 
