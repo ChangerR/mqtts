@@ -3,28 +3,54 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
+  authorization:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: modules/authz/go.mod
+          cache-dependency-path: modules/authz/go.sum
+      - run: go -C modules/authz test -race ./...
+      - run: go -C modules/authz vet ./...
+      - name: Verify generated Protobuf bindings
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.9
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          modules/authz/bin/generate.sh
+          git diff --exit-code -- modules/authz/api
   native:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config g++ libssl-dev libyaml-cpp-dev libsqlite3-dev libhiredis-dev protobuf-compiler libprotobuf-dev libcurl4-openssl-dev nlohmann-json3-dev python3
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build pkg-config g++ libssl-dev libyaml-cpp-dev libsqlite3-dev libhiredis-dev protobuf-compiler libprotobuf-dev libgrpc++-dev protobuf-compiler-grpc libcurl4-openssl-dev nlohmann-json3-dev python3
       - name: Install pinned llhttp
         run: |
           bash bin/install-llhttp.sh "$RUNNER_TEMP/mqtts-llhttp"
           echo "PKG_CONFIG_PATH=$RUNNER_TEMP/mqtts-llhttp/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/mqtts-llhttp/lib" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: modules/authz/go.mod
+          cache-dependency-path: modules/authz/go.sum
       - name: Configure with assertions enabled
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE='-O1 -g0 -UNDEBUG' -DCMAKE_C_FLAGS_RELEASE='-O1 -g0 -UNDEBUG'
       - run: cmake --build build --parallel 3
       - run: ctest --test-dir build --output-on-failure --timeout 120
+      - name: Real gRPC service and MQTT concurrency
+        run: |
+          go -C modules/authz build -o "$RUNNER_TEMP/mqtts-authz-fixture" ./integration/fixture
+          python3 unittest/grpc_auth_concurrency.py --broker "$PWD/build/mqtts" --authz-fixture "$RUNNER_TEMP/mqtts-authz-fixture" --pairs 128 --report build/unittest/mqtt-grpc-concurrency-report.json
       - uses: actions/upload-artifact@v4
         with:
           name: mqtt-http-authorization-benchmarks
           path: |
             build/unittest/mqtt-http-cache-report.json
             build/unittest/mqtt-http-concurrency-report.json
+            build/unittest/mqtt-grpc-concurrency-report.json
   container:
     runs-on: ubuntu-24.04
     steps:
@@ -35,6 +61,18 @@ jobs:
         id: revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - run: docker build -t mqtts:acceptance .
+      - run: docker build -t mqtts-authz:acceptance modules/authz
+      - name: Independent authorization image starts without application services
+        run: |
+          docker run -d --name mqtts-authz-acceptance --read-only --tmpfs /data:uid=10001,gid=10001 \
+            -e AUTHZ_INSECURE=true -e AUTHZ_QUERY_TOKEN=ci-query-credential-0000000000000000000000 \
+            -e AUTHZ_ADMIN_TOKEN=ci-admin-credential-0000000000000000000000 mqtts-authz:acceptance
+          for i in $(seq 1 30); do
+            if docker logs mqtts-authz-acceptance 2>&1 | grep -q 'authorization RPC listening'; then exit 0; fi
+            sleep 1
+          done
+          docker logs mqtts-authz-acceptance
+          exit 1
       - name: Runtime starts with shared library dependencies present
         run: |
           docker run -d --name mqtts-acceptance -p 127.0.0.1:1883:1883 mqtts:acceptance
@@ -50,15 +88,18 @@ jobs:
         run: |
           mkdir -p runtime
           docker tag mqtts:acceptance "mqtts:sha-$SOURCE_REVISION"
-          docker save "mqtts:sha-$SOURCE_REVISION" | gzip > runtime/mqtts-image.tar.gz
+          docker tag mqtts-authz:acceptance "mqtts-authz:sha-$SOURCE_REVISION"
+          docker save "mqtts:sha-$SOURCE_REVISION" "mqtts-authz:sha-$SOURCE_REVISION" | gzip > runtime/mqtts-image.tar.gz
           (cd runtime && sha256sum mqtts-image.tar.gz > SHA256SUMS)
           python3 - <<'PYTHON'
-          import json, os, pathlib
+          import hashlib, json, os, pathlib
           revision = os.environ['SOURCE_REVISION']
           pathlib.Path('runtime/metadata.json').write_text(json.dumps({
               'schema_version': 1, 'source_revision': revision,
               'image': 'mqtts:sha-' + revision, 'platform': 'linux/amd64',
-              'http_auth_contract': 1,
+              'http_auth_contract': 1, 'grpc_auth_contract': 1,
+              'authz_image': 'mqtts-authz:sha-' + revision,
+              'authz_proto_sha256': hashlib.sha256(pathlib.Path('modules/authz/proto/authorization.proto').read_bytes()).hexdigest(),
           }) + '\n')
           PYTHON
       - uses: actions/upload-artifact@v4
@@ -69,7 +110,7 @@ jobs:
           compression-level: 0
   release:
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    needs: [native, container]
+    needs: [native, authorization, container]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

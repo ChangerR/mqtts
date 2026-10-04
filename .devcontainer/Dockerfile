@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nlohmann-json3-dev \
     protobuf-compiler \
     libprotobuf-dev \
+    libgrpc++-dev \
+    protobuf-compiler-grpc \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 

@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libhiredis-dev \
     protobuf-compiler \
     libprotobuf-dev \
+    libgrpc++-dev \
+    protobuf-compiler-grpc \
     libcurl4-openssl-dev \
     nlohmann-json3-dev \
     python3 \
@@ -59,6 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-0 \
     libhiredis0.14 \
     libprotobuf23 \
+    libgrpc++1 \
     libcurl4 \
     netcat-openbsd \
     ca-certificates \

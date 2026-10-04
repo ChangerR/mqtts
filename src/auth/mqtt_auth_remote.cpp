@@ -1,5 +1,7 @@
-#include "mqtt_auth_http.h"
+#include "mqtt_auth_remote.h"
 #include "mqtt_runtime.h"
+#include "authorization.grpc.pb.h"
+#include <grpcpp/grpcpp.h>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
@@ -23,6 +25,7 @@ namespace mqtt {
 namespace auth {
 namespace {
 using Json = nlohmann::json;
+namespace pb = ::mqtts::authz::v1;
 std::atomic<uint64_t> next_authorization_session{1};
 uint64_t monotonic_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -140,8 +143,12 @@ struct PendingDelivery : AuthorizationRequest {
 };
 }
 
-struct HttpAuthProvider::Impl {
-  explicit Impl(const std::map<std::string, std::string>& value) : settings(value) {}
+struct RemoteAuthProvider::Impl {
+  explicit Impl(const std::map<std::string, std::string>& value, bool rpc) : settings(value), grpc_mode(rpc) {}
+  bool grpc_mode;
+  size_t batch_size = 32, batch_bytes = 4 * 1024 * 1024;
+  uint64_t batch_wait = 1;
+  std::unique_ptr<pb::Authorization::Stub> stub;
   std::map<std::string, std::string> settings;
   std::string token;
   size_t payload_limit = 1024 * 1024, cache_capacity = 16384, worker_count = 4;
@@ -155,7 +162,7 @@ struct HttpAuthProvider::Impl {
 
   struct Counters {
     std::atomic<uint64_t> logins{0}, successes{0}, checks{0}, allowed{0}, hits{0}, misses{0}, stale{0};
-    std::atomic<uint64_t> evictions{0}, requests{0}, failures{0}, rejected{0}, refreshes{0}, opened{0};
+    std::atomic<uint64_t> evictions{0}, requests{0}, failures{0}, rejected{0}, refreshes{0}, opened{0}, batches{0}, items{0};
   } stats;
   struct CacheEntry {
     Decision decision;
@@ -278,9 +285,70 @@ struct HttpAuthProvider::Impl {
       return result;
     } catch (...) { return Decision(); }
   }
+  Decision parse(const pb::Decision& value) {
+    Decision result;
+    if ((value.outcome() != pb::ALLOW && value.outcome() != pb::DENY) || value.cache_revision().size() > 128) return result;
+    result.authoritative = true;
+    result.result = value.outcome() == pb::ALLOW ? AuthResult::SUCCESS : AuthResult::ACCESS_DENIED;
+    result.expires_at = value.expires_at_ms();
+    if (result.expires_at && result.expires_at <= wall_ms()) result.result = AuthResult::ACCESS_DENIED;
+    result.fresh_ms = std::min<uint64_t>(fresh_limit, value.cache_ttl_ms());
+    result.max_age_ms = std::min<uint64_t>(age_limit, value.cache_max_age_ms());
+    result.fresh_ms = std::min(result.fresh_ms, result.max_age_ms);
+    if (result.result != AuthResult::SUCCESS) result.max_age_ms = result.fresh_ms = std::min<uint64_t>(1000, result.fresh_ms);
+    result.revision = value.cache_revision();
+    return result;
+  }
+  void rpc_context(grpc::ClientContext& context, uint64_t deadline) {
+    const auto now = monotonic_ms();
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(deadline > now ? deadline - now : 0));
+    context.AddMetadata("authorization", "Bearer " + token);
+    context.set_wait_for_ready(false);
+  }
+  void rpc_batch(const std::vector<std::shared_ptr<Job>>& jobs) {
+    std::vector<Decision> results(jobs.size());
+    bool healthy = false, attempted = false;
+    try {
+      uint64_t deadline = std::numeric_limits<uint64_t>::max();
+      for (const auto& job : jobs) deadline = std::min(deadline, job->deadline);
+      if (!stopping && deadline > monotonic_ms() && circuit_admit()) {
+        attempted = true; ++stats.requests;
+        grpc::ClientContext context; rpc_context(context, deadline);
+        if (jobs.front()->url == "authenticate") {
+          pb::AuthenticateRequest request; pb::Decision reply;
+          healthy = request.ParseFromString(jobs.front()->body) && stub->Authenticate(&context, request, &reply).ok();
+          if (healthy) { results[0] = parse(reply); healthy = results[0].authoritative; }
+        } else {
+          pb::BatchAuthorizeRequest request; pb::BatchAuthorizeResponse reply;
+          for (size_t i = 0; i < jobs.size(); ++i) {
+            auto* item = request.add_requests();
+            if (!item->ParseFromString(jobs[i]->body)) throw std::invalid_argument("invalid authorization request");
+            item->set_request_id(i + 1);
+          }
+          ++stats.batches; stats.items += jobs.size();
+          healthy = stub->BatchAuthorize(&context, request, &reply).ok() && static_cast<size_t>(reply.results_size()) == jobs.size();
+          std::unordered_set<uint64_t> seen;
+          if (healthy) for (const auto& item : reply.results()) {
+            const auto id = item.request_id();
+            if (!id || id > jobs.size() || !seen.insert(id).second || !item.has_decision()) { healthy = false; break; }
+            results[id - 1] = parse(item.decision());
+          }
+          // A malformed envelope cannot associate permissions with a request.
+          if (!healthy) results.assign(jobs.size(), Decision());
+          else for (const auto& result : results) if (!result.authoritative) healthy = false;
+        }
+      } else ++stats.rejected;
+    } catch (...) { healthy = false; results.assign(jobs.size(), Decision()); }
+    if (attempted) { circuit_result(healthy); if (!healthy) ++stats.failures; }
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      if (monotonic_ms() >= jobs[i]->deadline) results[i] = Decision();
+      jobs[i]->finish(std::move(results[i]));
+    }
+  }
   bool enqueue(const std::shared_ptr<Job>& job) {
     std::lock_guard<std::mutex> lock(queue_mutex);
-    if (stopping || queue.size() >= queue_capacity || job->body.size() > queue_byte_limit - queued_bytes) {
+    if (stopping || queue.size() >= queue_capacity || job->body.size() > queue_byte_limit - queued_bytes ||
+        (grpc_mode && job->url == "authorize" && job->body.size() + 32 > batch_bytes)) {
       ++stats.rejected;
       return false;
     }
@@ -293,12 +361,29 @@ struct HttpAuthProvider::Impl {
     CURL* curl = curl_easy_init();
     for (;;) {
       std::shared_ptr<Job> job;
+      std::vector<std::shared_ptr<Job>> batch;
       {
         std::unique_lock<std::mutex> lock(queue_mutex);
         work_ready.wait(lock, [&] { return stopping || !queue.empty(); });
         if (queue.empty()) break;
         job = queue.front(); queue.pop_front(); queued_bytes -= job->body.size();
+        if (grpc_mode) {
+          batch.push_back(job);
+          if (job->url == "authorize" && job->deadline > monotonic_ms()) {
+            // A bounded aggregation window is paid only on cold/refresh work.
+            // CONNECT is never delayed for batching and cannot be starved by it.
+            work_ready.wait_for(lock, std::chrono::milliseconds(batch_wait), [&] { return stopping.load() || queue.size() >= batch_size - 1 || (!queue.empty() && queue.front()->url == "authenticate"); });
+            size_t bytes = job->body.size() + 32;
+            while (!queue.empty() && batch.size() < batch_size && queue.front()->url == "authorize") {
+              const auto& next = queue.front();
+              if (bytes + next->body.size() + 32 > batch_bytes) break;
+              bytes += next->body.size() + 32; queued_bytes -= next->body.size();
+              batch.push_back(next); queue.pop_front();
+            }
+          }
+        }
       }
+      if (grpc_mode) { rpc_batch(batch); continue; }
       Decision result;
       try { if (!stopping) result = parse(http(curl, job->url, job->body, job->deadline)); }
       catch (...) { ++stats.failures; circuit_result(false); }
@@ -322,7 +407,13 @@ struct HttpAuthProvider::Impl {
   void watch_version() {
     CURL* curl = curl_easy_init();
     while (!stopping) {
-      const auto data = http(curl, settings.at("cache_version_url"), "{}", monotonic_ms() + timeout, true);
+      Json data;
+      if (grpc_mode) {
+        grpc::ClientContext context; rpc_context(context, monotonic_ms() + timeout);
+        pb::RevisionRequest request; pb::RevisionResponse reply; ++stats.requests;
+        if (stub->GetRevision(&context, request, &reply).ok()) data = {{"cache_revision", reply.revision()}};
+        else ++stats.failures;
+      } else data = http(curl, settings.at("cache_version_url"), "{}", monotonic_ms() + timeout, true);
       if (data.is_object() && data.contains("cache_revision") && data["cache_revision"].is_string()) {
         const auto value = data["cache_revision"].get<std::string>();
         if (!value.empty() && value.size() <= 128) update_version(value);
@@ -378,6 +469,13 @@ struct HttpAuthProvider::Impl {
     if (!initialized || (user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
         (payload && payload->size() > payload_limit)) return rejected;
     const auto body = [&]() {
+      if (grpc_mode) {
+        pb::AuthorizeRequest value;
+        value.set_username(from_mqtt_string(user.username)); value.set_client_id(from_mqtt_string(user.client_id));
+        value.set_action(std::string(action) == "publish" ? pb::PUBLISH : pb::SUBSCRIBE); value.set_topic(topic);
+        if (payload) { value.set_has_payload(true); value.set_payload(payload->data(), payload->size()); }
+        return value.SerializeAsString();
+      }
       Json value = {{"username", from_mqtt_string(user.username)}, {"clientid", from_mqtt_string(user.client_id)}, {"action", action}, {"topic", topic}};
       if (payload) { value["payload_encoding"] = "base64"; value["payload"] = base64(*payload); }
       return value.dump();
@@ -457,31 +555,38 @@ struct HttpAuthProvider::Impl {
   }
 };
 
-HttpAuthProvider::HttpAuthProvider(const std::map<std::string, std::string>& settings) : impl_(new Impl(settings)) {}
-HttpAuthProvider::~HttpAuthProvider() { cleanup(); }
-int HttpAuthProvider::initialize() {
+RemoteAuthProvider::RemoteAuthProvider(const std::map<std::string, std::string>& settings, bool grpc) : impl_(new Impl(settings, grpc)) {}
+RemoteAuthProvider::~RemoteAuthProvider() { cleanup(); }
+int RemoteAuthProvider::initialize() {
   auto& p = *impl_;
   if (p.initialized) return MQ_SUCCESS;
-  static const std::unordered_set<std::string> supported = {"authentication_url", "authorization_url", "token_file", "token_env", "ca_file", "timeout_ms", "publish_payload", "max_payload_bytes", "cache_ttl_ms", "cache_max_age_ms", "cache_max_entries", "cache_version_url", "cache_version_interval_ms", "publish_cache_ignored_fields", "http_workers", "http_queue_capacity", "http_queue_bytes", "failure_cooldown_ms"};
-  for (const auto& setting : p.settings) if (!supported.count(setting.first)) return MQ_ERR_INVALID_ARGS;
+  p.token.clear(); p.ignored_fields.clear();
+  static const std::unordered_set<std::string> common = {"token_file", "token_env", "ca_file", "timeout_ms", "publish_payload", "max_payload_bytes", "cache_ttl_ms", "cache_max_age_ms", "cache_max_entries", "cache_version_interval_ms", "publish_cache_ignored_fields", "failure_cooldown_ms"};
+  static const std::unordered_set<std::string> http_settings = {"authentication_url", "authorization_url", "cache_version_url", "http_workers", "http_queue_capacity", "http_queue_bytes"};
+  static const std::unordered_set<std::string> rpc_settings = {"endpoint", "insecure", "client_cert_file", "client_key_file", "rpc_workers", "rpc_queue_capacity", "rpc_queue_bytes", "batch_max_requests", "batch_max_bytes", "batch_wait_ms"};
+  for (const auto& setting : p.settings) if (!common.count(setting.first) && !(p.grpc_mode ? rpc_settings : http_settings).count(setting.first)) return MQ_ERR_INVALID_ARGS;
   static const CURLcode ready = curl_global_init(CURL_GLOBAL_DEFAULT);
-  if (ready != CURLE_OK || !valid_url(p.settings["authentication_url"]) || !valid_url(p.settings["authorization_url"])) return MQ_ERR_INVALID_ARGS;
+  if (ready != CURLE_OK) return MQ_ERR_INVALID_ARGS;
+  if (p.grpc_mode) {
+    if (p.settings["endpoint"].empty() || p.settings["endpoint"].size() > 1024 || p.settings["endpoint"].find_first_of("\r\n") != std::string::npos) return MQ_ERR_INVALID_ARGS;
+    p.settings["authentication_url"] = "authenticate"; p.settings["authorization_url"] = "authorize"; p.settings["cache_version_url"] = "revision";
+  } else if (!valid_url(p.settings["authentication_url"]) || !valid_url(p.settings["authorization_url"])) return MQ_ERR_INVALID_ARGS;
   try {
     p.timeout = p.number("timeout_ms", 2000, 100, 10000);
     p.payload_limit = p.number("max_payload_bytes", 1048576, 1, 16777216);
     p.fresh_limit = p.number("cache_ttl_ms", 0, 0, 300000);
     p.age_limit = p.number("cache_max_age_ms", 300000, 1, 300000);
     p.cache_capacity = p.number("cache_max_entries", 16384, 16, 1048576);
-    p.worker_count = p.number("http_workers", 4, 1, 16);
-    p.queue_capacity = p.number("http_queue_capacity", 64, 1, 4096);
-    p.queue_byte_limit = p.number("http_queue_bytes", 16777216, 8192, 134217728);
+    p.worker_count = p.number(p.grpc_mode ? "rpc_workers" : "http_workers", 4, 1, 16);
+    p.queue_capacity = p.number(p.grpc_mode ? "rpc_queue_capacity" : "http_queue_capacity", 64, 1, 4096);
+    p.queue_byte_limit = p.number(p.grpc_mode ? "rpc_queue_bytes" : "http_queue_bytes", 16777216, 8192, 134217728);
     p.cooldown = p.number("failure_cooldown_ms", 1000, 100, 30000);
     p.version_interval = p.number("cache_version_interval_ms", 250, 100, 60000);
     if (p.fresh_limit > p.age_limit) return MQ_ERR_INVALID_ARGS;
-    if (!p.settings["cache_version_url"].empty() && (!p.fresh_limit || !valid_url(p.settings["cache_version_url"]))) return MQ_ERR_INVALID_ARGS;
+    if (!p.grpc_mode && !p.settings["cache_version_url"].empty() && (!p.fresh_limit || !valid_url(p.settings["cache_version_url"]))) return MQ_ERR_INVALID_ARGS;
     const auto mode = p.settings.find("publish_payload");
-    if (mode != p.settings.end() && mode->second != "none" && mode->second != "base64") return MQ_ERR_INVALID_ARGS;
-    p.include_payload = mode != p.settings.end() && mode->second == "base64";
+    if (mode != p.settings.end() && mode->second != "none" && mode->second != (p.grpc_mode ? "bytes" : "base64")) return MQ_ERR_INVALID_ARGS;
+    p.include_payload = mode != p.settings.end() && mode->second == (p.grpc_mode ? "bytes" : "base64");
     if (p.settings.count("publish_cache_ignored_fields")) {
       const auto fields = Json::parse(p.settings.at("publish_cache_ignored_fields"));
       if (!p.include_payload || !p.fresh_limit || !fields.is_array() || fields.size() > 32) return MQ_ERR_INVALID_ARGS;
@@ -495,6 +600,34 @@ int HttpAuthProvider::initialize() {
   } catch (...) { return MQ_ERR_INVALID_ARGS; }
   if (!p.token.empty() && p.token.back() == '\r') p.token.pop_back();
   if (p.token.size() < 32 || p.token.size() > 4096 || p.token.find_first_of("\r\n") != std::string::npos) return MQ_ERR_INVALID_ARGS;
+  if (p.grpc_mode) {
+    try {
+      p.batch_size = p.number("batch_max_requests", 32, 1, 64);
+      p.batch_bytes = p.number("batch_max_bytes", 4194304, 16384, 4194304);
+      p.batch_wait = p.number("batch_wait_ms", 1, 0, 10);
+      if (p.payload_limit > 1048576 || p.payload_limit + 8192 > p.batch_bytes) return MQ_ERR_INVALID_ARGS;
+      const auto file_contents = [](const std::string& path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) throw std::invalid_argument("RPC TLS file unavailable");
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+      };
+      std::shared_ptr<grpc::ChannelCredentials> credentials;
+      if (p.settings["insecure"] == "true") {
+        if (!p.settings["ca_file"].empty() || !p.settings["client_cert_file"].empty() || !p.settings["client_key_file"].empty()) return MQ_ERR_INVALID_ARGS;
+        credentials = grpc::InsecureChannelCredentials();
+      } else {
+        if (!p.settings["insecure"].empty() && p.settings["insecure"] != "false") return MQ_ERR_INVALID_ARGS;
+        grpc::SslCredentialsOptions tls;
+        if (!p.settings["ca_file"].empty()) tls.pem_root_certs = file_contents(p.settings["ca_file"]);
+        if (!p.settings["client_cert_file"].empty() || !p.settings["client_key_file"].empty()) {
+          tls.pem_cert_chain = file_contents(p.settings["client_cert_file"]); tls.pem_private_key = file_contents(p.settings["client_key_file"]);
+        }
+        credentials = grpc::SslCredentials(tls);
+      }
+      grpc::ChannelArguments args; args.SetMaxReceiveMessageSize(4194304); args.SetMaxSendMessageSize(4194304);
+      p.stub = pb::Authorization::NewStub(grpc::CreateCustomChannel(p.settings["endpoint"], credentials, args));
+    } catch (...) { return MQ_ERR_INVALID_ARGS; }
+  }
   p.stopping = false;
   try {
     for (size_t i = 0; i < p.worker_count; ++i) p.workers.emplace_back([&p] { p.worker(); });
@@ -503,7 +636,7 @@ int HttpAuthProvider::initialize() {
   p.initialized = true;
   return MQ_SUCCESS;
 }
-void HttpAuthProvider::cleanup() {
+void RemoteAuthProvider::cleanup() {
   auto& p = *impl_;
   p.initialized = false; p.stopping = true; p.work_ready.notify_all();
   ++*p.epoch;
@@ -514,14 +647,22 @@ void HttpAuthProvider::cleanup() {
     std::lock_guard<std::mutex> lock(shard.mutex);
     shard.entries.clear(); shard.lru.clear(); shard.pending.clear();
   }
+  if (p.grpc_mode) {
+    p.settings.erase("authentication_url"); p.settings.erase("authorization_url"); p.settings.erase("cache_version_url");
+  }
 }
-bool HttpAuthProvider::is_healthy() const { return impl_->initialized; }
-AuthResult HttpAuthProvider::authenticate_user(const MQTTString& username, const MQTTString& password,
+const char* RemoteAuthProvider::get_provider_name() const { return impl_->grpc_mode ? "gRPC" : "HTTP"; }
+bool RemoteAuthProvider::is_healthy() const { return impl_->initialized; }
+AuthResult RemoteAuthProvider::authenticate_user(const MQTTString& username, const MQTTString& password,
     const MQTTString& client_id, const MQTTString& client_ip, uint16_t client_port, UserInfo& user) {
   auto& p = *impl_; ++p.stats.logins;
   Decision result;
   try {
-    result = p.fetch(p.settings.at("authentication_url"), Json({{"username", from_mqtt_string(username)}, {"password", from_mqtt_string(password)}, {"clientid", from_mqtt_string(client_id)}}).dump());
+    if (p.grpc_mode) {
+      pb::AuthenticateRequest request;
+      request.set_username(from_mqtt_string(username)); request.set_password(from_mqtt_string(password)); request.set_client_id(from_mqtt_string(client_id));
+      result = p.fetch("authenticate", request.SerializeAsString());
+    } else result = p.fetch(p.settings.at("authentication_url"), Json({{"username", from_mqtt_string(username)}, {"password", from_mqtt_string(password)}, {"clientid", from_mqtt_string(client_id)}}).dump());
   } catch (...) {}
   if (result.result == AuthResult::SUCCESS) {
     ++p.stats.successes;
@@ -530,7 +671,7 @@ AuthResult HttpAuthProvider::authenticate_user(const MQTTString& username, const
   }
   return result.result;
 }
-AuthResult HttpAuthProvider::check_topic_access(const UserInfo& user, const MQTTString& topic, Permission permission) {
+AuthResult RemoteAuthProvider::check_topic_access(const UserInfo& user, const MQTTString& topic, Permission permission) {
   if (permission != Permission::READ && permission != Permission::WRITE) return AuthResult::ACCESS_DENIED;
   auto& p = *impl_; ++p.stats.checks;
   Decision result;
@@ -538,14 +679,14 @@ AuthResult HttpAuthProvider::check_topic_access(const UserInfo& user, const MQTT
   if (result.result == AuthResult::SUCCESS) ++p.stats.allowed;
   return result.result;
 }
-AuthResult HttpAuthProvider::check_publish(const UserInfo& user, const MQTTString& topic, const MQTTByteVector& payload) {
+AuthResult RemoteAuthProvider::check_publish(const UserInfo& user, const MQTTString& topic, const MQTTByteVector& payload) {
   auto& p = *impl_; ++p.stats.checks;
   Decision result;
   try { result = p.authorize(user, from_mqtt_string(topic), "publish", p.include_payload ? &payload : nullptr); } catch (...) {}
   if (result.result == AuthResult::SUCCESS) ++p.stats.allowed;
   return result.result;
 }
-AuthResult HttpAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
+AuthResult RemoteAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
                                                    std::shared_ptr<AuthorizationRequest>& pending) {
   auto& p = *impl_;
   if (!p.initialized) { pending.reset(); return AuthResult::ACCESS_DENIED; }
@@ -565,19 +706,20 @@ AuthResult HttpAuthProvider::check_delivery_access(const UserInfo& user, const M
   }
   return result;
 }
-AuthStats HttpAuthProvider::get_stats() const {
+AuthStats RemoteAuthProvider::get_stats() const {
   const auto& s = impl_->stats;
   AuthStats out;
   out.total_login_attempts = s.logins; out.successful_logins = s.successes; out.failed_logins = out.total_login_attempts - std::min(out.total_login_attempts, out.successful_logins);
   out.total_topic_checks = s.checks; out.topic_access_granted = s.allowed; out.topic_access_denied = out.total_topic_checks - std::min(out.total_topic_checks, out.topic_access_granted);
   out.cache_hits = s.hits; out.cache_misses = s.misses; out.cache_stale_hits = s.stale; out.cache_evictions = s.evictions;
-  out.http_requests = s.requests; out.http_failures = s.failures; out.http_rejected = s.rejected; out.cache_refreshes = s.refreshes; out.circuit_opened = s.opened;
+  if (impl_->grpc_mode) { out.rpc_requests = s.requests; out.rpc_failures = s.failures; out.rpc_rejected = s.rejected; out.rpc_batches = s.batches; out.rpc_batch_items = s.items; }
+  else { out.http_requests = s.requests; out.http_failures = s.failures; out.http_rejected = s.rejected; } out.cache_refreshes = s.refreshes; out.circuit_opened = s.opened;
   return out;
 }
-void HttpAuthProvider::reset_stats() {
+void RemoteAuthProvider::reset_stats() {
   auto& s = impl_->stats;
   s.logins = 0; s.successes = 0; s.checks = 0; s.allowed = 0; s.hits = 0; s.misses = 0; s.stale = 0;
-  s.evictions = 0; s.requests = 0; s.failures = 0; s.rejected = 0; s.refreshes = 0; s.opened = 0;
+  s.evictions = 0; s.requests = 0; s.failures = 0; s.rejected = 0; s.refreshes = 0; s.opened = 0; s.batches = 0; s.items = 0;
 }
 } // namespace auth
 } // namespace mqtt

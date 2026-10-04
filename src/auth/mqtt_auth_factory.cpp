@@ -1,5 +1,6 @@
 #include "mqtt_auth_factory.h"
 #include "mqtt_auth_http.h"
+#include "mqtt_auth_grpc.h"
 #include "mqtt_auth_sqlite.h"
 #include "mqtt_auth_redis.h"
 #include "logger.h"
@@ -22,6 +23,9 @@ int configure_auth(const mqtt::AuthConfig& config, MQTTAllocator* allocator,
     std::unique_ptr<IAuthProvider> provider;
     if (entry.type == "http") {
       provider.reset(new HttpAuthProvider(entry.settings));
+    }
+    else if (entry.type == "grpc") {
+      provider.reset(new GrpcAuthProvider(entry.settings));
     }
 #ifdef HAVE_SQLITE3
     else if (entry.type == "sqlite") {

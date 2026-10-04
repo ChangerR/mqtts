@@ -74,7 +74,7 @@ docker rm -f mqtts                # stop and remove
 
 **Message Processing**
 - `MQTTMessageQueue`: Thread-safe message queuing with shared content references
-- `MQTTSendWorkerPool`: Four send coroutines per MQTT event thread; deferred HTTP authorization lets other recipients progress while preserving each client's order
+- `MQTTSendWorkerPool`: Four send coroutines per MQTT event thread; deferred remote authorization lets other recipients progress while preserving each client's order
 - `ConcurrentTopicTree`: Lock-free topic matching with wildcard support and copy-on-write
 - Coroutine-based I/O using libco for high concurrency
 
@@ -92,8 +92,9 @@ docker rm -f mqtts                # stop and remove
 - Server heartbeat and client connect/disconnect tracking
 
 **Authentication System**
-- Pluggable auth providers: SQLite, Redis, HTTP (configurable priority)
+- Pluggable auth providers: SQLite, Redis, HTTP, gRPC (configurable priority)
 - HTTP is an optional external policy contract; never add application-specific topics or payload fields to the broker
+- `modules/authz` is an independently deployed generic Go authorization service; see its README for the Protobuf APIs and bounded batching
 - Auth caching with TTL support
 - `MQTTAuthManager` coordinates provider chain
 - Password hashing via OpenSSL

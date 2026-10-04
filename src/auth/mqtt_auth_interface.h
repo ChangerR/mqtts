@@ -114,6 +114,8 @@ struct AuthStats {
   uint64_t cache_misses;
   uint64_t cache_stale_hits = 0;
   uint64_t cache_evictions = 0;
+  uint64_t rpc_requests = 0, rpc_failures = 0, rpc_rejected = 0;
+  uint64_t rpc_batches = 0, rpc_batch_items = 0;
   uint64_t http_requests = 0;
   uint64_t http_failures = 0;
   uint64_t http_rejected = 0;

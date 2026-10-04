@@ -110,6 +110,22 @@ add_subdirectory(3rd EXCLUDE_FROM_ALL)
 # 查找认证相关依赖
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
+pkg_check_modules(GRPC REQUIRED IMPORTED_TARGET grpc++)
+find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+set(AUTHZ_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/modules/authz/proto/authorization.proto")
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.h"
+           "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.h"
+    COMMAND protobuf::protoc --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/modules/authz/proto
+            --cpp_out=${CMAKE_CURRENT_BINARY_DIR} --grpc_out=${CMAKE_CURRENT_BINARY_DIR}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${AUTHZ_PROTO}
+    DEPENDS ${AUTHZ_PROTO}
+    VERBATIM
+)
+add_library(mqtt_authz_proto STATIC "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.cc")
+target_compile_features(mqtt_authz_proto PUBLIC cxx_std_17)
+target_include_directories(mqtt_authz_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(mqtt_authz_proto PUBLIC protobuf::libprotobuf PkgConfig::GRPC)
 
 protobuf_generate_cpp(MQTT_ROUTER_PROTO_SRCS MQTT_ROUTER_PROTO_HDRS src/router/mqtt_router.proto)
 protobuf_generate_cpp(MQTT_FORWARDING_PROTO_SRCS MQTT_FORWARDING_PROTO_HDRS src/forwarding/mqtt_forwarding.proto)
@@ -188,7 +204,7 @@ target_link_libraries(mqtt_router mqtt_proto)
 
 # 添加mqtt_auth库
 add_library(mqtt_auth STATIC
-    src/auth/mqtt_auth_http.cpp
+    src/auth/mqtt_auth_remote.cpp
     src/auth/mqtt_auth_factory.cpp
     src/auth/mqtt_auth_manager.cpp
     src/auth/mqtt_auth_sqlite.cpp
@@ -198,6 +214,8 @@ add_library(mqtt_auth STATIC
     src/common/logger.cpp
     src/common/mqtt_buffer.cpp
 )
+
+target_link_libraries(mqtt_auth mqtt_authz_proto)
 
 # 查找SQLite3 (可选)
 find_package(SQLite3 QUIET)
