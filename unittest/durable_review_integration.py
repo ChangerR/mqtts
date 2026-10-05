@@ -88,6 +88,21 @@ def maintenance(binary, fault):
             print('PASS terminal append failure rejects durable traffic without rejecting new clean clients', flush=True)
 
 
+def sender_loop_avoidance(binary):
+    for version in (4, 5):
+        for persistent in (False, True):
+            with Fixture(binary, persistence={} if persistent else None) as f:
+                writer, _ = client(f, 'writer', version=version, clean=not persistent, expiry=60 if persistent else 0)
+                reader, _ = client(f, 'reader', version=version, clean=not persistent, expiry=60 if persistent else 0)
+                assert writer.sub('fixture/echo') == 1
+                assert reader.sub('fixture/echo') == 1
+                data = f.payload(writer, 1)
+                writer.pub('fixture/echo', data)
+                assert reader.delivery()[1] == data
+                writer.quiet()
+    print('PASS MQTT 3/5 sender loop avoidance in durable and live fanout', flush=True)
+
+
 def qos_zero_takeover(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
@@ -261,6 +276,7 @@ if __name__ == '__main__':
     maintenance(args.broker, args.fault_library)
     authorization_failures(args.broker)
     qos_zero_takeover(args.broker)
+    sender_loop_avoidance(args.broker)
     poison_messages(args.broker)
     stored_wire_budget(args.broker)
     expired_inflight(args.broker)

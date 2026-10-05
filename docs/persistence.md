@@ -75,6 +75,9 @@ an earlier uncommitted publication to that client, including across topic partit
 Thus disk workers run concurrently while client replay preserves the accepted order.
 A stalled earlier message can intentionally hold later messages to the same consumer;
 a consumer for an independent partition continues to receive.
+The publisher's own Client ID is excluded from durable fanout, matching the broker's
+existing live-delivery loop avoidance. This preserves the existing behavior; per-filter
+MQTT 5 No Local option negotiation is not implemented by this change.
 
 Clean Start discards the previous owner's session/queue. Another authenticated owner
 cannot take over a retained Client ID. Connection epochs fence late socket operations,

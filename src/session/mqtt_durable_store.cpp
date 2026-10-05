@@ -904,7 +904,7 @@ std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::ma
   return live;
 }
 DurableStore::Result DurableStore::publish(const std::string& topic, const std::string& wire,
-                                           const std::string&, int64_t expires)
+                                           const std::string& sender, int64_t expires)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
@@ -912,6 +912,10 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
     if (expires > 0 && expires <= now_ms())
       return {};
     auto targets = v.match(topic);
+    targets.erase(std::remove_if(
+                      targets.begin(), targets.end(),
+                      [&](const std::shared_ptr<Impl::Session>& s) { return s->client == sender; }),
+                  targets.end());
     if (targets.empty())
       return {};
     v.check_metadata(0, v.pending + targets.size(), wire.size());
