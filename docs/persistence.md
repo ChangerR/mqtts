@@ -45,6 +45,14 @@ packet may exceed the target), honor the receive window, and yield between batch
 A short state mutex still serializes bookkeeping; this is not an unlimited scale-out
 engine. Measured capacity is in [the load report](performance/durable-concurrency.md).
 
+Subscription admission updates only that filter's trie path and metadata counters.
+Removing unused paths recycles their nodes; the next publication never rebuilds all
+subscriptions. Ordered expiry indexes track only expiring messages and offline
+sessions. Each maintenance pass visits at most 256 message recipients and 256 session
+entries/deliveries; overdue cleanup can span passes without scanning unrelated
+backlogs. Fetch and reconnect also enforce expiry immediately. Startup rebuilds the
+indexes once; online lease heartbeats still visit online sessions once per second.
+
 ## Protocol and durability contract
 
 1. Establish the TCP persistent subscription before publishing traffic that must

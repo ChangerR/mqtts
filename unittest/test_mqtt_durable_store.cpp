@@ -142,6 +142,58 @@ static void test_v2_upgrade(const std::string& path)
     assert(batch.deliveries[0].wire == "v2-payload" && batch.deliveries[0].packet_id == 7);
   }
 }
+
+static void test_incremental_routing_and_expiry(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.checkpoint_interval_ms = 600000;
+  DurableStore store(cfg);
+  for (int i = 0; i < 64; ++i) {
+    auto name = "other-" + std::to_string(i);
+    auto s = store.connect(name, "owner", false, 60);
+    for (int j = 0; j < 16; ++j)
+      assert(store.subscribe(name, s.epoch, name + "/" + std::to_string(j) + "/#", 1).ok);
+  }
+  auto changing = store.connect("changing", "owner", false, 60);
+  for (int i = 0; i < 100; ++i) {
+    auto filter = "changing/" + std::to_string(i) + "/+";
+    assert(store.subscribe("changing", changing.epoch, filter, 1).ok);
+    assert(
+        store.publish("changing/" + std::to_string(i) + "/leaf", "x", "writer", 0).targets.size() ==
+        1);
+    assert(store.subscribe("changing", changing.epoch, filter, 0).ok);
+    assert(
+        store.publish("changing/" + std::to_string(i) + "/leaf", "x", "writer", 0).targets.empty());
+    assert(store.unsubscribe("changing", changing.epoch, filter).ok);
+  }
+  changing = store.connect("changing", "owner", true, 60);
+  assert(store.statistics().pending == 0);
+  auto expired = store.connect("expires", "owner", false, 60);
+  auto resumed = store.connect("resumed", "owner", false, 1);
+  assert(store.subscribe("expires", expired.epoch, "ttl", 1).ok);
+  assert(store.subscribe("resumed", resumed.epoch, "ttl", 1).ok);
+  assert(store.disconnect("resumed", resumed.epoch).ok);
+  resumed = store.connect("resumed", "owner", false, 60);
+  assert(store.publish("ttl", "shared", "writer", DurableStore::now_ms() + 100).ok);
+  auto in_flight = store.fetch("resumed", resumed.epoch, 0, 1);
+  assert(in_flight.deliveries.size() == 1);
+  for (int i = 0; i < 40 && store.statistics().pending != 1; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  assert(store.statistics().pending == 1 && store.statistics().unique_bytes == 6);
+  // Cancelling the old offline deadline must preserve the reconnected session.
+  assert(store.acknowledge("resumed", resumed.epoch, in_flight.deliveries[0].packet_id).ok);
+  assert(store.statistics().unique_bytes == 0);
+  assert(store.publish("ttl", "session-expiry", "writer", 0).ok);
+  assert(store.disconnect("expires", expired.epoch, 1).ok);
+  assert(store.disconnect("resumed", resumed.epoch, 1).ok);
+  for (int i = 0; i < 40 && store.statistics().pending; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  assert(store.statistics().pending == 0 && store.statistics().unique_bytes == 0);
+  assert(store.publish("ttl", "gone", "writer", 0).targets.empty());
+  // Unrelated filters remain live after repeated branch removal and node reuse.
+  assert(store.publish("other-63/15/leaf", "still routed", "writer", 0).targets.size() == 1);
+}
 int main()
 {
   char dir[] = "/tmp/mqtts-store-XXXXXX";
@@ -279,6 +331,7 @@ int main()
   }
   test_compaction(std::string(dir) + "/compact");
   test_v2_upgrade(std::string(dir) + "/upgrade");
+  test_incremental_routing_and_expiry(std::string(dir) + "/indexes");
   std::filesystem::remove_all(dir);
   puts(
       "PASS persistent restart, ownership, epochs, receive window, expiry, deduplication, quotas "

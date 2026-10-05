@@ -127,11 +127,14 @@ int64_t DurableStore::now_ms()
 
 struct DurableStore::Impl
 {
+  struct Session;
   struct Message
   {
     int64_t id = 0, expires = 0;
     size_t partition = 0;
     size_t references = 0;
+    size_t expiry_cursor = 0;
+    std::vector<std::weak_ptr<Session>> recipients;
     Location location;
     std::string wire;
     bool committed = false;
@@ -148,6 +151,7 @@ struct DurableStore::Impl
     uint64_t generation = 0, epoch = 0;
     uint32_t expiry = 0;
     int64_t deadline = 0;
+    int64_t scheduled_expiry = 0;
     bool online = false, busy = false;
     uint16_t next_packet = 1;
     size_t bytes = 0;
@@ -161,13 +165,13 @@ struct DurableStore::Impl
   struct TopicNode
   {
     std::unordered_map<std::string, size_t> children;
-    std::vector<std::shared_ptr<Session>> clients;
+    std::unordered_map<std::string, std::shared_ptr<Session>> clients;
   };
   PersistenceConfig config;
   mutable std::mutex mutex;
   std::mutex checkpoint_mutex;
   std::condition_variable stopped;
-  bool stopping = false, failed = false, index_dirty = true;
+  bool stopping = false, failed = false, indexing = false;
   std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
@@ -180,6 +184,9 @@ struct DurableStore::Impl
   std::atomic<size_t> discarded_denied{0}, discarded_oversize{0}, discarded_malformed{0};
   std::map<std::string, std::shared_ptr<Session>> sessions;
   std::vector<TopicNode> index;
+  std::vector<size_t> free_nodes;
+  std::map<std::pair<int64_t, int64_t>, std::weak_ptr<Message>> message_expiry;
+  std::map<std::pair<int64_t, std::string>, std::weak_ptr<Session>> session_expiry;
   std::vector<std::unique_ptr<AppendLog>> messages, states;
   std::vector<uint64_t> message_cuts, state_cuts;
   std::thread maintenance;
@@ -287,20 +294,112 @@ struct DurableStore::Impl
     if (s->signal)
       s->signal->notify();
   }
-  void recount_subscriptions()
+  size_t session_cost(const std::shared_ptr<Session>& s) const
+  {
+    return 512 + s->client.size() * 2 + s->owner.size();
+  }
+  void index_subscription(const std::shared_ptr<Session>& s, const std::string& filter, bool add)
+  {
+    size_t node = 0, offset = 0;
+    std::vector<std::pair<size_t, std::string>> path;
+    for (;;) {
+      size_t end = filter.find('/', offset);
+      std::string level = filter.substr(offset, end == std::string::npos ? end : end - offset);
+      auto found = index[node].children.find(level);
+      size_t next;
+      if (found == index[node].children.end()) {
+        if (!add)
+          return;
+        if (free_nodes.empty()) {
+          next = index.size();
+          index.emplace_back();
+        } else {
+          next = free_nodes.back();
+          free_nodes.pop_back();
+        }
+        index[node].children.emplace(level, next);
+      } else
+        next = found->second;
+      path.emplace_back(node, level);
+      node = next;
+      if (end == std::string::npos)
+        break;
+      offset = end + 1;
+    }
+    if (add) {
+      index[node].clients[s->client] = s;
+      return;
+    }
+    index[node].clients.erase(s->client);
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+      if (!index[node].clients.empty() || !index[node].children.empty())
+        break;
+      index[it->first].children.erase(it->second);
+      index[node] = TopicNode();
+      free_nodes.push_back(node);
+      node = it->first;
+    }
+  }
+  void set_subscription(const std::shared_ptr<Session>& s, const std::string& filter, uint8_t qos,
+                        bool remove = false)
+  {
+    auto previous = s->subscriptions.find(filter);
+    if (previous != s->subscriptions.end()) {
+      if (previous->second) {
+        index_subscription(s, filter, false);
+        --subscriptions;
+      }
+      metadata_bytes -= subscription_cost(filter);
+      s->subscriptions.erase(previous);
+    }
+    if (!remove) {
+      s->subscriptions[filter] = qos;
+      metadata_bytes += subscription_cost(filter);
+      if (qos) {
+        index_subscription(s, filter, true);
+        ++subscriptions;
+      }
+    }
+  }
+  void schedule_session(const std::shared_ptr<Session>& s, int64_t deadline = 0)
+  {
+    if (s->scheduled_expiry)
+      session_expiry.erase({s->scheduled_expiry, s->client});
+    s->scheduled_expiry = deadline;
+    if (deadline)
+      session_expiry[{deadline, s->client}] = s;
+  }
+  void schedule_message(const std::shared_ptr<Message>& m)
+  {
+    if (m->references && m->committed && m->expires > 0)
+      message_expiry[{m->expires, m->id}] = m;
+  }
+  void rebuild_indexes()
   {
     size_t count = 0;
     metadata_bytes = 0;
+    index.clear();
+    index.emplace_back();
+    free_nodes.clear();
+    message_expiry.clear();
+    session_expiry.clear();
     for (const auto& s : sessions) {
-      metadata_bytes += 512 + s.first.size() * 2 + s.second->owner.size();
+      metadata_bytes += session_cost(s.second);
       for (const auto& sub : s.second->subscriptions) {
         metadata_bytes += subscription_cost(sub.first);
-        if (sub.second)
+        if (sub.second) {
           ++count;
+          index_subscription(s.second, sub.first, true);
+        }
       }
+      s.second->scheduled_expiry = 0;
+      if (!s.second->online)
+        schedule_session(s.second, s.second->deadline);
+      for (const auto& delivery : s.second->pending)
+        schedule_message(delivery.second.message);
     }
     subscriptions.store(count);
-    index_dirty = true;
+    indexing = true;
   }
   void check_metadata(size_t extra, size_t deliveries, size_t payload = 0)
   {
@@ -313,16 +412,19 @@ struct DurableStore::Impl
     if (metadata_bytes + extra - unique_bytes - payload > config.max_request_bytes * 4ULL)
       throw std::runtime_error("persistent metadata memory limit");
   }
-  void reference(const std::shared_ptr<Message>& message)
+  void reference(const std::shared_ptr<Message>& message, const std::shared_ptr<Session>& s)
   {
     if (!message->references++)
       unique_bytes += message->wire.size();
+    message->recipients.push_back(s);
   }
   void drop(const std::shared_ptr<Session>& s, std::map<int64_t, DeliveryState>::iterator entry)
   {
     auto& delivery = entry->second;
-    if (!--delivery.message->references)
+    if (!--delivery.message->references) {
       unique_bytes -= delivery.message->wire.size();
+      message_expiry.erase({delivery.message->expires, delivery.message->id});
+    }
     bytes -= delivery.message->wire.size();
     s->bytes -= delivery.message->wire.size();
     --pending;
@@ -338,12 +440,65 @@ struct DurableStore::Impl
     notify(s);
     while (!s->pending.empty())
       drop(s, s->pending.begin());
+    schedule_session(s);
+    if (indexing) {
+      while (!s->subscriptions.empty())
+        set_subscription(s, s->subscriptions.begin()->first, 0, true);
+      metadata_bytes -= session_cost(s);
+    }
     sessions.erase(s->client);
-    recount_subscriptions();
   }
   void expire(bool startup = false)
   {
     auto now = DurableStore::now_ms();
+    if (!startup) {
+      // Bound each heartbeat's work independently of unrelated backlog size.
+      size_t budget = 256;
+      while (budget && !message_expiry.empty() && message_expiry.begin()->first.first <= now) {
+        const auto key = message_expiry.begin()->first;
+        auto m = message_expiry.begin()->second.lock();
+        if (!m) {
+          message_expiry.erase(key);
+          --budget;
+          continue;
+        }
+        while (budget && m->expiry_cursor < m->recipients.size()) {
+          --budget;
+          auto s = m->recipients[m->expiry_cursor++].lock();
+          if (!s)
+            continue;
+          auto entry = s->pending.find(m->id);
+          if (entry != s->pending.end() && !entry->second.attempted) {
+            drop(s, entry);
+            notify(s);
+          }
+        }
+        if (m->expiry_cursor == m->recipients.size())
+          message_expiry.erase(key);
+      }
+      budget = 256;
+      while (budget && !session_expiry.empty() && session_expiry.begin()->first.first <= now) {
+        auto s = session_expiry.begin()->second.lock();
+        session_expiry.erase(session_expiry.begin());
+        --budget;
+        if (!s)
+          continue;
+        s->scheduled_expiry = 0;
+        if (s->busy) {
+          schedule_session(s, now + 100);
+          continue;
+        }
+        while (budget && !s->pending.empty()) {
+          drop(s, s->pending.begin());
+          --budget;
+        }
+        if (s->pending.empty())
+          erase_session(s);
+        else
+          schedule_session(s, now + 100);
+      }
+      return;
+    }
     for (auto it = sessions.begin(); it != sessions.end();) {
       auto s = it->second;
       ++it;
@@ -570,10 +725,12 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
               s->expiry = expiry;
               s->deadline = deadline;
               s->online = true;
+              v.schedule_session(s);
               s->busy = false;
               s->signal = signal;
               v.sessions[client] = s;
-              v.recount_subscriptions();
+              if (old && clean)
+                v.metadata_bytes += v.session_cost(s);
               *r = success();
               r->present = bool(old && !clean);
               r->epoch = epoch;
@@ -589,7 +746,7 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
           s->owner = owner;
           s->busy = true;
           v.sessions[client] = s;
-          v.recount_subscriptions();
+          v.metadata_bytes += v.session_cost(s);
         }
         return ticket;
       },
@@ -627,8 +784,10 @@ DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_
           s->deadline = deadline;
           if (!expiry)
             v.erase_session(s);
-          else
+          else {
+            v.schedule_session(s, deadline);
             v.notify(s);
+          }
           *r = success();
         });
     s->busy = true;
@@ -666,8 +825,7 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
           s->busy = false;
           if (!ok)
             return;
-          s->subscriptions[filter] = qos;
-          v.recount_subscriptions();
+          v.set_subscription(s, filter, qos);
           *r = success();
           r->present = existed;
           if (existed)
@@ -698,8 +856,7 @@ DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64
           s->busy = false;
           if (!ok)
             return;
-          s->subscriptions.erase(filter);
-          v.recount_subscriptions();
+          v.set_subscription(s, filter, 0, true);
           *r = success();
         });
     s->busy = true;
@@ -710,34 +867,6 @@ DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64
 std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::match(
     const std::string& topic)
 {
-  if (index_dirty) {
-    std::vector<TopicNode> rebuilt(1);
-    for (const auto& item : sessions)
-      for (const auto& sub : item.second->subscriptions) {
-        if (!sub.second)
-          continue;
-        size_t node = 0, offset = 0;
-        for (;;) {
-          size_t end = sub.first.find('/', offset);
-          std::string level =
-              sub.first.substr(offset, end == std::string::npos ? end : end - offset);
-          auto found = rebuilt[node].children.find(level);
-          if (found == rebuilt[node].children.end()) {
-            size_t next = rebuilt.size();
-            rebuilt.emplace_back();
-            rebuilt[node].children.emplace(level, next);
-            node = next;
-          } else
-            node = found->second;
-          if (end == std::string::npos)
-            break;
-          offset = end + 1;
-        }
-        rebuilt[node].clients.push_back(item.second);
-      }
-    index = std::move(rebuilt);
-    index_dirty = false;
-  }
   std::set<std::shared_ptr<Session>> targets;
   std::vector<std::pair<size_t, size_t>> todo;
   todo.emplace_back(0, 0);
@@ -749,10 +878,10 @@ std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::ma
     auto hash = node.children.find("#");
     if (!system && hash != node.children.end())
       for (const auto& s : index[hash->second].clients)
-        targets.insert(s);
+        targets.insert(s.second);
     if (item.second > topic.size()) {
       for (const auto& s : node.clients)
-        targets.insert(s);
+        targets.insert(s.second);
       continue;
     }
     size_t end = topic.find('/', item.second),
@@ -823,6 +952,7 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
                                 return;
                               message->location = location;
                               message->committed = true;
+                              v.schedule_message(message);
                               for (const auto& s : targets)
                                 v.notify(s);
                             });
@@ -832,7 +962,7 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
       entry.message = message;
       entry.packet = packets[i];
       s->pending.emplace(message->id, entry);
-      v.reference(message);
+      v.reference(message, s);
       if (entry.packet) {
         s->packets[entry.packet] = message->id;
         s->next_packet = uint16_t(entry.packet % 65535 + 1);
@@ -1192,7 +1322,7 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     entry.attempted = entry.started = packet != 0;
     if (!s->pending.emplace(m->id, entry).second)
       throw std::runtime_error("duplicate journal message identity");
-    reference(m);
+    reference(m, s);
     ++pending;
     bytes += m->wire.size();
     s->bytes += m->wire.size();
@@ -1282,7 +1412,7 @@ void DurableStore::Impl::restore()
         entry.attempted = entry.started = packet != 0;
         if (!s->pending.emplace(id, entry).second)
           throw std::runtime_error("duplicate checkpoint delivery");
-        reference(entry.message);
+        reference(entry.message, s);
         ++pending;
         bytes += entry.message->wire.size();
         s->bytes += entry.message->wire.size();
@@ -1318,7 +1448,7 @@ void DurableStore::Impl::restore()
     item.second->recovery_claims.clear();
   }
   expire(true);
-  recount_subscriptions();
+  rebuild_indexes();
   validate_state();
 }
 void DurableStore::Impl::validate_state()
@@ -1575,6 +1705,7 @@ void DurableStore::import_legacy(const std::string& exported)
     if (v.next_id || !v.sessions.empty() || v.requests)
       throw std::runtime_error("offline import requires a new empty store");
     v.frozen = true;
+    v.indexing = false;
   }
   journal::atomic_file(v.config.path + "/IMPORTING", "offline migration in progress\n");
   try {
@@ -1663,7 +1794,7 @@ void DurableStore::import_legacy(const std::string& exported)
       if (!job->wait())
         throw std::runtime_error(job->error);
     v.expire(true);
-    v.recount_subscriptions();
+    v.rebuild_indexes();
     v.validate_state();
     exclusive.unlock();
     v.checkpoint();
