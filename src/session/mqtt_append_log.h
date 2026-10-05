@@ -66,6 +66,9 @@ class AppendLog
     Callback applied;
     std::shared_ptr<Completion> completion;
     bool seal = false;
+    bool reclaim = false;
+    uint64_t cut = 0;
+    std::set<uint64_t> retained;
   };
   struct Segment
   {
@@ -88,6 +91,7 @@ class AppendLog
   void recover();
   void scan(uint64_t segment, bool repair_tail, const Visitor& visit);
   void close_segment();
+  void prune_segments(uint64_t cut, const std::set<uint64_t>& retained);
   Location write_record(const std::string& data);
 };
 

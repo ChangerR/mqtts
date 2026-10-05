@@ -83,7 +83,9 @@ Message expiry and explicit MQTT 5 zero expiry are honored.
 Admission/quota failures withhold positive publisher PUBACK and close the publishing
 connection for retry. Accepted older messages are never evicted to admit new ones.
 Actual journal write/sync failure fails persistent traffic closed and requires
-storage recovery/restart. A complete record written before a failed sync may appear
+storage recovery/restart; new clean sessions without retained state can still connect.
+Checkpoint or obsolete-segment reclamation errors retain the usable logs and retry
+with backoff rather than poisoning the store. A complete record written before a failed sync may appear
 on replay even though its publisher did not receive success: this is the ordinary
 QoS 1 ambiguous-receipt boundary.
 
@@ -102,15 +104,18 @@ CRC. New segment directory entries are synced. Recovery truncates only an incomp
 final frame in the last segment; a complete checksum mismatch, damaged sealed frame,
 missing post-checkpoint serial or missing referenced segment refuses startup.
 
-Checkpoints briefly freeze admission, fence and seal every log, and record committed
-state and segment references. They do not rewrite message payloads. The checkpoint
-is written to a temporary file, fsynced, renamed and its directory fsynced **before**
+Checkpoints briefly freeze admission, fence and seal every log, and copy committed
+state and segment references. Admission resumes before snapshot encoding or disk I/O.
+Event coroutines use cooperative lock acquisition and do not block their OS thread
+behind the snapshot. They do not treat the maintenance fence as quota exhaustion.
+The checkpoint is written to a temporary file, fsynced, renamed and its directory fsynced **before**
 eligible segments are unlinked. A live delivery pins its containing message segment;
 ACK gaps and offline readers cannot be reclaimed past. Session segments covered by
 the checkpoint can be removed. Crashing before/after checkpoint installation leaves
 either the older logs or the new checkpoint plus all its referenced segments usable.
-The checkpoint admission pause is part of latency measurements and must be included
-in sustained production-capacity testing.
+Reclamation is queued on the owning log worker and cannot race new appends. Heartbeats
+are split into bounded records, including when clients use long identifiers.
+The snapshot admission pause remains part of sustained latency measurements.
 
 ## Bounds and configuration
 

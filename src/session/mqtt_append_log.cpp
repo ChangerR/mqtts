@@ -422,8 +422,12 @@ void AppendLog::work()
       changed_.wait_for(lock, std::chrono::milliseconds(1),
                         [&] { return stopping_ || queue_.size() >= 64; });
       while (!queue_.empty() && batch.size() < 64) {
+        if (!batch.empty() && (queue_.front().seal || queue_.front().reclaim))
+          break;
         batch.push_back(std::move(queue_.front()));
         queue_.pop_front();
+        if (batch.back().seal || batch.back().reclaim)
+          break;
       }
     }
     std::string error;
@@ -431,17 +435,21 @@ void AppendLog::work()
       if (failed_)
         throw std::runtime_error("journal writer failed");
       for (auto& entry : batch) {
-        if (entry.seal)
+        if (entry.reclaim)
+          prune_segments(entry.cut, entry.retained);
+        else if (entry.seal)
           close_segment();
         else
           entry.completion->location = write_record(entry.data);
       }
-      if (fd_ >= 0)
+      if (fd_ >= 0 && !batch.front().reclaim)
         check(fdatasync(fd_) == 0, "commit journal batch");
     } catch (const std::exception& e) {
       error = e.what();
       std::lock_guard<std::mutex> lock(mutex_);
-      failed_ = true;
+      // Reclamation failure cannot invalidate the checkpoint-covered prefix.
+      if (!batch.front().reclaim)
+        failed_ = true;
     }
     for (auto& entry : batch) {
       auto& c = *entry.completion;
@@ -456,7 +464,7 @@ void AppendLog::work()
         std::lock_guard<std::mutex> lock(mutex_);
         failed_ = true;
       }
-      if (!entry.seal) {
+      if (!entry.seal && !entry.reclaim) {
         std::lock_guard<std::mutex> lock(mutex_);
         reserved_bytes_ -= entry.data.size() + header_size;
       }
@@ -465,6 +473,24 @@ void AppendLog::work()
   }
 }
 void AppendLog::prune(uint64_t cut, const std::set<uint64_t>& retained)
+{
+  auto completion = std::make_shared<Completion>(true);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_)
+      throw std::runtime_error("journal stopping");
+    Entry e;
+    e.reclaim = true;
+    e.cut = cut;
+    e.retained = retained;
+    e.completion = completion;
+    queue_.push_back(std::move(e));
+  }
+  changed_.notify_one();
+  if (!completion->wait())
+    throw std::runtime_error(completion->error);
+}
+void AppendLog::prune_segments(uint64_t cut, const std::set<uint64_t>& retained)
 {
   bool changed = false;
   for (auto it = segments_.begin(); it != segments_.end();) {

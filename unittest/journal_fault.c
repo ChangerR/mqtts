@@ -52,3 +52,17 @@ int fdatasync(int fd)
   }
   return (int)syscall(SYS_fdatasync, fd);
 }
+int fsync(int fd)
+{
+  if (selected(fd, "checkpoint_delay")) {
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/checkpoint-entered", getenv("MQTTS_JOURNAL_FAULT_CONTROL"));
+    int signaled = (int)syscall(SYS_openat, AT_FDCWD, marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (signaled >= 0) syscall(SYS_close, signaled);
+  }
+  while (selected(fd, "checkpoint_delay")) {
+    struct timespec delay = {0, 1000000};
+    syscall(SYS_nanosleep, &delay, NULL);
+  }
+  return (int)syscall(SYS_fsync, fd);
+}

@@ -34,6 +34,9 @@ enum Record : uint8_t {
 struct Deferred
 {
 };
+struct MaintenancePause
+{
+};
 size_t subscription_cost(const std::string& filter)
 {
   // Bound the flat topic trie as well as the saved filter text, including deeply
@@ -170,7 +173,8 @@ struct DurableStore::Impl
   mutable std::mutex mutex;
   std::mutex checkpoint_mutex;
   std::condition_variable stopped;
-  bool stopping = false, frozen = false, failed = false, index_dirty = true;
+  bool stopping = false, failed = false, index_dirty = true;
+  std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
   size_t pending = 0, bytes = 0, requests = 0, request_bytes = 0, metadata_bytes = 0,
@@ -191,7 +195,8 @@ struct DurableStore::Impl
       if (item.second->signal)
         item.second->signal->notify();
   }
-  Result call(const std::function<Ticket(const std::shared_ptr<Result>&)>& fn, bool wait = true)
+  Result call(const std::function<Ticket(const std::shared_ptr<Result>&)>& fn, bool wait = true,
+              bool inspect_unavailable = false)
   {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     for (;;) {
@@ -199,14 +204,19 @@ struct DurableStore::Impl
       Ticket ticket;
       try {
         {
-          std::lock_guard<std::mutex> guard(mutex);
-          if (failed || stopping) {
+          // A coroutine must never block its event thread behind snapshot work.
+          std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
+          if (!guard.owns_lock() && frozen.load())
+            throw MaintenancePause();
+          if (!guard.owns_lock())
+            throw Deferred();
+          if ((failed || stopping) && !inspect_unavailable) {
             r->error = "persistent journal unavailable";
             r->stale = true;
             return *r;
           }
-          if (frozen)
-            throw Deferred();
+          if (frozen && !inspect_unavailable)
+            throw MaintenancePause();
           ticket = fn(r);
         }
         if (ticket && wait && !ticket->wait()) {
@@ -214,6 +224,9 @@ struct DurableStore::Impl
           r->error = ticket->error;
         }
         return *r;
+      } catch (const MaintenancePause&) {
+        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        runtime::current_runtime().wait(-1, 0, 1);
       } catch (const Deferred&) {
         if (std::chrono::steady_clock::now() >= deadline) {
           r->ok = false;
@@ -477,82 +490,94 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
 {
   auto& v = *impl_;
   expiry = std::min(expiry, v.config.max_session_expiry_seconds);
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
-    auto it = v.sessions.find(client);
-    std::shared_ptr<Impl::Session> old = it == v.sessions.end() ? nullptr : it->second;
-    if (old && old->busy)
-      throw Deferred();
-    if (old && !old->online && old->deadline <= now_ms()) {
-      v.erase_session(old);
-      old.reset();
-    }
-    if (old && old->owner != owner)
-      throw std::runtime_error("persistent session belongs to another identity");
-    if (!old && expiry == 0) {
-      *r = success();
-      return {};
-    }
-    if (!old && v.sessions.size() >= v.config.max_sessions)
-      throw std::runtime_error("persistent session limit");
-    if (!old)
-      v.check_metadata(512 + client.size() * 2 + owner.size(), v.pending);
-    auto s = (old && !clean) ? old : std::make_shared<Impl::Session>();
-    uint64_t epoch = ++v.next_id, generation = (old && !clean) ? old->generation : epoch;
-    int64_t deadline = now_ms() + int64_t(expiry) * 1000;
-    auto signal = std::make_shared<Signal>();
-    Encoder e;
-    e.u8(CONNECT);
-    e.text(client);
-    e.text(owner);
-    e.u64(generation);
-    e.u64(epoch);
-    e.u32(expiry);
-    e.u64(deadline);
-    e.u8(clean);
-    auto ticket =
-        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
-          if (old)
-            old->busy = false;
-          if (!ok)
-            return;
-          if (old)
-            v.notify(old);
-          if (old && clean)
-            v.erase_session(old);
-          if (clean && expiry == 0) {
-            *r = success();
-            return;
-          }
+  return v.call(
+      [&](const std::shared_ptr<Result>& r) -> Ticket {
+        auto it = v.sessions.find(client);
+        std::shared_ptr<Impl::Session> old = it == v.sessions.end() ? nullptr : it->second;
+        if (!old && expiry == 0 && !v.stopping) {
+          *r = success();
+          return {};
+        }
+        if (v.failed || v.stopping) {
+          r->error = "persistent journal unavailable";
+          return {};
+        }
+        if (v.frozen)
+          throw MaintenancePause();
+        if (old && old->busy)
+          throw Deferred();
+        if (old && !old->online && old->deadline <= now_ms()) {
+          v.erase_session(old);
+          old.reset();
+        }
+        if (old && old->owner != owner)
+          throw std::runtime_error("persistent session belongs to another identity");
+        if (!old && expiry == 0) {
+          *r = success();
+          return {};
+        }
+        if (!old && v.sessions.size() >= v.config.max_sessions)
+          throw std::runtime_error("persistent session limit");
+        if (!old)
+          v.check_metadata(512 + client.size() * 2 + owner.size(), v.pending);
+        auto s = (old && !clean) ? old : std::make_shared<Impl::Session>();
+        uint64_t epoch = ++v.next_id, generation = (old && !clean) ? old->generation : epoch;
+        int64_t deadline = now_ms() + int64_t(expiry) * 1000;
+        auto signal = std::make_shared<Signal>();
+        Encoder e;
+        e.u8(CONNECT);
+        e.text(client);
+        e.text(owner);
+        e.u64(generation);
+        e.u64(epoch);
+        e.u32(expiry);
+        e.u64(deadline);
+        e.u8(clean);
+        auto ticket =
+            v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+              if (old)
+                old->busy = false;
+              if (!ok)
+                return;
+              if (old)
+                v.notify(old);
+              if (old && clean)
+                v.erase_session(old);
+              if (clean && expiry == 0) {
+                *r = success();
+                return;
+              }
+              s->client = client;
+              s->owner = owner;
+              s->generation = generation;
+              s->epoch = epoch;
+              s->expiry = expiry;
+              s->deadline = deadline;
+              s->online = true;
+              s->busy = false;
+              s->signal = signal;
+              v.sessions[client] = s;
+              v.recount_subscriptions();
+              *r = success();
+              r->present = bool(old && !clean);
+              r->epoch = epoch;
+              r->revision = signal;
+              for (const auto& sub : s->subscriptions)
+                r->subscriptions.push_back(sub);
+              v.notify(s);
+            });
+        if (old)
+          old->busy = true;
+        else {
           s->client = client;
           s->owner = owner;
-          s->generation = generation;
-          s->epoch = epoch;
-          s->expiry = expiry;
-          s->deadline = deadline;
-          s->online = true;
-          s->busy = false;
-          s->signal = signal;
+          s->busy = true;
           v.sessions[client] = s;
           v.recount_subscriptions();
-          *r = success();
-          r->present = bool(old && !clean);
-          r->epoch = epoch;
-          r->revision = signal;
-          for (const auto& sub : s->subscriptions)
-            r->subscriptions.push_back(sub);
-          v.notify(s);
-        });
-    if (old)
-      old->busy = true;
-    else {
-      s->client = client;
-      s->owner = owner;
-      s->busy = true;
-      v.sessions[client] = s;
-      v.recount_subscriptions();
-    }
-    return ticket;
-  });
+        }
+        return ticket;
+      },
+      true, true);
 }
 DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_t epoch,
                                               int64_t expiry_override)
@@ -1248,73 +1273,102 @@ void DurableStore::Impl::checkpoint()
     for (const auto& fence : fences)
       if (!fence->wait())
         throw std::runtime_error(fence->error);
-    Encoder e;
-    std::vector<std::set<uint64_t>> retained(messages.size());
+    struct SnapshotSession
+    {
+      std::string client, owner;
+      uint64_t generation, epoch;
+      uint32_t expiry;
+      int64_t deadline;
+      bool online;
+      uint16_t next_packet;
+      std::map<std::string, uint8_t> subscriptions;
+      std::vector<std::pair<std::shared_ptr<Message>, uint16_t>> pending;
+    };
+    uint64_t snapshot_id;
+    std::vector<SnapshotSession> snapshot;
+    std::vector<uint64_t> message_fences(messages.size()), state_fences(states.size());
     {
       std::lock_guard<std::mutex> guard(mutex);
       if (failed || requests)
         throw std::runtime_error("checkpoint fence failed");
-      expire();
-      e.text("MQTTS-CHECKPOINT-2");
-      e.u32(uint32_t(config.partitions));
-      e.u64(next_id);
+      snapshot_id = next_id;
       for (size_t p = 0; p < config.partitions; ++p) {
-        message_cuts[p] = messages[p]->serial();
-        state_cuts[p] = states[p]->serial();
-        e.u64(message_cuts[p]);
-        e.u64(state_cuts[p]);
+        message_fences[p] = messages[p]->serial();
+        state_fences[p] = states[p]->serial();
       }
-      std::map<int64_t, std::shared_ptr<Message>> live;
-      for (const auto& s : sessions)
-        for (const auto& delivery : s.second->pending)
-          live.emplace(delivery.first, delivery.second.message);
-      e.u32(uint32_t(live.size()));
-      for (const auto& item : live) {
-        auto m = item.second;
-        if (!m->committed)
-          throw std::runtime_error("uncommitted checkpoint message");
-        e.u64(m->id);
-        e.u32(uint32_t(m->partition));
-        location_write(e, m->location);
-        retained[m->partition].insert(m->location.segment);
-      }
-      e.u32(uint32_t(sessions.size()));
+      snapshot.reserve(sessions.size());
       for (const auto& item : sessions) {
-        auto s = item.second;
-        e.text(s->client);
-        e.text(s->owner);
-        e.u64(s->generation);
-        e.u64(s->epoch);
-        e.u32(s->expiry);
-        e.u64(s->deadline);
-        e.u8(s->online);
-        e.u32(s->next_packet);
-        e.u32(uint32_t(s->subscriptions.size()));
-        for (const auto& sub : s->subscriptions) {
-          e.text(sub.first);
-          e.u8(sub.second);
-        }
-        e.u32(uint32_t(s->pending.size()));
-        for (const auto& entry : s->pending) {
-          e.u64(entry.first);
-          e.u32(entry.second.packet);
-        }
+        const auto& s = *item.second;
+        SnapshotSession copy{s.client,   s.owner,  s.generation,  s.epoch,         s.expiry,
+                             s.deadline, s.online, s.next_packet, s.subscriptions, {}};
+        copy.pending.reserve(s.pending.size());
+        for (const auto& entry : s.pending)
+          copy.pending.emplace_back(entry.second.message, entry.second.packet);
+        snapshot.push_back(std::move(copy));
+      }
+      // Writers can continue into new segments. Snapshot references pin the
+      // sealed prefix until its checkpoint is durably installed.
+      frozen = false;
+    }
+    Encoder e;
+    e.text("MQTTS-CHECKPOINT-2");
+    e.u32(uint32_t(config.partitions));
+    e.u64(snapshot_id);
+    for (size_t p = 0; p < config.partitions; ++p) {
+      e.u64(message_fences[p]);
+      e.u64(state_fences[p]);
+    }
+    std::vector<std::set<uint64_t>> retained(messages.size());
+    std::map<int64_t, std::shared_ptr<Message>> live;
+    for (const auto& s : snapshot)
+      for (const auto& delivery : s.pending)
+        live.emplace(delivery.first->id, delivery.first);
+    e.u32(uint32_t(live.size()));
+    for (const auto& item : live) {
+      const auto& m = *item.second;
+      if (!m.committed)
+        throw std::runtime_error("uncommitted checkpoint message");
+      e.u64(m.id);
+      e.u32(uint32_t(m.partition));
+      location_write(e, m.location);
+      retained[m.partition].insert(m.location.segment);
+    }
+    e.u32(uint32_t(snapshot.size()));
+    for (const auto& s : snapshot) {
+      e.text(s.client);
+      e.text(s.owner);
+      e.u64(s.generation);
+      e.u64(s.epoch);
+      e.u32(s.expiry);
+      e.u64(s.deadline);
+      e.u8(s.online);
+      e.u32(s.next_packet);
+      e.u32(uint32_t(s.subscriptions.size()));
+      for (const auto& sub : s.subscriptions) {
+        e.text(sub.first);
+        e.u8(sub.second);
+      }
+      e.u32(uint32_t(s.pending.size()));
+      for (const auto& entry : s.pending) {
+        e.u64(entry.first->id);
+        e.u32(entry.second);
       }
     }
     if (e.data.size() + 4 > config.max_disk_bytes / 8)
       throw std::runtime_error("checkpoint exceeds reserved disk budget");
     journal::atomic_file(config.path + "/CHECKPOINT", checked(e.data));
-    // The checkpoint rename AND its directory fsync precede any reclamation.
+    message_cuts = message_fences;
+    state_cuts = state_fences;
+    // Reclamation runs on each owning writer, serialized with new appends.
     for (size_t p = 0; p < config.partitions; ++p) {
-      messages[p]->prune(message_cuts[p], retained[p]);
-      states[p]->prune(state_cuts[p], {});
+      messages[p]->prune(message_fences[p], retained[p]);
+      states[p]->prune(state_fences[p], {});
     }
-    std::lock_guard<std::mutex> guard(mutex);
-    frozen = false;
   } catch (...) {
     std::lock_guard<std::mutex> guard(mutex);
     frozen = false;
-    fail();
+    // A failed checkpoint leaves the old checkpoint and its logs usable.
+    // Genuine append/flush failures are already fenced by enqueue().
     throw;
   }
 }
@@ -1324,48 +1378,61 @@ void DurableStore::Impl::heartbeat()
   if (frozen || failed || stopping)
     return;
   expire();
+  std::vector<std::vector<std::shared_ptr<Session>>> shards(states.size());
+  for (const auto& item : sessions)
+    if (item.second->online && !item.second->busy)
+      shards[journal::topic_hash(item.first) % states.size()].push_back(item.second);
   for (size_t p = 0; p < states.size(); ++p) {
-    std::vector<std::shared_ptr<Session>> live;
-    for (const auto& item : sessions)
-      if (item.second->online && !item.second->busy &&
-          journal::topic_hash(item.first) % states.size() == p)
-        live.push_back(item.second);
-    if (live.empty())
-      continue;
-    Encoder e;
-    e.u8(HEARTBEAT);
-    e.u32(uint32_t(live.size()));
-    std::vector<uint64_t> epochs;
-    std::vector<int64_t> deadlines;
-    for (const auto& s : live) {
-      epochs.push_back(s->epoch);
-      int64_t deadline = DurableStore::now_ms() + int64_t(s->expiry) * 1000;
-      deadlines.push_back(deadline);
-      e.text(s->client);
-      e.u64(s->generation);
-      e.u64(s->epoch);
-      e.u64(deadline);
+    const auto& online = shards[p];
+    for (size_t offset = 0; offset < online.size();) {
+      std::vector<std::shared_ptr<Session>> live;
+      size_t record_bytes = 5;
+      while (offset < online.size() && live.size() < 64) {
+        size_t bytes = online[offset]->client.size() + 28;
+        if (record_bytes + bytes + 256 > config.max_request_bytes)
+          break;
+        live.push_back(online[offset++]);
+        record_bytes += bytes;
+      }
+      if (live.empty())
+        throw std::runtime_error("session identity exceeds heartbeat admission limit");
+      Encoder e;
+      e.u8(HEARTBEAT);
+      e.u32(uint32_t(live.size()));
+      std::vector<uint64_t> epochs;
+      std::vector<int64_t> deadlines;
+      for (const auto& s : live) {
+        epochs.push_back(s->epoch);
+        int64_t deadline = DurableStore::now_ms() + int64_t(s->expiry) * 1000;
+        deadlines.push_back(deadline);
+        e.text(s->client);
+        e.u64(s->generation);
+        e.u64(s->epoch);
+        e.u64(deadline);
+      }
+      try {
+        enqueue(
+            *states[p], std::move(e.data),
+            [=](bool ok, const Location&) {
+              if (ok)
+                for (size_t i = 0; i < live.size(); ++i)
+                  if (live[i]->epoch == epochs[i] && live[i]->online)
+                    live[i]->deadline = deadlines[i];
+            },
+            false);
+      } catch (const Deferred&) {
+        return;
+      } catch (const journal::AdmissionFull&) {
+        break;
+      }
     }
-    try {
-      enqueue(
-          *states[p], std::move(e.data),
-          [=](bool ok, const Location&) {
-            if (!ok)
-              return;
-            for (size_t i = 0; i < live.size(); ++i)
-              if (live[i]->epoch == epochs[i] && live[i]->online)
-                live[i]->deadline = deadlines[i];
-          },
-          false);
-    } catch (const Deferred&) {
-    }  // Saturation never extends a lease that was not persisted.
-    catch (const journal::AdmissionFull&) {
-    }  // Maintenance below will reclaim eligible segments.
   }
 }
 void DurableStore::Impl::maintain()
 {
   auto last_heartbeat = std::chrono::steady_clock::now(), last_checkpoint = last_heartbeat;
+  auto retry_after = last_heartbeat;
+  unsigned retry_ms = 1000;
   for (;;) {
     {
       std::unique_lock<std::mutex> guard(mutex);
@@ -1383,16 +1450,17 @@ void DurableStore::Impl::maintain()
         pressure = pressure || log->needs_checkpoint();
       for (const auto& log : states)
         pressure = pressure || log->needs_checkpoint();
-      if (now - last_checkpoint >= std::chrono::milliseconds(config.checkpoint_interval_ms) ||
-          (pressure && now - last_checkpoint >= std::chrono::seconds(1))) {
+      if (now >= retry_after &&
+          (now - last_checkpoint >= std::chrono::milliseconds(config.checkpoint_interval_ms) ||
+           (pressure && now - last_checkpoint >= std::chrono::seconds(1)))) {
         checkpoint();
         last_checkpoint = now;
+        retry_ms = 1000;
       }
     } catch (const std::exception& e) {
-      LOG_ERROR("Persistent journal maintenance failed: {}", e.what());
-      std::lock_guard<std::mutex> guard(mutex);
-      fail();
-      return;
+      LOG_ERROR("Persistent journal maintenance will retry: {}", e.what());
+      retry_after = std::chrono::steady_clock::now() + std::chrono::milliseconds(retry_ms);
+      retry_ms = std::min(60000U, retry_ms * 2);
     }
   }
 }

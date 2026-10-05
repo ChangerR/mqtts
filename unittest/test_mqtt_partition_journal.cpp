@@ -199,6 +199,21 @@ int main()
     rejected = true;
   }
   assert(rejected);
+  {
+    mqtt::PersistenceConfig heartbeat;
+    heartbeat.enabled = true;
+    heartbeat.path = root + "/heartbeat";
+    heartbeat.partitions = 1;
+    heartbeat.max_request_bytes = 4 * 1024 * 1024;
+    DurableStore store(heartbeat);
+    // A single unbounded heartbeat would exceed the request budget even
+    // though every session and the total metadata fit their limits.
+    for (int i = 0; i < 80; ++i)
+      assert(store.connect(std::to_string(i) + std::string(60000, 'h'), "owner", false, 300).ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    assert(store.connect("heartbeat-check", "owner", false, 300).ok);
+    store.checkpoint();
+  }
   fs::remove_all(root);
   puts(
       "PASS log rotation, torn tails, corruption, quotas, reclamation, missing records, packet-ID "
