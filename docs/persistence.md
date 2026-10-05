@@ -226,3 +226,11 @@ policy decision. Delivery authorization queues a bounded fetch batch before awai
 results, allowing the independent RPC workers to use Protobuf BatchAuthorize.
 Decoded packets use a separate bounded budget proportional to the globally reserved
 wire bytes, so a large accepted publication cannot exhaust a receiver's client pool.
+
+Message expiry does not free an unacknowledged in-flight Packet ID or its receive
+window credit. Those deliveries complete through PUBACK even when resumed after
+expiry. Prefetching or waiting for authorization is not a send attempt. In-process
+DUP tracking starts immediately before the socket send; crash recovery remains
+conservative for every durably assigned ID, since preassignment cannot prove whether
+a previous socket saw the packet. Zero expiry suppresses a new publication in both
+persistent and live-only modes.

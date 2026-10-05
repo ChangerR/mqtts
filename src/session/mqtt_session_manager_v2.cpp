@@ -1001,12 +1001,12 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       packet.properties.topic_alias != 0)
     return MQ_ERR_PUBLISH_TOPIC;
   std::vector<std::string> persisted_targets;
+  if (packet.properties.has_message_expiry_interval &&
+      packet.properties.message_expiry_interval == 0)
+    return 0;
   if (durable_store_) {
     if (packet.qos > 1)
       return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
-    if (packet.properties.has_message_expiry_interval &&
-        packet.properties.message_expiry_interval == 0)
-      return 0;
     if (packet.qos == 1 && durable_store_->has_subscriptions()) {
       try {
         MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,

@@ -198,6 +198,46 @@ def stored_wire_budget(binary):
     print('PASS malformed stored record isolation and replay larger than the 1 MiB client pool', flush=True)
 
 
+def expired_inflight(binary):
+    with Fixture(binary, persistence=dict(checkpoint_interval_ms=200)) as f:
+        reader, _ = client(f, 'reader', receive=1)
+        assert reader.sub('fixture/expiry') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/expiry', f.payload(writer, 0), expiry=1)
+        first = reader.delivery(ack=False)
+        time.sleep(1.2)  # Cross both message expiry and the maintenance sweep.
+        writer.pub('fixture/expiry', f.payload(writer, 1))
+        reader.quiet()  # The expired in-flight packet still owns receive-window credit.
+        restart(f)
+        reader, present = client(f, 'reader', receive=1); assert present
+        replay = reader.delivery()
+        assert replay[1:3] == first[1:3] and replay[3]
+        second = reader.delivery()
+        assert second[2] != first[2] and json.loads(second[1])['nonce'] == 1
+    with Fixture(binary, persistence={}) as f:
+        f.wildcards = True
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/waiting', f.payload(writer, 0))
+        reader, _ = client(f, 'reader'); assert reader.sub('fixture/#') == 1
+        f.mode = 'offline'
+        writer.pub('fixture/waiting', f.payload(writer, 1), expiry=1)
+        time.sleep(1.2)
+        f.mode = 'normal'
+        time.sleep(.3)
+        reader.quiet()  # Prefetched while auth was unavailable is not an in-flight send.
+        good = f.payload(writer, 2)
+        writer.pub('fixture/waiting', good)
+        assert reader.delivery()[1] == good
+    for persistence in (None, {}):
+        with Fixture(binary, persistence=persistence) as f:
+            reader, _ = client(f, 'reader', clean=True, expiry=0)
+            assert reader.sub('fixture/zero', qos=0) == 0
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            writer.pub('fixture/zero', f.payload(writer, 0), expiry=0)
+            reader.quiet()
+    print('PASS message expiry preserves in-flight packet IDs and receive credit through restart', flush=True)
+
+
 def authorization_failures(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, cache_ttl_ms=0) as f:
@@ -223,3 +263,4 @@ if __name__ == '__main__':
     qos_zero_takeover(args.broker)
     poison_messages(args.broker)
     stored_wire_budget(args.broker)
+    expired_inflight(args.broker)

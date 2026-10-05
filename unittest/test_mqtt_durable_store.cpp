@@ -59,6 +59,8 @@ int main()
     assert(store.statistics().pending == 64);
     auto batch = store.fetch("reader", c.epoch, 0, 2);
     assert(batch.deliveries.size() == 2);
+    for (const auto& delivery : batch.deliveries)
+      assert(store.begin_delivery("reader", c.epoch, delivery.sequence, delivery.packet_id).ok);
     auto last = batch.deliveries.back().sequence;
     assert(store.fetch("reader", c.epoch, last, 2).deliveries.empty());
     // Reconnect with a smaller receive window, including already assigned IDs.

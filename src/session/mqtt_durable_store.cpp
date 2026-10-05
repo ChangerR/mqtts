@@ -146,7 +146,7 @@ struct DurableStore::Impl
   {
     std::shared_ptr<Message> message;
     uint16_t packet = 0;
-    bool attempted = false, ack_pending = false, claim_pending = false;
+    bool attempted = false, started = false, ack_pending = false, claim_pending = false;
   };
   struct Session
   {
@@ -352,8 +352,8 @@ struct DurableStore::Impl
       }
       for (auto entry = s->pending.begin(); entry != s->pending.end();) {
         auto old = entry++;
-        if (old->second.message->committed && old->second.message->expires > 0 &&
-            old->second.message->expires <= now) {
+        if (!old->second.attempted && old->second.message->committed &&
+            old->second.message->expires > 0 && old->second.message->expires <= now) {
           drop(s, old);
           notify(s);
         }
@@ -852,7 +852,7 @@ DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epo
       auto message = entry.message;
       if (!message->committed || entry.claim_pending)
         break;
-      if (message->expires > 0 && message->expires <= now_ms()) {
+      if (!entry.attempted && message->expires > 0 && message->expires <= now_ms()) {
         v.drop(s, current);
         continue;
       }
@@ -874,7 +874,7 @@ DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epo
       delivery.expires = message->expires;
       delivery.wire = message->wire;
       delivery.packet_id = entry.packet;
-      delivery.dup = entry.attempted;
+      delivery.dup = entry.started;
       if (!delivery.packet_id) {
         delivery.packet_id = v.available_packet(s, reserved);
         if (!delivery.packet_id)
@@ -929,6 +929,27 @@ DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epo
     return ticket;
   });
 }
+DurableStore::Result DurableStore::begin_delivery(const std::string& client, uint64_t epoch,
+                                                  int64_t sequence, uint16_t packet_id)
+{
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto s = v.current(client, epoch);
+    if (!s) {
+      *r = stale();
+      return {};
+    }
+    auto it = s->pending.find(sequence);
+    if (it == s->pending.end() || it->second.packet != packet_id || it->second.ack_pending) {
+      *r = stale();
+      return {};
+    }
+    it->second.started = true;
+    *r = success();
+    return {};
+  });
+}
+
 DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64_t epoch,
                                                uint16_t packet_id, bool wait_for_commit)
 {
@@ -1144,12 +1165,12 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     auto claim = s->recovery_claims.find(m->id);
     if (claim != s->recovery_claims.end())
       packet = claim->second;
-    if (m->expires > 0 && m->expires <= DurableStore::now_ms())
+    if (!packet && m->expires > 0 && m->expires <= DurableStore::now_ms())
       continue;
     DeliveryState entry;
     entry.message = m;
     entry.packet = uint16_t(packet);
-    entry.attempted = packet != 0;
+    entry.attempted = entry.started = packet != 0;
     if (!s->pending.emplace(m->id, entry).second)
       throw std::runtime_error("duplicate journal message identity");
     ++pending;
@@ -1222,7 +1243,7 @@ void DurableStore::Impl::restore()
         DeliveryState entry;
         entry.message = message->second;
         entry.packet = uint16_t(packet);
-        entry.attempted = packet != 0;
+        entry.attempted = entry.started = packet != 0;
         if (!s->pending.emplace(id, entry).second)
           throw std::runtime_error("duplicate checkpoint delivery");
         ++pending;

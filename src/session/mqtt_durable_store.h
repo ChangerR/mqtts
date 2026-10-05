@@ -65,6 +65,8 @@ class DurableStore
   Result publish(const std::string& topic, const std::string& wire, const std::string& sender,
                  int64_t expires);
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
+  Result begin_delivery(const std::string& client, uint64_t epoch, int64_t sequence,
+                        uint16_t packet_id);
   Result acknowledge(const std::string& client, uint64_t epoch, uint16_t packet_id,
                      bool wait_for_commit = true);
   enum class DiscardReason { NotAuthorized, PacketTooLarge, Malformed };

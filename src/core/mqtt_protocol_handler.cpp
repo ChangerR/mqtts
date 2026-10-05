@@ -1890,7 +1890,10 @@ void MQTTProtocolHandler::pump_durable()
           fetch_again = true;
           break;
         }
-        if (delivery.expires && delivery.expires <= DurableStore::now_ms()) {
+        // Expiry only removes messages whose delivery has not started. An
+        // unacknowledged QoS 1 packet keeps its identity until PUBACK, including
+        // after reconnect. Recovery treats assigned IDs conservatively as sent.
+        if (!delivery.dup && delivery.expires && delivery.expires <= DurableStore::now_ms()) {
           auto ack =
               store->acknowledge(from_mqtt_string(client_id_), durable_epoch_, delivery.packet_id);
           if (ack.ok)
@@ -1903,7 +1906,7 @@ void MQTTProtocolHandler::pump_durable()
         packet->dup = delivery.dup;
         if (delivery.expires)
           packet->properties.message_expiry_interval =
-              uint32_t((delivery.expires - DurableStore::now_ms() + 999) / 1000);
+              uint32_t(std::max<int64_t>(0, (delivery.expires - DurableStore::now_ms() + 999) / 1000));
         MQTTParser encoder(&delivery_allocator);
         encoder.set_protocol_version_hint(negotiated_protocol_version_);
         MQTTBuffer output(&delivery_allocator);
@@ -1918,6 +1921,12 @@ void MQTTProtocolHandler::pump_durable()
           if (!discard(DurableStore::DiscardReason::PacketTooLarge))
             break;
           continue;
+        }
+        if (!store->begin_delivery(from_mqtt_string(client_id_), durable_epoch_,
+                                   delivery.sequence, delivery.packet_id).ok) {
+          socket_->close();
+          durable_running_ = false;
+          break;
         }
         if (send_data_with_lock(reinterpret_cast<const char*>(output.data()), output.size()) !=
             MQ_SUCCESS) {
