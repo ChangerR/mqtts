@@ -127,9 +127,8 @@ func (s *Service) BatchAuthorize(ctx context.Context, req *pb.BatchAuthorizeRequ
 	return out, nil
 }
 
-func (s *Service) GetRevision(context.Context, *pb.RevisionRequest) (*pb.RevisionResponse, error) {
-	_, revision := s.Store.Versions()
-	return &pb.RevisionResponse{Revision: revision}, nil
+func (s *Service) GetRevision(_ context.Context, req *pb.RevisionRequest) (*pb.RevisionResponse, error) {
+	return s.Store.Revision(req.GetKnownRevision()), nil
 }
 
 func (s *Service) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResponse, error) {

@@ -31,7 +31,18 @@ type Store struct {
 	version, revision     string
 	bytes                 int
 	maxSessions, maxBytes int
+	history               []revisionChange
+	historyNames          int
 }
+
+type revisionChange struct {
+	from, to string
+	names    []string
+}
+
+const maxRevisionChanges = 1024
+const maxRevisionNames = 8192
+const maxRevisionReplyNames = 1024
 
 func randomVersion() string {
 	var value [24]byte
@@ -105,6 +116,43 @@ func (s *Store) Versions() (string, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.version, s.revision
+}
+
+// Revision never scans all sessions. History loss (including process restart)
+// asks the broker for a full invalidation instead of guessing a partial delta.
+func (s *Store) Revision(known string) *pb.RevisionResponse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	reply := &pb.RevisionResponse{Revision: s.revision}
+	if known == s.revision {
+		reply.IsDelta = true
+		return reply
+	}
+	start := -1
+	for i, change := range s.history {
+		if change.from == known {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return reply
+	}
+	names := make(map[string]bool)
+	for _, change := range s.history[start:] {
+		for _, name := range change.names {
+			names[name] = true
+			if len(names) > maxRevisionReplyNames {
+				return reply
+			}
+		}
+	}
+	for name := range names {
+		reply.InvalidatedUsernames = append(reply.InvalidatedUsernames, name)
+	}
+	sort.Strings(reply.InvalidatedUsernames)
+	reply.IsDelta = true
+	return reply
 }
 func (s *Store) List(namespace, after string, limit int) ([]*pb.Session, string, string) {
 	if limit < 1 || limit > 128 {
@@ -203,6 +251,7 @@ func (s *Store) Apply(request *pb.ApplyRequest) (string, string, error) {
 	}
 	count, total, changed := len(s.sessions), s.bytes, false
 	metadataChanged := false
+	var invalidated []string
 	for name, row := range upserts {
 		old := s.sessions[name]
 		if old != nil {
@@ -211,7 +260,10 @@ func (s *Store) Apply(request *pb.ApplyRequest) (string, string, error) {
 				return "", "", ErrConflict
 			}
 			total -= proto.Size(old)
-			changed = changed || !sameRules(old, row)
+			if !sameRules(old, row) {
+				changed = true
+				invalidated = append(invalidated, name)
+			}
 			metadataChanged = metadataChanged || !bytes.Equal(old.SourceContext, row.SourceContext)
 		} else {
 			count++
@@ -222,7 +274,10 @@ func (s *Store) Apply(request *pb.ApplyRequest) (string, string, error) {
 		if old := s.sessions[name]; old != nil {
 			count--
 			total -= proto.Size(old)
-			changed = changed || old.ExpiresAtMs == 0 || old.ExpiresAtMs > now
+			if old.ExpiresAtMs == 0 || old.ExpiresAtMs > now {
+				changed = true
+				invalidated = append(invalidated, name)
+			}
 		}
 	}
 	revision := s.revision
@@ -270,6 +325,13 @@ func (s *Store) Apply(request *pb.ApplyRequest) (string, string, error) {
 	}
 	if changed {
 		revision = randomVersion()
+		s.history = append(s.history, revisionChange{from: s.revision, to: revision, names: invalidated})
+		s.historyNames += len(invalidated)
+		for len(s.history) > maxRevisionChanges || s.historyNames > maxRevisionNames {
+			s.historyNames -= len(s.history[0].names)
+			s.history[0] = revisionChange{}
+			s.history = s.history[1:]
+		}
 	}
 	s.revision = revision
 	return s.version, s.revision, nil

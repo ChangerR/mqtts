@@ -15,9 +15,17 @@ static uint64_t wall() { return duration_cast<milliseconds>(system_clock::now().
 class Policy : public pb::Authorization::Service {
 public:
   std::atomic<int> mode{0}, version{1}, calls{0}, largest{0}, delay{0};
-  grpc::Status GetRevision(grpc::ServerContext*, const pb::RevisionRequest*, pb::RevisionResponse* out) override {
+  std::atomic<bool> delta{false};
+  std::atomic<int> ttl{100}, age{600};
+  grpc::Status GetRevision(grpc::ServerContext*, const pb::RevisionRequest* req, pb::RevisionResponse* out) override {
     if (mode == 3) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "offline");
-    out->set_revision(std::to_string(version.load())); return grpc::Status::OK;
+    const int current = version;
+    out->set_revision(std::to_string(current));
+    if (delta && (req->known_revision() == std::to_string(current) || req->known_revision() == std::to_string(current - 1))) {
+      out->set_is_delta(true);
+      if (req->known_revision() != out->revision()) out->add_invalidated_usernames("fixture");
+    }
+    return grpc::Status::OK;
   }
   grpc::Status BatchAuthorize(grpc::ServerContext* context, const pb::BatchAuthorizeRequest* req, pb::BatchAuthorizeResponse* out) override {
     ++calls;
@@ -33,10 +41,10 @@ public:
       auto* result = out->add_results();
       result->set_request_id(current_mode == 1 ? 999999 : request.request_id());
       auto* decision = result->mutable_decision();
-      decision->set_outcome(request.topic().find("denied") != std::string::npos || current_mode == 2 ? pb::DENY : pb::ALLOW);
+      decision->set_outcome(request.topic().find("denied") != std::string::npos || current_mode == 2 || (current_mode == 4 && request.username() == "fixture") ? pb::DENY : pb::ALLOW);
       decision->set_cache_revision(std::to_string(revision));
-      decision->set_cache_ttl_ms(100); decision->set_cache_max_age_ms(600);
-      decision->set_expires_at_ms(wall() + 600);
+      decision->set_cache_ttl_ms(ttl); decision->set_cache_max_age_ms(age);
+      decision->set_expires_at_ms(wall() + age);
     }
     return grpc::Status::OK;
   }
@@ -99,6 +107,39 @@ int main() {
   std::this_thread::sleep_for(milliseconds(50)); ++policy.version;
   std::this_thread::sleep_for(milliseconds(400));
   assert(newer.check_delivery_access(user, destination, ticket) == AuthResult::INTERNAL_ERROR);
-  newer.cleanup(); server->Shutdown();
+  newer.cleanup();
+  policy.mode = 0; policy.delay = 0; policy.delta = true; policy.ttl = 5000; policy.age = 5000;
+  settings["cache_ttl_ms"] = "5000"; settings["cache_max_age_ms"] = "5000";
+  GrpcAuthProvider scoped(settings); assert(scoped.initialize() == MQ_SUCCESS);
+  std::this_thread::sleep_for(milliseconds(150));
+  UserInfo unrelated(allocator); unrelated.username = "unrelated"; unrelated.client_id = "other"; unrelated.authorization_session = 8;
+  // Exercise fixed identity partitions with distinct buckets on this toolchain.
+  while (std::hash<std::string>{}(mqtt::from_mqtt_string(unrelated.username)) % 1024 == std::hash<std::string>{}("fixture") % 1024)
+    unrelated.username += "x";
+  destination = topic("scoped-cache");
+  assert(scoped.check_topic_access(user, destination, Permission::READ) == AuthResult::SUCCESS);
+  assert(scoped.check_topic_access(unrelated, destination, Permission::READ) == AuthResult::SUCCESS);
+  policy.mode = 4; ++policy.version;
+  std::this_thread::sleep_for(milliseconds(220));
+  const auto warm_calls = policy.calls.load();
+  assert(scoped.check_topic_access(unrelated, destination, Permission::READ) == AuthResult::SUCCESS);
+  assert(policy.calls == warm_calls);
+  assert(scoped.check_topic_access(user, destination, Permission::READ) == AuthResult::ACCESS_DENIED);
+  assert(policy.calls == warm_calls + 1);
+  // Both synchronous waiters and deferred delivery jobs fence old RPC results.
+  policy.mode = 0; policy.delay = 300;
+  AuthResult late = AuthResult::SUCCESS;
+  const auto start_calls = policy.calls.load();
+  std::thread waiter([&] { late = scoped.check_topic_access(user, topic("scoped-in-flight"), Permission::READ); });
+  for (int i = 0; i < 100 && policy.calls == start_calls; ++i) std::this_thread::sleep_for(milliseconds(2));
+  ++policy.version;
+  waiter.join(); assert(late == AuthResult::INTERNAL_ERROR);
+  // Missing delta support/history still performs full invalidation.
+  policy.delay = 0; policy.delta = false; ++policy.version;
+  std::this_thread::sleep_for(milliseconds(220));
+  const auto reset_calls = policy.calls.load();
+  assert(scoped.check_topic_access(unrelated, destination, Permission::READ) == AuthResult::SUCCESS);
+  assert(policy.calls == reset_calls + 1);
+  scoped.cleanup(); server->Shutdown();
   std::cout << "128 mixed decisions in " << stats.rpc_batches << " RPC batches; cache, outage expiry, malformed IDs and in-flight revocation passed\n";
 }

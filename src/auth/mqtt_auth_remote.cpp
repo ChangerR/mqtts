@@ -105,6 +105,12 @@ struct Job {
   Decision decision;
   std::vector<std::shared_ptr<Signal>> waiters;
 
+  Decision validate(Decision value) const {
+    if (current && !current()) return Decision();
+    if (value.expires_at && value.expires_at <= wall_ms()) return denied();
+    return value;
+  }
+
   Decision poll() {
     if (current && !current()) return Decision();
     std::lock_guard<std::mutex> lock(mutex);
@@ -133,7 +139,7 @@ struct Job {
     const auto signal = std::make_shared<Signal>();
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (finished) return decision;
+      if (finished) return validate(decision);
       if (signal->fd < 0 || waiters.size() >= 64) return Decision();
       waiters.push_back(signal);
     }
@@ -144,10 +150,10 @@ struct Job {
       // wait for the same single-flight request without sharing poll state.
       runtime::current_runtime().wait_readable(signal->fd, static_cast<int>(deadline - now));
       std::lock_guard<std::mutex> lock(mutex);
-      if (finished) return decision;
+      if (finished) return validate(decision);
     }
     std::lock_guard<std::mutex> lock(mutex);
-    return finished ? decision : Decision();
+    return finished ? validate(decision) : Decision();
   }
 };
 
@@ -183,6 +189,19 @@ struct RemoteAuthProvider::Impl {
   std::vector<std::string> ignored_fields;
   std::atomic<bool> initialized{false}, stopping{false};
   std::shared_ptr<std::atomic<uint64_t>> epoch = std::make_shared<std::atomic<uint64_t>>(0);
+  struct ScopeEpochs {
+    std::array<std::atomic<uint64_t>, 1024> values;
+    ScopeEpochs() { for (auto& value : values) value.store(0); }
+  };
+  std::shared_ptr<ScopeEpochs> scope_epochs = std::make_shared<ScopeEpochs>();
+  size_t scope_for(const std::string& name) const { return std::hash<std::string>{}(name) % scope_epochs->values.size(); }
+  std::function<bool()> fence(size_t scope, uint64_t captured_epoch, uint64_t captured_scope) const {
+    const auto global = epoch;
+    const auto local = scope_epochs;
+    return [global, local, scope, captured_epoch, captured_scope] {
+      return global->load() == captured_epoch && local->values[scope].load() == captured_scope;
+    };
+  }
   std::shared_ptr<const std::string> revision = std::make_shared<const std::string>();
 
   struct Counters {
@@ -191,7 +210,7 @@ struct RemoteAuthProvider::Impl {
   } stats;
   struct CacheEntry {
     Decision decision;
-    uint64_t fresh_until = 0, expires = 0, retry_after = 0, epoch = 0;
+    uint64_t fresh_until = 0, expires = 0, retry_after = 0, epoch = 0, scope_epoch = 0;
     std::list<std::string>::iterator lru;
   };
   struct Shard {
@@ -416,9 +435,16 @@ struct RemoteAuthProvider::Impl {
     }
     if (curl) curl_easy_cleanup(curl);
   }
-  void update_version(const std::string& value) {
+  void update_version(const std::string& value, const std::vector<std::string>& invalidated = {}, bool delta = false) {
     const auto before = std::atomic_load(&revision);
     if (*before == value) return;
+    if (delta && !before->empty()) {
+      // Fixed-size identity partitions bound memory without scanning cache
+      // shards. Hash collisions cause extra invalidation, never stale grants.
+      for (const auto& name : invalidated) ++scope_epochs->values[scope_for(name)];
+      std::atomic_store(&revision, std::make_shared<const std::string>(value));
+      return;
+    }
     std::atomic_store(&revision, std::make_shared<const std::string>(value));
     ++*epoch;
     for (auto& shard : shards) {
@@ -436,7 +462,14 @@ struct RemoteAuthProvider::Impl {
       if (grpc_mode) {
         grpc::ClientContext context; rpc_context(context, monotonic_ms() + timeout);
         pb::RevisionRequest request; pb::RevisionResponse reply; ++stats.requests;
-        if (stub->GetRevision(&context, request, &reply).ok()) data = {{"cache_revision", reply.revision()}};
+        request.set_known_revision(*std::atomic_load(&revision));
+        if (stub->GetRevision(&context, request, &reply).ok()) {
+          if (!reply.revision().empty() && reply.revision().size() <= 128) {
+            std::vector<std::string> names(reply.invalidated_usernames().begin(), reply.invalidated_usernames().end());
+            const bool valid = names.size() <= 1024 && std::all_of(names.begin(), names.end(), [](const std::string& name) { return !name.empty() && name.size() <= 1024; });
+            update_version(reply.revision(), valid ? names : std::vector<std::string>{}, reply.is_delta() && valid);
+          }
+        }
         else ++stats.failures;
       } else data = http(curl, settings.at("cache_version_url"), "{}", monotonic_ms() + timeout, true);
       if (data.is_object() && data.contains("cache_revision") && data["cache_revision"].is_string()) {
@@ -453,16 +486,23 @@ struct RemoteAuthProvider::Impl {
     *deferred = job;
     return job->poll();
   }
-  Decision fetch(const std::string& url, const std::string& body, std::shared_ptr<Job>* deferred = nullptr) {
+  Decision fetch(const std::string& url, const std::string& body, std::shared_ptr<Job>* deferred = nullptr, const std::string& username = "") {
     if (!initialized || body.size() > 8192 + (include_payload ? 4 * ((payload_limit + 2) / 3) : 0)) return Decision();
-    const auto job = std::make_shared<Job>();
-    job->url = url; job->body = body; job->deadline = job->started + timeout;
-    if (deferred) {
-      const auto generation = epoch;
-      const auto captured_epoch = generation->load();
-      job->current = [generation, captured_epoch] { return generation->load() == captured_epoch; };
+    const auto deadline = monotonic_ms() + timeout;
+    const bool bootstrap = std::atomic_load(&revision)->empty();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const auto job = std::make_shared<Job>();
+      job->url = url; job->body = body; job->deadline = deadline;
+      const auto scope = scope_for(username);
+      job->current = fence(scope, epoch->load(), scope_epochs->values[scope].load());
+      if (!enqueue(job)) return Decision();
+      const auto result = await_job(job, deferred);
+      // The first revision poll may fence a concurrent CONNECT at startup.
+      // Revalidate once within the original deadline, never reuse that result.
+      if (!deferred && bootstrap && !attempt && !job->current() && monotonic_ms() < deadline) continue;
+      return result;
     }
-    return enqueue(job) ? await_job(job, deferred) : Decision();
+    return Decision();
   }
   std::string payload_key(const MQTTByteVector& payload) {
     if (!ignored_fields.empty()) {
@@ -506,7 +546,8 @@ struct RemoteAuthProvider::Impl {
       if (payload) { value["payload_encoding"] = "base64"; value["payload"] = base64(*payload); }
       return value.dump();
     };
-    if (!fresh_limit) return fetch(settings.at("authorization_url"), body(), deferred);
+    const auto username = from_mqtt_string(user.username);
+    if (!fresh_limit) return fetch(settings.at("authorization_url"), body(), deferred, username);
     std::string key = Json::array({user.authorization_session, from_mqtt_string(user.username), from_mqtt_string(user.client_id), action, topic}).dump();
     if (payload) key += payload_key(*payload);
     key = digest(key);
@@ -516,11 +557,14 @@ struct RemoteAuthProvider::Impl {
     bool hit = false, create = false;
     const auto now = monotonic_ms();
     const auto captured_epoch = epoch->load();
+    const auto scope = scope_for(username);
+    const auto captured_scope = scope_epochs->values[scope].load();
     {
       std::lock_guard<std::mutex> lock(shard.mutex);
       auto found = shard.entries.find(key);
       if (found != shard.entries.end()) {
-        if (now < found->second.expires && found->second.epoch == epoch->load()) {
+        if (now < found->second.expires && found->second.epoch == epoch->load()
+            && found->second.scope_epoch == scope_epochs->values[scope].load()) {
           hit = true; cached = found->second.decision;
           shard.lru.splice(shard.lru.begin(), shard.lru, found->second.lru);
           ++stats.hits;
@@ -534,8 +578,7 @@ struct RemoteAuthProvider::Impl {
       if (pending != shard.pending.end()) job = pending->second;
       else if (shard.pending.size() < queue_capacity + worker_count) {
         job = std::make_shared<Job>(); job->deadline = job->started + timeout;
-        const auto generation = epoch;
-        job->current = [generation, captured_epoch] { return generation->load() == captured_epoch; };
+        job->current = fence(scope, captured_epoch, captured_scope);
         shard.pending.emplace(key, job); create = true;
       }
     }
@@ -545,10 +588,10 @@ struct RemoteAuthProvider::Impl {
       job->url = settings.at("authorization_url");
       const uint64_t session_expiry = user.expires_at_ms;
       const uint64_t started = job->started;
-      job->complete = [this, &shard, key, captured_epoch, session_expiry, started](Decision result) {
+      job->complete = [this, &shard, key, captured_epoch, captured_scope, scope, session_expiry, started](Decision result) {
         std::lock_guard<std::mutex> lock(shard.mutex);
         shard.pending.erase(key);
-        if (captured_epoch != epoch->load()) return Decision();
+        if (captured_epoch != epoch->load() || captured_scope != scope_epochs->values[scope].load()) return Decision();
         auto existing = shard.entries.find(key);
         if (!result.authoritative) {
           if (existing != shard.entries.end()) existing->second.retry_after = monotonic_ms() + cooldown;
@@ -570,6 +613,7 @@ struct RemoteAuthProvider::Impl {
         }
         shard.lru.push_front(key);
         CacheEntry entry; entry.decision = result; entry.expires = expires; entry.epoch = captured_epoch;
+        entry.scope_epoch = captured_scope;
         entry.fresh_until = std::min(started + result.fresh_ms, expires); entry.lru = shard.lru.begin();
         shard.entries.emplace(key, std::move(entry));
         return result;
@@ -687,8 +731,8 @@ AuthResult RemoteAuthProvider::authenticate_user(const MQTTString& username, con
     if (p.grpc_mode) {
       pb::AuthenticateRequest request;
       request.set_username(from_mqtt_string(username)); request.set_password(from_mqtt_string(password)); request.set_client_id(from_mqtt_string(client_id));
-      result = p.fetch("authenticate", request.SerializeAsString());
-    } else result = p.fetch(p.settings.at("authentication_url"), Json({{"username", from_mqtt_string(username)}, {"password", from_mqtt_string(password)}, {"clientid", from_mqtt_string(client_id)}}).dump());
+      result = p.fetch("authenticate", request.SerializeAsString(), nullptr, from_mqtt_string(username));
+    } else result = p.fetch(p.settings.at("authentication_url"), Json({{"username", from_mqtt_string(username)}, {"password", from_mqtt_string(password)}, {"clientid", from_mqtt_string(client_id)}}).dump(), nullptr, from_mqtt_string(username));
   } catch (...) {}
   if (result.result == AuthResult::SUCCESS) {
     ++p.stats.successes;

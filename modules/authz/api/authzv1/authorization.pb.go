@@ -492,6 +492,7 @@ func (x *BatchAuthorizeResponse) GetResults() []*AuthorizationResult {
 
 type RevisionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	KnownRevision string                 `protobuf:"bytes,1,opt,name=known_revision,json=knownRevision,proto3" json:"known_revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -526,11 +527,23 @@ func (*RevisionRequest) Descriptor() ([]byte, []int) {
 	return file_authorization_proto_rawDescGZIP(), []int{6}
 }
 
+func (x *RevisionRequest) GetKnownRevision() string {
+	if x != nil {
+		return x.KnownRevision
+	}
+	return ""
+}
+
 type RevisionResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Revision      string                 `protobuf:"bytes,1,opt,name=revision,proto3" json:"revision,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Revision string                 `protobuf:"bytes,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	// A bounded delta from known_revision. Unknown/restarted/too-old histories
+	// return is_delta=false and require global invalidation. Old peers therefore
+	// retain the original safe global-revision behavior.
+	InvalidatedUsernames []string `protobuf:"bytes,2,rep,name=invalidated_usernames,json=invalidatedUsernames,proto3" json:"invalidated_usernames,omitempty"`
+	IsDelta              bool     `protobuf:"varint,3,opt,name=is_delta,json=isDelta,proto3" json:"is_delta,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *RevisionResponse) Reset() {
@@ -568,6 +581,20 @@ func (x *RevisionResponse) GetRevision() string {
 		return x.Revision
 	}
 	return ""
+}
+
+func (x *RevisionResponse) GetInvalidatedUsernames() []string {
+	if x != nil {
+		return x.InvalidatedUsernames
+	}
+	return nil
+}
+
+func (x *RevisionResponse) GetIsDelta() bool {
+	if x != nil {
+		return x.IsDelta
+	}
+	return false
 }
 
 // Optional generic JSON bindings chosen by the policy publisher. Every present
@@ -1141,10 +1168,13 @@ const file_authorization_proto_rawDesc = "" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x124\n" +
 	"\bdecision\x18\x02 \x01(\v2\x18.mqtts.authz.v1.DecisionR\bdecision\"W\n" +
 	"\x16BatchAuthorizeResponse\x12=\n" +
-	"\aresults\x18\x01 \x03(\v2#.mqtts.authz.v1.AuthorizationResultR\aresults\"\x11\n" +
-	"\x0fRevisionRequest\".\n" +
+	"\aresults\x18\x01 \x03(\v2#.mqtts.authz.v1.AuthorizationResultR\aresults\"8\n" +
+	"\x0fRevisionRequest\x12%\n" +
+	"\x0eknown_revision\x18\x01 \x01(\tR\rknownRevision\"~\n" +
 	"\x10RevisionResponse\x12\x1a\n" +
-	"\brevision\x18\x01 \x01(\tR\brevision\"\x8e\x01\n" +
+	"\brevision\x18\x01 \x01(\tR\brevision\x123\n" +
+	"\x15invalidated_usernames\x18\x02 \x03(\tR\x14invalidatedUsernames\x12\x19\n" +
+	"\bis_delta\x18\x03 \x01(\bR\aisDelta\"\x8e\x01\n" +
 	"\vJsonBinding\x12\x14\n" +
 	"\x05paths\x18\x01 \x03(\tR\x05paths\x12#\n" +
 	"\requals_string\x18\x02 \x01(\tR\fequalsString\x12!\n" +

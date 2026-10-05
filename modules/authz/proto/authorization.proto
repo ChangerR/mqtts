@@ -53,8 +53,15 @@ message AuthorizationResult {
   Decision decision = 2;
 }
 message BatchAuthorizeResponse { repeated AuthorizationResult results = 1; }
-message RevisionRequest {}
-message RevisionResponse { string revision = 1; }
+message RevisionRequest { string known_revision = 1; }
+message RevisionResponse {
+  string revision = 1;
+  // A bounded delta from known_revision. Unknown/restarted/too-old histories
+  // return is_delta=false and require global invalidation. Old peers therefore
+  // retain the original safe global-revision behavior.
+  repeated string invalidated_usernames = 2;
+  bool is_delta = 3;
+}
 
 // Optional generic JSON bindings chosen by the policy publisher. Every present
 // path must match. required_any additionally requires at least one path. A topic

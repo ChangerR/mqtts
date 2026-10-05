@@ -64,6 +64,9 @@ both ends; it is used only by the isolated fixtures and internal Compose example
   unavailable outcomes. Replies include expiry, cache limits and policy revision.
   The entire batch reads one immutable policy snapshot. Payloads are raw bytes.
 - `GetRevision`: opaque revision, polled independently of authorization workers.
+  The broker supplies its known revision and receives a bounded list of changed
+  usernames. Unknown history, service restart or an oversized delta requests a
+  global reset. Older peers retain the original global-revision behavior.
 - `Apply`: atomic durable upsert/delete batch, at most 128 changes. Inserts use
   `create_only`; updates/deletes require `expected_version`. Read that version
   before reading source permissions. Existing identity/client/password/namespace
@@ -74,6 +77,19 @@ both ends; it is used only by the isolated fixtures and internal Compose example
 
 New identities and lease-only renewals leave the CAS version and public revision
 stable so login traffic does not invalidate unrelated caches or starve revocation.
+Permission changes and logout invalidate only the affected identity partitions in
+the broker's cache. There are 1,024 fixed partitions, so tracking memory is bounded;
+hash collisions may invalidate extra identities but cannot retain a revoked grant.
+The service keeps at most 1,024 revision transitions / 8,192 changed names and returns
+at most 1,024 names per poll. Both synchronous and deferred RPC results are fenced
+against their original global and identity generations. Cached entries outside the
+changed partitions keep their original expiry; outages never extend the five-minute
+ceiling or the source session/projection lease.
+
+`password_sha256` is for independently generated, high-entropy session credentials
+(at least 32 random bytes), not human passwords. The policy publisher must authenticate
+human passwords using its own salted password KDF before minting these credentials.
+Never project a user's password or a direct unsalted hash of it into this service.
 Permission changes invalidate both; source-context changes invalidate CAS only.
 Pages are not a frozen snapshot of concurrent new identities; publishers should
 repeat reconciliation periodically. CAS rejects reads preceding a permission change.
