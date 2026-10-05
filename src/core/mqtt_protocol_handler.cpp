@@ -557,6 +557,7 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   int ret = MQ_SUCCESS;
   bool need_reject = false;
   bool session_present = false;
+  std::vector<std::pair<std::string, uint8_t>> restored_subscriptions;
   ReasonCode reject_reason = ReasonCode::Success;
   auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
   MQTTString username{MQTTStrAllocator(allocator_)};
@@ -681,23 +682,7 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
       maximum_packet_size_ = packet->properties.maximum_packet_size
                                  ? packet->properties.maximum_packet_size
                                  : 268435455;
-      session_manager_->unsubscribe_all_topics(packet->client_id);
-      try {
-        for (const auto& sub : opened.subscriptions) {
-          auto filter = to_mqtt_string(sub.first, allocator_);
-          if (add_subscription(filter) != MQ_SUCCESS ||
-              session_manager_->subscribe_topic_with_router(filter, packet->client_id,
-                                                            sub.second) != MQ_SUCCESS)
-            throw std::runtime_error("persistent subscription restore failed");
-        }
-      } catch (const std::exception&) {
-        store->disconnect(from_mqtt_string(packet->client_id), durable_epoch_);
-        durable_epoch_ = 0;
-        session_manager_->unsubscribe_all_topics(packet->client_id);
-        ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
-        reject_reason = ReasonCode::ServerUnavailable;
-        need_reject = true;
-      }
+      restored_subscriptions = std::move(opened.subscriptions);
     }
   }
 
@@ -712,6 +697,29 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     ret = register_session_with_manager();
     if (MQ_FAIL(ret)) {
       connected_ = false;
+    }
+  }
+
+  if (MQ_SUCC(ret) && session_manager_ && session_manager_->durable_store()) {
+    // Ownership must change before filters become visible. Otherwise the old
+    // socket's cleanup can erase the new connection's restored QoS 0 filters.
+    session_manager_->unsubscribe_all_topics(client_id_);
+    try {
+      for (const auto& sub : restored_subscriptions) {
+        auto filter = to_mqtt_string(sub.first, allocator_);
+        if (add_subscription(filter) != MQ_SUCCESS ||
+            session_manager_->subscribe_topic_with_router(filter, client_id_, sub.second) != MQ_SUCCESS)
+          throw std::runtime_error("persistent subscription restore failed");
+      }
+    } catch (const std::exception&) {
+      session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
+      durable_epoch_ = 0;
+      session_manager_->unsubscribe_all_topics(client_id_);
+      session_manager_->unregister_session(client_id_);
+      connected_ = false;
+      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = ReasonCode::ServerUnavailable;
+      need_reject = true;
     }
   }
 

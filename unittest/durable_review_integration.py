@@ -84,6 +84,24 @@ def maintenance(binary, fault):
             print('PASS terminal append failure rejects durable traffic without rejecting new clean clients', flush=True)
 
 
+def qos_zero_takeover(binary):
+    for version in (4, 5):
+        with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
+            reader, _ = client(f, 'takeover-reader', version=version)
+            assert reader.sub('fixture/takeover', qos=0) == 0
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            for nonce in range(16):
+                previous = reader
+                reader, present = client(f, 'takeover-reader', version=version)
+                assert present
+                previous.close()
+                time.sleep(.03)
+                data = f.payload(writer, nonce)
+                writer.pub('fixture/takeover', data)
+                assert reader.message() == ('fixture/takeover', data)
+    print('PASS MQTT 3/5 QoS 0 subscriptions survive repeated cross-thread takeover', flush=True)
+
+
 def authorization_failures(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, cache_ttl_ms=0) as f:
@@ -106,3 +124,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     maintenance(args.broker, args.fault_library)
     authorization_failures(args.broker)
+    qos_zero_takeover(args.broker)
