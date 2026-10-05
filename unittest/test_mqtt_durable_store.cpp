@@ -64,7 +64,7 @@ static void test_compaction(const std::string& path)
   }
 }
 
-static void test_v2_upgrade(const std::string& path)
+static void test_native_upgrade(const std::string& path, uint32_t version)
 {
   using namespace mqtt::journal;
   mqtt::PersistenceConfig cfg;
@@ -74,7 +74,7 @@ static void test_v2_upgrade(const std::string& path)
   ensure_directory(path);
   Encoder format;
   format.text("MQTTS-PARTITION-LOG");
-  format.u32(2);
+  format.u32(version);
   format.u32(1);
   atomic_file(path + "/FORMAT", checked(format.data));
   Location location;
@@ -97,7 +97,7 @@ static void test_v2_upgrade(const std::string& path)
     assert(log.seal()->wait());
   }
   Encoder checkpoint;
-  checkpoint.text("MQTTS-CHECKPOINT-2");
+  checkpoint.text("MQTTS-CHECKPOINT-" + std::to_string(version));
   checkpoint.u32(1);
   checkpoint.u64(2);
   checkpoint.u64(1);
@@ -105,10 +105,15 @@ static void test_v2_upgrade(const std::string& path)
   checkpoint.u32(1);
   checkpoint.u64(2);
   checkpoint.u32(0);
-  checkpoint.u64(location.segment);
-  checkpoint.u64(location.offset);
-  checkpoint.u64(location.serial);
-  checkpoint.u32(location.size);
+  if (version == 2) {
+    checkpoint.u64(location.segment);
+    checkpoint.u64(location.offset);
+    checkpoint.u64(location.serial);
+    checkpoint.u32(location.size);
+  } else {
+    checkpoint.u64(0);
+    checkpoint.text("v2-payload");
+  }
   checkpoint.u32(1);
   checkpoint.text("legacy");
   checkpoint.text("owner");
@@ -134,12 +139,74 @@ static void test_v2_upgrade(const std::string& path)
   {
     auto marker = read_file(path + "/FORMAT", 4096).substr(4);
     Decoder d(marker);
-    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 3);
+    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 4);
     DurableStore store(cfg);
     auto c = store.connect("legacy", "owner", false, 60);
     auto batch = store.fetch("legacy", c.epoch, 0, 32);
     assert(c.present && batch.deliveries.size() == 1);
     assert(batch.deliveries[0].wire == "v2-payload" && batch.deliveries[0].packet_id == 7);
+  }
+}
+
+static void test_overflow_isolation(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.overflow_policy = "isolate";
+  cfg.max_messages = 10;
+  cfg.max_messages_per_session = 2;
+  int64_t gap = 0;
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    auto fast = store.connect("fast", "owner", false, 60);
+    assert(store.subscribe("slow", slow.epoch, "topic", 1).ok);
+    assert(store.subscribe("fast", fast.epoch, "topic", 1).ok);
+    assert(store.disconnect("slow", slow.epoch).ok);
+    for (int i = 0; i < 6; ++i) {
+      const auto data = "message-" + std::to_string(i);
+      auto published = store.publish("topic", data, "writer", 0);
+      assert(published.ok && published.accepted_targets == (i < 2 ? 2 : 1));
+      auto delivery = store.fetch("fast", fast.epoch, 0, 32);
+      assert(delivery.deliveries.size() == 1 && delivery.deliveries[0].wire == data);
+      assert(store.acknowledge("fast", fast.epoch, delivery.deliveries[0].packet_id).ok);
+    }
+    assert(store.statistics().pending == 2 && store.statistics().isolated_sessions == 1);
+    assert(store.statistics().overflow_skipped == 4);
+    // Recover the gap from the message log before a checkpoint exists.
+  }
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    gap = slow.overflow_sequence;
+    assert(gap && slow.present && store.statistics().isolated_sessions == 1);
+    assert(store.subscribe("slow", slow.epoch, "topic", 1).quota_exceeded);
+    auto delivery = store.fetch("slow", slow.epoch, 0, 32);
+    assert(delivery.overflow_sequence == gap && delivery.deliveries.size() == 2);
+    assert(delivery.deliveries[0].wire == "message-0" &&
+           delivery.deliveries[1].wire == "message-1");
+    store.checkpoint();
+  }
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    assert(slow.overflow_sequence == gap);
+    auto delivery = store.fetch("slow", slow.epoch, 0, 32);
+    for (const auto& d : delivery.deliveries)
+      assert(store.acknowledge("slow", slow.epoch, d.packet_id).ok);
+    assert(store.statistics().pending == 0);
+    auto reset = store.connect("slow", "owner", true, 60);
+    assert(reset.ok && !reset.overflow_sequence && store.statistics().isolated_sessions == 0);
+  }
+  cfg.path = path + "-bytes";
+  cfg.max_bytes_per_session = 4;
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    assert(store.subscribe("slow", slow.epoch, "topic", 1).ok);
+    assert(store.publish("topic", "abcd", "writer", 0).ok);
+    assert(store.publish("topic", "e", "writer", 0).ok);
+    assert(store.statistics().isolated_sessions == 1 && store.statistics().bytes == 4);
   }
 }
 
@@ -331,7 +398,9 @@ int main()
     assert(store.statistics().bytes == store.statistics().unique_bytes * 4);
   }
   test_compaction(std::string(dir) + "/compact");
-  test_v2_upgrade(std::string(dir) + "/upgrade");
+  test_native_upgrade(std::string(dir) + "/upgrade-2", 2);
+  test_native_upgrade(std::string(dir) + "/upgrade-3", 3);
+  test_overflow_isolation(std::string(dir) + "/overflow");
   test_incremental_routing_and_expiry(std::string(dir) + "/indexes");
   std::filesystem::remove_all(dir);
   puts(

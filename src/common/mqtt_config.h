@@ -29,7 +29,10 @@ struct PersistenceConfig {
   size_t max_sessions = 10000;
   size_t max_subscriptions_per_session = 128;
   size_t max_messages = 100000;
-  size_t max_messages_per_session = 100000;
+  size_t max_messages_per_session = 10000;
+  size_t max_bytes_per_session = 32 * 1024 * 1024;
+  // Isolation permits a reported gap while keeping previously accepted records.
+  std::string overflow_policy = "reject";
   size_t max_bytes = 256 * 1024 * 1024;
   size_t max_requests = 1024;
   size_t max_request_bytes = 16 * 1024 * 1024;

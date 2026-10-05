@@ -43,6 +43,7 @@
 #define MQ_ERR_PUBLISH_QOS -403
 #define MQ_ERR_PUBLISH_RETAIN -404
 #define MQ_ERR_PUBLISH_NOT_AUTHORIZED -405
+#define MQ_ERR_PUBLISH_QUOTA -406
 
 // MQTT Subscribe error codes (-500 to -599)
 #define MQ_ERR_SUBSCRIBE -500
@@ -212,6 +213,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Invalid retain flag";
     case MQ_ERR_PUBLISH_NOT_AUTHORIZED:
       return "Not authorized to publish";
+    case MQ_ERR_PUBLISH_QUOTA:
+      return "Publish quota exceeded";
 
     // Subscribe errors
     case MQ_ERR_SUBSCRIBE:

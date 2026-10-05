@@ -29,7 +29,8 @@ enum Record : uint8_t {
   ACK = 5,
   CLAIM = 6,
   HEARTBEAT = 7,
-  MESSAGE = 8
+  MESSAGE = 8,
+  MESSAGE_WITH_GAPS = 9
 };
 struct Deferred
 {
@@ -151,6 +152,7 @@ struct DurableStore::Impl
     uint64_t generation = 0, epoch = 0;
     uint32_t expiry = 0;
     int64_t deadline = 0;
+    int64_t overflow_sequence = 0;
     int64_t scheduled_expiry = 0;
     bool online = false, busy = false;
     uint16_t next_packet = 1;
@@ -175,13 +177,14 @@ struct DurableStore::Impl
   std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
-  uint32_t format_version = 3;
+  uint32_t format_version = 4;
   std::atomic<size_t> checkpoint_bytes{0};
   size_t pending = 0, bytes = 0, unique_bytes = 0, requests = 0, request_bytes = 0,
          metadata_bytes = 0, metadata_reserved = 0;
   std::shared_ptr<std::atomic<size_t>> delivery_bytes{new std::atomic<size_t>(0)};
   std::atomic<size_t> subscriptions{0};
   std::atomic<size_t> discarded_denied{0}, discarded_oversize{0}, discarded_malformed{0};
+  size_t isolated_sessions = 0, overflow_skipped = 0;
   std::map<std::string, std::shared_ptr<Session>> sessions;
   std::vector<TopicNode> index;
   std::vector<size_t> free_nodes;
@@ -235,9 +238,15 @@ struct DurableStore::Impl
         if (std::chrono::steady_clock::now() >= deadline) {
           r->ok = false;
           r->error = "persistent admission timeout";
+          r->quota_exceeded = true;
           return *r;
         }
         runtime::current_runtime().wait(-1, 0, 1);
+      } catch (const journal::AdmissionFull& e) {
+        r->ok = false;
+        r->quota_exceeded = true;
+        r->error = e.what();
+        return *r;
       } catch (const std::exception& e) {
         r->ok = false;
         r->error = e.what();
@@ -250,7 +259,7 @@ struct DurableStore::Impl
   {
     size_t size = data.size() + 256;
     if (size > config.max_request_bytes)
-      throw std::runtime_error("persistent request exceeds byte limit");
+      throw journal::AdmissionFull("persistent request exceeds byte limit");
     if (requests >= config.max_requests || request_bytes > config.max_request_bytes - size ||
         delivery_bytes->load() > config.max_request_bytes - size - request_bytes)
       throw Deferred();
@@ -383,7 +392,10 @@ struct DurableStore::Impl
     free_nodes.clear();
     message_expiry.clear();
     session_expiry.clear();
+    isolated_sessions = 0;
     for (const auto& s : sessions) {
+      if (s.second->overflow_sequence)
+        ++isolated_sessions;
       metadata_bytes += session_cost(s.second);
       for (const auto& sub : s.second->subscriptions) {
         metadata_bytes += subscription_cost(sub.first);
@@ -408,9 +420,9 @@ struct DurableStore::Impl
     if (extra > budget || metadata_bytes > budget - extra ||
         metadata_bytes + extra > budget - std::min(budget, overhead) ||
         deliveries > (budget - overhead - metadata_bytes - extra) / 80)
-      throw std::runtime_error("persistent metadata/checkpoint capacity exhausted");
+      throw journal::AdmissionFull("persistent metadata/checkpoint capacity exhausted");
     if (metadata_bytes + extra - unique_bytes - payload > config.max_request_bytes * 4ULL)
-      throw std::runtime_error("persistent metadata memory limit");
+      throw journal::AdmissionFull("persistent metadata memory limit");
   }
   void reference(const std::shared_ptr<Message>& message, const std::shared_ptr<Session>& s)
   {
@@ -442,6 +454,8 @@ struct DurableStore::Impl
       drop(s, s->pending.begin());
     schedule_session(s);
     if (indexing) {
+      if (s->overflow_sequence)
+        --isolated_sessions;
       while (!s->subscriptions.empty())
         set_subscription(s, s->subscriptions.begin()->first, 0, true);
       metadata_bytes -= session_cost(s);
@@ -532,6 +546,16 @@ struct DurableStore::Impl
     return 0;
   }
   std::vector<std::shared_ptr<Session>> match(const std::string& topic);
+  void mark_overflow(const std::shared_ptr<Session>& s, int64_t sequence)
+  {
+    if (s->overflow_sequence)
+      return;
+    s->overflow_sequence = sequence;
+    if (indexing)
+      ++isolated_sessions;
+    notify(s);
+    LOG_WARN("Persistent consumer isolated: client {}, first_gap_sequence {}", s->client, sequence);
+  }
   void replay_control(const std::string& data, bool acknowledgements);
   std::shared_ptr<Message> decode_message(const std::string& data, size_t partition,
                                           const Location& location, bool attach);
@@ -546,7 +570,8 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
 {
   if (!config.partitions || config.partitions > 32 || config.segment_bytes < 4096 ||
       config.max_disk_bytes / (config.partitions * 4) < config.segment_bytes ||
-      config.checkpoint_interval_ms < 100)
+      config.checkpoint_interval_ms < 100 || !config.max_bytes_per_session ||
+      (config.overflow_policy != "reject" && config.overflow_policy != "isolate"))
     throw std::runtime_error("invalid partition journal configuration");
   lock_fd = open((config.path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
@@ -584,7 +609,7 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
       if (d.text() != "MQTTS-PARTITION-LOG")
         throw std::runtime_error("invalid journal format");
       format_version = d.u32();
-      if ((format_version != 2 && format_version != 3) || d.u32() != config.partitions)
+      if ((format_version < 2 || format_version > 4) || d.u32() != config.partitions)
         throw std::runtime_error(
             "journal format/partition count differs; offline migration required");
       d.end();
@@ -600,6 +625,14 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
     message_cuts.resize(config.partitions);
     state_cuts.resize(config.partitions);
     restore();
+    if (format_version < 4) {
+      Encoder marker;
+      marker.text("MQTTS-PARTITION-LOG");
+      marker.u32(4);
+      marker.u32(uint32_t(config.partitions));
+      journal::atomic_file(config.path + "/FORMAT", checked(marker.data));
+      format_version = 4;
+    }
     maintenance = std::thread(&Impl::maintain, this);
   } catch (...) {
     messages.clear();
@@ -642,6 +675,8 @@ DurableStore::Statistics DurableStore::statistics() const
   s.bytes = impl_->bytes;
   s.unique_bytes = impl_->unique_bytes;
   s.checkpoint_bytes = impl_->checkpoint_bytes.load();
+  s.isolated_sessions = impl_->isolated_sessions;
+  s.overflow_skipped = impl_->overflow_skipped;
   for (const auto& log : impl_->messages)
     s.message_partition_bytes.push_back(log->disk_bytes());
   for (const auto& log : impl_->states)
@@ -691,7 +726,7 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
           return {};
         }
         if (!old && v.sessions.size() >= v.config.max_sessions)
-          throw std::runtime_error("persistent session limit");
+          throw journal::AdmissionFull("persistent session limit");
         if (!old)
           v.check_metadata(512 + client.size() * 2 + owner.size(), v.pending);
         auto s = (old && !clean) ? old : std::make_shared<Impl::Session>();
@@ -737,6 +772,7 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
               *r = success();
               r->present = bool(old && !clean);
               r->epoch = epoch;
+              r->overflow_sequence = s->overflow_sequence;
               r->revision = signal;
               for (const auto& sub : s->subscriptions)
                 r->subscriptions.push_back(sub);
@@ -809,7 +845,10 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
     }
     if (!s->subscriptions.count(filter) &&
         s->subscriptions.size() >= v.config.max_subscriptions_per_session)
-      throw std::runtime_error("persistent subscription limit");
+      throw journal::AdmissionFull("persistent subscription limit");
+    if (s->overflow_sequence)
+      throw journal::AdmissionFull(
+          "isolated session requires explicit gap recovery and Clean Start");
     if (!s->subscriptions.count(filter))
       v.check_metadata(subscription_cost(filter), v.pending);
     size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
@@ -921,22 +960,45 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
                   targets.end());
     if (targets.empty())
       return {};
-    v.check_metadata(0, v.pending + targets.size(), wire.size());
-    if (targets.size() > v.config.max_messages ||
-        v.pending > v.config.max_messages - targets.size() ||
-        wire.size() > v.config.max_bytes / targets.size() ||
-        v.bytes > v.config.max_bytes - wire.size() * targets.size())
-      throw std::runtime_error("persistent message capacity exhausted");
-    for (const auto& s : targets)
-      if (s->pending.size() >= v.config.max_messages_per_session)
-        throw std::runtime_error("persistent client backlog exhausted");
+    std::vector<std::shared_ptr<Impl::Session>> active, overflows;
+    for (const auto& s : targets) {
+      r->targets.push_back(s->client);  // Also exclude isolated consumers from live fallback.
+      if (s->overflow_sequence) {
+        if (v.config.overflow_policy == "reject")
+          throw journal::AdmissionFull("isolated session requires gap recovery");
+        continue;
+      }
+      const bool full = s->pending.size() >= v.config.max_messages_per_session ||
+                        wire.size() > v.config.max_bytes_per_session ||
+                        s->bytes > v.config.max_bytes_per_session - wire.size();
+      if (full) {
+        if (v.config.overflow_policy == "reject")
+          throw journal::AdmissionFull("persistent client backlog exhausted");
+        overflows.push_back(s);
+      } else
+        active.push_back(s);
+    }
+    std::sort(r->targets.begin(), r->targets.end());
+    const size_t skipped = targets.size() - active.size();
+    targets = std::move(active);
+    r->accepted_targets = targets.size();
+    if (targets.empty() && overflows.empty()) {
+      v.overflow_skipped += skipped;
+      return {};
+    }
+    v.check_metadata(0, v.pending + targets.size(), targets.empty() ? 0 : wire.size());
+    if (!targets.empty() && (targets.size() > v.config.max_messages ||
+                             v.pending > v.config.max_messages - targets.size() ||
+                             wire.size() > v.config.max_bytes / targets.size() ||
+                             v.bytes > v.config.max_bytes - wire.size() * targets.size()))
+      throw journal::AdmissionFull("persistent message capacity exhausted");
     auto message = std::make_shared<Impl::Message>();
     message->id = ++v.next_id;
     message->expires = expires;
     message->partition = journal::topic_hash(topic) % v.messages.size();
     message->wire = wire;
     Encoder e;
-    e.u8(MESSAGE);
+    e.u8(overflows.empty() ? MESSAGE : MESSAGE_WITH_GAPS);
     e.u64(message->id);
     e.u64(expires);
     e.text(wire);
@@ -948,21 +1010,32 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
       e.text(s->client);
       e.u64(s->generation);
       e.u32(packet);
-      r->targets.push_back(s->client);
     }
-    // The live router uses binary_search to exclude recipients already queued
-    // here. Topic-index session pointers are not ordered by Client ID.
-    std::sort(r->targets.begin(), r->targets.end());
+    if (!overflows.empty()) {
+      e.u32(uint32_t(overflows.size()));
+      for (const auto& s : overflows) {
+        e.text(s->client);
+        e.u64(s->generation);
+      }
+    }
     auto ticket = v.enqueue(*v.messages[message->partition], std::move(e.data),
                             [=, &v](bool ok, const Location& location) {
+                              for (const auto& s : overflows)
+                                s->busy = false;
                               if (!ok)
                                 return;
+                              for (const auto& s : overflows)
+                                v.mark_overflow(s, message->id);
+                              v.overflow_skipped += skipped;
                               message->location = location;
                               message->committed = true;
                               v.schedule_message(message);
                               for (const auto& s : targets)
                                 v.notify(s);
                             });
+    // Fence this transition until the gap and healthy recipients commit together.
+    for (const auto& s : overflows)
+      s->busy = true;
     for (size_t i = 0; i < targets.size(); ++i) {
       auto s = targets[i];
       Impl::DeliveryState entry;
@@ -992,6 +1065,7 @@ DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epo
       return {};
     }
     *r = success();
+    r->overflow_sequence = s->overflow_sequence;
     size_t inflight = 0, returned_bytes = 0;
     auto reservation = std::make_shared<DeliveryReservation>(v.delivery_bytes);
     r->reservation = reservation;
@@ -1293,7 +1367,8 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     const std::string& data, size_t partition, const Location& location, bool attach)
 {
   Decoder d(data);
-  if (d.u8() != MESSAGE)
+  const auto kind = d.u8();
+  if (kind != MESSAGE && kind != MESSAGE_WITH_GAPS)
     throw std::runtime_error("invalid message journal record");
   auto m = std::make_shared<Message>();
   m->id = d.u64();
@@ -1334,6 +1409,18 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     bytes += m->wire.size();
     s->bytes += m->wire.size();
   }
+  if (kind == MESSAGE_WITH_GAPS) {
+    const auto gaps = d.u32();
+    if (gaps > config.max_sessions)
+      throw std::runtime_error("invalid journal overflow count");
+    for (uint32_t i = 0; i < gaps; ++i) {
+      const auto client = d.text();
+      const auto generation = d.u64();
+      const auto found = sessions.find(client);
+      if (attach && found != sessions.end() && found->second->generation == generation)
+        mark_overflow(found->second, m->id);
+    }
+  }
   d.end();
   return m;
 }
@@ -1344,9 +1431,10 @@ void DurableStore::Impl::restore()
     auto body = unchecked(file);
     Decoder d(body);
     const auto magic = d.text();
-    const bool embedded = magic == "MQTTS-CHECKPOINT-3";
+    const bool gaps = magic == "MQTTS-CHECKPOINT-4";
+    const bool embedded = gaps || magic == "MQTTS-CHECKPOINT-3";
     if ((!embedded && magic != "MQTTS-CHECKPOINT-2") || (embedded && format_version < 3) ||
-        d.u32() != config.partitions)
+        (gaps && format_version < 4) || d.u32() != config.partitions)
       throw std::runtime_error("checkpoint format/partition mismatch");
     checkpoint_bytes = file.size();
     next_id = d.u64();
@@ -1396,6 +1484,11 @@ void DurableStore::Impl::restore()
       if (!next || next > 65535)
         throw std::runtime_error("invalid checkpoint packet cursor");
       s->next_packet = uint16_t(next);
+      if (gaps) {
+        s->overflow_sequence = d.u64();
+        if (s->overflow_sequence < 0 || uint64_t(s->overflow_sequence) > next_id)
+          throw std::runtime_error("invalid checkpoint overflow sequence");
+      }
       uint32_t subs = d.u32();
       if (subs > config.max_subscriptions_per_session)
         throw std::runtime_error("checkpoint subscription limit");
@@ -1469,7 +1562,8 @@ void DurableStore::Impl::validate_state()
     auto s = item.second;
     if (!s->generation || !s->epoch ||
         s->subscriptions.size() > config.max_subscriptions_per_session ||
-        s->pending.size() > config.max_messages_per_session)
+        s->pending.size() > config.max_messages_per_session ||
+        s->bytes > config.max_bytes_per_session)
       throw std::runtime_error("invalid recovered session or configured capacity");
     s->packets.clear();
     for (const auto& delivery : s->pending)
@@ -1502,6 +1596,7 @@ void DurableStore::Impl::checkpoint()
       uint64_t generation, epoch;
       uint32_t expiry;
       int64_t deadline;
+      int64_t overflow_sequence;
       bool online;
       uint16_t next_packet;
       std::map<std::string, uint8_t> subscriptions;
@@ -1522,8 +1617,17 @@ void DurableStore::Impl::checkpoint()
       snapshot.reserve(sessions.size());
       for (const auto& item : sessions) {
         const auto& s = *item.second;
-        SnapshotSession copy{s.client,   s.owner,  s.generation,  s.epoch,         s.expiry,
-                             s.deadline, s.online, s.next_packet, s.subscriptions, {}};
+        SnapshotSession copy{s.client,
+                             s.owner,
+                             s.generation,
+                             s.epoch,
+                             s.expiry,
+                             s.deadline,
+                             s.overflow_sequence,
+                             s.online,
+                             s.next_packet,
+                             s.subscriptions,
+                             {}};
         copy.pending.reserve(s.pending.size());
         for (const auto& entry : s.pending)
           copy.pending.emplace_back(entry.second.message, entry.second.packet);
@@ -1534,7 +1638,7 @@ void DurableStore::Impl::checkpoint()
       frozen = false;
     }
     Encoder e;
-    e.text("MQTTS-CHECKPOINT-3");
+    e.text("MQTTS-CHECKPOINT-4");
     e.u32(uint32_t(config.partitions));
     e.u64(snapshot_id);
     for (size_t p = 0; p < config.partitions; ++p) {
@@ -1565,6 +1669,7 @@ void DurableStore::Impl::checkpoint()
       e.u64(s.deadline);
       e.u8(s.online);
       e.u32(s.next_packet);
+      e.u64(s.overflow_sequence);
       e.u32(uint32_t(s.subscriptions.size()));
       for (const auto& sub : s.subscriptions) {
         e.text(sub.first);
@@ -1578,17 +1683,6 @@ void DurableStore::Impl::checkpoint()
     }
     if (e.data.size() + 4 > config.max_disk_bytes / 8)
       throw std::runtime_error("checkpoint exceeds reserved disk budget");
-    if (format_version < 3) {
-      // Upgrade the marker first: old readers must refuse a compacted store.
-      // New readers accept a v3 marker with either checkpoint generation after
-      // a crash between the two atomic replacements.
-      Encoder marker;
-      marker.text("MQTTS-PARTITION-LOG");
-      marker.u32(3);
-      marker.u32(uint32_t(config.partitions));
-      journal::atomic_file(config.path + "/FORMAT", checked(marker.data));
-      format_version = 3;
-    }
     journal::atomic_file(config.path + "/CHECKPOINT", checked(e.data));
     checkpoint_bytes = e.data.size() + 4;
     message_cuts = message_fences;

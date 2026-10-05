@@ -68,7 +68,9 @@ persistence:
   max_sessions: 10000
   max_subscriptions_per_session: 128
   max_messages: 100000
-  max_messages_per_session: 100000
+  max_messages_per_session: 10000
+  max_bytes_per_session: 33554432
+  overflow_policy: reject
   max_bytes: 268435456
   max_requests: 1024
   max_request_bytes: 16777216

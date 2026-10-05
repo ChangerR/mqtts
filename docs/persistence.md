@@ -32,7 +32,8 @@ Their disk work does not sit in the message append queue.
 
 Workers group up to 64 requests with a maximum 1 ms batch-formation wait. A publication
 contains the payload once plus its recipient-generation and Packet ID references.
-All matching recipients' logical quotas are reserved atomically before admission.
+With the default overflow policy, all matching recipients' logical quotas are
+reserved atomically before admission. Opt-in isolation is described below.
 The normal path assigns Packet IDs in that same append, avoiding a second durable
 transaction before delivery. A backlog exceeding the 65,535-ID space claims freed
 IDs through the session journal before those packets can be sent.
@@ -99,8 +100,11 @@ one-second heartbeats; recovery uses the last persisted deadline and never grant
 new lease from restart time. Delayed disk work can shorten that recovery window.
 Message expiry and explicit MQTT 5 zero expiry are honored.
 
-Admission/quota failures withhold positive publisher PUBACK and close the publishing
-connection for retry. Accepted older messages are never evicted to admit new ones.
+Admission/quota failures withhold positive publisher PUBACK. MQTT 5 QoS 1 publishers
+(TCP and WebSocket) receive `0x97 Quota exceeded` and keep their connection; they must
+handle that negative acknowledgement and retry according to their application policy.
+MQTT 3 has no negative PUBACK and closes for retry. Accepted older messages are never
+evicted to admit new ones.
 Actual journal write/sync failure fails persistent traffic closed and requires
 storage recovery/restart; new clean sessions without retained state can still connect.
 Checkpoint or obsolete-segment reclamation errors retain the usable logs and retry
@@ -167,7 +171,9 @@ persistence:
   max_sessions: 10000
   max_subscriptions_per_session: 128
   max_messages: 100000
-  max_messages_per_session: 100000
+  max_messages_per_session: 10000
+  max_bytes_per_session: 33554432
+  overflow_policy: reject # or explicit opt-in isolate; see below
   max_bytes: 268435456
   max_requests: 1024
   max_request_bytes: 16777216
@@ -197,21 +203,53 @@ larger record occupies a larger segment. Filesystem allocation/metadata still ne
 additional free-space headroom beyond counted file bytes. Back up the whole directory
 while the broker is stopped; never copy just one segment or one checkpoint.
 
+### Slow-consumer policy
+
+The defaults limit one recipient to 10,000 messages / 32 MiB, below the global
+100,000-message / 256 MiB limits. This bounds a single consumer's impact on unrelated
+topics; many consumers together can still exhaust global capacity.
+
+- `reject` (default) preserves complete durable fanout. A full recipient applies
+  backpressure to publications that match it. Use this for a database-ingestion
+  consumer when no other durable source can recover missing records.
+- `isolate` explicitly permits **new-message gaps** for a saturated recipient while
+  healthy recipients continue. The first skipped publication records the consumer's
+  gap and healthy recipients in the same synced log record, before positive PUBACK.
+  All previously accepted messages stay available. Global disk/memory exhaustion
+  still rejects the publication. Positive PUBACK in this mode excludes isolated
+  recipients; it is not a promise that they can later replay every new publication.
+
+An online consumer is disconnected once with MQTT 5 `Quota exceeded`. On reconnect,
+MQTT 5 CONNACK contains user property `mqtts-overflow-from` (first missing broker
+sequence). The consumer may drain its old backlog, but new subscriptions are rejected
+and new messages stay paused until explicit recovery followed by Clean Start and
+resubscription. The sequence is diagnostic, not a history-fetch API. Missing records
+must come from an independently durable source; do not assume the ingestion database
+contains them. MQTT 3 cannot convey the gap property and refuses to resume an isolated
+session; use MQTT 5 to drain and recover, or explicitly reset the old session.
+
+The gap survives checkpoints and restarts. `Statistics.isolated_sessions` and the
+per-process `overflow_skipped` delivery counter, plus a first-gap warning, expose the
+condition. Switching back to `reject` does not erase gaps: recover/reset affected
+sessions first. Clean Start has its standard explicit backlog-discard semantics.
+
 ## Upgrade from the SQLite version
 
-The wire contract remains QoS 1, but `durable_sessions_contract` is now **3** because
+The wire contract remains QoS 1, but `durable_sessions_contract` is now **4** because
 the on-disk format changed. Existing configured basenames are deliberately preserved.
 An old SQLite file at that path refuses startup instead of starting an empty store at
 a different implicit path. Do not delete or rename the old volume to make startup pass.
 
-Native format 2 directories upgrade in place when the first compacted checkpoint is
-installed. The new reader accepts both checkpoint formats. The FORMAT marker is
-atomically advanced to 3 before installing the first version 3 checkpoint, so an old
-binary refuses the upgraded directory instead of misreading it. Back up the stopped
-store before upgrading; rollback requires restoring that backup. Format 3 reserves
+Native format 2/3 directories upgrade in place after successful recovery. The new
+reader accepts checkpoint formats 2, 3 and 4. The FORMAT marker is atomically advanced
+to 4 before admitting writes that can contain gap records, so an old binary refuses
+the upgraded directory instead of misreading it. Back up the stopped
+store before upgrading; rollback requires restoring that backup. Compacted formats reserve
 checkpoint space for all unique live payloads as well as metadata. If a custom
 format 2 backlog exceeds that budget, startup refuses without deleting records;
-raise `max_disk_bytes` or drain with the old binary before upgrading.
+raise `max_disk_bytes` or drain with the old binary before upgrading. Existing
+backlogs above the new per-session defaults also require explicit matching limits
+before startup; an upgrade never drops records to fit a smaller configured quota.
 
 Stop the old broker, retain a backup, build the native importer, then migrate into a
 new directory on the same machine with the Python standard-library export tool:
@@ -233,7 +271,8 @@ original expiration semantics. The native importer is also included at
 a Python 3 maintenance environment; it is not a broker runtime dependency.
 
 The importer currently enforces default store limits (10,000 sessions, 100,000 pending
-messages and 256 MiB logical payloads). An oversized source is refused and kept intact;
+messages, 10,000 messages / 32 MiB per session and 256 MiB logical payloads overall).
+An oversized source is refused and kept intact;
 review/configure a larger importer before migrating a deployment with custom limits.
 An interrupted destination carries `IMPORTING` and refuses broker startup. Retry into
 a new destination from the intact source. After successful import, explicitly change

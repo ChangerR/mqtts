@@ -122,6 +122,46 @@ def publish_negative_ack(binary):
     print('PASS TCP/WS MQTT 5 negative PUBACK/PUBREC, denial vs outage, and connection reuse', flush=True)
 
 
+def overflow_isolation(binary):
+    with Fixture(binary, persistence=dict(max_messages_per_session=2, max_messages=10, overflow_policy='isolate', checkpoint_interval_ms=200)) as f:
+        slow, _ = client(f, 'slow')
+        fast, _ = client(f, 'fast')
+        assert slow.sub('fixture/overflow') == fast.sub('fixture/overflow') == 1
+        slow.disconnect()
+        writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=True)
+        for i in range(6):
+            data = f.payload(writer, i)
+            writer.pub('fixture/overflow', data)
+            assert fast.delivery()[1] == data
+        time.sleep(.3)
+        restart(f)
+        slow, present = client(f, 'slow')
+        assert present and b'mqtts-overflow-from' in slow.connack
+        assert [json.loads(slow.delivery()[1])['nonce'] for _ in range(2)] == [0, 1]
+        assert slow.sub('fixture/overflow') == 0x97
+        slow.quiet()
+        slow.disconnect()
+        # MQTT 3 cannot represent the explicit gap property; never silently resume it.
+        client(f, 'slow', version=4, expected=1)
+        slow, present = client(f, 'slow', clean=True)
+        assert not present and b'mqtts-overflow-from' not in slow.connack
+        assert slow.sub('fixture/overflow') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/overflow', f.payload(writer, 7))
+        assert json.loads(slow.delivery()[1])['nonce'] == 7
+    # An online saturated consumer is notified; the publisher still continues.
+    with Fixture(binary, persistence=dict(max_messages_per_session=1, overflow_policy='isolate')) as f:
+        slow, _ = client(f, 'slow', receive=1)
+        assert slow.sub('fixture/overflow') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/overflow', f.payload(writer, 0))
+        slow.delivery(ack=False)
+        writer.pub('fixture/overflow', f.payload(writer, 1))
+        h,b=slow.read();assert h==0xe0 and b[0]==0x97,(h,b)
+        writer.send(b'\xc0\0');assert writer.read()==(0xd0,b'')
+    print('PASS isolated overflow preserves old backlog, healthy fanout, durable gap and explicit reset', flush=True)
+
+
 def qos_zero_takeover(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
@@ -297,6 +337,7 @@ if __name__ == '__main__':
     qos_zero_takeover(args.broker)
     sender_loop_avoidance(args.broker)
     publish_negative_ack(args.broker)
+    overflow_isolation(args.broker)
     poison_messages(args.broker)
     stored_wire_budget(args.broker)
     expired_inflight(args.broker)

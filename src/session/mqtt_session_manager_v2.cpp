@@ -1001,6 +1001,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       packet.properties.topic_alias != 0)
     return MQ_ERR_PUBLISH_TOPIC;
   std::vector<std::string> persisted_targets;
+  size_t persisted_count = 0;
   if (packet.properties.has_message_expiry_interval &&
       packet.properties.message_expiry_interval == 0)
     return 0;
@@ -1036,8 +1037,9 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
             from_mqtt_string(sender_client_id), expires);
         if (!result.ok) {
           LOG_WARN("Persistent publish refused: {}", result.error);
-          return MQ_ERR_INTERNAL;
+          return result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
         }
+        persisted_count = result.accepted_targets;
         persisted_targets = std::move(result.targets);
       } catch (const std::exception& error) {
         LOG_WARN("Persistent publish failed: {}", error.what());
@@ -1054,8 +1056,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   }
 
   if (subscribers.empty())
-    return int(persisted_targets.size());
-  int forwarded_count = int(persisted_targets.size());
+    return int(persisted_count);
+  int forwarded_count = int(persisted_count);
   try {
     // Previously every recipient copied the payload using the publisher's
     // 1-MiB allocator. A single 4-KiB publish to 500 recipients could exhaust

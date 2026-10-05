@@ -110,7 +110,7 @@ jobs:
           pathlib.Path('runtime/metadata.json').write_text(json.dumps({
               'schema_version': 1, 'source_revision': revision,
               'image': 'mqtts:sha-' + revision, 'platform': 'linux/amd64',
-              'http_auth_contract': 1, 'grpc_auth_contract': 1, 'durable_sessions_contract': 3,
+              'http_auth_contract': 1, 'grpc_auth_contract': 1, 'durable_sessions_contract': 4,
               'authz_image': 'mqtts-authz:sha-' + revision,
               'authz_proto_sha256': hashlib.sha256(pathlib.Path('modules/authz/proto/authorization.proto').read_bytes()).hexdigest(),
           }) + '\n')

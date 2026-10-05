@@ -892,7 +892,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     const auto protocol = client_protocol_versions_.find(client_id);
     const bool negative_ack = protocol != client_protocol_versions_.end() && protocol->second >= 5 &&
         (packet->qos == 1 || packet->qos == 2) &&
-        (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED || ret == MQ_ERR_AUTH_UNAVAILABLE);
+        (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED || ret == MQ_ERR_AUTH_UNAVAILABLE || ret == MQ_ERR_PUBLISH_QUOTA);
     if (ret != MQ_SUCCESS && !negative_ack) {
       auto handler = handlers_.find(client_id);
       if (handler != handlers_.end())
@@ -905,7 +905,8 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
         puback.type = mqtt::PacketType::PUBACK;
         puback.packet_id = packet->packet_id;
         puback.reason_code = ret == MQ_SUCCESS ? mqtt::ReasonCode::Success :
-            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError);
+            (ret == MQ_ERR_PUBLISH_QUOTA ? mqtt::ReasonCode::QuotaExceeded :
+            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError));
         return send_serialized_mqtt_packet(client_id, puback);
     }
 

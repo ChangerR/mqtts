@@ -44,8 +44,11 @@ class DurableStore
   struct Result
   {
     bool ok = false, present = false, stale = false, wake = false, not_authorized = false;
+    bool quota_exceeded = false;
     std::shared_ptr<Signal> revision;
     uint64_t epoch = 0;
+    int64_t overflow_sequence = 0;
+    size_t accepted_targets = 0;
     std::string error;
     std::vector<std::pair<std::string, uint8_t>> subscriptions;
     std::vector<std::string> targets;
@@ -79,6 +82,7 @@ class DurableStore
   {
     size_t sessions = 0, pending = 0, bytes = 0;
     size_t unique_bytes = 0, checkpoint_bytes = 0;
+    size_t isolated_sessions = 0, overflow_skipped = 0;
     std::vector<size_t> message_partition_bytes, session_partition_bytes;
     size_t discarded_denied = 0, discarded_oversize = 0, discarded_malformed = 0;
   };

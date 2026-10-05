@@ -73,6 +73,10 @@ int ConfigManager::load_from_file(const std::string& config_file)
         config_.persistence.max_messages = p["max_messages"].as<size_t>();
       if (p["max_messages_per_session"])
         config_.persistence.max_messages_per_session = p["max_messages_per_session"].as<size_t>();
+      if (p["max_bytes_per_session"])
+        config_.persistence.max_bytes_per_session = p["max_bytes_per_session"].as<size_t>();
+      if (p["overflow_policy"])
+        config_.persistence.overflow_policy = p["overflow_policy"].as<std::string>();
       if (p["max_bytes"])
         config_.persistence.max_bytes = p["max_bytes"].as<size_t>();
       if (p["max_requests"])
@@ -109,7 +113,9 @@ int ConfigManager::validate() const
        p.max_disk_bytes / (p.partitions * 4) < p.segment_bytes ||
        p.checkpoint_interval_ms < 100 || !p.max_session_expiry_seconds || !p.max_sessions ||
        !p.max_subscriptions_per_session || !p.max_messages || !p.max_messages_per_session ||
-       !p.max_bytes || !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
+       !p.max_bytes || !p.max_bytes_per_session ||
+       (p.overflow_policy != "reject" && p.overflow_policy != "isolate") ||
+       !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
        !p.max_inflight || p.max_inflight > 65535)) {
     LOG_ERROR("Invalid bounded persistence configuration");
     return -1;

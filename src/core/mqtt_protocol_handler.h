@@ -142,6 +142,7 @@ class MQTTProtocolHandler
   MQTTString client_id_;
   bool connected_;
   uint64_t durable_epoch_ = 0;
+  int64_t durable_gap_ = 0;
   bool durable_running_ = false;
   runtime::TaskHandle durable_task_;
   std::shared_ptr<DurableStore::Signal> durable_revision_;

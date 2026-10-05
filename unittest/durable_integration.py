@@ -22,6 +22,7 @@ class DurableClient(Client):
         if self.version==5: body+=bytes([len(props)])+props
         self.send(packet(0x10,body+utf(name)+utf(owner or name)+utf('test-password')))
         head,body=self.read();assert head==0x20
+        self.connack=body
         return body[1],bool(body[0]&1)
     def sub(self, topic, qos=1):
         self.send(packet(0x82,b'\0\1'+(b'\0' if self.version==5 else b'')+utf(topic)+bytes([qos])))
@@ -142,12 +143,14 @@ def run(binary, fault_library):
         r,_=client(f,'bounded');assert r.sub('fixture/full')==1;r.disconnect();time.sleep(.05)
         w,_=client(f,'writer',clean=True,expiry=0)
         for i in range(2):w.pub('fixture/full',f.payload(w,i))
-        try:w.pub('fixture/full',f.payload(w,3))
-        except (EOFError,ConnectionError):pass
-        else:raise AssertionError('overflow received a positive PUBACK')
+        w.send(packet(0x32,utf('fixture/full')+b'\0\7\0'+f.payload(w,3)))
+        h,b=w.read();assert h==0x40 and b[:3]==b'\0\7\x97',(h,b)
+        w.send(b'\xc0\0');assert w.read()==(0xd0,b'')
         r,present=client(f,'bounded');assert present
         assert [json.loads(r.delivery()[1])['nonce'] for _ in range(2)]==[0,1]
-        print('PASS disk backlog exhaustion closes publisher without positive PUBACK',flush=True)
+        time.sleep(.1)
+        w.pub('fixture/full',f.payload(w,4));assert json.loads(r.delivery()[1])['nonce']==4
+        print('PASS backlog exhaustion returns quota PUBACK, retains old messages and reuses publisher connection',flush=True)
     if fault_library:
         journal_faults(binary, fault_library)
     with Fixture(binary,persistence=dict(checkpoint_interval_ms=200,segment_bytes=4096),http_workers=4,http_queue_capacity=64) as f:

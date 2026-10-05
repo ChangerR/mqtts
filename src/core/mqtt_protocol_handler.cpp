@@ -669,12 +669,18 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
                                                   : packet->username;
     auto opened = store->connect(from_mqtt_string(packet->client_id), from_mqtt_string(principal),
                                   packet->flags.clean_start, expiry);
-    if (!opened.ok) {
+    if (opened.ok && opened.overflow_sequence && negotiated_protocol_version_ < 5) {
+      store->disconnect(from_mqtt_string(packet->client_id), opened.epoch);
+      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = ReasonCode::ServerUnavailable;
+      need_reject = true;
+    } else if (!opened.ok) {
       ret = opened.not_authorized ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
       reject_reason = opened.not_authorized ? ReasonCode::NotAuthorized : ReasonCode::ServerUnavailable;
       need_reject = true;
     } else {
       durable_epoch_ = opened.epoch;
+      durable_gap_ = opened.overflow_sequence;
       durable_revision_ = opened.revision;
       session_present = opened.present;
       session_expiry_interval_ = std::min(expiry, store->max_session_expiry());
@@ -861,6 +867,8 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
       } else {
         LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}",
                  from_mqtt_string(packet->topic_name), forward_ret);
+        if (forward_ret == MQ_ERR_PUBLISH_QUOTA && negotiated_protocol_version_ >= 5 && packet->qos == 1)
+          return send_puback(packet->packet_id, ReasonCode::QuotaExceeded);
         // No positive acknowledgement before the durable transaction commits.
         if (socket_)
           socket_->close();
@@ -1185,7 +1193,7 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         if (!stored.ok) {
           if (!existed) remove_subscription(topic);
           local_added = false;
-          reason_code = ReasonCode::UnspecifiedError;
+          reason_code = stored.quota_exceeded ? ReasonCode::QuotaExceeded : ReasonCode::UnspecifiedError;
         }
         previous = std::move(stored);
       }
@@ -1316,6 +1324,10 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
   if (durable_epoch_ && negotiated_protocol_version_ >= 5) {
     packet->properties.has_session_expiry_interval = true;
     packet->properties.session_expiry_interval = session_expiry_interval_;
+    if (durable_gap_) {
+      packet->properties.user_properties.emplace_back(to_mqtt_string("mqtts-overflow-from", allocator_),
+          to_mqtt_string(std::to_string(durable_gap_), allocator_));
+    }
   }
 
   // 序列化包
@@ -1830,6 +1842,12 @@ void MQTTProtocolHandler::pump_durable()
         runtime::current_runtime().wait(-1, 0, 10);
         fetch_again = true;
         continue;
+      }
+      if (batch.overflow_sequence && batch.overflow_sequence != durable_gap_) {
+        if (negotiated_protocol_version_ >= 5)
+          (void)send_disconnect(ReasonCode::QuotaExceeded);
+        socket_->close();
+        break;
       }
       // Fetch bounds wire bytes globally. Decode with a separate, proportional
       // budget so a publisher cannot exhaust the receiver's small client pool.
