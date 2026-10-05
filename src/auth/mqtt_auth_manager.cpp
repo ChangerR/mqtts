@@ -333,12 +333,13 @@ int AuthManager::check_topic_access(const ClientAuthContext& auth_context,
     auth_result = AuthResult::ACCESS_DENIED;
     const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    if (auth_context.user_info.expires_at_ms && now >= auth_context.user_info.expires_at_ms) return ret;
+    if ((auth_context.expires_at_ms && now >= auth_context.expires_at_ms) ||
+        (auth_context.user_info.expires_at_ms && now >= auth_context.user_info.expires_at_ms)) return ret;
     if (permission == Permission::WRITE && topic_str.find_first_of("+#") != std::string::npos) return ret;
     for (const auto& entry : providers_snapshot()) {
         if (auth_context.user_info.provider_name == entry.provider->get_provider_name()
             && entry.provider->requires_online_authorization()) {
-            if (entry.provider->is_healthy()) auth_result = entry.provider->check_topic_access(auth_context.user_info, topic, permission);
+            auth_result = entry.provider->is_healthy() ? entry.provider->check_topic_access(auth_context.user_info, topic, permission) : AuthResult::INTERNAL_ERROR;
             return ret;
         }
     }
@@ -367,14 +368,15 @@ int AuthManager::check_delivery(const ClientAuthContext& context, const MQTTStri
     result = AuthResult::ACCESS_DENIED;
     const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    if (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms) {
+    if ((context.expires_at_ms && now >= context.expires_at_ms) ||
+        (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) {
         pending.reset();
         return MQ_SUCCESS;
     }
     for (const auto& entry : providers_snapshot()) {
         if (context.user_info.provider_name == entry.provider->get_provider_name()
             && entry.provider->requires_online_authorization()) {
-            if (entry.provider->is_healthy()) result = entry.provider->check_delivery_access(context.user_info, topic, pending);
+            result = entry.provider->is_healthy() ? entry.provider->check_delivery_access(context.user_info, topic, pending) : AuthResult::INTERNAL_ERROR;
             return MQ_SUCCESS;
         }
     }
@@ -398,11 +400,12 @@ int AuthManager::check_publish(const ClientAuthContext& context, const MQTTStrin
     result = AuthResult::ACCESS_DENIED;
     const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    if (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms) return MQ_SUCCESS;
+    if ((context.expires_at_ms && now >= context.expires_at_ms) ||
+        (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) return MQ_SUCCESS;
     if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos) return MQ_SUCCESS;
     for (const auto& entry : providers_snapshot()) {
         if (context.user_info.provider_name == entry.provider->get_provider_name() && entry.provider->requires_online_authorization()) {
-            if (entry.provider->is_healthy()) result = entry.provider->check_publish(context.user_info, topic, payload);
+            result = entry.provider->is_healthy() ? entry.provider->check_publish(context.user_info, topic, payload) : AuthResult::INTERNAL_ERROR;
             return MQ_SUCCESS;
         }
     }

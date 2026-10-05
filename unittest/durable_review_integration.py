@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from durable_integration import client, restart
+from durable_integration import DurableClient, client, restart
 from http_auth_cache_integration import Fixture
 
 
@@ -84,9 +84,25 @@ def maintenance(binary, fault):
             print('PASS terminal append failure rejects durable traffic without rejecting new clean clients', flush=True)
 
 
+def authorization_failures(binary):
+    for version in (4, 5):
+        with Fixture(binary, persistence={}, cache_ttl_ms=0) as f:
+            f.mode = 'offline'
+            cold = DurableClient(f.port, version); f.clients.append(cold)
+            code, _ = cold.connect_session('cold-unavailable', clean=True, expiry=0)
+            assert code == (3 if version == 4 else 0x88), code
+            f.mode = 'normal'
+            f.revoked.add('denied')
+            cold = DurableClient(f.port, version); f.clients.append(cold)
+            code, _ = cold.connect_session('denied', clean=True, expiry=0)
+            assert code == (5 if version == 4 else 0x87), code
+    print('PASS unavailable authentication and authoritative denial use distinct MQTT reason codes', flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--broker', required=True)
     parser.add_argument('--fault-library', required=True)
     args = parser.parse_args()
     maintenance(args.broker, args.fault_library)
+    authorization_failures(args.broker)

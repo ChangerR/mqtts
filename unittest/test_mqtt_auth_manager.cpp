@@ -437,6 +437,17 @@ void test_auth_manager_client_auth_context() {
     auth_context.user_info.expires_at_ms = 1;
     auth_manager.check_topic_access(auth_context, allowed_topic, Permission::READ, auth_result);
     assert(auth_result == AuthResult::ACCESS_DENIED);
+    auth_context.user_info.expires_at_ms = 0;
+    auth_context.expires_at_ms = 1;
+    auth_context.is_super_user = true;
+    auth_manager.check_topic_access(auth_context, allowed_topic, Permission::READ, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
+    mqtt::MQTTByteVector payload{mqtt::MQTTSTLAllocator<uint8_t>(allocator)};
+    auth_manager.check_publish(auth_context, allowed_topic, payload, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
+    std::shared_ptr<AuthorizationRequest> pending;
+    auth_manager.check_delivery(auth_context, allowed_topic, pending, auth_result);
+    assert(auth_result == AuthResult::ACCESS_DENIED);
     auth_manager.cleanup();
     std::cout << "✓ AuthManager client auth context test passed" << std::endl;
 }

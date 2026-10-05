@@ -42,8 +42,29 @@ size_t read_response(char* data, size_t size, size_t count, void* target) {
   return size * count;
 }
 bool valid_url(const std::string& url) {
-  return (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0)
-      && url.find_first_of("\r\n") == std::string::npos;
+  if (url.empty() || std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= 32 || c == 127; })) return false;
+  CURLU* parsed = curl_url();
+  if (!parsed) return false;
+  bool valid = curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK;
+  char* value = nullptr;
+  if (valid) {
+    valid = curl_url_get(parsed, CURLUPART_SCHEME, &value, 0) == CURLUE_OK
+        && (std::string(value) == "http" || std::string(value) == "https");
+    curl_free(value); value = nullptr;
+  }
+  if (valid) {
+    valid = curl_url_get(parsed, CURLUPART_HOST, &value, 0) == CURLUE_OK && value && *value;
+    curl_free(value); value = nullptr;
+  }
+  if (valid && curl_url_get(parsed, CURLUPART_PORT, &value, 0) == CURLUE_OK)
+    valid = std::string(value) != "0";
+  curl_free(value); value = nullptr;
+  for (auto part : {CURLUPART_USER, CURLUPART_PASSWORD, CURLUPART_FRAGMENT}) {
+    if (curl_url_get(parsed, part, &value, 0) == CURLUE_OK) valid = false;
+    curl_free(value); value = nullptr;
+  }
+  curl_url_cleanup(parsed);
+  return valid;
 }
 std::string digest(const void* bytes, size_t size) {
   unsigned char output[SHA256_DIGEST_LENGTH];
@@ -65,11 +86,15 @@ struct Signal {
   void notify() { const uint64_t value = 1; if (fd >= 0) (void)write(fd, &value, sizeof(value)); }
 };
 struct Decision {
-  AuthResult result = AuthResult::ACCESS_DENIED;
+  AuthResult result = AuthResult::INTERNAL_ERROR;
   bool authoritative = false;
   uint64_t expires_at = 0, fresh_ms = 0, max_age_ms = 0;
   std::string revision;
 };
+Decision denied() {
+  Decision value; value.result = AuthResult::ACCESS_DENIED; value.authoritative = true;
+  return value;
+}
 struct Job {
   std::string url, body;
   uint64_t started = monotonic_ms(), deadline = 0;
@@ -84,7 +109,7 @@ struct Job {
     if (current && !current()) return Decision();
     std::lock_guard<std::mutex> lock(mutex);
     if (finished) {
-      if (decision.expires_at && decision.expires_at <= wall_ms()) return Decision();
+      if (decision.expires_at && decision.expires_at <= wall_ms()) return denied();
       return decision;
     }
     Decision value;
@@ -466,8 +491,9 @@ struct RemoteAuthProvider::Impl {
   Decision authorize(const UserInfo& user, const std::string& topic, const char* action, const MQTTByteVector* payload,
                      std::shared_ptr<Job>* deferred = nullptr) {
     Decision rejected;
-    if (!initialized || (user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
-        (payload && payload->size() > payload_limit)) return rejected;
+    if (!initialized) return rejected;
+    if ((user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
+        (payload && payload->size() > payload_limit)) return denied();
     const auto body = [&]() {
       if (grpc_mode) {
         pb::AuthorizeRequest value;
@@ -689,8 +715,8 @@ AuthResult RemoteAuthProvider::check_publish(const UserInfo& user, const MQTTStr
 AuthResult RemoteAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
                                                    std::shared_ptr<AuthorizationRequest>& pending) {
   auto& p = *impl_;
-  if (!p.initialized) { pending.reset(); return AuthResult::ACCESS_DENIED; }
-  AuthResult result = AuthResult::ACCESS_DENIED;
+  if (!p.initialized) { pending.reset(); return AuthResult::INTERNAL_ERROR; }
+  AuthResult result = AuthResult::INTERNAL_ERROR;
   try {
     if (pending) result = pending->poll(user, topic);
     else {
@@ -699,7 +725,7 @@ AuthResult RemoteAuthProvider::check_delivery_access(const UserInfo& user, const
       result = p.authorize(user, from_mqtt_string(topic), "subscribe", nullptr, &job).result;
       if (result == AuthResult::PENDING) pending = std::make_shared<PendingDelivery>(job, user, topic);
     }
-  } catch (...) { result = AuthResult::ACCESS_DENIED; }
+  } catch (...) { result = AuthResult::INTERNAL_ERROR; }
   if (result != AuthResult::PENDING) {
     pending.reset();
     if (result == AuthResult::SUCCESS) ++p.stats.allowed;

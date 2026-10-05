@@ -79,7 +79,7 @@ int main() {
   policy.mode = 1;
   std::shared_ptr<AuthorizationRequest> ticket;
   auto destination = topic("malformed");
-  assert(await(destination, ticket, provider.check_delivery_access(user, destination, ticket)) == AuthResult::ACCESS_DENIED);
+  assert(await(destination, ticket, provider.check_delivery_access(user, destination, ticket)) == AuthResult::INTERNAL_ERROR);
   policy.mode = 0; destination = topic("outage");
   assert(await(destination, ticket, provider.check_delivery_access(user, destination, ticket)) == AuthResult::SUCCESS);
   const auto before = policy.calls.load();
@@ -87,7 +87,7 @@ int main() {
   policy.mode = 3; std::this_thread::sleep_for(milliseconds(150));
   assert(provider.check_delivery_access(user, destination, ticket) == AuthResult::SUCCESS);
   std::this_thread::sleep_for(milliseconds(650));
-  assert(await(destination, ticket, provider.check_delivery_access(user, destination, ticket)) == AuthResult::ACCESS_DENIED);
+  assert(await(destination, ticket, provider.check_delivery_access(user, destination, ticket)) == AuthResult::INTERNAL_ERROR);
 
   // A revision observed while an old ALLOW is in flight invalidates its waiter.
   provider.cleanup(); policy.mode = 0; policy.delay = 0;
@@ -98,7 +98,7 @@ int main() {
   assert(newer.check_delivery_access(user, destination, ticket) == AuthResult::PENDING);
   std::this_thread::sleep_for(milliseconds(50)); ++policy.version;
   std::this_thread::sleep_for(milliseconds(400));
-  assert(newer.check_delivery_access(user, destination, ticket) == AuthResult::ACCESS_DENIED);
+  assert(newer.check_delivery_access(user, destination, ticket) == AuthResult::INTERNAL_ERROR);
   newer.cleanup(); server->Shutdown();
   std::cout << "128 mixed decisions in " << stats.rpc_batches << " RPC batches; cache, outage expiry, malformed IDs and in-flight revocation passed\n";
 }

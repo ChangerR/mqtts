@@ -278,6 +278,13 @@ def run(binary, include_payload):
         valid_auth = config['auth']
         invalid_settings = []
         for setting, value in [('publish_payload', 'json'), ('max_payload_bytes', '-1'),
+                               ('authentication_url', 'http://'),
+                               ('authentication_url', 'http:///'),
+                               ('authentication_url', 'http://localhost:invalid/auth'),
+                               ('authentication_url', 'http://localhost:65536/auth'),
+                               ('authentication_url', 'http://localhost:0/auth'),
+                               ('authorization_url', 'https://user:secret@localhost/auth'),
+                               ('authorization_url', 'https://localhost/auth#fragment'),
                                ('max_payload_bytes', '1024oops'), ('max_payload_bytes', 0),
                                ('max_payload_bytes', 16777217), ('cache_max_age_ms', 300001),
                                ('cache_ttl_ms', 300001), ('http_workers', 0),
