@@ -1822,10 +1822,9 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
   MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
   bool strict_cluster_mode = false;
 
-  if (MQ_FAIL(subscribe_topic(topic_filter, client_id, qos))) {
-  } else if (router_client_.get() == NULL) {
-    ret = MQ_SUCCESS;
-  } else {
+  // Do not replace an existing local filter until router admission succeeds.
+  // A failed re-SUBSCRIBE must retain its previous QoS and routing entry.
+  if (router_client_.get() != NULL) {
     strict_cluster_mode = cluster_config_.cluster_enabled;
     request.server_id = server_id_;
     request.client_id = client_id;
@@ -1836,12 +1835,10 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
     } else {
       ret = router_client_->subscribe_async(request);
     }
-    if (MQ_SUCCESS != ret && strict_cluster_mode) {
-      (void)unsubscribe_topic(topic_filter, client_id);
-    }
+    if (MQ_SUCCESS != ret)
+      return ret;
   }
-
-  return ret;
+  return subscribe_topic(topic_filter, client_id, qos);
 }
 
 int GlobalSessionManager::unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id)

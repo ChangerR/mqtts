@@ -1133,6 +1133,8 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
       int subscribe_ret = MQ_SUCCESS;
       int rollback_ret = MQ_SUCCESS;
       bool local_added = false;
+      const bool existed = std::find(subscriptions_.begin(), subscriptions_.end(), topic) != subscriptions_.end();
+      DurableStore::Result previous;
       ReasonCode reason_code = ReasonCode::UnspecifiedError;
       auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
 
@@ -1176,10 +1178,11 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         auto stored = session_manager_->durable_store()->subscribe(
             from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), qos);
         if (!stored.ok) {
-          remove_subscription(topic);
+          if (!existed) remove_subscription(topic);
           local_added = false;
           reason_code = ReasonCode::UnspecifiedError;
         }
+        previous = std::move(stored);
       }
       if (local_added && session_manager_) {
         subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
@@ -1192,10 +1195,17 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
               "Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}",
               client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
           reason_code = ReasonCode::UnspecifiedError;
-          if (durable_epoch_)
-            session_manager_->durable_store()->unsubscribe(from_mqtt_string(client_id_),
-                                                           durable_epoch_, from_mqtt_string(topic));
-          rollback_ret = remove_subscription(topic);
+          if (durable_epoch_) {
+            auto* store = session_manager_->durable_store();
+            auto restored = previous.present
+                ? store->subscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), previous.subscriptions.front().second)
+                : store->unsubscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic));
+            if (!restored.ok) {
+              if (socket_) socket_->close();
+              return MQ_ERR_INTERNAL;
+            }
+          }
+          rollback_ret = existed ? MQ_SUCCESS : remove_subscription(topic);
           if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
             LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
                      client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);

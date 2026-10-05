@@ -13,6 +13,7 @@
 #include "mqtt_buffer.h"
 #include "mqtt_socket.h"
 #include "mqtt_session_manager_v2.h"
+#include "mqtt_router_rpc_client.h"
 #include <filesystem>
 #include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
@@ -447,6 +448,14 @@ void test_slow_reader_deadline_and_close()
     std::cout << "Slow reader send deadline and cancellation passed" << std::endl;
 }
 
+class RejectSubscriptionRouter : public MQTTRouterRpcClient {
+public:
+    explicit RejectSubscriptionRouter(MQTTAllocator* allocator)
+        : MQTTRouterRpcClient(allocator, RpcClientConfig()) {}
+    int subscribe(const SubscribeRequest&) override { return MQ_ERR_ROUTER_PROTOCOL; }
+    int client_disconnect_async(const ClientDisconnectRequest&) override { return MQ_SUCCESS; }
+};
+
 void test_persistent_connection_has_one_packet_id_owner()
 {
     char root[] = "/tmp/mqtts-live-guard-XXXXXX";
@@ -489,10 +498,38 @@ void test_persistent_connection_has_one_packet_id_owner()
             assert(recv(fds[1], &byte, 1, MSG_DONTWAIT) < 0 && errno == EAGAIN);
             assert(handler.send_publish(topic, data, 0) == MQ_SUCCESS);
             drain_socket(fds[1]);
+            mqtt::SubscribePacket subscribe(&allocator);
+            subscribe.packet_id = 1;
+            subscribe.subscriptions.emplace_back(topic, 1);
+            assert(handler.handle_subscribe(&subscribe) == MQ_SUCCESS);
+            drain_socket(fds[1]);
+            ClusterConfig cluster;
+            cluster.cluster_enabled = true;
+            cluster.server_id = "fixture";
+            cluster.server_token = "fixture-token";
+            cluster.forwarding_host = "127.0.0.1";
+            cluster.forwarding_port = 29091;
+            assert(context.manager->set_cluster_config(cluster) == MQ_SUCCESS);
+            context.manager->set_router_client(std::unique_ptr<MQTTRouterRpcClient>(
+                new RejectSubscriptionRouter(context.manager->get_allocator())));
+            subscribe.packet_id = 2;
+            subscribe.subscriptions.front().second = 0;
+            assert(handler.handle_subscribe(&subscribe) == MQ_SUCCESS);
+            uint8_t reply[128];
+            int count = recv(fds[1], reply, sizeof(reply), MSG_DONTWAIT);
+            assert(count > 0 && reply[0] == 0x90 && reply[count-1] == 0x80);
+            mqtt::MQTTVector<mqtt::MQTTString> filters{mqtt::MQTTSTLAllocator<mqtt::MQTTString>(&allocator)};
+            assert(handler.get_subscriptions(filters) == MQ_SUCCESS && filters.size() == 1);
+            std::vector<mqtt::SubscriberInfo> subscribers;
+            assert(context.manager->find_topic_subscribers(topic, subscribers) == MQ_SUCCESS);
+            assert(subscribers.size() == 1 && subscribers[0].qos == 1);
             close(fds[1]);
             return nullptr;
         }, &context);
         assert(task.join(2000) == 0);
+        auto resumed = manager.durable_store()->connect("persistent-reader", "owner", false, 60);
+        assert(resumed.ok && resumed.subscriptions.size() == 1 && resumed.subscriptions[0].second == 1);
+
     }
     std::filesystem::remove_all(root);
     std::cout << "Persistent connections reject alternate live QoS packet IDs" << std::endl;

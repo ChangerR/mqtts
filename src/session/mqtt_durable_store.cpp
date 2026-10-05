@@ -639,6 +639,9 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
     if (!s->subscriptions.count(filter))
       v.check_metadata(subscription_cost(filter), v.pending);
     size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
+    const auto previous = s->subscriptions.find(filter);
+    const bool existed = previous != s->subscriptions.end();
+    const uint8_t previous_qos = existed ? previous->second : 0;
     Encoder e;
     e.u8(SUBSCRIBE);
     e.text(client);
@@ -654,6 +657,9 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
           s->subscriptions[filter] = qos;
           v.recount_subscriptions();
           *r = success();
+          r->present = existed;
+          if (existed)
+            r->subscriptions.emplace_back(filter, previous_qos);
         });
     v.metadata_reserved += reservation;
     s->busy = true;
