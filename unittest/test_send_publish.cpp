@@ -12,6 +12,8 @@
 #include "mqtt_protocol_handler.h"
 #include "mqtt_buffer.h"
 #include "mqtt_socket.h"
+#include "mqtt_session_manager_v2.h"
+#include <filesystem>
 #include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
 
@@ -445,6 +447,57 @@ void test_slow_reader_deadline_and_close()
     std::cout << "Slow reader send deadline and cancellation passed" << std::endl;
 }
 
+void test_persistent_connection_has_one_packet_id_owner()
+{
+    char root[] = "/tmp/mqtts-live-guard-XXXXXX";
+    assert(mkdtemp(root));
+    {
+        mqtt::GlobalSessionManager manager;
+        assert(manager.pre_register_threads(1) == MQ_SUCCESS);
+        assert(manager.register_thread_manager(std::this_thread::get_id()));
+        assert(manager.finalize_thread_registration() == MQ_SUCCESS);
+        mqtt::PersistenceConfig config;
+        config.enabled = true;
+        config.path = std::string(root) + "/journal";
+        manager.configure_persistence(config);
+        struct Context { mqtt::GlobalSessionManager* manager; } context{&manager};
+        auto task = mqtt::runtime::current_runtime().spawn([](void* arg) -> void* {
+            auto& context = *static_cast<Context*>(arg);
+            int fds[2];
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+            MQTTAllocator allocator("persistent_live_guard", MQTTMemoryTag::MEM_TAG_CLIENT);
+            MQTTSocket socket(fds[0]);
+            socket.set_nonblocking();
+            mqtt::MQTTProtocolHandler handler(&allocator);
+            handler.set_session_manager(context.manager);
+            assert(handler.init(&socket, "127.0.0.1", 1883) == MQ_SUCCESS);
+            mqtt::ConnectPacket connect(&allocator);
+            connect.protocol_name = "MQTT";
+            connect.protocol_version = 5;
+            connect.client_id = "persistent-reader";
+            connect.username = "owner";
+            connect.flags.clean_start = true;
+            connect.properties.session_expiry_interval = 60;
+            assert(handler.handle_connect(&connect) == MQ_SUCCESS);
+            drain_socket(fds[1]);
+            mqtt::MQTTString topic("guard/topic", mqtt::MQTTStrAllocator(&allocator));
+            mqtt::MQTTByteVector data{mqtt::MQTTSTLAllocator<uint8_t>(&allocator)};
+            data.push_back('x');
+            assert(handler.send_publish(topic, data, 1) == MQ_ERR_PUBLISH_QOS);
+            assert(handler.send_publish(topic, data, 2) == MQ_ERR_PUBLISH_QOS);
+            char byte;
+            assert(recv(fds[1], &byte, 1, MSG_DONTWAIT) < 0 && errno == EAGAIN);
+            assert(handler.send_publish(topic, data, 0) == MQ_SUCCESS);
+            drain_socket(fds[1]);
+            close(fds[1]);
+            return nullptr;
+        }, &context);
+        assert(task.join(2000) == 0);
+    }
+    std::filesystem::remove_all(root);
+    std::cout << "Persistent connections reject alternate live QoS packet IDs" << std::endl;
+}
+
 int main()
 {
     std::cout << "Starting MQTT PUBLISH packet serialization tests\n" << std::endl;
@@ -460,6 +513,7 @@ int main()
         test_allocated_packet_nested_publish_returns_to_baseline();
         test_send_publish_socketpair_allocator_unchanged();
         test_slow_reader_deadline_and_close();
+        test_persistent_connection_has_one_packet_id_owner();
         
         std::cout << "\nAll PUBLISH serialization tests passed!" << std::endl;
         std::cout << "This verifies that MQTTProtocolHandler::send_publish() correctly serializes PUBLISH packets." << std::endl;

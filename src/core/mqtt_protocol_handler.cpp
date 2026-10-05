@@ -1723,6 +1723,12 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
     return MQ_ERR_SOCKET;
   }
 
+  // A persistent connection has exactly one Packet ID owner. Alternate live
+  // paths (including cluster forwarding) must never allocate an ID that a
+  // PUBACK could incorrectly apply to its durable queue.
+  if (durable_epoch_ && qos > 0)
+    return MQ_ERR_PUBLISH_QOS;
+
   // Recheck an existing subscription before delivery. A revoked account or
   // removed group member must not keep receiving through a stale subscription.
   if (auth_manager_) {
