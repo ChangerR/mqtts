@@ -6,8 +6,142 @@
 #include <filesystem>
 #include <thread>
 #include <vector>
+#include "mqtt_append_log.h"
 #include "mqtt_durable_store.h"
 using mqtt::DurableStore;
+
+static std::string checked(const std::string& data)
+{
+  mqtt::journal::Encoder e;
+  e.u32(mqtt::journal::checksum(data.data(), data.size()));
+  return e.data + data;
+}
+
+static void test_compaction(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.segment_bytes = 8192;
+  cfg.max_disk_bytes = 1024 * 1024;
+  cfg.checkpoint_interval_ms = 600000;
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    auto fast = store.connect("fast", "owner", false, 60);
+    assert(store.subscribe("slow", slow.epoch, "slow", 1).ok);
+    assert(store.subscribe("fast", fast.epoch, "fast", 1).ok);
+    assert(store.disconnect("slow", slow.epoch).ok);
+    // Sparse pending records share segments with much larger, consumed records.
+    // Without live-record compaction this exhausts the 384 KiB partition quota.
+    for (int i = 0; i < 200; ++i) {
+      assert(store.publish("slow", "pending-" + std::to_string(i), "writer", 0).ok);
+      assert(store.publish("fast", std::string(7000, 'x'), "writer", 0).ok);
+      auto batch = store.fetch("fast", fast.epoch, 0, 32);
+      assert(batch.ok && batch.deliveries.size() == 1);
+      assert(store.acknowledge("fast", fast.epoch, batch.deliveries[0].packet_id).ok);
+      if (i % 10 == 9)
+        store.checkpoint();
+    }
+    auto stats = store.statistics();
+    assert(stats.pending == 200 && stats.bytes == stats.unique_bytes);
+    assert(stats.message_partition_bytes[0] == 0 && stats.checkpoint_bytes < 16000);
+  }
+  {
+    DurableStore store(cfg);
+    auto slow = store.connect("slow", "owner", false, 60);
+    assert(slow.present && store.statistics().pending == 200);
+    size_t count = 0;
+    while (store.statistics().pending) {
+      auto batch = store.fetch("slow", slow.epoch, 0, 32);
+      assert(batch.ok && !batch.deliveries.empty());
+      for (const auto& d : batch.deliveries) {
+        assert(d.wire == "pending-" + std::to_string(count++) && d.dup);
+        assert(store.acknowledge("slow", slow.epoch, d.packet_id).ok);
+      }
+    }
+    assert(count == 200 && store.statistics().unique_bytes == 0);
+  }
+}
+
+static void test_v2_upgrade(const std::string& path)
+{
+  using namespace mqtt::journal;
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.checkpoint_interval_ms = 600000;
+  ensure_directory(path);
+  Encoder format;
+  format.text("MQTTS-PARTITION-LOG");
+  format.u32(2);
+  format.u32(1);
+  atomic_file(path + "/FORMAT", checked(format.data));
+  Location location;
+  {
+    AppendLog log(path + "/messages-0", cfg.segment_bytes, cfg.max_disk_bytes / 4);
+    Encoder message;
+    message.u8(8);
+    message.u64(2);
+    message.u64(0);
+    message.text("v2-payload");
+    message.u32(1);
+    message.text("legacy");
+    message.u64(1);
+    message.u32(7);
+    auto appended = log.append(message.data, [&](bool ok, const Location& p) {
+      assert(ok);
+      location = p;
+    });
+    assert(appended->wait());
+    assert(log.seal()->wait());
+  }
+  Encoder checkpoint;
+  checkpoint.text("MQTTS-CHECKPOINT-2");
+  checkpoint.u32(1);
+  checkpoint.u64(2);
+  checkpoint.u64(1);
+  checkpoint.u64(0);
+  checkpoint.u32(1);
+  checkpoint.u64(2);
+  checkpoint.u32(0);
+  checkpoint.u64(location.segment);
+  checkpoint.u64(location.offset);
+  checkpoint.u64(location.serial);
+  checkpoint.u32(location.size);
+  checkpoint.u32(1);
+  checkpoint.text("legacy");
+  checkpoint.text("owner");
+  checkpoint.u64(1);
+  checkpoint.u64(1);
+  checkpoint.u32(60);
+  checkpoint.u64(DurableStore::now_ms() + 60000);
+  checkpoint.u8(0);
+  checkpoint.u32(8);
+  checkpoint.u32(1);
+  checkpoint.text("topic");
+  checkpoint.u8(1);
+  checkpoint.u32(1);
+  checkpoint.u64(2);
+  checkpoint.u32(7);
+  atomic_file(path + "/CHECKPOINT", checked(checkpoint.data));
+  {
+    DurableStore store(cfg);
+    assert(store.statistics().pending == 1 && store.statistics().unique_bytes == 10);
+    store.checkpoint();
+    assert(store.statistics().message_partition_bytes[0] == 0);
+  }
+  {
+    auto marker = read_file(path + "/FORMAT", 4096).substr(4);
+    Decoder d(marker);
+    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 3);
+    DurableStore store(cfg);
+    auto c = store.connect("legacy", "owner", false, 60);
+    auto batch = store.fetch("legacy", c.epoch, 0, 32);
+    assert(c.present && batch.deliveries.size() == 1);
+    assert(batch.deliveries[0].wire == "v2-payload" && batch.deliveries[0].packet_id == 7);
+  }
+}
 int main()
 {
   char dir[] = "/tmp/mqtts-store-XXXXXX";
@@ -141,7 +275,10 @@ int main()
     auto fanout = store.publish("fanout/one", "one publication", "writer", 0);
     assert(fanout.ok);
     assert((fanout.targets == std::vector<std::string>{"alpha", "bravo", "tango", "zulu"}));
+    assert(store.statistics().bytes == store.statistics().unique_bytes * 4);
   }
+  test_compaction(std::string(dir) + "/compact");
+  test_v2_upgrade(std::string(dir) + "/upgrade");
   std::filesystem::remove_all(dir);
   puts(
       "PASS persistent restart, ownership, epochs, receive window, expiry, deduplication, quotas "

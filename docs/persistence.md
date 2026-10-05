@@ -97,7 +97,8 @@ The storage path is a **directory**, mode 0700. Files and the exclusive adjacent
 - `FORMAT`: checksummed engine version and immutable partition count.
 - `messages-N/00000000000000000001.log`: sequential message segments.
 - `sessions-N/...log`: independent session/control/ACK segments.
-- `CHECKPOINT`: checksummed session state, exact pending references and per-log cuts.
+- `CHECKPOINT`: checksummed session state, unique live payloads, exact pending
+  references and per-log cuts.
 
 Each record has a versioned magic, length, monotonic log serial, header CRC and body
 CRC. New segment directory entries are synced. Recovery truncates only an incomplete
@@ -105,17 +106,23 @@ final frame in the last segment; a complete checksum mismatch, damaged sealed fr
 missing post-checkpoint serial or missing referenced segment refuses startup.
 
 Checkpoints briefly freeze admission, fence and seal every log, and copy committed
-state and segment references. Admission resumes before snapshot encoding or disk I/O.
+state and shared live-payload references. Admission resumes before snapshot encoding or disk I/O.
 Event coroutines use cooperative lock acquisition and do not block their OS thread
 behind the snapshot. They do not treat the maintenance fence as quota exhaustion.
 The checkpoint is written to a temporary file, fsynced, renamed and its directory fsynced **before**
-eligible segments are unlinked. A live delivery pins its containing message segment;
-ACK gaps and offline readers cannot be reclaimed past. Session segments covered by
-the checkpoint can be removed. Crashing before/after checkpoint installation leaves
-either the older logs or the new checkpoint plus all its referenced segments usable.
+eligible segments are unlinked. Live payloads are compacted into the checkpoint once
+per publication, regardless of recipient count. A small pending message therefore
+does not pin the consumed records that shared its old segment. Every sealed message
+and session segment covered by the checkpoint can be removed, preserving exact ACK
+gaps and offline backlogs in the checkpoint. Crashing before/after installation leaves
+either the older logs or the new checkpoint plus all post-snapshot logs usable.
 Reclamation is queued on the owning log worker and cannot race new appends. Heartbeats
 are split into bounded records, including when clients use long identifiers.
 The snapshot admission pause remains part of sustained latency measurements.
+Compaction rewrites the live payload set on each checkpoint (up to the configured
+backlog bound); that disk bandwidth and the temporary snapshot memory must be included
+in capacity planning. `DurableStore::Statistics` exposes unique live payload bytes,
+checkpoint bytes and each message/session partition's disk usage.
 
 ## Bounds and configuration
 
@@ -148,7 +155,7 @@ cannot create an unbounded second copy of the backlog. Admission covers at most 
 requests / 16 MiB across writers and delivery results. MQTT connection/input buffers
 are additionally bounded by the connection and packet-size configuration.
 Metadata is limited to four times the I/O byte budget and a conservative checkpoint
-size reservation. Reducing limits below recovered data refuses startup rather than
+size reservation including unique live payload bytes. Reducing limits below recovered data refuses startup rather than
 discarding the backlog. Admission waits cooperatively for up to 500 ms; event threads
 do not block on disk. A topic/consumer hot spot can still create queueing.
 
@@ -163,10 +170,19 @@ while the broker is stopped; never copy just one segment or one checkpoint.
 
 ## Upgrade from the SQLite version
 
-The wire contract remains QoS 1, but `durable_sessions_contract` is now **2** because
+The wire contract remains QoS 1, but `durable_sessions_contract` is now **3** because
 the on-disk format changed. Existing configured basenames are deliberately preserved.
 An old SQLite file at that path refuses startup instead of starting an empty store at
 a different implicit path. Do not delete or rename the old volume to make startup pass.
+
+Native format 2 directories upgrade in place when the first compacted checkpoint is
+installed. The new reader accepts both checkpoint formats. The FORMAT marker is
+atomically advanced to 3 before installing the first version 3 checkpoint, so an old
+binary refuses the upgraded directory instead of misreading it. Back up the stopped
+store before upgrading; rollback requires restoring that backup. Format 3 reserves
+checkpoint space for all unique live payloads as well as metadata. If a custom
+format 2 backlog exceeds that budget, startup refuses without deleting records;
+raise `max_disk_bytes` or drain with the old binary before upgrading.
 
 Stop the old broker, retain a backup, build the native importer, then migrate into a
 new directory on the same machine with the Python standard-library export tool:

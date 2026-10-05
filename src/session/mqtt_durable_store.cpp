@@ -66,13 +66,6 @@ DurableStore::Result stale()
   r.error = "stale persistent connection";
   return r;
 }
-void location_write(Encoder& e, const Location& p)
-{
-  e.u64(p.segment);
-  e.u64(p.offset);
-  e.u64(p.serial);
-  e.u32(p.size);
-}
 Location location_read(Decoder& d)
 {
   Location p;
@@ -138,6 +131,7 @@ struct DurableStore::Impl
   {
     int64_t id = 0, expires = 0;
     size_t partition = 0;
+    size_t references = 0;
     Location location;
     std::string wire;
     bool committed = false;
@@ -177,8 +171,10 @@ struct DurableStore::Impl
   std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
-  size_t pending = 0, bytes = 0, requests = 0, request_bytes = 0, metadata_bytes = 0,
-         metadata_reserved = 0;
+  uint32_t format_version = 3;
+  std::atomic<size_t> checkpoint_bytes{0};
+  size_t pending = 0, bytes = 0, unique_bytes = 0, requests = 0, request_bytes = 0,
+         metadata_bytes = 0, metadata_reserved = 0;
   std::shared_ptr<std::atomic<size_t>> delivery_bytes{new std::atomic<size_t>(0)};
   std::atomic<size_t> subscriptions{0};
   std::atomic<size_t> discarded_denied{0}, discarded_oversize{0}, discarded_malformed{0};
@@ -306,20 +302,27 @@ struct DurableStore::Impl
     subscriptions.store(count);
     index_dirty = true;
   }
-  void check_metadata(size_t extra, size_t deliveries)
+  void check_metadata(size_t extra, size_t deliveries, size_t payload = 0)
   {
-    extra += metadata_reserved;
+    extra += metadata_reserved + unique_bytes + payload;
     uint64_t budget = config.max_disk_bytes / 8, overhead = 1024 + config.partitions * 16;
     if (extra > budget || metadata_bytes > budget - extra ||
         metadata_bytes + extra > budget - std::min(budget, overhead) ||
         deliveries > (budget - overhead - metadata_bytes - extra) / 80)
       throw std::runtime_error("persistent metadata/checkpoint capacity exhausted");
-    if (metadata_bytes + extra > config.max_request_bytes * 4ULL)
+    if (metadata_bytes + extra - unique_bytes - payload > config.max_request_bytes * 4ULL)
       throw std::runtime_error("persistent metadata memory limit");
+  }
+  void reference(const std::shared_ptr<Message>& message)
+  {
+    if (!message->references++)
+      unique_bytes += message->wire.size();
   }
   void drop(const std::shared_ptr<Session>& s, std::map<int64_t, DeliveryState>::iterator entry)
   {
     auto& delivery = entry->second;
+    if (!--delivery.message->references)
+      unique_bytes -= delivery.message->wire.size();
     bytes -= delivery.message->wire.size();
     s->bytes -= delivery.message->wire.size();
     --pending;
@@ -417,13 +420,16 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
         throw std::runtime_error("journal FORMAT missing from nonempty directory");
       Encoder e;
       e.text("MQTTS-PARTITION-LOG");
-      e.u32(2);
+      e.u32(format_version);
       e.u32(uint32_t(config.partitions));
       journal::atomic_file(config.path + "/FORMAT", checked(e.data));
     } else {
       auto body = unchecked(format);
       Decoder d(body);
-      if (d.text() != "MQTTS-PARTITION-LOG" || d.u32() != 2 || d.u32() != config.partitions)
+      if (d.text() != "MQTTS-PARTITION-LOG")
+        throw std::runtime_error("invalid journal format");
+      format_version = d.u32();
+      if ((format_version != 2 && format_version != 3) || d.u32() != config.partitions)
         throw std::runtime_error(
             "journal format/partition count differs; offline migration required");
       d.end();
@@ -479,6 +485,12 @@ DurableStore::Statistics DurableStore::statistics() const
   s.sessions = impl_->sessions.size();
   s.pending = impl_->pending;
   s.bytes = impl_->bytes;
+  s.unique_bytes = impl_->unique_bytes;
+  s.checkpoint_bytes = impl_->checkpoint_bytes.load();
+  for (const auto& log : impl_->messages)
+    s.message_partition_bytes.push_back(log->disk_bytes());
+  for (const auto& log : impl_->states)
+    s.session_partition_bytes.push_back(log->disk_bytes());
   s.discarded_denied = impl_->discarded_denied.load();
   s.discarded_oversize = impl_->discarded_oversize.load();
   s.discarded_malformed = impl_->discarded_malformed.load();
@@ -773,7 +785,7 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
     auto targets = v.match(topic);
     if (targets.empty())
       return {};
-    v.check_metadata(0, v.pending + targets.size());
+    v.check_metadata(0, v.pending + targets.size(), wire.size());
     if (targets.size() > v.config.max_messages ||
         v.pending > v.config.max_messages - targets.size() ||
         wire.size() > v.config.max_bytes / targets.size() ||
@@ -820,6 +832,7 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
       entry.message = message;
       entry.packet = packets[i];
       s->pending.emplace(message->id, entry);
+      v.reference(message);
       if (entry.packet) {
         s->packets[entry.packet] = message->id;
         s->next_packet = uint16_t(entry.packet % 65535 + 1);
@@ -1179,6 +1192,7 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     entry.attempted = entry.started = packet != 0;
     if (!s->pending.emplace(m->id, entry).second)
       throw std::runtime_error("duplicate journal message identity");
+    reference(m);
     ++pending;
     bytes += m->wire.size();
     s->bytes += m->wire.size();
@@ -1192,8 +1206,12 @@ void DurableStore::Impl::restore()
   if (!file.empty()) {
     auto body = unchecked(file);
     Decoder d(body);
-    if (d.text() != "MQTTS-CHECKPOINT-2" || d.u32() != config.partitions)
+    const auto magic = d.text();
+    const bool embedded = magic == "MQTTS-CHECKPOINT-3";
+    if ((!embedded && magic != "MQTTS-CHECKPOINT-2") || (embedded && format_version < 3) ||
+        d.u32() != config.partitions)
       throw std::runtime_error("checkpoint format/partition mismatch");
+    checkpoint_bytes = file.size();
     next_id = d.u64();
     for (size_t p = 0; p < config.partitions; ++p) {
       message_cuts[p] = d.u64();
@@ -1206,10 +1224,22 @@ void DurableStore::Impl::restore()
     for (uint32_t i = 0; i < count; ++i) {
       int64_t id = d.u64();
       size_t partition = d.u32();
-      auto location = location_read(d);
-      if (partition >= messages.size() || location.serial > message_cuts[partition])
+      if (partition >= messages.size() || id <= 0 || uint64_t(id) > next_id)
         throw std::runtime_error("invalid checkpoint partition/cut");
-      auto m = decode_message(messages[partition]->read(location), partition, location, false);
+      std::shared_ptr<Message> m;
+      if (embedded) {
+        m = std::make_shared<Message>();
+        m->id = id;
+        m->partition = partition;
+        m->expires = d.u64();
+        m->wire = d.text();
+        m->committed = true;
+      } else {
+        auto location = location_read(d);
+        if (location.serial > message_cuts[partition])
+          throw std::runtime_error("invalid checkpoint message cut");
+        m = decode_message(messages[partition]->read(location), partition, location, false);
+      }
       if (m->id != id || !referenced.emplace(id, m).second)
         throw std::runtime_error("checkpoint message identity mismatch");
     }
@@ -1252,6 +1282,7 @@ void DurableStore::Impl::restore()
         entry.attempted = entry.started = packet != 0;
         if (!s->pending.emplace(id, entry).second)
           throw std::runtime_error("duplicate checkpoint delivery");
+        reference(entry.message);
         ++pending;
         bytes += entry.message->wire.size();
         s->bytes += entry.message->wire.size();
@@ -1366,14 +1397,13 @@ void DurableStore::Impl::checkpoint()
       frozen = false;
     }
     Encoder e;
-    e.text("MQTTS-CHECKPOINT-2");
+    e.text("MQTTS-CHECKPOINT-3");
     e.u32(uint32_t(config.partitions));
     e.u64(snapshot_id);
     for (size_t p = 0; p < config.partitions; ++p) {
       e.u64(message_fences[p]);
       e.u64(state_fences[p]);
     }
-    std::vector<std::set<uint64_t>> retained(messages.size());
     std::map<int64_t, std::shared_ptr<Message>> live;
     for (const auto& s : snapshot)
       for (const auto& delivery : s.pending)
@@ -1385,8 +1415,8 @@ void DurableStore::Impl::checkpoint()
         throw std::runtime_error("uncommitted checkpoint message");
       e.u64(m.id);
       e.u32(uint32_t(m.partition));
-      location_write(e, m.location);
-      retained[m.partition].insert(m.location.segment);
+      e.u64(m.expires);
+      e.text(m.wire);
     }
     e.u32(uint32_t(snapshot.size()));
     for (const auto& s : snapshot) {
@@ -1411,13 +1441,30 @@ void DurableStore::Impl::checkpoint()
     }
     if (e.data.size() + 4 > config.max_disk_bytes / 8)
       throw std::runtime_error("checkpoint exceeds reserved disk budget");
+    if (format_version < 3) {
+      // Upgrade the marker first: old readers must refuse a compacted store.
+      // New readers accept a v3 marker with either checkpoint generation after
+      // a crash between the two atomic replacements.
+      Encoder marker;
+      marker.text("MQTTS-PARTITION-LOG");
+      marker.u32(3);
+      marker.u32(uint32_t(config.partitions));
+      journal::atomic_file(config.path + "/FORMAT", checked(marker.data));
+      format_version = 3;
+    }
     journal::atomic_file(config.path + "/CHECKPOINT", checked(e.data));
+    checkpoint_bytes = e.data.size() + 4;
     message_cuts = message_fences;
     state_cuts = state_fences;
     // Reclamation runs on each owning writer, serialized with new appends.
     for (size_t p = 0; p < config.partitions; ++p) {
-      messages[p]->prune(message_fences[p], retained[p]);
+      const size_t before = messages[p]->disk_bytes() + states[p]->disk_bytes();
+      messages[p]->prune(message_fences[p], {});
       states[p]->prune(state_fences[p], {});
+      LOG_INFO(
+          "Durable checkpoint partition {}: before_bytes {}, message_bytes {}, "
+          "session_bytes {}, checkpoint_bytes {}",
+          p, before, messages[p]->disk_bytes(), states[p]->disk_bytes(), checkpoint_bytes.load());
     }
   } catch (...) {
     std::lock_guard<std::mutex> guard(mutex);

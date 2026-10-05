@@ -78,6 +78,8 @@ class DurableStore
   struct Statistics
   {
     size_t sessions = 0, pending = 0, bytes = 0;
+    size_t unique_bytes = 0, checkpoint_bytes = 0;
+    std::vector<size_t> message_partition_bytes, session_partition_bytes;
     size_t discarded_denied = 0, discarded_oversize = 0, discarded_malformed = 0;
   };
   Statistics statistics() const;
