@@ -14,7 +14,7 @@ class MQTTSocket
   int listen(const char* ip, int port, bool reuse = true, int backlog = 128);
   int accept(MQTTSocket*& client);  // 返回具体错误码
   int connect(const char* ip, int port);
-  int send(const uint8_t* buf, int len);
+  int send(const uint8_t* buf, int len, int timeout_ms = 5000);
   int send(const mqtt::MQTTBuffer& buffer);
   int recv(char* buf, int& len);
   int recv(mqtt::MQTTBuffer& buffer, int& len);

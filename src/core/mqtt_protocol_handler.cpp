@@ -1638,6 +1638,9 @@ int MQTTProtocolHandler::send_pingresp()
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)
 {
   durable_running_ = false;
+  // The pump may be waiting for a slow reader. Shut down I/O before joining it.
+  if (socket_)
+    socket_->close();
   while (durable_task_.is_valid() && !durable_task_.is_finished())
     runtime::current_runtime().wait(-1, 0, 5);
   durable_task_.release();

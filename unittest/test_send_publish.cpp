@@ -1,4 +1,6 @@
 #include <cassert>
+#include <chrono>
+#include "mqtt_runtime.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -412,6 +414,37 @@ void test_send_publish_socketpair_allocator_unchanged()
               << " bytes)" << std::endl;
 }
 
+void test_slow_reader_deadline_and_close()
+{
+    for (bool cancel : {false, true}) {
+        int fds[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        MQTTSocket socket(fds[0]);
+        socket.set_nonblocking();
+        socket.set_buffer_size(4096, 4096);
+        struct Send {
+            MQTTSocket* socket;
+            int result = MQ_SUCCESS;
+            std::vector<uint8_t> payload = std::vector<uint8_t>(1024 * 1024, 'x');
+        } send{&socket};
+        auto started = std::chrono::steady_clock::now();
+        auto task = mqtt::runtime::current_runtime().spawn([](void* arg) -> void* {
+            auto& send = *static_cast<Send*>(arg);
+            send.result = send.socket->send(send.payload.data(), send.payload.size(), 150);
+            return nullptr;
+        }, &send);
+        assert(!task.is_finished());
+        if (cancel) socket.close();
+        assert(task.join(1000) == 0);
+        auto elapsed = std::chrono::steady_clock::now() - started;
+        assert(send.result != MQ_SUCCESS && !socket.is_connected());
+        assert(elapsed < std::chrono::milliseconds(800));
+        if (!cancel) assert(elapsed >= std::chrono::milliseconds(100));
+        close(fds[1]);
+    }
+    std::cout << "Slow reader send deadline and cancellation passed" << std::endl;
+}
+
 int main()
 {
     std::cout << "Starting MQTT PUBLISH packet serialization tests\n" << std::endl;
@@ -426,6 +459,7 @@ int main()
         test_publish_serialization_large_payload();
         test_allocated_packet_nested_publish_returns_to_baseline();
         test_send_publish_socketpair_allocator_unchanged();
+        test_slow_reader_deadline_and_close();
         
         std::cout << "\nAll PUBLISH serialization tests passed!" << std::endl;
         std::cout << "This verifies that MQTTProtocolHandler::send_publish() correctly serializes PUBLISH packets." << std::endl;
