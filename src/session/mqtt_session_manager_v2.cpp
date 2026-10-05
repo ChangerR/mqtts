@@ -993,6 +993,13 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
 {
+  // Inbound topic aliases are not supported (CONNACK advertises a maximum of
+  // zero). Reject unresolved/invalid topics before they can enter the journal,
+  // including the WebSocket bridge's publishing path.
+  if (topic.empty() || topic.find('+') != MQTTString::npos ||
+      topic.find('#') != MQTTString::npos || topic.find('\0') != MQTTString::npos ||
+      packet.properties.topic_alias != 0)
+    return MQ_ERR_PUBLISH_TOPIC;
   std::vector<std::string> persisted_targets;
   if (durable_store_) {
     if (packet.qos > 1)

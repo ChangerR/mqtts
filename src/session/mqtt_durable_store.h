@@ -67,12 +67,16 @@ class DurableStore
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
   Result acknowledge(const std::string& client, uint64_t epoch, uint16_t packet_id,
                      bool wait_for_commit = true);
+  enum class DiscardReason { NotAuthorized, PacketTooLarge, Malformed };
+  Result discard(const std::string& client, uint64_t epoch, uint16_t packet_id,
+                 DiscardReason reason);
   bool has_subscriptions() const;
   uint32_t max_session_expiry() const;
   static int64_t now_ms();
   struct Statistics
   {
     size_t sessions = 0, pending = 0, bytes = 0;
+    size_t discarded_denied = 0, discarded_oversize = 0, discarded_malformed = 0;
   };
   Statistics statistics() const;
   // Maintenance/administration API; performs blocking disk work outside MQTT threads.

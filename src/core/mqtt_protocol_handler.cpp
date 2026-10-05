@@ -1810,40 +1810,82 @@ void MQTTProtocolHandler::pump_durable()
         fetch_again = true;
         continue;
       }
-      for (const auto& delivery : batch.deliveries) {
-        if (!durable_running_)
-          break;
-        MQTTParser decoder(allocator_);
+      // Fetch bounds wire bytes globally. Decode with a separate, proportional
+      // budget so a publisher cannot exhaust the receiver's small client pool.
+      size_t wire_bytes = 0;
+      for (const auto& delivery : batch.deliveries)
+        wire_bytes += delivery.wire.size();
+      MQTTAllocator delivery_allocator("durable_delivery", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                       wire_bytes * 16 + 65536);
+      auto cleanup = [&](PublishPacket* p) {
+        if (p) {
+          p->~PublishPacket();
+          delivery_allocator.deallocate(p, sizeof(PublishPacket));
+        }
+      };
+      using OwnedPublish = std::unique_ptr<PublishPacket, decltype(cleanup)>;
+      std::vector<OwnedPublish> packets;
+      std::vector<std::shared_ptr<auth::AuthorizationRequest>> authorizations(
+          batch.deliveries.size());
+      std::vector<auth::AuthResult> decisions(batch.deliveries.size(), auth::AuthResult::SUCCESS);
+      // Queue the bounded batch before awaiting any one decision. Remote auth
+      // workers can coalesce these into BatchAuthorize without reordering sends.
+      for (size_t i = 0; i < batch.deliveries.size(); ++i) {
+        const auto& wire = batch.deliveries[i].wire;
+        MQTTParser decoder(&delivery_allocator);
         decoder.set_protocol_version_hint(5);
         Packet* raw = nullptr;
-        if (decoder.parse_packet(reinterpret_cast<const uint8_t*>(delivery.wire.data()),
-                                 delivery.wire.size(), &raw) != MQ_SUCCESS ||
-            !raw || raw->type != PacketType::PUBLISH) {
-          LOG_ERROR("Invalid durable PUBLISH record: sequence {}, size {}, first byte {}",
-                    delivery.sequence, delivery.wire.size(),
-                    delivery.wire.empty() ? 0 : int(uint8_t(delivery.wire[0])));
-          socket_->close();
-          durable_running_ = false;
-          break;
-        }
-        auto* packet = static_cast<PublishPacket*>(raw);
-        auto cleanup = [this](PublishPacket* p) {
-          p->~PublishPacket();
-          allocator_->deallocate(p, sizeof(PublishPacket));
-        };
-        std::unique_ptr<PublishPacket, decltype(cleanup)> owned(packet, cleanup);
-        auto destroy = [&] { owned.reset(); };
-        auth::AuthResult allowed = auth::AuthResult::SUCCESS;
-        if (auth_manager_) {
-          allowed = auth::AuthResult::ACCESS_DENIED;
+        int parsed = wire.empty() || (uint8_t(wire[0]) >> 4) != 3
+                         ? MQ_ERR_PACKET_INVALID
+                         : decoder.parse_packet(reinterpret_cast<const uint8_t*>(wire.data()),
+                                                wire.size(), &raw);
+        packets.emplace_back(parsed == MQ_SUCCESS ? static_cast<PublishPacket*>(raw) : nullptr,
+                             cleanup);
+        if (packets.back() && auth_manager_) {
+          decisions[i] = auth::AuthResult::ACCESS_DENIED;
           if (current_auth_context_)
-            auth_manager_->check_topic_access(*current_auth_context_, packet->topic_name,
-                                              auth::Permission::READ, allowed);
+            auth_manager_->check_delivery(*current_auth_context_, packets.back()->topic_name,
+                                          authorizations[i], decisions[i]);
         }
+      }
+      for (size_t i = 0; i < batch.deliveries.size(); ++i) {
+        const auto& delivery = batch.deliveries[i];
+        if (!durable_running_)
+          break;
+        auto* packet = packets[i].get();
+        auto discard = [&](DurableStore::DiscardReason reason) {
+          auto removed = store->discard(from_mqtt_string(client_id_), durable_epoch_,
+                                        delivery.packet_id, reason);
+          fetch_again = true;
+          if (removed.ok)
+            cursor = delivery.sequence;
+          return removed.ok;
+        };
+        if (!packet) {
+          if (!discard(DurableStore::DiscardReason::Malformed))
+            break;
+          continue;
+        }
+        while (decisions[i] == auth::AuthResult::PENDING && durable_running_ &&
+               socket_->is_connected()) {
+          runtime::current_runtime().wait(-1, 0, 1);
+          auth_manager_->check_delivery(*current_auth_context_, packet->topic_name,
+                                        authorizations[i], decisions[i]);
+        }
+        if (!durable_running_ || !socket_->is_connected())
+          break;
+        auto allowed = decisions[i];
         if (allowed != auth::AuthResult::SUCCESS) {
-          // Retain the record across authorization outages/revocation; never use
-          // a historical grant to bypass current access checks during replay.
-          destroy();
+          if (allowed == auth::AuthResult::ACCESS_DENIED ||
+              allowed == auth::AuthResult::TOPIC_ACCESS_DENIED ||
+              allowed == auth::AuthResult::INVALID_CREDENTIALS ||
+              allowed == auth::AuthResult::USER_NOT_FOUND) {
+            if (!discard(DurableStore::DiscardReason::NotAuthorized))
+              break;
+            continue;
+          }
+          // Transport failures, throttling and invalidated in-flight decisions
+          // do not revoke an existing message. Retry after a bounded pause.
           runtime::current_runtime().wait(-1, 0, 250);
           fetch_again = true;
           break;
@@ -1851,7 +1893,6 @@ void MQTTProtocolHandler::pump_durable()
         if (delivery.expires && delivery.expires <= DurableStore::now_ms()) {
           auto ack =
               store->acknowledge(from_mqtt_string(client_id_), durable_epoch_, delivery.packet_id);
-          destroy();
           if (ack.ok)
             cursor = delivery.sequence;
           fetch_again = true;
@@ -1863,14 +1904,23 @@ void MQTTProtocolHandler::pump_durable()
         if (delivery.expires)
           packet->properties.message_expiry_interval =
               uint32_t((delivery.expires - DurableStore::now_ms() + 999) / 1000);
-        MQTTParser encoder(allocator_);
+        MQTTParser encoder(&delivery_allocator);
         encoder.set_protocol_version_hint(negotiated_protocol_version_);
-        MQTTBuffer output(allocator_);
+        MQTTBuffer output(&delivery_allocator);
         int ret = encoder.serialize_publish(packet, output);
-        destroy();
-        if (ret != MQ_SUCCESS || output.size() > maximum_packet_size_ ||
-            send_data_with_lock(reinterpret_cast<const char*>(output.data()), output.size()) !=
-                MQ_SUCCESS) {
+        packets[i].reset();
+        if (ret != MQ_SUCCESS) {
+          if (!discard(DurableStore::DiscardReason::Malformed))
+            break;
+          continue;
+        }
+        if (output.size() > maximum_packet_size_) {
+          if (!discard(DurableStore::DiscardReason::PacketTooLarge))
+            break;
+          continue;
+        }
+        if (send_data_with_lock(reinterpret_cast<const char*>(output.data()), output.size()) !=
+            MQ_SUCCESS) {
           socket_->close();
           durable_running_ = false;
           break;

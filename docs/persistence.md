@@ -211,3 +211,18 @@ use SIGKILL around committed publications and checkpoints, verify current ACL re
 and inject actual `write`/`fdatasync` errors through a **test-only** preload library.
 A stalled message partition test verifies that a different partition continues to
 publish/deliver and that no success is returned before the stalled flush completes.
+
+Delivery failures are handled per record. An authoritative current READ denial or a
+packet larger than MQTT 5 Maximum Packet Size is durably removed before continuing
+with later messages. The latter follows MQTT-3.1.2-25. A malformed stored PUBLISH is
+also removed with a `malformed` diagnostic; inbound empty topics, wildcard topics
+and unsupported topic aliases are rejected before journal admission. Each removal
+logs the client, epoch, packet ID and reason and increments the corresponding
+`DurableStore::Statistics.discarded_*` counter. Payloads and credentials are not logged.
+Authorization timeouts, backend outages, throttling and stale revision responses
+retain the message and retry; they are not interpreted as a permanent denial.
+Restoring access does not resurrect deliveries already rejected by an authoritative
+policy decision. Delivery authorization queues a bounded fetch batch before awaiting
+results, allowing the independent RPC workers to use Protobuf BatchAuthorize.
+Decoded packets use a separate bounded budget proportional to the globally reserved
+wire bytes, so a large accepted publication cannot exhaust a receiver's client pool.

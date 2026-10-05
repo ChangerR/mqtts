@@ -14,9 +14,10 @@ from http_auth_cache_integration import Fixture
 from http_auth_integration import Client, packet, utf
 
 class DurableClient(Client):
-    def connect_session(self, name, clean=False, expiry=60, receive=32, owner=None):
+    def connect_session(self, name, clean=False, expiry=60, receive=32, owner=None, maximum=None):
         self.name=name
         props=b'\x11'+struct.pack('!I',expiry)+b'\x21'+struct.pack('!H',receive)
+        if maximum is not None: props+=b'\x27'+struct.pack('!I',maximum)
         body=utf('MQTT')+bytes([self.version,0xc2 if clean else 0xc0,0,60])
         if self.version==5: body+=bytes([len(props)])+props
         self.send(packet(0x10,body+utf(name)+utf(owner or name)+utf('test-password')))
@@ -59,8 +60,9 @@ def client(f,name,version=5,clean=False,expiry=60,receive=32,owner=None,websocke
     assert (code==0)==(expected==0),(name,code,expected)
     return c,present
 
-def restart(f):
+def restart(f, before_start=None):
     f.proc.kill();f.proc.wait()
+    if before_start: before_start()
     f.proc=subprocess.Popen([f.binary,'-c',str(f.root/'config.json')],stdout=f.log,stderr=f.log,env=f.process_env)
     end=time.monotonic()+8
     while True:
@@ -97,7 +99,8 @@ def run(binary, fault_library):
             f.revoked.add('reader');f.revision='revoked';time.sleep(.25)
             data=f.payload(w,101);w.pub('fixture/revoked',data);r.quiet()
             f.revoked.clear();f.revision='restored';time.sleep(.35)
-            assert r.delivery()[1]==data
+            r.quiet()  # Authoritative denial durably removes the revoked delivery.
+            data=f.payload(w,104);w.pub('fixture/restored',data);assert r.delivery()[1]==data
             r.quiet()  # Allow asynchronous ACK deletion to commit before takeover.
             # A replacement socket must not be unregistered by the old one.
             for _ in range(8):

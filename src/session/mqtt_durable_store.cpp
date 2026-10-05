@@ -181,6 +181,7 @@ struct DurableStore::Impl
          metadata_reserved = 0;
   std::shared_ptr<std::atomic<size_t>> delivery_bytes{new std::atomic<size_t>(0)};
   std::atomic<size_t> subscriptions{0};
+  std::atomic<size_t> discarded_denied{0}, discarded_oversize{0}, discarded_malformed{0};
   std::map<std::string, std::shared_ptr<Session>> sessions;
   std::vector<TopicNode> index;
   std::vector<std::unique_ptr<AppendLog>> messages, states;
@@ -478,6 +479,9 @@ DurableStore::Statistics DurableStore::statistics() const
   s.sessions = impl_->sessions.size();
   s.pending = impl_->pending;
   s.bytes = impl_->bytes;
+  s.discarded_denied = impl_->discarded_denied.load();
+  s.discarded_oversize = impl_->discarded_oversize.load();
+  s.discarded_malformed = impl_->discarded_malformed.load();
   return s;
 }
 void DurableStore::checkpoint()
@@ -943,6 +947,7 @@ DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64
         auto found = s->pending.find(p->second);
         if (found == s->pending.end() || !found->second.attempted)
           return {};
+        r->present = true;
         if (found->second.ack_pending) {
           if (wait_for_commit)
             throw Deferred();
@@ -970,6 +975,29 @@ DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64
         return ticket;
       },
       wait_for_commit);
+}
+
+DurableStore::Result DurableStore::discard(const std::string& client, uint64_t epoch,
+                                           uint16_t packet_id, DiscardReason reason)
+{
+  // The exact delivery's removal is durable before the pump advances. Never
+  // count a failed disk write or an already removed packet as a discard.
+  auto result = acknowledge(client, epoch, packet_id);
+  if (result.ok && result.present) {
+    const char* label = "malformed";
+    if (reason == DiscardReason::NotAuthorized) {
+      ++impl_->discarded_denied;
+      label = "not_authorized";
+    } else if (reason == DiscardReason::PacketTooLarge) {
+      ++impl_->discarded_oversize;
+      label = "packet_too_large";
+    } else {
+      ++impl_->discarded_malformed;
+    }
+    LOG_WARN("Durable delivery discarded: client {}, epoch {}, packet {}, reason {}", client, epoch,
+             packet_id, label);
+  }
+  return result;
 }
 
 void DurableStore::Impl::replay_control(const std::string& data, bool acknowledgements)

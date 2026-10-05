@@ -23,6 +23,7 @@ class Fixture:
         self.binary, self.settings = binary, settings
         self.token = secrets.token_hex(32)
         self.counts, self.revoked = Counter(), set()
+        self.denied_deliveries = set()
         self.requests_by_user = Counter()
         self.revision = 'initial'
         self.delay, self.mode, self.consent = 0, 'normal', True
@@ -54,6 +55,8 @@ class Fixture:
                     if self.path == '/authentication':
                         allowed &= req.get('password') == 'test-password'
                     elif self.path == '/authorization':
+                        if req.get('action') == 'subscribe':
+                            allowed &= (name, topic) not in fixture.denied_deliveries
                         allowed &= topic.startswith('fixture/') and ((fixture.wildcards and req.get('action') == 'subscribe') or ('#' not in topic and '+' not in topic))
                         if req.get('action') == 'publish':
                             raw = base64.b64decode(req['payload'], validate=True)
