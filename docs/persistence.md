@@ -288,6 +288,15 @@ TCP and WebSocket publishers both enter the same durable publication path. Persi
 advertises maximum QoS 1 and rejects QoS 2 publication / persistent WebSocket sessions.
 Disk loss, expired records and intentional session reset remain outside this guarantee.
 
+Enabling `persistence.enabled` is a **breaking change for existing QoS 2 publishers**,
+including MQTT 3 clients and topics with no durable subscribers. Configure those
+publishers for QoS 1 before enabling this mode, or keep their workload on a separate
+broker with persistence disabled. MQTT 5 advertises Maximum QoS 1 and disconnects an
+offending publisher with `0x9B QoS not supported`; MQTT 3 cannot negotiate this limit
+and closes the connection without acknowledging the QoS 2 publication. TCP and
+WebSocket behave consistently. No publication is silently downgraded: that would
+promise QoS 2 without its durable four-step handshake and duplicate-suppression state.
+
 Native tests cover journal framing/corruption, torn tails, missing records, rotation,
 checkpoint reclamation, exact ACK gaps, more than 65,535 pending messages, Packet ID
 exhaustion/reuse, owner/epoch fencing, migration and capacity refusal. Real MQTT tests

@@ -855,6 +855,11 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   }
 
   if (MQ_SUCC(ret) && !auth_denied) {
+    if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
+      if (negotiated_protocol_version_ >= 5)
+        (void)send_disconnect(ReasonCode::QoSNotSupported);
+      return MQ_ERR_PUBLISH_QOS;
+    }
     LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
               client_ip_.c_str(), client_port_, packet->payload.size());
 

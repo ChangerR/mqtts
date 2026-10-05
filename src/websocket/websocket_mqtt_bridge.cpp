@@ -885,6 +885,18 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, c
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
+    if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
+      const auto protocol = client_protocol_versions_.find(client_id);
+      if (protocol != client_protocol_versions_.end() && protocol->second >= 5) {
+        mqtt::DisconnectPacket reply(allocator_);
+        reply.type = mqtt::PacketType::DISCONNECT;
+        reply.reason_code = mqtt::ReasonCode::QoSNotSupported;
+        (void)send_serialized_mqtt_packet(client_id, reply);
+      }
+      auto handler = handlers_.find(client_id);
+      if (handler != handlers_.end()) handler->second->close_connection();
+      return MQ_ERR_PUBLISH_QOS;
+    }
     std::string topic = mqtt::from_mqtt_string(packet->topic_name);
     std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
     int ret =
@@ -964,6 +976,9 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
             break;
         case mqtt::PacketType::PINGRESP:
             ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::DISCONNECT:
+            ret = parser.serialize_disconnect(reinterpret_cast<const mqtt::DisconnectPacket*>(&packet), serialized);
             break;
         case mqtt::PacketType::PUBACK:
             ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet), serialized);

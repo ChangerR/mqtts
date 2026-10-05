@@ -162,6 +162,26 @@ def overflow_isolation(binary):
     print('PASS isolated overflow preserves old backlog, healthy fanout, durable gap and explicit reset', flush=True)
 
 
+def qos_two_boundary(binary):
+    for websocket in (False, True):
+        for version in (4, 5):
+            with Fixture(binary, persistence={}) as f:
+                writer, _ = client(f, 'writer', version=version, clean=True, expiry=0, websocket=websocket)
+                # No durable subscriptions exist; the advertised mode-wide limit still applies.
+                writer.send(packet(0x34, utf('fixture/qos2') + b'\0\7' + (b'\0' if version == 5 else b'') + f.payload(writer, 0)))
+                if version == 5:
+                    head, body = writer.read()
+                    assert head == 0xe0 and body[0] == 0x9b, (head, body)
+                else:
+                    try:
+                        received = writer.read()
+                    except (EOFError, ConnectionError):
+                        pass
+                    else:
+                        raise AssertionError(('MQTT 3 QoS 2 incorrectly acknowledged', received))
+    print('PASS explicit TCP/WS MQTT 3/5 QoS 2 persistence boundary', flush=True)
+
+
 def qos_zero_takeover(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
@@ -338,6 +358,7 @@ if __name__ == '__main__':
     sender_loop_avoidance(args.broker)
     publish_negative_ack(args.broker)
     overflow_isolation(args.broker)
+    qos_two_boundary(args.broker)
     poison_messages(args.broker)
     stored_wire_budget(args.broker)
     expired_inflight(args.broker)
