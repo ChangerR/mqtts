@@ -11,8 +11,9 @@ HTTP 和 gRPC provider 共用分片缓存、有界工作队列、熔断及异步
 缓存命中不调用远程服务；故障不会延长原会话和最多5分钟的授权租约。
 原有可选 [HTTP 契约](docs/http-auth.md) 继续兼容。
 
-可选的 [持久会话与 QoS 1 投递](docs/persistence.md) 使用独立磁盘线程、
-有界请求队列和 SQLite WAL，支持 TCP 消费者离线及 Broker 重启恢复。
+可选的 [持久会话与 QoS 1 投递](docs/persistence.md) 使用内置 Topic 分区追加日志、
+独立会话日志、批量刷盘和有界内存，支持 TCP 消费者离线及 Broker 重启恢复。
+消息持久化不依赖 SQLite、Kafka 或应用数据库；旧存储需要先离线迁移。
 TCP / WebSocket 发布者共用落盘路径，补发仍检查当前授权。
 
 ## 容器优先约定（重要）

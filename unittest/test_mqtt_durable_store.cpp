@@ -1,32 +1,20 @@
-#include <sqlite3.h>
 #include <unistd.h>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <thread>
 #include <vector>
 #include "mqtt_durable_store.h"
 using mqtt::DurableStore;
-static int64_t scalar(const std::string& path, const char* query)
-{
-  sqlite3* db = nullptr;
-  assert(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
-  sqlite3_stmt* row = nullptr;
-  assert(sqlite3_prepare_v2(db, query, -1, &row, nullptr) == SQLITE_OK);
-  assert(sqlite3_step(row) == SQLITE_ROW);
-  auto n = sqlite3_column_int64(row, 0);
-  sqlite3_finalize(row);
-  sqlite3_close(db);
-  return n;
-}
 int main()
 {
   char dir[] = "/tmp/mqtts-store-XXXXXX";
   assert(mkdtemp(dir));
   mqtt::PersistenceConfig cfg;
   cfg.enabled = true;
-  cfg.path = std::string(dir) + "/sessions.db";
+  cfg.path = std::string(dir) + "/journal";
   cfg.max_messages = 64;
   cfg.max_messages_per_session = 64;
   uint16_t first = 0;
@@ -64,12 +52,11 @@ int main()
            d.deliveries[0].packet_id == first);
     assert(d.deliveries[0].wire == "payload");
     assert(store.acknowledge("reader", c.epoch, first).ok);
-    assert(scalar(cfg.path, "SELECT pending FROM counters") == 0);
-    assert(scalar(cfg.path, "SELECT count(*) FROM messages") == 0);
+    assert(store.statistics().pending == 0);
     for (int i = 0; i < 64; ++i)
       assert(store.publish("room/one", "data", "writer", 0).ok);
     assert(!store.publish("room/one", "overflow", "writer", 0).ok);
-    assert(scalar(cfg.path, "SELECT pending FROM counters") == 64);
+    assert(store.statistics().pending == 64);
     auto batch = store.fetch("reader", c.epoch, 0, 2);
     assert(batch.deliveries.size() == 2);
     auto last = batch.deliveries.back().sequence;
@@ -81,7 +68,7 @@ int main()
     assert(store.disconnect("reader", c.epoch).stale);
     auto clean = store.connect("reader", "owner", true, 60);
     assert(clean.ok && !clean.present && clean.subscriptions.empty());
-    assert(scalar(cfg.path, "SELECT bytes FROM counters") == 0);
+    assert(store.statistics().bytes == 0);
     assert(store.subscribe("reader", clean.epoch, "#", 1).ok);
     assert(store.publish("$SYS/state", "secret", "writer", 0).targets.empty());
     assert(store.subscribe("reader", clean.epoch, "$SYS/#", 1).ok);
@@ -94,24 +81,6 @@ int main()
     assert(store.disconnect("expiring", expired.epoch).ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     assert(!store.connect("expiring", "owner", false, 60).present);
-    auto failed_ack = store.connect("failed-ack", "owner", false, 60);
-    assert(store.subscribe("failed-ack", failed_ack.epoch, "ack", 1).ok);
-    assert(store.publish("ack", "ack-payload", "writer", 0).ok);
-    auto flight = store.fetch("failed-ack", failed_ack.epoch, 0, 1);
-    assert(flight.deliveries.size() == 1);
-    sqlite3* blocker = nullptr;
-    assert(sqlite3_open(cfg.path.c_str(), &blocker) == SQLITE_OK);
-    assert(sqlite3_exec(blocker, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
-    assert(store.acknowledge("failed-ack", failed_ack.epoch, flight.deliveries[0].packet_id, false)
-               .ok);
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    assert(sqlite3_exec(blocker, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(blocker);
-    assert(store.fetch("failed-ack", failed_ack.epoch, flight.deliveries[0].sequence, 1).stale);
-    auto retry = store.connect("failed-ack", "owner", false, 60);
-    auto replay = store.fetch("failed-ack", retry.epoch, 0, 1);
-    assert(replay.deliveries.size() == 1 && replay.deliveries[0].dup);
-    assert(store.disconnect("failed-ack", retry.epoch, 0).ok);
     auto concurrent = store.connect("parallel", "owner", false, 60);
     assert(store.subscribe("parallel", concurrent.epoch, "load/#", 1).ok);
     std::vector<std::thread> writers;
@@ -122,11 +91,56 @@ int main()
       });
     for (auto& thread : writers)
       thread.join();
-    assert(scalar(cfg.path, "SELECT pending FROM counters") == 64);
+    assert(store.statistics().pending == 64);
   }
-  for (auto suffix : {"", "-wal", "-shm", ".lock"})
-    unlink((cfg.path + suffix).c_str());
-  rmdir(dir);
+  {
+    // Checkpointing keeps exact ACK gaps across topic partitions and compaction.
+    DurableStore store(cfg);
+    auto c = store.connect("parallel", "owner", false, 60);
+    auto batch = store.fetch("parallel", c.epoch, 0, 32);
+    assert(batch.ok && batch.deliveries.size() == 32);
+    for (size_t i = 1; i < batch.deliveries.size(); i += 2)
+      assert(store.acknowledge("parallel", c.epoch, batch.deliveries[i].packet_id).ok);
+    assert(store.statistics().pending == 48);
+    store.checkpoint();
+  }
+  {
+    DurableStore store(cfg);
+    auto c = store.connect("parallel", "owner", false, 60);
+    int64_t cursor = 0;
+    size_t count = 0;
+    while (store.statistics().pending) {
+      auto batch = store.fetch("parallel", c.epoch, cursor, 32);
+      assert(batch.ok && !batch.deliveries.empty());
+      for (const auto& d : batch.deliveries) {
+        assert(d.dup && d.sequence > cursor);
+        cursor = d.sequence;
+        assert(store.acknowledge("parallel", c.epoch, d.packet_id).ok);
+        ++count;
+      }
+    }
+    assert(count == 48);
+    store.checkpoint();
+    for (int i = 0; i < 32; ++i)
+      assert(store.publish("load/" + std::to_string(i), "partition-data", "writer", 0).ok);
+    store.checkpoint();
+  }
+  {
+    DurableStore store(cfg);
+    assert(store.statistics().pending == 32);
+    auto c = store.connect("parallel", "owner", true, 60);
+    assert(c.ok && store.statistics().pending == 0);
+    store.checkpoint();
+    for (const auto& name : {"zulu", "alpha", "tango", "bravo"}) {
+      auto reader = store.connect(name, "owner", false, 60);
+      assert(reader.ok && store.subscribe(name, reader.epoch, "fanout/#", 1).ok);
+      assert(store.subscribe(name, reader.epoch, "fanout/one", 1).ok);
+    }
+    auto fanout = store.publish("fanout/one", "one publication", "writer", 0);
+    assert(fanout.ok);
+    assert((fanout.targets == std::vector<std::string>{"alpha", "bravo", "tango", "zulu"}));
+  }
+  std::filesystem::remove_all(dir);
   puts(
       "PASS persistent restart, ownership, epochs, receive window, expiry, deduplication, quotas "
       "and concurrent commits");

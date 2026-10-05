@@ -225,6 +225,7 @@ class Pair:
     def receive(self, topic, data):
         value = json.loads(data)
         seq = value['nonce']
+        assert seq == self.received + 1, ('out-of-order delivery', self.topic, seq, self.received)
         assert topic == self.topic and value['actor'] == self.writer.name
         assert value['data'] == 'x'*self.size
         assert seq in self.waiters, ('duplicate or unexpected delivery', self.topic, seq)

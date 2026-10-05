@@ -53,6 +53,14 @@ int ConfigManager::load_from_file(const std::string& config_file)
         config_.persistence.enabled = p["enabled"].as<bool>();
       if (p["path"])
         config_.persistence.path = p["path"].as<std::string>();
+      if (p["partitions"])
+        config_.persistence.partitions = p["partitions"].as<size_t>();
+      if (p["segment_bytes"])
+        config_.persistence.segment_bytes = p["segment_bytes"].as<size_t>();
+      if (p["max_disk_bytes"])
+        config_.persistence.max_disk_bytes = p["max_disk_bytes"].as<uint64_t>();
+      if (p["checkpoint_interval_ms"])
+        config_.persistence.checkpoint_interval_ms = p["checkpoint_interval_ms"].as<uint32_t>();
       if (p["max_session_expiry_seconds"])
         config_.persistence.max_session_expiry_seconds =
             p["max_session_expiry_seconds"].as<uint32_t>();
@@ -97,7 +105,9 @@ int ConfigManager::validate() const
 {
   const auto& p = config_.persistence;
   if (p.enabled &&
-      (p.path.empty() || !p.max_session_expiry_seconds || !p.max_sessions ||
+      (p.path.empty() || !p.partitions || p.partitions > 32 || p.segment_bytes < 4096 ||
+       p.max_disk_bytes / (p.partitions * 4) < p.segment_bytes ||
+       p.checkpoint_interval_ms < 100 || !p.max_session_expiry_seconds || !p.max_sessions ||
        !p.max_subscriptions_per_session || !p.max_messages || !p.max_messages_per_session ||
        !p.max_bytes || !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
        !p.max_inflight || p.max_inflight > 65535)) {

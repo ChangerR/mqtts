@@ -13,6 +13,7 @@
 #include "mqtt_buffer.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_define.h"
+#include "mqtt_durable_store.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
@@ -143,7 +144,7 @@ class MQTTProtocolHandler
   uint64_t durable_epoch_ = 0;
   bool durable_running_ = false;
   runtime::TaskHandle durable_task_;
-  std::shared_ptr<std::atomic<uint64_t>> durable_revision_;
+  std::shared_ptr<DurableStore::Signal> durable_revision_;
   void pump_durable();
   uint16_t next_packet_id_;
 

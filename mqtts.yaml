@@ -59,6 +59,11 @@ monitoring:
 persistence:
   enabled: false
   path: /data/sessions.db
+  # This path is now a directory. A legacy SQLite file requires offline migration.
+  partitions: 4
+  segment_bytes: 16777216
+  max_disk_bytes: 4294967296
+  checkpoint_interval_ms: 30000
   max_session_expiry_seconds: 86400
   max_sessions: 10000
   max_subscriptions_per_session: 128

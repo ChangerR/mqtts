@@ -1,9 +1,8 @@
 #include "mqtt_durable_store.h"
+#include <dirent.h>
 #include <fcntl.h>
-#include <sqlite3.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
 #include <chrono>
@@ -11,63 +10,46 @@
 #include <set>
 #include <stdexcept>
 #include "logger.h"
+#include "mqtt_append_log.h"
+#include "mqtt_log_codec.h"
 #include "mqtt_runtime.h"
 
 namespace mqtt {
+using journal::AppendLog;
+using journal::Decoder;
+using journal::Encoder;
+using journal::Location;
+using Ticket = std::shared_ptr<journal::Completion>;
 namespace {
-void sql(sqlite3* db, const char* text)
-{
-  if (sqlite3_exec(db, text, nullptr, nullptr, nullptr) != SQLITE_OK)
-    throw std::runtime_error(sqlite3_errmsg(db));
-}
-class Statement
-{
- public:
-  sqlite3_stmt* s = nullptr;
-  explicit Statement(sqlite3* db, const char* text)
-  {
-    if (sqlite3_prepare_v2(db, text, -1, &s, nullptr) != SQLITE_OK)
-      throw std::runtime_error(sqlite3_errmsg(db));
-  }
-  ~Statement() { sqlite3_finalize(s); }
-  Statement(const Statement&) = delete;
-  void bind(int i, const std::string& value)
-  {
-    if (sqlite3_bind_text(s, i, value.data(), value.size(), SQLITE_TRANSIENT) != SQLITE_OK)
-      throw std::runtime_error("bind text failed");
-  }
-  void bind(int i, int64_t value)
-  {
-    if (sqlite3_bind_int64(s, i, value) != SQLITE_OK)
-      throw std::runtime_error("bind integer failed");
-  }
-  void blob(int i, const std::string& value)
-  {
-    if (sqlite3_bind_blob(s, i, value.data(), value.size(), SQLITE_TRANSIENT) != SQLITE_OK)
-      throw std::runtime_error("bind blob failed");
-  }
-  bool step()
-  {
-    int rc = sqlite3_step(s);
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
-      throw std::runtime_error(sqlite3_errmsg(sqlite3_db_handle(s)));
-    return rc == SQLITE_ROW;
-  }
-  int64_t integer(int i) const { return sqlite3_column_int64(s, i); }
-  std::string text(int i) const
-  {
-    const auto* p = sqlite3_column_blob(s, i);
-    int n = sqlite3_column_bytes(s, i);
-    return p ? std::string(static_cast<const char*>(p), n) : std::string();
-  }
+enum Record : uint8_t {
+  CONNECT = 1,
+  DISCONNECT = 2,
+  SUBSCRIBE = 3,
+  UNSUBSCRIBE = 4,
+  ACK = 5,
+  CLAIM = 6,
+  HEARTBEAT = 7,
+  MESSAGE = 8
 };
-bool current(sqlite3* db, const std::string& client, uint64_t epoch)
+struct Deferred
 {
-  Statement s(db, "SELECT 1 FROM sessions WHERE client=? AND epoch=? AND online=1");
-  s.bind(1, client);
-  s.bind(2, int64_t(epoch));
-  return s.step();
+};
+size_t subscription_cost(const std::string& filter)
+{
+  // Bound the flat topic trie as well as the saved filter text, including deeply
+  // nested adversarial filters whose per-level nodes dominate their byte length.
+  return 256 + filter.size() * 2 + size_t(std::count(filter.begin(), filter.end(), '/')) * 192;
 }
+struct DeliveryReservation
+{
+  explicit DeliveryReservation(const std::shared_ptr<std::atomic<size_t>>& counter)
+      : counter(counter)
+  {
+  }
+  ~DeliveryReservation() { counter->fetch_sub(bytes); }
+  std::shared_ptr<std::atomic<size_t>> counter;
+  size_t bytes = 0;
+};
 DurableStore::Result success()
 {
   DurableStore::Result r;
@@ -81,27 +63,65 @@ DurableStore::Result stale()
   r.error = "stale persistent connection";
   return r;
 }
-}  // namespace
-struct DurableStore::Request
+void location_write(Encoder& e, const Location& p)
 {
-  int fd;
-  std::string failure_client;
-  uint64_t failure_epoch = 0;
-  size_t bytes;
-  bool bulk = false;
-  std::function<Result(sqlite3*)> fn;
-  Result result;
-  std::atomic<bool> done{false};
-  Request(size_t size, std::function<Result(sqlite3*)> call, bool wait)
-      : fd(wait ? eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) : -1), bytes(size), fn(std::move(call))
-  {
+  e.u64(p.segment);
+  e.u64(p.offset);
+  e.u64(p.serial);
+  e.u32(p.size);
+}
+Location location_read(Decoder& d)
+{
+  Location p;
+  p.segment = d.u64();
+  p.offset = d.u64();
+  p.serial = d.u64();
+  p.size = d.u32();
+  return p;
+}
+std::string checked(const std::string& value)
+{
+  Encoder e;
+  e.u32(journal::checksum(value.data(), value.size()));
+  e.data.append(value);
+  return e.data;
+}
+std::string unchecked(const std::string& value)
+{
+  Decoder d(value);
+  auto crc = d.u32();
+  auto body = value.substr(4);
+  if (journal::checksum(body.data(), body.size()) != crc)
+    throw std::runtime_error("checkpoint checksum mismatch");
+  return body;
+}
+}  // namespace
+DurableStore::Signal::Signal()
+{
+  fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (fd_ < 0)
+    throw std::runtime_error("persistent notification eventfd unavailable");
+}
+DurableStore::Signal::~Signal()
+{
+  if (fd_ >= 0)
+    close(fd_);
+}
+void DurableStore::Signal::notify()
+{
+  revision_.fetch_add(1, std::memory_order_release);
+  uint64_t one = 1;
+  (void)::write(fd_, &one, sizeof(one));
+}
+void DurableStore::Signal::wait(uint64_t observed, int timeout_ms)
+{
+  uint64_t value;
+  while (::read(fd_, &value, sizeof(value)) > 0) {
   }
-  ~Request()
-  {
-    if (fd >= 0)
-      close(fd);
-  }
-};
+  if (load() != observed)
+    return;
+  runtime::current_runtime().wait_readable(fd_, timeout_ms);
+}
 int64_t DurableStore::now_ms()
 {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -109,618 +129,1387 @@ int64_t DurableStore::now_ms()
       .count();
 }
 
-DurableStore::DurableStore(const PersistenceConfig& config) : config_(config)
+struct DurableStore::Impl
 {
+  struct Message
+  {
+    int64_t id = 0, expires = 0;
+    size_t partition = 0;
+    Location location;
+    std::string wire;
+    bool committed = false;
+  };
+  struct DeliveryState
+  {
+    std::shared_ptr<Message> message;
+    uint16_t packet = 0;
+    bool attempted = false, ack_pending = false, claim_pending = false;
+  };
+  struct Session
+  {
+    std::string client, owner;
+    uint64_t generation = 0, epoch = 0;
+    uint32_t expiry = 0;
+    int64_t deadline = 0;
+    bool online = false, busy = false;
+    uint16_t next_packet = 1;
+    size_t bytes = 0;
+    std::map<std::string, uint8_t> subscriptions;
+    std::map<int64_t, DeliveryState> pending;
+    std::unordered_map<uint16_t, int64_t> packets;
+    std::vector<int64_t> recovery_acks;
+    std::unordered_map<int64_t, uint16_t> recovery_claims;
+    std::shared_ptr<Signal> signal;
+  };
+  struct TopicNode
+  {
+    std::unordered_map<std::string, size_t> children;
+    std::vector<std::shared_ptr<Session>> clients;
+  };
+  PersistenceConfig config;
+  mutable std::mutex mutex;
+  std::mutex checkpoint_mutex;
+  std::condition_variable stopped;
+  bool stopping = false, frozen = false, failed = false, index_dirty = true;
+  int lock_fd = -1;
+  uint64_t next_id = 0;
+  size_t pending = 0, bytes = 0, requests = 0, request_bytes = 0, metadata_bytes = 0,
+         metadata_reserved = 0;
+  std::shared_ptr<std::atomic<size_t>> delivery_bytes{new std::atomic<size_t>(0)};
+  std::atomic<size_t> subscriptions{0};
+  std::map<std::string, std::shared_ptr<Session>> sessions;
+  std::vector<TopicNode> index;
+  std::vector<std::unique_ptr<AppendLog>> messages, states;
+  std::vector<uint64_t> message_cuts, state_cuts;
+  std::thread maintenance;
+  explicit Impl(const PersistenceConfig& cfg);
+  ~Impl();
+  void fail()
+  {
+    failed = true;
+    for (auto& item : sessions)
+      if (item.second->signal)
+        item.second->signal->notify();
+  }
+  Result call(const std::function<Ticket(const std::shared_ptr<Result>&)>& fn, bool wait = true)
+  {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    for (;;) {
+      auto r = std::make_shared<Result>();
+      Ticket ticket;
+      try {
+        {
+          std::lock_guard<std::mutex> guard(mutex);
+          if (failed || stopping) {
+            r->error = "persistent journal unavailable";
+            r->stale = true;
+            return *r;
+          }
+          if (frozen)
+            throw Deferred();
+          ticket = fn(r);
+        }
+        if (ticket && wait && !ticket->wait()) {
+          r->ok = false;
+          r->error = ticket->error;
+        }
+        return *r;
+      } catch (const Deferred&) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          r->ok = false;
+          r->error = "persistent admission timeout";
+          return *r;
+        }
+        runtime::current_runtime().wait(-1, 0, 1);
+      } catch (const std::exception& e) {
+        r->ok = false;
+        r->error = e.what();
+        return *r;
+      }
+    }
+  }
+  Ticket enqueue(AppendLog& log, std::string data, const AppendLog::Callback& apply,
+                 bool wait = true)
+  {
+    size_t size = data.size() + 256;
+    if (size > config.max_request_bytes)
+      throw std::runtime_error("persistent request exceeds byte limit");
+    if (requests >= config.max_requests || request_bytes > config.max_request_bytes - size ||
+        delivery_bytes->load() > config.max_request_bytes - size - request_bytes)
+      throw Deferred();
+    // Callers hold the state mutex. Writers publish completions after reservations
+    // and pending-delivery entries have been installed, and only after fdatasync.
+    auto ticket = log.append(
+        std::move(data),
+        [=](bool ok, const Location& location) {
+          std::lock_guard<std::mutex> guard(mutex);
+          --requests;
+          request_bytes -= size;
+          if (!ok)
+            fail();
+          try {
+            apply(ok, location);
+          } catch (...) {
+            fail();
+            throw;
+          }
+        },
+        wait);
+    ++requests;
+    request_bytes += size;
+    return ticket;
+  }
+  AppendLog& state_log(const std::string& client)
+  {
+    return *states[journal::topic_hash(client) % states.size()];
+  }
+  std::shared_ptr<Session> current(const std::string& client, uint64_t epoch)
+  {
+    auto it = sessions.find(client);
+    if (it == sessions.end() || it->second->epoch != epoch || !it->second->online)
+      return {};
+    if (it->second->busy)
+      throw Deferred();
+    return it->second;
+  }
+  void notify(const std::shared_ptr<Session>& s)
+  {
+    if (s->signal)
+      s->signal->notify();
+  }
+  void recount_subscriptions()
+  {
+    size_t count = 0;
+    metadata_bytes = 0;
+    for (const auto& s : sessions) {
+      metadata_bytes += 512 + s.first.size() * 2 + s.second->owner.size();
+      for (const auto& sub : s.second->subscriptions) {
+        metadata_bytes += subscription_cost(sub.first);
+        if (sub.second)
+          ++count;
+      }
+    }
+    subscriptions.store(count);
+    index_dirty = true;
+  }
+  void check_metadata(size_t extra, size_t deliveries)
+  {
+    extra += metadata_reserved;
+    uint64_t budget = config.max_disk_bytes / 8, overhead = 1024 + config.partitions * 16;
+    if (extra > budget || metadata_bytes > budget - extra ||
+        metadata_bytes + extra > budget - std::min(budget, overhead) ||
+        deliveries > (budget - overhead - metadata_bytes - extra) / 80)
+      throw std::runtime_error("persistent metadata/checkpoint capacity exhausted");
+    if (metadata_bytes + extra > config.max_request_bytes * 4ULL)
+      throw std::runtime_error("persistent metadata memory limit");
+  }
+  void drop(const std::shared_ptr<Session>& s, std::map<int64_t, DeliveryState>::iterator entry)
+  {
+    auto& delivery = entry->second;
+    bytes -= delivery.message->wire.size();
+    s->bytes -= delivery.message->wire.size();
+    --pending;
+    if (delivery.packet) {
+      auto p = s->packets.find(delivery.packet);
+      if (p != s->packets.end() && p->second == entry->first)
+        s->packets.erase(p);
+    }
+    s->pending.erase(entry);
+  }
+  void erase_session(const std::shared_ptr<Session>& s)
+  {
+    notify(s);
+    while (!s->pending.empty())
+      drop(s, s->pending.begin());
+    sessions.erase(s->client);
+    recount_subscriptions();
+  }
+  void expire(bool startup = false)
+  {
+    auto now = DurableStore::now_ms();
+    for (auto it = sessions.begin(); it != sessions.end();) {
+      auto s = it->second;
+      ++it;
+      if (startup)
+        s->online = false;
+      if (!s->busy && !s->online && s->deadline <= now) {
+        erase_session(s);
+        continue;
+      }
+      for (auto entry = s->pending.begin(); entry != s->pending.end();) {
+        auto old = entry++;
+        if (old->second.message->committed && old->second.message->expires > 0 &&
+            old->second.message->expires <= now) {
+          drop(s, old);
+          notify(s);
+        }
+      }
+    }
+  }
+  uint16_t available_packet(const std::shared_ptr<Session>& s,
+                            const std::set<uint16_t>& reserved = {})
+  {
+    if (s->packets.size() + reserved.size() >= 65535)
+      return 0;
+    uint16_t candidate = s->next_packet;
+    for (size_t i = 0; i < 65535; ++i) {
+      if (!s->packets.count(candidate) && !reserved.count(candidate))
+        return candidate;
+      candidate = uint16_t(candidate % 65535 + 1);
+    }
+    return 0;
+  }
+  std::vector<std::shared_ptr<Session>> match(const std::string& topic);
+  void replay_control(const std::string& data, bool acknowledgements);
+  std::shared_ptr<Message> decode_message(const std::string& data, size_t partition,
+                                          const Location& location, bool attach);
+  void restore();
+  void checkpoint();
+  void maintain();
+  void heartbeat();
+  void validate_state();
+};
+
+DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
+{
+  if (!config.partitions || config.partitions > 32 || config.segment_bytes < 4096 ||
+      config.max_disk_bytes / (config.partitions * 4) < config.segment_bytes ||
+      config.checkpoint_interval_ms < 100)
+    throw std::runtime_error("invalid partition journal configuration");
+  lock_fd = open((config.path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+    if (lock_fd >= 0)
+      close(lock_fd);
+    throw std::runtime_error("persistent store missing or owned by another broker");
+  }
   try {
-    lock_fd_ = open((config_.path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (lock_fd_ < 0 || flock(lock_fd_, LOCK_EX | LOCK_NB) != 0)
-      throw std::runtime_error("persistent store path missing or already owned by another broker");
-    int private_file = open(config_.path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (private_file < 0)
-      throw std::runtime_error("cannot create persistent store");
-    fchmod(private_file, 0600);
-    close(private_file);
-    if (sqlite3_open_v2(config_.path.c_str(), &db_,
-                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
-                        nullptr) != SQLITE_OK)
-      throw std::runtime_error("cannot open persistent store");
-    sqlite3_busy_timeout(db_, 100);
-    sql(db_,
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA "
-        "cache_size=-8192;");
-    {
-      Statement s(db_, "PRAGMA user_version");
-      s.step();
-      if (s.integer(0) > 1)
-        throw std::runtime_error("unsupported persistent store version");
+    journal::ensure_directory(config.path);
+    if (access((config.path + "/IMPORTING").c_str(), F_OK) == 0)
+      throw std::runtime_error(
+          "incomplete offline import; preserve source and retry into a fresh directory");
+    auto format = journal::read_file(config.path + "/FORMAT", 4096);
+    if (format.empty()) {
+      DIR* directory = opendir(config.path.c_str());
+      if (!directory)
+        throw std::runtime_error("cannot inspect journal directory");
+      bool empty = true;
+      while (auto* entry = readdir(directory)) {
+        std::string name = entry->d_name;
+        if (name != "." && name != ".." && name != "FORMAT.tmp")
+          empty = false;
+      }
+      closedir(directory);
+      if (!empty)
+        throw std::runtime_error("journal FORMAT missing from nonempty directory");
+      Encoder e;
+      e.text("MQTTS-PARTITION-LOG");
+      e.u32(2);
+      e.u32(uint32_t(config.partitions));
+      journal::atomic_file(config.path + "/FORMAT", checked(e.data));
+    } else {
+      auto body = unchecked(format);
+      Decoder d(body);
+      if (d.text() != "MQTTS-PARTITION-LOG" || d.u32() != 2 || d.u32() != config.partitions)
+        throw std::runtime_error(
+            "journal format/partition count differs; offline migration required");
+      d.end();
     }
-    sql(db_, R"SQL(
-      CREATE TABLE IF NOT EXISTS sessions(client TEXT PRIMARY KEY, owner TEXT NOT NULL, epoch INTEGER NOT NULL,
-        expiry INTEGER NOT NULL, deadline INTEGER NOT NULL, online INTEGER NOT NULL, next_packet INTEGER NOT NULL DEFAULT 1,
-        pending INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS subscriptions(client TEXT NOT NULL REFERENCES sessions(client) ON DELETE CASCADE,
-        filter TEXT NOT NULL,qos INTEGER NOT NULL,PRIMARY KEY(client,filter));
-      CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,wire BLOB NOT NULL,expires INTEGER NOT NULL,refs INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS deliveries(client TEXT NOT NULL REFERENCES sessions(client) ON DELETE CASCADE,
-        message INTEGER NOT NULL REFERENCES messages(id),packet INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(client,message));
-      CREATE UNIQUE INDEX IF NOT EXISTS delivery_packets ON deliveries(client,packet) WHERE packet>0;
-      CREATE TABLE IF NOT EXISTS counters(id INTEGER PRIMARY KEY CHECK(id=1),epoch INTEGER NOT NULL,pending INTEGER NOT NULL,bytes INTEGER NOT NULL);
-      INSERT OR IGNORE INTO counters VALUES(1,0,0,0);
-      CREATE TRIGGER IF NOT EXISTS delivery_added AFTER INSERT ON deliveries BEGIN
-        UPDATE messages SET refs=refs+1 WHERE id=new.message;
-        UPDATE sessions SET pending=pending+1,bytes=bytes+(SELECT length(wire) FROM messages WHERE id=new.message) WHERE client=new.client;
-        UPDATE counters SET pending=pending+1,bytes=bytes+(SELECT length(wire) FROM messages WHERE id=new.message) WHERE id=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS delivery_removed AFTER DELETE ON deliveries BEGIN
-        UPDATE sessions SET pending=pending-1,bytes=bytes-(SELECT length(wire) FROM messages WHERE id=old.message) WHERE client=old.client;
-        UPDATE counters SET pending=pending-1,bytes=bytes-(SELECT length(wire) FROM messages WHERE id=old.message) WHERE id=1;
-        UPDATE messages SET refs=refs-1 WHERE id=old.message;
-        DELETE FROM messages WHERE id=old.message AND refs=0;
-      END;
-      PRAGMA user_version=1;
-    )SQL");
-    sql(db_, "BEGIN IMMEDIATE");
-    sweep(db_, true);
-    sql(db_, "COMMIT");
-    {
-      Statement s(db_, "SELECT count(*) FROM subscriptions WHERE qos>0");
-      s.step();
-      subscription_count_.store(s.integer(0));
+    size_t disk_per_log =
+        size_t((config.max_disk_bytes - config.max_disk_bytes / 4) / (2 * config.partitions));
+    for (size_t p = 0; p < config.partitions; ++p) {
+      messages.emplace_back(new AppendLog(config.path + "/messages-" + std::to_string(p),
+                                          config.segment_bytes, disk_per_log));
+      states.emplace_back(new AppendLog(config.path + "/sessions-" + std::to_string(p),
+                                        config.segment_bytes, disk_per_log));
     }
-    worker_ = std::thread(&DurableStore::work, this);
+    message_cuts.resize(config.partitions);
+    state_cuts.resize(config.partitions);
+    restore();
+    maintenance = std::thread(&Impl::maintain, this);
   } catch (...) {
-    if (db_)
-      sqlite3_close(db_);
-    if (lock_fd_ >= 0)
-      close(lock_fd_);
+    messages.clear();
+    states.clear();
+    close(lock_fd);
+    lock_fd = -1;
     throw;
   }
 }
-DurableStore::~DurableStore()
+DurableStore::Impl::~Impl()
 {
   {
-    std::lock_guard<std::mutex> guard(mutex_);
-    stopping_ = true;
+    std::lock_guard<std::mutex> guard(mutex);
+    stopping = true;
   }
-  changed_.notify_all();
-  if (worker_.joinable())
-    worker_.join();
-  if (db_)
-    sqlite3_close(db_);
-  if (lock_fd_ >= 0)
-    close(lock_fd_);
+  stopped.notify_all();
+  if (maintenance.joinable())
+    maintenance.join();
+  messages.clear();
+  states.clear();
+  if (lock_fd >= 0)
+    close(lock_fd);
 }
-DurableStore::Result DurableStore::execute(size_t bytes, std::function<Result(sqlite3*)> fn,
-                                           bool bulk, bool wait_for_commit,
-                                           const std::string& failure_client,
-                                           uint64_t failure_epoch)
+DurableStore::DurableStore(const PersistenceConfig& config) : impl_(new Impl(config)) {}
+DurableStore::~DurableStore() = default;
+bool DurableStore::has_subscriptions() const
 {
-  auto r = std::make_shared<Request>(bytes, std::move(fn), wait_for_commit);
-  r->bulk = bulk;
-  r->failure_client = failure_client;
-  r->failure_epoch = failure_epoch;
-  if (wait_for_commit && r->fd < 0) {
-    r->result.error = "persistent completion descriptor unavailable";
-    return r->result;
-  }
-  const auto admission_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-  for (;;) {
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      bool full = outstanding_ >= config_.max_requests || bytes > config_.max_request_bytes ||
-                  bytes_ > config_.max_request_bytes - std::min(bytes, config_.max_request_bytes) ||
-                  (bulk && (outstanding_ >= std::max<size_t>(1, config_.max_requests / 4) ||
-                            bytes > config_.max_request_bytes / 2 ||
-                            bulk_bytes_ > config_.max_request_bytes / 2 -
-                                              std::min(bytes, config_.max_request_bytes / 2)));
-      if (stopping_ || (full && (bulk || bytes > config_.max_request_bytes ||
-                                 std::chrono::steady_clock::now() >= admission_deadline))) {
-        r->result.error = "persistent IO admission full";
-        return r->result;
-      }
-      if (!full) {
-        ++outstanding_;
-        bytes_ += bytes;
-        if (bulk)
-          bulk_bytes_ += bytes;
-        queue_.push_back(r);
-        break;
-      }
-    }
-    // Briefly backpressure the calling connection during an ACK burst. The
-    // admitted queue stays bounded and the network event thread keeps running.
-    runtime::current_runtime().wait(-1, 0, 2);
-  }
-  changed_.notify_one();
-  if (!wait_for_commit)
-    return success();
-  while (!r->done.load(std::memory_order_acquire))
-    runtime::current_runtime().wait_readable(r->fd, 100);
-  return std::move(r->result);
+  return impl_->subscriptions.load() != 0;
 }
-bool DurableStore::reserve_result(size_t bytes)
+uint32_t DurableStore::max_session_expiry() const
 {
-  std::lock_guard<std::mutex> guard(mutex_);
-  if (!active_request_ || bytes > config_.max_request_bytes / 2 ||
-      bulk_bytes_ > config_.max_request_bytes / 2 - bytes ||
-      bytes_ > config_.max_request_bytes - bytes)
-    return false;
-  bytes_ += bytes;
-  bulk_bytes_ += bytes;
-  active_request_->bytes += bytes;
-  return true;
+  return impl_->config.max_session_expiry_seconds;
 }
-void DurableStore::sweep(sqlite3* db, bool startup)
+DurableStore::Statistics DurableStore::statistics() const
 {
-  if (startup)
-    sql(db, "UPDATE sessions SET online=0");
-  Statement expired(db, "DELETE FROM sessions WHERE online=0 AND deadline<=?");
-  expired.bind(1, now_ms());
-  expired.step();
-  if (sqlite3_changes(db))
-    index_dirty_ = true;
-  Statement waking(db,
-                   "SELECT DISTINCT d.client FROM deliveries d JOIN messages m ON m.id=d.message "
-                   "WHERE m.expires>0 AND m.expires<=?");
-  waking.bind(1, now_ms());
-  while (waking.step()) {
-    auto it = signals_.find(waking.text(0));
-    if (it != signals_.end())
-      it->second->fetch_add(1);
-  }
-  Statement messages(db,
-                     "DELETE FROM deliveries WHERE message IN (SELECT id FROM messages WHERE "
-                     "expires>0 AND expires<=?)");
-  messages.bind(1, now_ms());
-  messages.step();
-  for (auto it = signals_.begin(); it != signals_.end();) {
-    Statement exists(db, "SELECT 1 FROM sessions WHERE client=?");
-    exists.bind(1, it->first);
-    if (!exists.step()) {
-      it->second->fetch_add(1);
-      failed_epochs_.erase(it->first);
-      it = signals_.erase(it);
-    } else
-      ++it;
-  }
-  // A crash expires online sessions from the last heartbeat, never from a new
-  // lease granted on restart. This can expire up to one second conservatively.
-  Statement heartbeat(db, "UPDATE sessions SET deadline=?+expiry*1000 WHERE online=1");
-  heartbeat.bind(1, now_ms());
-  heartbeat.step();
+  std::lock_guard<std::mutex> guard(impl_->mutex);
+  Statistics s;
+  s.sessions = impl_->sessions.size();
+  s.pending = impl_->pending;
+  s.bytes = impl_->bytes;
+  return s;
 }
-void DurableStore::work()
+void DurableStore::checkpoint()
 {
-  int64_t swept = now_ms();
-  for (;;) {
-    std::vector<std::shared_ptr<Request>> batch;
-    {
-      std::unique_lock<std::mutex> guard(mutex_);
-      changed_.wait_for(guard, std::chrono::milliseconds(100),
-                        [&] { return stopping_ || !queue_.empty(); });
-      if (stopping_ && queue_.empty())
-        break;
-      if (!queue_.empty())
-        changed_.wait_for(guard, std::chrono::milliseconds(1),
-                          [&] { return stopping_ || queue_.size() >= 32; });
-      while (!queue_.empty() && batch.size() < 32) {
-        batch.push_back(queue_.front());
-        queue_.pop_front();
-      }
-    }
-    if (batch.empty() && now_ms() - swept < 1000)
-      continue;
-    try {
-      sql(db_, "BEGIN IMMEDIATE");
-      if (now_ms() - swept >= 1000) {
-        sweep(db_);
-        swept = now_ms();
-      }
-      for (auto& r : batch) {
-        sql(db_, "SAVEPOINT request");
-        try {
-          active_request_ = r.get();
-          r->result = r->fn(db_);
-          active_request_ = nullptr;
-          sql(db_, "RELEASE request");
-        } catch (const std::exception& e) {
-          sql(db_, "ROLLBACK TO request; RELEASE request");
-          index_dirty_ = true;
-          r->result = Result();
-          r->result.error = e.what();
-        }
-      }
-      sql(db_, "COMMIT");
-      for (auto& r : batch)
-        if (r->result.wake)
-          for (const auto& target : r->result.targets) {
-            auto signal = signals_.find(target);
-            if (signal != signals_.end())
-              signal->second->fetch_add(1);
-          }
-      Statement count(db_, "SELECT count(*) FROM subscriptions WHERE qos>0");
-      count.step();
-      subscription_count_.store(count.integer(0));
-    } catch (const std::exception& e) {
-      sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-      index_dirty_ = true;
-      LOG_ERROR("Persistent transaction failed: {}", e.what());
-      for (auto& r : batch) {
-        r->result = Result();
-        r->result.error = e.what();
-      }
-    }
-    active_request_ = nullptr;
-    for (auto& r : batch) {
-      // ACK deletion can be deferred safely (a crash may repeat delivery), but
-      // an unsuccessful async deletion must reconnect instead of wedging the
-      // receive window behind records the client has already acknowledged.
-      if (!r->result.ok && !r->failure_client.empty()) {
-        auto& failed = failed_epochs_[r->failure_client];
-        failed = std::max(failed, r->failure_epoch);
-        auto signal = signals_.find(r->failure_client);
-        if (signal != signals_.end())
-          signal->second->fetch_add(1);
-      }
-      {
-        std::lock_guard<std::mutex> guard(mutex_);
-        --outstanding_;
-        bytes_ -= r->bytes;
-        if (r->bulk)
-          bulk_bytes_ -= r->bytes;
-      }
-      r->done.store(true, std::memory_order_release);
-      uint64_t one = 1;
-      if (r->fd >= 0)
-        (void)write(r->fd, &one, sizeof(one));
-    }
-  }
+  impl_->checkpoint();
 }
+
 DurableStore::Result DurableStore::connect(const std::string& client, const std::string& owner,
                                            bool clean, uint32_t expiry)
 {
-  expiry = std::min(expiry, config_.max_session_expiry_seconds);
-  return execute(1024, [=](sqlite3* db) {
-    index_dirty_ = true;
-    Result r = success();
-    {
-      Statement expired(db, "DELETE FROM sessions WHERE client=? AND online=0 AND deadline<=?");
-      expired.bind(1, client);
-      expired.bind(2, now_ms());
-      expired.step();
+  auto& v = *impl_;
+  expiry = std::min(expiry, v.config.max_session_expiry_seconds);
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto it = v.sessions.find(client);
+    std::shared_ptr<Impl::Session> old = it == v.sessions.end() ? nullptr : it->second;
+    if (old && old->busy)
+      throw Deferred();
+    if (old && !old->online && old->deadline <= now_ms()) {
+      v.erase_session(old);
+      old.reset();
     }
-    bool exists = false;
-    {
-      Statement row(db, "SELECT owner FROM sessions WHERE client=?");
-      row.bind(1, client);
-      exists = row.step();
-      if (exists && row.text(0) != owner)
-        throw std::runtime_error("persistent session belongs to another identity");
+    if (old && old->owner != owner)
+      throw std::runtime_error("persistent session belongs to another identity");
+    if (!old && expiry == 0) {
+      *r = success();
+      return {};
     }
-    if (clean) {
-      Statement drop(db, "DELETE FROM sessions WHERE client=?");
-      drop.bind(1, client);
-      drop.step();
-      exists = false;
+    if (!old && v.sessions.size() >= v.config.max_sessions)
+      throw std::runtime_error("persistent session limit");
+    if (!old)
+      v.check_metadata(512 + client.size() * 2 + owner.size(), v.pending);
+    auto s = (old && !clean) ? old : std::make_shared<Impl::Session>();
+    uint64_t epoch = ++v.next_id, generation = (old && !clean) ? old->generation : epoch;
+    int64_t deadline = now_ms() + int64_t(expiry) * 1000;
+    auto signal = std::make_shared<Signal>();
+    Encoder e;
+    e.u8(CONNECT);
+    e.text(client);
+    e.text(owner);
+    e.u64(generation);
+    e.u64(epoch);
+    e.u32(expiry);
+    e.u64(deadline);
+    e.u8(clean);
+    auto ticket =
+        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+          if (old)
+            old->busy = false;
+          if (!ok)
+            return;
+          if (old)
+            v.notify(old);
+          if (old && clean)
+            v.erase_session(old);
+          if (clean && expiry == 0) {
+            *r = success();
+            return;
+          }
+          s->client = client;
+          s->owner = owner;
+          s->generation = generation;
+          s->epoch = epoch;
+          s->expiry = expiry;
+          s->deadline = deadline;
+          s->online = true;
+          s->busy = false;
+          s->signal = signal;
+          v.sessions[client] = s;
+          v.recount_subscriptions();
+          *r = success();
+          r->present = bool(old && !clean);
+          r->epoch = epoch;
+          r->revision = signal;
+          for (const auto& sub : s->subscriptions)
+            r->subscriptions.push_back(sub);
+          v.notify(s);
+        });
+    if (old)
+      old->busy = true;
+    else {
+      s->client = client;
+      s->owner = owner;
+      s->busy = true;
+      v.sessions[client] = s;
+      v.recount_subscriptions();
     }
-    if (!exists && expiry == 0) {
-      r.wake = true;
-      r.targets.push_back(client);
-      return r;
-    }
-    if (!exists) {
-      Statement count(db, "SELECT count(*) FROM sessions");
-      count.step();
-      if (count.integer(0) >= int64_t(config_.max_sessions))
-        throw std::runtime_error("persistent session capacity exhausted");
-    }
-    sql(db, "UPDATE counters SET epoch=epoch+1 WHERE id=1");
-    {
-      Statement generation(db, "SELECT epoch FROM counters WHERE id=1");
-      generation.step();
-      r.epoch = generation.integer(0);
-    }
-    Statement row(
-        db,
-        "INSERT INTO sessions(client,owner,epoch,expiry,deadline,online) VALUES(?,?,?,?,?,1) ON "
-        "CONFLICT(client) DO UPDATE SET "
-        "epoch=excluded.epoch,expiry=excluded.expiry,deadline=excluded.deadline,online=1");
-    row.bind(1, client);
-    row.bind(2, owner);
-    row.bind(3, int64_t(r.epoch));
-    row.bind(4, int64_t(expiry));
-    row.bind(5, now_ms() + int64_t(expiry) * 1000);
-    row.step();
-    failed_epochs_.erase(client);
-    r.present = exists;
-    r.wake = true;
-    r.targets.push_back(client);
-    auto& signal = signals_[client];
-    if (!signal)
-      signal = std::make_shared<std::atomic<uint64_t>>(0);
-    r.revision = signal;
-    Statement subs(db, "SELECT filter,qos FROM subscriptions WHERE client=? ORDER BY filter");
-    subs.bind(1, client);
-    while (subs.step())
-      r.subscriptions.emplace_back(subs.text(0), uint8_t(subs.integer(1)));
-    return r;
+    return ticket;
   });
 }
 DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_t epoch,
                                               int64_t expiry_override)
 {
-  return execute(512, [=](sqlite3* db) {
-    if (!current(db, client, epoch))
-      return stale();
-    if (expiry_override >= 0) {
-      Statement s(db, "UPDATE sessions SET expiry=? WHERE client=?");
-      s.bind(1, std::min<int64_t>(expiry_override, config_.max_session_expiry_seconds));
-      s.bind(2, client);
-      s.step();
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto s = v.current(client, epoch);
+    if (!s) {
+      *r = stale();
+      return {};
     }
-    Statement end(db,
-                  "UPDATE sessions SET online=0,deadline=?+expiry*1000 WHERE client=? AND epoch=?");
-    end.bind(1, now_ms());
-    end.bind(2, client);
-    end.bind(3, int64_t(epoch));
-    end.step();
-    Statement drop(db, "DELETE FROM sessions WHERE client=? AND expiry=0");
-    drop.bind(1, client);
-    drop.step();
-    if (sqlite3_changes(db))
-      index_dirty_ = true;
-    return success();
+    uint32_t expiry =
+        expiry_override < 0
+            ? s->expiry
+            : uint32_t(std::min<int64_t>(expiry_override, v.config.max_session_expiry_seconds));
+    int64_t deadline = now_ms() + int64_t(expiry) * 1000;
+    Encoder e;
+    e.u8(DISCONNECT);
+    e.text(client);
+    e.u64(s->generation);
+    e.u64(epoch);
+    e.u32(expiry);
+    e.u64(deadline);
+    auto ticket =
+        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+          s->busy = false;
+          if (!ok)
+            return;
+          s->online = false;
+          s->expiry = expiry;
+          s->deadline = deadline;
+          if (!expiry)
+            v.erase_session(s);
+          else
+            v.notify(s);
+          *r = success();
+        });
+    s->busy = true;
+    return ticket;
   });
 }
 DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t epoch,
                                              const std::string& filter, uint8_t qos)
 {
-  return execute(filter.size() + 512, [=](sqlite3* db) {
-    if (!current(db, client, epoch))
-      return stale();
-    Statement count(db, "SELECT count(*) FROM subscriptions WHERE client=? AND filter<>?");
-    count.bind(1, client);
-    count.bind(2, filter);
-    count.step();
-    if (count.integer(0) >= int64_t(config_.max_subscriptions_per_session))
-      throw std::runtime_error("persistent subscription capacity exhausted");
-    Statement s(db,
-                "INSERT INTO subscriptions VALUES(?,?,?) ON CONFLICT(client,filter) DO UPDATE SET "
-                "qos=excluded.qos");
-    s.bind(1, client);
-    s.bind(2, filter);
-    s.bind(3, int64_t(qos));
-    s.step();
-    index_dirty_ = true;
-    return success();
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto s = v.current(client, epoch);
+    if (!s) {
+      *r = stale();
+      return {};
+    }
+    if (!s->subscriptions.count(filter) &&
+        s->subscriptions.size() >= v.config.max_subscriptions_per_session)
+      throw std::runtime_error("persistent subscription limit");
+    if (!s->subscriptions.count(filter))
+      v.check_metadata(subscription_cost(filter), v.pending);
+    size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
+    Encoder e;
+    e.u8(SUBSCRIBE);
+    e.text(client);
+    e.u64(s->generation);
+    e.text(filter);
+    e.u8(qos);
+    auto ticket =
+        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+          v.metadata_reserved -= reservation;
+          s->busy = false;
+          if (!ok)
+            return;
+          s->subscriptions[filter] = qos;
+          v.recount_subscriptions();
+          *r = success();
+        });
+    v.metadata_reserved += reservation;
+    s->busy = true;
+    return ticket;
   });
 }
 DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64_t epoch,
                                                const std::string& filter)
 {
-  return execute(filter.size() + 512, [=](sqlite3* db) {
-    if (!current(db, client, epoch))
-      return stale();
-    Statement s(db, "DELETE FROM subscriptions WHERE client=? AND filter=?");
-    s.bind(1, client);
-    s.bind(2, filter);
-    s.step();
-    index_dirty_ = true;
-    return success();
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto s = v.current(client, epoch);
+    if (!s) {
+      *r = stale();
+      return {};
+    }
+    Encoder e;
+    e.u8(UNSUBSCRIBE);
+    e.text(client);
+    e.u64(s->generation);
+    e.text(filter);
+    auto ticket =
+        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+          s->busy = false;
+          if (!ok)
+            return;
+          s->subscriptions.erase(filter);
+          v.recount_subscriptions();
+          *r = success();
+        });
+    s->busy = true;
+    return ticket;
   });
 }
-// Worker-owned trie: publishing visits matching topic levels and recipients,
-// never scans all persisted subscriptions. Rebuild only after subscription or
-// session changes; flat nodes also bound stack use for deeply nested filters.
-std::vector<std::string> DurableStore::match_targets(sqlite3* db, const std::string& topic)
+
+std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::match(
+    const std::string& topic)
 {
-  if (index_dirty_) {
+  if (index_dirty) {
     std::vector<TopicNode> rebuilt(1);
-    Statement rows(db, "SELECT client,filter FROM subscriptions WHERE qos>0");
-    while (rows.step()) {
-      std::string client = rows.text(0), filter = rows.text(1);
-      size_t node = 0, offset = 0;
-      for (;;) {
-        size_t end = filter.find('/', offset);
-        std::string level = filter.substr(offset, end == std::string::npos ? end : end - offset);
-        auto found = rebuilt[node].children.find(level);
-        if (found == rebuilt[node].children.end()) {
-          size_t next = rebuilt.size();
-          rebuilt.emplace_back();
-          rebuilt[node].children.emplace(level, next);
-          node = next;
-        } else
-          node = found->second;
-        if (end == std::string::npos)
-          break;
-        offset = end + 1;
+    for (const auto& item : sessions)
+      for (const auto& sub : item.second->subscriptions) {
+        if (!sub.second)
+          continue;
+        size_t node = 0, offset = 0;
+        for (;;) {
+          size_t end = sub.first.find('/', offset);
+          std::string level =
+              sub.first.substr(offset, end == std::string::npos ? end : end - offset);
+          auto found = rebuilt[node].children.find(level);
+          if (found == rebuilt[node].children.end()) {
+            size_t next = rebuilt.size();
+            rebuilt.emplace_back();
+            rebuilt[node].children.emplace(level, next);
+            node = next;
+          } else
+            node = found->second;
+          if (end == std::string::npos)
+            break;
+          offset = end + 1;
+        }
+        rebuilt[node].clients.push_back(item.second);
       }
-      rebuilt[node].clients.push_back(std::move(client));
-    }
-    topic_index_ = std::move(rebuilt);
-    index_dirty_ = false;
+    index = std::move(rebuilt);
+    index_dirty = false;
   }
-  std::set<std::string> candidates;
-  std::vector<std::pair<size_t, size_t>> pending{{0, 0}};
-  while (!pending.empty()) {
-    auto item = pending.back();
-    pending.pop_back();
-    const auto& node = topic_index_[item.first];
+  std::set<std::shared_ptr<Session>> targets;
+  std::vector<std::pair<size_t, size_t>> todo;
+  todo.emplace_back(0, 0);
+  while (!todo.empty()) {
+    auto item = todo.back();
+    todo.pop_back();
+    const auto& node = index[item.first];
     bool system = item.first == 0 && !topic.empty() && topic[0] == '$';
     auto hash = node.children.find("#");
     if (!system && hash != node.children.end())
-      for (const auto& c : topic_index_[hash->second].clients)
-        candidates.insert(c);
+      for (const auto& s : index[hash->second].clients)
+        targets.insert(s);
     if (item.second > topic.size()) {
-      for (const auto& c : node.clients)
-        candidates.insert(c);
+      for (const auto& s : node.clients)
+        targets.insert(s);
       continue;
     }
     size_t end = topic.find('/', item.second),
            next = end == std::string::npos ? topic.size() + 1 : end + 1;
-    std::string level =
-        topic.substr(item.second, end == std::string::npos ? end : end - item.second);
+    auto level = topic.substr(item.second, end == std::string::npos ? end : end - item.second);
     auto exact = node.children.find(level);
     if (exact != node.children.end())
-      pending.emplace_back(exact->second, next);
+      todo.emplace_back(exact->second, next);
     auto plus = node.children.find("+");
     if (!system && plus != node.children.end())
-      pending.emplace_back(plus->second, next);
+      todo.emplace_back(plus->second, next);
   }
-  std::vector<std::string> targets;
-  for (const auto& client : candidates) {
-    Statement live(db, "SELECT 1 FROM sessions WHERE client=? AND (online=1 OR deadline>?)");
-    live.bind(1, client);
-    live.bind(2, now_ms());
-    if (live.step())
-      targets.push_back(client);
+  std::vector<std::shared_ptr<Session>> live;
+  for (const auto& s : targets) {
+    if (s->busy)
+      throw Deferred();
+    if (s->online || s->deadline > DurableStore::now_ms())
+      live.push_back(s);
   }
-  return targets;
+  return live;
 }
 DurableStore::Result DurableStore::publish(const std::string& topic, const std::string& wire,
-                                           const std::string& sender, int64_t expires)
+                                           const std::string&, int64_t expires)
 {
-  return execute(wire.size() + topic.size() + 512, [=](sqlite3* db) {
-    Result r = success();
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    *r = success();
     if (expires > 0 && expires <= now_ms())
-      return r;
-    r.targets = match_targets(db, topic);
-    if (r.targets.empty())
-      return r;
-    {
-      Statement budget(db, "SELECT pending,bytes FROM counters WHERE id=1");
-      budget.step();
-      if (r.targets.size() > config_.max_messages ||
-          uint64_t(budget.integer(0)) > config_.max_messages - r.targets.size() ||
-          wire.size() > config_.max_bytes / r.targets.size() ||
-          uint64_t(budget.integer(1)) > config_.max_bytes - wire.size() * r.targets.size())
-        throw std::runtime_error("persistent message capacity exhausted");
-    }
-    for (const auto& target : r.targets) {
-      Statement budget(db, "SELECT pending FROM sessions WHERE client=?");
-      budget.bind(1, target);
-      budget.step();
-      if (budget.integer(0) >= int64_t(config_.max_messages_per_session))
+      return {};
+    auto targets = v.match(topic);
+    if (targets.empty())
+      return {};
+    v.check_metadata(0, v.pending + targets.size());
+    if (targets.size() > v.config.max_messages ||
+        v.pending > v.config.max_messages - targets.size() ||
+        wire.size() > v.config.max_bytes / targets.size() ||
+        v.bytes > v.config.max_bytes - wire.size() * targets.size())
+      throw std::runtime_error("persistent message capacity exhausted");
+    for (const auto& s : targets)
+      if (s->pending.size() >= v.config.max_messages_per_session)
         throw std::runtime_error("persistent client backlog exhausted");
+    auto message = std::make_shared<Impl::Message>();
+    message->id = ++v.next_id;
+    message->expires = expires;
+    message->partition = journal::topic_hash(topic) % v.messages.size();
+    message->wire = wire;
+    Encoder e;
+    e.u8(MESSAGE);
+    e.u64(message->id);
+    e.u64(expires);
+    e.text(wire);
+    e.u32(uint32_t(targets.size()));
+    std::vector<uint16_t> packets;
+    for (const auto& s : targets) {
+      uint16_t packet = s->pending.size() < 65535 ? v.available_packet(s) : 0;
+      packets.push_back(packet);
+      e.text(s->client);
+      e.u64(s->generation);
+      e.u32(packet);
+      r->targets.push_back(s->client);
     }
-    Statement m(db, "INSERT INTO messages(wire,expires) VALUES(?,?)");
-    m.blob(1, wire);
-    m.bind(2, expires);
-    m.step();
-    int64_t id = sqlite3_last_insert_rowid(db);
-    for (const auto& target : r.targets) {
-      Statement d(db, "INSERT INTO deliveries(client,message) VALUES(?,?)");
-      d.bind(1, target);
-      d.bind(2, id);
-      d.step();
+    // The live router uses binary_search to exclude recipients already queued
+    // here. Topic-index session pointers are not ordered by Client ID.
+    std::sort(r->targets.begin(), r->targets.end());
+    auto ticket = v.enqueue(*v.messages[message->partition], std::move(e.data),
+                            [=, &v](bool ok, const Location& location) {
+                              if (!ok)
+                                return;
+                              message->location = location;
+                              message->committed = true;
+                              for (const auto& s : targets)
+                                v.notify(s);
+                            });
+    for (size_t i = 0; i < targets.size(); ++i) {
+      auto s = targets[i];
+      Impl::DeliveryState entry;
+      entry.message = message;
+      entry.packet = packets[i];
+      s->pending.emplace(message->id, entry);
+      if (entry.packet) {
+        s->packets[entry.packet] = message->id;
+        s->next_packet = uint16_t(entry.packet % 65535 + 1);
+      }
+      s->bytes += wire.size();
+      v.bytes += wire.size();
+      ++v.pending;
     }
-    r.wake = true;
-    return r;
+    return ticket;
   });
 }
 DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epoch, int64_t after,
                                          uint16_t receive_maximum)
 {
-  return execute(
-      512,
-      [=](sqlite3* db) {
-        if (failed_epochs_[client] == epoch || !current(db, client, epoch))
-          return stale();
-        Result r = success();
-        size_t inflight = 0;
-        int64_t next = 1;
-        {
-          Statement n(db,
-                      "SELECT count(*) FROM deliveries WHERE client=? AND packet>0 AND message<=?");
-          n.bind(1, client);
-          n.bind(2, after);
-          n.step();
-          inflight = n.integer(0);
+  auto& v = *impl_;
+  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+    auto s = v.current(client, epoch);
+    if (!s) {
+      *r = stale();
+      return {};
+    }
+    *r = success();
+    size_t inflight = 0, returned_bytes = 0;
+    auto reservation = std::make_shared<DeliveryReservation>(v.delivery_bytes);
+    r->reservation = reservation;
+    for (auto it = s->pending.begin(); it != s->pending.end() && it->first <= after; ++it)
+      ++inflight;
+    size_t limit =
+        std::min<size_t>(v.config.max_inflight, receive_maximum ? receive_maximum : 65535);
+    std::vector<std::pair<int64_t, uint16_t>> claims;
+    std::set<uint16_t> reserved;
+    for (auto it = s->pending.upper_bound(after);
+         it != s->pending.end() && r->deliveries.size() < 32 && inflight < limit;) {
+      auto current = it++;
+      auto& entry = current->second;
+      auto message = entry.message;
+      if (!message->committed || entry.claim_pending)
+        break;
+      if (message->expires > 0 && message->expires <= now_ms()) {
+        v.drop(s, current);
+        continue;
+      }
+      size_t budget = v.config.max_request_bytes / 2;
+      if (message->wire.size() > budget ||
+          v.delivery_bytes->load() > budget - message->wire.size() ||
+          v.request_bytes >
+              v.config.max_request_bytes - message->wire.size() - v.delivery_bytes->load()) {
+        if (r->deliveries.empty()) {
+          r->ok = false;
+          r->error = "persistent delivery buffer full";
         }
-        {
-          Statement n(db, "SELECT next_packet FROM sessions WHERE client=?");
-          n.bind(1, client);
-          n.step();
-          next = n.integer(0);
-        }
-        size_t limit = std::min<size_t>(config_.max_inflight,
-                                        receive_maximum ? receive_maximum : 65535),
-               bytes = 0;
-        Statement rows(
-            db,
-            "SELECT d.message,d.packet,m.wire,m.expires FROM deliveries d JOIN messages m ON "
-            "m.id=d.message WHERE d.client=? AND d.message>? ORDER BY d.message LIMIT 32");
-        rows.bind(1, client);
-        rows.bind(2, after);
-        while (rows.step()) {
-          Delivery d;
-          d.sequence = rows.integer(0);
-          d.packet_id = rows.integer(1);
-          d.dup = d.packet_id != 0;
-          d.expires = rows.integer(3);
-          if (d.expires > 0 && d.expires <= now_ms())
-            continue;
-          if (inflight >= limit)
-            break;
-          // Reserve actual result bytes rather than a maximum-sized packet for
-          // every idle reader. This keeps admission bounded without starving
-          // publishers during a burst of hundreds of small-message consumers.
-          if (!reserve_result(size_t(sqlite3_column_bytes(rows.s, 2)))) {
-            if (r.deliveries.empty()) {
-              r.ok = false;
-              r.error = "persistent read admission full";
-            }
-            break;
+        break;
+      }
+      v.delivery_bytes->fetch_add(message->wire.size());
+      reservation->bytes += message->wire.size();
+      Delivery delivery;
+      delivery.sequence = message->id;
+      delivery.expires = message->expires;
+      delivery.wire = message->wire;
+      delivery.packet_id = entry.packet;
+      delivery.dup = entry.attempted;
+      if (!delivery.packet_id) {
+        delivery.packet_id = v.available_packet(s, reserved);
+        if (!delivery.packet_id)
+          break;
+        reserved.insert(delivery.packet_id);
+        claims.emplace_back(message->id, delivery.packet_id);
+      }
+      r->deliveries.push_back(std::move(delivery));
+      ++inflight;
+      returned_bytes += message->wire.size();
+      if (returned_bytes >= 256 * 1024)
+        break;
+    }
+    if (claims.empty()) {
+      for (const auto& delivery : r->deliveries)
+        s->pending.at(delivery.sequence).attempted = true;
+      return {};
+    }
+    Encoder e;
+    e.u8(CLAIM);
+    e.text(client);
+    e.u64(s->generation);
+    e.u32(uint32_t(claims.size()));
+    for (const auto& claim : claims) {
+      e.u64(claim.first);
+      e.u32(claim.second);
+    }
+    auto ticket =
+        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+          if (!ok)
+            return;
+          for (const auto& claim : claims) {
+            auto found = s->pending.find(claim.first);
+            if (found == s->pending.end())
+              continue;
+            found->second.packet = claim.second;
+            found->second.claim_pending = false;
           }
-          if (d.packet_id == 0) {
-            for (int tries = 0; tries < 65535; ++tries) {
-              Statement used(db, "SELECT 1 FROM deliveries WHERE client=? AND packet=?");
-              used.bind(1, client);
-              used.bind(2, next);
-              if (!used.step())
-                break;
-              next = next % 65535 + 1;
-            }
-            d.packet_id = uint16_t(next);
-            next = next % 65535 + 1;
-            Statement claim(db, "UPDATE deliveries SET packet=? WHERE client=? AND message=?");
-            claim.bind(1, int64_t(d.packet_id));
-            claim.bind(2, client);
-            claim.bind(3, d.sequence);
-            claim.step();
+          for (const auto& delivery : r->deliveries) {
+            auto found = s->pending.find(delivery.sequence);
+            if (found != s->pending.end())
+              found->second.attempted = true;
           }
-          ++inflight;
-          d.wire = rows.text(2);
-          bytes += d.wire.size();
-          r.deliveries.push_back(std::move(d));
-          if (bytes >= 256 * 1024)
-            break;
-        }
-        Statement n(db, "UPDATE sessions SET next_packet=? WHERE client=?");
-        n.bind(1, next);
-        n.bind(2, client);
-        n.step();
-        return r;
-      },
-      true);
+          if (s->epoch != epoch)
+            *r = stale();
+        });
+    for (const auto& claim : claims) {
+      s->packets[claim.second] = claim.first;
+      s->pending.at(claim.first).claim_pending = true;
+      s->next_packet = uint16_t(claim.second % 65535 + 1);
+    }
+    return ticket;
+  });
 }
 DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64_t epoch,
                                                uint16_t packet_id, bool wait_for_commit)
 {
-  return execute(
-      512,
-      [=](sqlite3* db) {
-        if (!current(db, client, epoch))
-          return stale();
-        Statement s(db, "DELETE FROM deliveries WHERE client=? AND packet=? AND packet>0");
-        s.bind(1, client);
-        s.bind(2, int64_t(packet_id));
-        s.step();
-        auto r = success();
-        r.wake = true;
-        r.targets.push_back(client);
-        return r;
+  auto& v = *impl_;
+  return v.call(
+      [&](const std::shared_ptr<Result>& r) -> Ticket {
+        auto s = v.current(client, epoch);
+        if (!s) {
+          *r = stale();
+          return {};
+        }
+        *r = success();
+        auto p = s->packets.find(packet_id);
+        if (p == s->packets.end())
+          return {};
+        auto found = s->pending.find(p->second);
+        if (found == s->pending.end() || !found->second.attempted)
+          return {};
+        if (found->second.ack_pending) {
+          if (wait_for_commit)
+            throw Deferred();
+          return {};
+        }
+        int64_t id = found->first;
+        Encoder e;
+        e.u8(ACK);
+        e.text(client);
+        e.u64(s->generation);
+        e.u64(id);
+        e.u32(packet_id);
+        auto ticket = v.enqueue(
+            v.state_log(client), std::move(e.data),
+            [=, &v](bool ok, const Location&) {
+              if (!ok)
+                return;
+              auto item = s->pending.find(id);
+              if (item != s->pending.end())
+                v.drop(s, item);
+              v.notify(s);
+            },
+            wait_for_commit);
+        found->second.ack_pending = true;
+        return ticket;
       },
-      false, wait_for_commit, client, epoch);
+      wait_for_commit);
+}
+
+void DurableStore::Impl::replay_control(const std::string& data, bool acknowledgements)
+{
+  Decoder d(data);
+  uint8_t kind = d.u8();
+  if (kind < CONNECT || kind > HEARTBEAT)
+    throw std::runtime_error("invalid session journal record");
+  if (acknowledgements != (kind == ACK || kind == CLAIM))
+    return;
+  if (kind == HEARTBEAT) {
+    uint32_t count = d.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+      auto name = d.text();
+      auto generation = d.u64(), epoch = d.u64();
+      int64_t deadline = d.u64();
+      auto found = sessions.find(name);
+      if (found != sessions.end() && found->second->generation == generation &&
+          found->second->epoch == epoch && found->second->online)
+        found->second->deadline = deadline;
+    }
+    d.end();
+    return;
+  }
+  auto name = d.text();
+  if (kind == CONNECT) {
+    auto owner = d.text();
+    auto generation = d.u64(), epoch = d.u64();
+    auto expiry = d.u32();
+    int64_t deadline = d.u64();
+    bool clean = d.u8();
+    d.end();
+    if (!generation || !epoch)
+      throw std::runtime_error("invalid session generation");
+    next_id = std::max(next_id, std::max(generation, epoch));
+    auto found = sessions.find(name);
+    std::shared_ptr<Session> s = found == sessions.end() ? nullptr : found->second;
+    if (s && (clean || s->generation != generation)) {
+      erase_session(s);
+      s.reset();
+    }
+    if (clean && !expiry)
+      return;
+    if (!s)
+      s = std::make_shared<Session>();
+    s->client = name;
+    s->owner = owner;
+    s->generation = generation;
+    s->epoch = epoch;
+    s->expiry = expiry;
+    s->deadline = deadline;
+    s->online = true;
+    sessions[name] = s;
+    return;
+  }
+  auto generation = d.u64();
+  auto found = sessions.find(name);
+  auto s = (found != sessions.end() && found->second->generation == generation) ? found->second
+                                                                                : nullptr;
+  if (kind == DISCONNECT) {
+    auto epoch = d.u64();
+    auto expiry = d.u32();
+    int64_t deadline = d.u64();
+    if (s && s->epoch == epoch) {
+      s->expiry = expiry;
+      s->deadline = deadline;
+      s->online = false;
+      if (!expiry)
+        erase_session(s);
+    }
+  } else if (kind == SUBSCRIBE) {
+    auto filter = d.text();
+    auto qos = d.u8();
+    if (qos > 2)
+      throw std::runtime_error("invalid stored subscription QoS");
+    if (s)
+      s->subscriptions[filter] = qos;
+  } else if (kind == UNSUBSCRIBE) {
+    auto filter = d.text();
+    if (s)
+      s->subscriptions.erase(filter);
+  } else if (kind == ACK) {
+    int64_t id = d.u64();
+    uint32_t packet = d.u32();
+    if (!packet || packet > 65535)
+      throw std::runtime_error("invalid stored ACK packet");
+    if (s) {
+      auto entry = s->pending.find(id);
+      if (entry != s->pending.end()) {
+        if (entry->second.packet != packet)
+          throw std::runtime_error("stored ACK refers to a different packet");
+        drop(s, entry);
+      } else
+        s->recovery_acks.push_back(id);
+      s->recovery_claims.erase(id);
+    }
+  } else if (kind == CLAIM) {
+    uint32_t count = d.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+      int64_t id = d.u64();
+      uint32_t packet = d.u32();
+      if (!packet || packet > 65535)
+        throw std::runtime_error("invalid stored packet claim");
+      if (s) {
+        auto entry = s->pending.find(id);
+        if (entry != s->pending.end())
+          entry->second.packet = uint16_t(packet);
+        else
+          s->recovery_claims[id] = uint16_t(packet);
+      }
+    }
+  }
+  d.end();
+}
+std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
+    const std::string& data, size_t partition, const Location& location, bool attach)
+{
+  Decoder d(data);
+  if (d.u8() != MESSAGE)
+    throw std::runtime_error("invalid message journal record");
+  auto m = std::make_shared<Message>();
+  m->id = d.u64();
+  m->expires = d.u64();
+  m->wire = d.text();
+  m->partition = partition;
+  m->location = location;
+  m->committed = true;
+  if (m->id <= 0)
+    throw std::runtime_error("invalid stored message sequence");
+  next_id = std::max(next_id, uint64_t(m->id));
+  uint32_t count = d.u32();
+  for (uint32_t i = 0; i < count; ++i) {
+    auto name = d.text();
+    auto generation = d.u64();
+    uint32_t packet = d.u32();
+    if (packet > 65535)
+      throw std::runtime_error("invalid stored packet identifier");
+    auto found = sessions.find(name);
+    if (!attach || found == sessions.end() || found->second->generation != generation)
+      continue;
+    auto s = found->second;
+    if (std::binary_search(s->recovery_acks.begin(), s->recovery_acks.end(), m->id))
+      continue;
+    auto claim = s->recovery_claims.find(m->id);
+    if (claim != s->recovery_claims.end())
+      packet = claim->second;
+    if (m->expires > 0 && m->expires <= DurableStore::now_ms())
+      continue;
+    DeliveryState entry;
+    entry.message = m;
+    entry.packet = uint16_t(packet);
+    entry.attempted = packet != 0;
+    if (!s->pending.emplace(m->id, entry).second)
+      throw std::runtime_error("duplicate journal message identity");
+    ++pending;
+    bytes += m->wire.size();
+    s->bytes += m->wire.size();
+  }
+  d.end();
+  return m;
+}
+void DurableStore::Impl::restore()
+{
+  auto file = journal::read_file(config.path + "/CHECKPOINT", size_t(config.max_disk_bytes / 8));
+  if (!file.empty()) {
+    auto body = unchecked(file);
+    Decoder d(body);
+    if (d.text() != "MQTTS-CHECKPOINT-2" || d.u32() != config.partitions)
+      throw std::runtime_error("checkpoint format/partition mismatch");
+    next_id = d.u64();
+    for (size_t p = 0; p < config.partitions; ++p) {
+      message_cuts[p] = d.u64();
+      state_cuts[p] = d.u64();
+    }
+    std::map<int64_t, std::shared_ptr<Message>> referenced;
+    uint32_t count = d.u32();
+    if (count > config.max_messages)
+      throw std::runtime_error("checkpoint exceeds configured message limit");
+    for (uint32_t i = 0; i < count; ++i) {
+      int64_t id = d.u64();
+      size_t partition = d.u32();
+      auto location = location_read(d);
+      if (partition >= messages.size() || location.serial > message_cuts[partition])
+        throw std::runtime_error("invalid checkpoint partition/cut");
+      auto m = decode_message(messages[partition]->read(location), partition, location, false);
+      if (m->id != id || !referenced.emplace(id, m).second)
+        throw std::runtime_error("checkpoint message identity mismatch");
+    }
+    count = d.u32();
+    if (count > config.max_sessions)
+      throw std::runtime_error("checkpoint exceeds configured session limit");
+    for (uint32_t i = 0; i < count; ++i) {
+      auto s = std::make_shared<Session>();
+      s->client = d.text();
+      s->owner = d.text();
+      s->generation = d.u64();
+      s->epoch = d.u64();
+      s->expiry = d.u32();
+      s->deadline = d.u64();
+      s->online = d.u8();
+      uint32_t next = d.u32();
+      if (!next || next > 65535)
+        throw std::runtime_error("invalid checkpoint packet cursor");
+      s->next_packet = uint16_t(next);
+      uint32_t subs = d.u32();
+      if (subs > config.max_subscriptions_per_session)
+        throw std::runtime_error("checkpoint subscription limit");
+      for (uint32_t j = 0; j < subs; ++j) {
+        auto filter = d.text();
+        auto qos = d.u8();
+        s->subscriptions[filter] = qos;
+      }
+      uint32_t entries = d.u32();
+      if (entries > config.max_messages_per_session)
+        throw std::runtime_error("checkpoint client backlog limit");
+      for (uint32_t j = 0; j < entries; ++j) {
+        int64_t id = d.u64();
+        uint32_t packet = d.u32();
+        auto message = referenced.find(id);
+        if (message == referenced.end() || packet > 65535)
+          throw std::runtime_error("invalid checkpoint delivery");
+        DeliveryState entry;
+        entry.message = message->second;
+        entry.packet = uint16_t(packet);
+        entry.attempted = packet != 0;
+        if (!s->pending.emplace(id, entry).second)
+          throw std::runtime_error("duplicate checkpoint delivery");
+        ++pending;
+        bytes += entry.message->wire.size();
+        s->bytes += entry.message->wire.size();
+      }
+      if (!sessions.emplace(s->client, s).second)
+        throw std::runtime_error("duplicate checkpoint session");
+    }
+    d.end();
+  }
+  // Controls establish the final generation for each client. Data records carry
+  // their original recipient generations; an old Clean Start can never resurrect.
+  for (size_t p = 0; p < states.size(); ++p)
+    states[p]->replay(state_cuts[p], [&](const Location&, const std::string& record) {
+      replay_control(record, false);
+    });
+  expire(true);
+  // Read compact ACK identities first. Replaying payloads before ACKs would
+  // temporarily materialize an entire checkpoint interval of already-consumed
+  // traffic in memory. Exact identities preserve holes without keeping payloads.
+  for (size_t p = 0; p < states.size(); ++p)
+    states[p]->replay(state_cuts[p], [&](const Location&, const std::string& record) {
+      replay_control(record, true);
+    });
+  for (const auto& item : sessions)
+    std::sort(item.second->recovery_acks.begin(), item.second->recovery_acks.end());
+  for (size_t p = 0; p < messages.size(); ++p)
+    messages[p]->replay(message_cuts[p],
+                        [&, p](const Location& location, const std::string& record) {
+                          decode_message(record, p, location, true);
+                        });
+  for (const auto& item : sessions) {
+    std::vector<int64_t>().swap(item.second->recovery_acks);
+    item.second->recovery_claims.clear();
+  }
+  expire(true);
+  recount_subscriptions();
+  validate_state();
+}
+void DurableStore::Impl::validate_state()
+{
+  check_metadata(0, pending);
+  if (sessions.size() > config.max_sessions || pending > config.max_messages ||
+      bytes > config.max_bytes)
+    throw std::runtime_error(
+        "recovered journal exceeds configured capacity; raise limits before opening");
+  for (const auto& item : sessions) {
+    auto s = item.second;
+    if (!s->generation || !s->epoch ||
+        s->subscriptions.size() > config.max_subscriptions_per_session ||
+        s->pending.size() > config.max_messages_per_session)
+      throw std::runtime_error("invalid recovered session or configured capacity");
+    s->packets.clear();
+    for (const auto& delivery : s->pending)
+      if (delivery.second.packet &&
+          !s->packets.emplace(delivery.second.packet, delivery.first).second)
+        throw std::runtime_error("duplicate live packet identifier in recovered session");
+  }
+}
+void DurableStore::Impl::checkpoint()
+{
+  std::lock_guard<std::mutex> single(checkpoint_mutex);
+  {
+    std::lock_guard<std::mutex> guard(mutex);
+    if (failed)
+      throw std::runtime_error("failed journal cannot checkpoint");
+    frozen = true;
+  }
+  try {
+    std::vector<Ticket> fences;
+    for (auto& log : messages)
+      fences.push_back(log->seal());
+    for (auto& log : states)
+      fences.push_back(log->seal());
+    for (const auto& fence : fences)
+      if (!fence->wait())
+        throw std::runtime_error(fence->error);
+    Encoder e;
+    std::vector<std::set<uint64_t>> retained(messages.size());
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      if (failed || requests)
+        throw std::runtime_error("checkpoint fence failed");
+      expire();
+      e.text("MQTTS-CHECKPOINT-2");
+      e.u32(uint32_t(config.partitions));
+      e.u64(next_id);
+      for (size_t p = 0; p < config.partitions; ++p) {
+        message_cuts[p] = messages[p]->serial();
+        state_cuts[p] = states[p]->serial();
+        e.u64(message_cuts[p]);
+        e.u64(state_cuts[p]);
+      }
+      std::map<int64_t, std::shared_ptr<Message>> live;
+      for (const auto& s : sessions)
+        for (const auto& delivery : s.second->pending)
+          live.emplace(delivery.first, delivery.second.message);
+      e.u32(uint32_t(live.size()));
+      for (const auto& item : live) {
+        auto m = item.second;
+        if (!m->committed)
+          throw std::runtime_error("uncommitted checkpoint message");
+        e.u64(m->id);
+        e.u32(uint32_t(m->partition));
+        location_write(e, m->location);
+        retained[m->partition].insert(m->location.segment);
+      }
+      e.u32(uint32_t(sessions.size()));
+      for (const auto& item : sessions) {
+        auto s = item.second;
+        e.text(s->client);
+        e.text(s->owner);
+        e.u64(s->generation);
+        e.u64(s->epoch);
+        e.u32(s->expiry);
+        e.u64(s->deadline);
+        e.u8(s->online);
+        e.u32(s->next_packet);
+        e.u32(uint32_t(s->subscriptions.size()));
+        for (const auto& sub : s->subscriptions) {
+          e.text(sub.first);
+          e.u8(sub.second);
+        }
+        e.u32(uint32_t(s->pending.size()));
+        for (const auto& entry : s->pending) {
+          e.u64(entry.first);
+          e.u32(entry.second.packet);
+        }
+      }
+    }
+    if (e.data.size() + 4 > config.max_disk_bytes / 8)
+      throw std::runtime_error("checkpoint exceeds reserved disk budget");
+    journal::atomic_file(config.path + "/CHECKPOINT", checked(e.data));
+    // The checkpoint rename AND its directory fsync precede any reclamation.
+    for (size_t p = 0; p < config.partitions; ++p) {
+      messages[p]->prune(message_cuts[p], retained[p]);
+      states[p]->prune(state_cuts[p], {});
+    }
+    std::lock_guard<std::mutex> guard(mutex);
+    frozen = false;
+  } catch (...) {
+    std::lock_guard<std::mutex> guard(mutex);
+    frozen = false;
+    fail();
+    throw;
+  }
+}
+void DurableStore::Impl::heartbeat()
+{
+  std::lock_guard<std::mutex> guard(mutex);
+  if (frozen || failed || stopping)
+    return;
+  expire();
+  for (size_t p = 0; p < states.size(); ++p) {
+    std::vector<std::shared_ptr<Session>> live;
+    for (const auto& item : sessions)
+      if (item.second->online && !item.second->busy &&
+          journal::topic_hash(item.first) % states.size() == p)
+        live.push_back(item.second);
+    if (live.empty())
+      continue;
+    Encoder e;
+    e.u8(HEARTBEAT);
+    e.u32(uint32_t(live.size()));
+    std::vector<uint64_t> epochs;
+    std::vector<int64_t> deadlines;
+    for (const auto& s : live) {
+      epochs.push_back(s->epoch);
+      int64_t deadline = DurableStore::now_ms() + int64_t(s->expiry) * 1000;
+      deadlines.push_back(deadline);
+      e.text(s->client);
+      e.u64(s->generation);
+      e.u64(s->epoch);
+      e.u64(deadline);
+    }
+    try {
+      enqueue(
+          *states[p], std::move(e.data),
+          [=](bool ok, const Location&) {
+            if (!ok)
+              return;
+            for (size_t i = 0; i < live.size(); ++i)
+              if (live[i]->epoch == epochs[i] && live[i]->online)
+                live[i]->deadline = deadlines[i];
+          },
+          false);
+    } catch (const Deferred&) {
+    }  // Saturation never extends a lease that was not persisted.
+    catch (const journal::AdmissionFull&) {
+    }  // Maintenance below will reclaim eligible segments.
+  }
+}
+void DurableStore::Impl::maintain()
+{
+  auto last_heartbeat = std::chrono::steady_clock::now(), last_checkpoint = last_heartbeat;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> guard(mutex);
+      if (stopped.wait_for(guard, std::chrono::milliseconds(100), [&] { return stopping; }))
+        return;
+    }
+    try {
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_heartbeat >= std::chrono::seconds(1)) {
+        heartbeat();
+        last_heartbeat = now;
+      }
+      bool pressure = false;
+      for (const auto& log : messages)
+        pressure = pressure || log->needs_checkpoint();
+      for (const auto& log : states)
+        pressure = pressure || log->needs_checkpoint();
+      if (now - last_checkpoint >= std::chrono::milliseconds(config.checkpoint_interval_ms) ||
+          (pressure && now - last_checkpoint >= std::chrono::seconds(1))) {
+        checkpoint();
+        last_checkpoint = now;
+      }
+    } catch (const std::exception& e) {
+      LOG_ERROR("Persistent journal maintenance failed: {}", e.what());
+      std::lock_guard<std::mutex> guard(mutex);
+      fail();
+      return;
+    }
+  }
+}
+void DurableStore::import_legacy(const std::string& exported)
+{
+  auto& v = *impl_;
+  std::unique_lock<std::mutex> exclusive(v.checkpoint_mutex);
+  {
+    std::lock_guard<std::mutex> guard(v.mutex);
+    if (v.next_id || !v.sessions.empty() || v.requests)
+      throw std::runtime_error("offline import requires a new empty store");
+    v.frozen = true;
+  }
+  journal::atomic_file(v.config.path + "/IMPORTING", "offline migration in progress\n");
+  try {
+    auto body = unchecked(exported);
+    Decoder d(body);
+    if (d.text() != "MQTTS-SQLITE-EXPORT-1")
+      throw std::runtime_error("unsupported offline export");
+    v.next_id = d.u64();
+    uint32_t count = d.u32();
+    if (count > v.config.max_sessions)
+      throw std::runtime_error("source exceeds import session limit");
+    for (uint32_t i = 0; i < count; ++i) {
+      auto s = std::make_shared<Impl::Session>();
+      s->client = d.text();
+      s->owner = d.text();
+      s->generation = d.u64();
+      s->epoch = s->generation;
+      s->expiry = d.u32();
+      s->deadline = d.u64();
+      s->online = false;
+      uint32_t next = d.u32();
+      if (!next || next > 65535)
+        throw std::runtime_error("invalid legacy packet cursor");
+      s->next_packet = uint16_t(next);
+      uint32_t subs = d.u32();
+      if (subs > v.config.max_subscriptions_per_session)
+        throw std::runtime_error("source exceeds import subscription limit");
+      for (uint32_t j = 0; j < subs; ++j) {
+        auto topic = d.text();
+        auto qos = d.u8();
+        s->subscriptions[topic] = qos;
+      }
+      if (!v.sessions.emplace(s->client, s).second)
+        throw std::runtime_error("duplicate legacy session");
+      v.next_id = std::max(v.next_id, s->generation);
+    }
+    count = d.u32();
+    if (count > v.config.max_messages)
+      throw std::runtime_error("source exceeds import message limit");
+    std::vector<Ticket> jobs;
+    size_t job_bytes = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      int64_t id = d.u64(), expires = d.u64();
+      auto topic = d.text(), wire = d.text();
+      uint32_t targets = d.u32();
+      Encoder e;
+      e.u8(MESSAGE);
+      e.u64(id);
+      e.u64(expires);
+      e.text(wire);
+      e.u32(targets);
+      for (uint32_t j = 0; j < targets; ++j) {
+        auto client = d.text();
+        auto generation = d.u64();
+        auto packet = d.u32();
+        e.text(client);
+        e.u64(generation);
+        e.u32(packet);
+      }
+      if (e.data.size() + 256 > v.config.max_request_bytes)
+        throw std::runtime_error("legacy message exceeds import request limit");
+      if (jobs.size() >= std::min<size_t>(64, v.config.max_requests) ||
+          job_bytes + e.data.size() + 256 > v.config.max_request_bytes) {
+        for (const auto& job : jobs)
+          if (!job->wait())
+            throw std::runtime_error(job->error);
+        jobs.clear();
+        job_bytes = 0;
+      }
+      size_t partition = journal::topic_hash(topic) % v.messages.size();
+      auto m = v.decode_message(e.data, partition, Location(), true);
+      m->committed = false;
+      if (v.pending > v.config.max_messages || v.bytes > v.config.max_bytes)
+        throw std::runtime_error("legacy backlog exceeds import capacity");
+      job_bytes += e.data.size() + 256;
+      jobs.push_back(
+          v.messages[partition]->append(std::move(e.data), [m](bool ok, const Location& location) {
+            if (ok) {
+              m->location = location;
+              m->committed = true;
+            }
+          }));
+    }
+    d.end();
+    for (const auto& job : jobs)
+      if (!job->wait())
+        throw std::runtime_error(job->error);
+    v.expire(true);
+    v.recount_subscriptions();
+    v.validate_state();
+    exclusive.unlock();
+    v.checkpoint();
+    if (unlink((v.config.path + "/IMPORTING").c_str()) != 0)
+      throw std::runtime_error("cannot finish import marker");
+    int directory = open(v.config.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0)
+      throw std::runtime_error("cannot open completed import directory");
+    int result = fsync(directory);
+    close(directory);
+    if (result != 0)
+      throw std::runtime_error("cannot sync completed import directory");
+  } catch (...) {
+    std::lock_guard<std::mutex> guard(v.mutex);
+    v.fail();
+    throw;
+  }
 }
 }  // namespace mqtt

@@ -1,0 +1,165 @@
+{
+  "storage": "native partition log v2",
+  "message_partitions": 4,
+  "state_partitions": 4,
+  "io_workers": 8,
+  "event_threads": 2,
+  "payload_bytes": 4096,
+  "seconds_per_rate": 30,
+  "measurements": [
+    {
+      "filesystem": "overlayfs",
+      "scenario": "one publisher and one persistent consumer",
+      "connections": 2,
+      "offered_messages_per_second": null,
+      "delivered": 256,
+      "elapsed_s": 0.658,
+      "delivered_per_second": 389,
+      "publish_to_receive_ms": {
+        "p50": 2.754,
+        "p95": 3.487,
+        "p99": 4.059,
+        "max": 5.481
+      },
+      "publish_to_puback_ms": {
+        "p50": 1.777,
+        "p95": 2.417,
+        "p99": 2.982,
+        "max": 4.257
+      },
+      "client_event_loop_lag_ms": {
+        "p50": 0.537,
+        "p95": 1.007,
+        "p99": 1.414,
+        "max": 1.414
+      },
+      "broker_thread_cpu_percent": [
+        7.6,
+        1.5,
+        1.5,
+        0.0,
+        0.0
+      ],
+      "remote_authorization_calls": 0
+    },
+    {
+      "filesystem": "overlayfs",
+      "scenario": "1000 connections at 1000 messages/s",
+      "connections": 1000,
+      "offered_messages_per_second": 1000,
+      "delivered": 30000,
+      "elapsed_s": 30.001,
+      "delivered_per_second": 1000,
+      "publish_to_receive_ms": {
+        "p50": 1.99,
+        "p95": 3.293,
+        "p99": 5.894,
+        "max": 37.054
+      },
+      "publish_to_puback_ms": {
+        "p50": 2.052,
+        "p95": 3.406,
+        "p99": 5.993,
+        "max": 37.21
+      },
+      "client_event_loop_lag_ms": {
+        "p50": 0.404,
+        "p95": 1.093,
+        "p99": 1.635,
+        "max": 10.59
+      },
+      "broker_thread_cpu_percent": [
+        15.4,
+        13.9,
+        2.5,
+        2.5,
+        2.5
+      ],
+      "remote_authorization_calls": 0,
+      "schedule_lag_ms": {
+        "p50": 0.386,
+        "p95": 1.1,
+        "p99": 1.488,
+        "max": 13.928
+      },
+      "peak_active_tasks": 38
+    },
+    {
+      "filesystem": "overlayfs",
+      "scenario": "1000 connections at 3000 messages/s",
+      "connections": 1000,
+      "offered_messages_per_second": 3000,
+      "delivered": 90000,
+      "elapsed_s": 30.005,
+      "delivered_per_second": 2999,
+      "publish_to_receive_ms": {
+        "p50": 2.339,
+        "p95": 7.083,
+        "p99": 38.879,
+        "max": 164.139
+      },
+      "publish_to_puback_ms": {
+        "p50": 2.433,
+        "p95": 7.515,
+        "p99": 41.054,
+        "max": 175.957
+      },
+      "client_event_loop_lag_ms": {
+        "p50": 0.446,
+        "p95": 1.697,
+        "p99": 7.15,
+        "max": 66.208
+      },
+      "broker_thread_cpu_percent": [
+        34.1,
+        30.9,
+        4.9,
+        4.8,
+        4.7
+      ],
+      "remote_authorization_calls": 0,
+      "schedule_lag_ms": {
+        "p50": 0.456,
+        "p95": 2.14,
+        "p99": 15.613,
+        "max": 73.025
+      },
+      "peak_active_tasks": 435
+    },
+    {
+      "filesystem": "overlayfs",
+      "scenario": "1000 connections, saturated window 4",
+      "connections": 1000,
+      "offered_messages_per_second": null,
+      "delivered": 64000,
+      "elapsed_s": 8.887,
+      "delivered_per_second": 7201,
+      "publish_to_receive_ms": {
+        "p50": 96.46,
+        "p95": 257.325,
+        "p99": 530.755,
+        "max": 677.533
+      },
+      "publish_to_puback_ms": {
+        "p50": 122.409,
+        "p95": 293.44,
+        "p99": 553.455,
+        "max": 689.37
+      },
+      "client_event_loop_lag_ms": {
+        "p50": 42.002,
+        "p95": 129.444,
+        "p99": 220.824,
+        "max": 259.077
+      },
+      "broker_thread_cpu_percent": [
+        67.2,
+        52.1,
+        6.3,
+        6.3,
+        6.3
+      ],
+      "remote_authorization_calls": 0
+    }
+  ]
+}

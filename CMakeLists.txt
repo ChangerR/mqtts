@@ -163,6 +163,7 @@ add_library(mqtt_parser STATIC
     src/common/mqtt_buffer.cpp
     src/common/mqtt_config.cpp
     src/session/mqtt_durable_store.cpp
+    src/session/mqtt_append_log.cpp
     src/session/mqtt_session_manager_v2.cpp
 	src/session/mqtt_session_info.cpp
     src/topic/mqtt_topic_tree.cpp
@@ -204,6 +205,9 @@ target_link_libraries(mqtt_router mqtt_runtime)
 target_link_libraries(mqtt_router mqtt_proto)
 
 # 添加mqtt_auth库
+add_executable(mqtts-store-import src/app/mqtts_store_import.cpp src/common/logger.cpp)
+target_link_libraries(mqtts-store-import mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)
+
 add_library(mqtt_auth STATIC
     src/auth/mqtt_auth_remote.cpp
     src/auth/mqtt_auth_factory.cpp
@@ -219,8 +223,7 @@ add_library(mqtt_auth STATIC
 target_link_libraries(mqtt_auth mqtt_authz_proto)
 
 # 查找SQLite3 (可选)
-find_package(SQLite3 REQUIRED)
-target_link_libraries(mqtt_parser SQLite::SQLite3)
+find_package(SQLite3 QUIET)
 
 # 查找hiredis (Redis client, 可选)
 pkg_check_modules(HIREDIS hiredis)

@@ -51,7 +51,7 @@ WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  && cmake --build build --target mqtts --parallel 3
+  && cmake --build build --target mqtts mqtts-store-import --parallel 3
 
 FROM ubuntu:22.04
 
@@ -72,6 +72,7 @@ RUN useradd -r -s /bin/false -d /app mqtts \
   && chown -R mqtts:mqtts /app /data
 
 COPY --from=builder /src/build/mqtts /app/bin/mqtts
+COPY --from=builder /src/build/mqtts-store-import /app/bin/mqtts-store-import
 COPY --from=builder /usr/local/lib/libllhttp.so* /app/lib/
 COPY mqtts.yaml /app/config/mqtts.yaml
 

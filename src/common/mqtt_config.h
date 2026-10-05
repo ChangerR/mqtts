@@ -18,7 +18,13 @@ namespace mqtt {
  */
 struct PersistenceConfig {
   bool enabled = false;
+  // Preserve the legacy basename so upgrades refuse an old SQLite file instead
+  // of silently starting an empty store at a different default location.
   std::string path = "mqtts-sessions.db";
+  size_t partitions = 4;
+  size_t segment_bytes = 16 * 1024 * 1024;
+  uint64_t max_disk_bytes = 4ULL * 1024 * 1024 * 1024;
+  uint32_t checkpoint_interval_ms = 30000;
   uint32_t max_session_expiry_seconds = 86400;
   size_t max_sessions = 10000;
   size_t max_subscriptions_per_session = 128;

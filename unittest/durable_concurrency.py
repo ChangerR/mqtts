@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise actual fsync-backed deliveries concurrently with warm/offline ACLs."""
+"""Exercise committed partition-log deliveries with warm/offline ACLs."""
 import argparse
 import asyncio
 import json
-import sqlite3
+import subprocess
 import time
 from pathlib import Path
 from http_auth_cache_integration import Fixture
@@ -49,15 +49,15 @@ async def load(f,count,messages,size,fan_in=False):
             assert all(c.failure is None for c in clients)
             callbacks=f.counts['/authorization']-before;assert callbacks==0
             row=metrics(label,count,samples,elapsed,callbacks,2,4,size)
-            row.update(connections=len(clients),persistent_consumers=1 if fan_in else count,durability='SQLite WAL synchronous FULL',disk_threads=1,io_queue_limit=1024,io_queue_bytes=16777216)
+            row.update(filesystem=subprocess.check_output(['stat','-f','-c','%T',str(f.root)],text=True).strip(),connections=len(clients),persistent_consumers=1 if fan_in else count,durability='partitioned append log, fdatasync before ACK',message_partitions=4,state_partitions=4,disk_threads=8,io_queue_limit=1024,io_queue_bytes=16777216)
             reports.append(row);print(json.dumps(row),flush=True)
         return reports
     except BaseException as error:
         print('FAILED phase:',repr(error),'broker status',f.proc.poll(),flush=True)
         print('Client failures:',[(c.name,repr(c.failure)) for c in clients if c.failure][:10],flush=True)
         if 'pairs' in locals(): print('Messages received/requested:',sum(p.received for p in pairs),sum(p.sequence for p in pairs),flush=True)
-        with sqlite3.connect(f.root/'sessions.db') as snapshot:
-            print('Queue count/inflight:',snapshot.execute('SELECT count(*),sum(packet>0) FROM deliveries').fetchone(),flush=True)
+        segments=list((f.root/'journal').glob('*/*.log'))
+        print('Journal segments/bytes:',len(segments),sum(p.stat().st_size for p in segments),flush=True)
         Path('/tmp/mqtts-durable-failure.log').write_text((f.root/'broker.log').read_text())
         raise
     finally:await asyncio.gather(*(c.close() for c in clients),return_exceptions=True)

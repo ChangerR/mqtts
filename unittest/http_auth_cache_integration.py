@@ -108,6 +108,7 @@ class Fixture:
                         publish_cache_ignored_fields='["nonce","data"]', http_workers=2,
                         http_queue_capacity=4, failure_cooldown_ms=200)
         settings.update(self.settings)
+        self.process_env = settings.pop('process_env', None)
         server_threads = settings.pop('server_threads', 1)
         max_connections = settings.pop('max_connections', 2048)
         persistence = settings.pop('persistence', None)
@@ -119,10 +120,11 @@ class Fixture:
                       monitoring=dict(enabled=False), log=dict(level='warn'),
                       auth=dict(enabled=True, allow_anonymous=False, providers=[dict(type='http', settings=settings)]))
         if persistence is not None:
-            config['persistence'] = dict(enabled=True, path=str(self.root/'sessions.db'), **persistence)
+            config['persistence'] = dict(enabled=True, path=str(self.root/'journal'))
+            config['persistence'].update(persistence)
         (self.root/'config.json').write_text(json.dumps(config))
         self.log = (self.root/'broker.log').open('w')
-        self.proc = subprocess.Popen([self.binary, '-c', str(self.root/'config.json')], stdout=self.log, stderr=self.log)
+        self.proc = subprocess.Popen([self.binary, '-c', str(self.root/'config.json')], stdout=self.log, stderr=self.log, env=self.process_env)
         deadline = time.monotonic()+8
         while True:
             assert self.proc.poll() is None, (self.root/'broker.log').read_text()

@@ -3,7 +3,10 @@
 import argparse
 import json
 import socket
-import sqlite3
+import os
+from pathlib import Path
+import tempfile
+import threading
 import struct
 import subprocess
 import time
@@ -58,7 +61,7 @@ def client(f,name,version=5,clean=False,expiry=60,receive=32,owner=None,websocke
 
 def restart(f):
     f.proc.kill();f.proc.wait()
-    f.proc=subprocess.Popen([f.binary,'-c',str(f.root/'config.json')],stdout=f.log,stderr=f.log)
+    f.proc=subprocess.Popen([f.binary,'-c',str(f.root/'config.json')],stdout=f.log,stderr=f.log,env=f.process_env)
     end=time.monotonic()+8
     while True:
         assert f.proc.poll() is None and time.monotonic()<end
@@ -66,7 +69,7 @@ def restart(f):
             with socket.create_connection(('127.0.0.1',f.port),timeout=.1):return
         except OSError:time.sleep(.02)
 
-def run(binary):
+def run(binary, fault_library):
     for version in (4,5):
         with Fixture(binary,persistence={},server_threads=2,version_feed=True,http_workers=4,http_queue_capacity=64) as f:
             f.wildcards=True
@@ -113,6 +116,23 @@ def run(binary):
                 # Persistent WS is explicitly rejected instead of promising durability.
                 client(f,'ws-persistent',websocket=True,expected=1)
             print('PASS MQTT',version,'offline -> crash -> session present -> ACK/DUP/window -> WebSocket -> ACL -> clean/expiry',flush=True)
+    with Fixture(binary,persistence={},server_threads=2,http_workers=4,http_queue_capacity=64) as f:
+        f.wildcards=True
+        readers=[]
+        # Router exclusion uses the durable target list. Allocation order must
+        # not affect deduplication against the ordinary live-delivery path.
+        for name in ['zulu','alpha','tango','bravo','sierra','charlie','romeo','delta']:
+            reader,_=client(f,name)
+            assert reader.sub('fixture/#')==1
+            assert reader.sub('fixture/fanout')==1
+            readers.append(reader)
+        writer,_=client(f,'writer',clean=True,expiry=0)
+        expected=[f.payload(writer,i) for i in range(4)]
+        for data in expected:writer.pub('fixture/fanout',data)
+        for reader in readers:
+            assert [reader.delivery()[1] for _ in expected]==expected,'duplicate or reordered live fanout'
+            reader.quiet()
+        print('PASS multiple durable subscribers and overlapping filters receive each publication once',flush=True)
     with Fixture(binary,persistence=dict(max_messages=2,max_messages_per_session=2)) as f:
         r,_=client(f,'bounded');assert r.sub('fixture/full')==1;r.disconnect();time.sleep(.05)
         w,_=client(f,'writer',clean=True,expiry=0)
@@ -122,24 +142,87 @@ def run(binary):
         else:raise AssertionError('overflow received a positive PUBACK')
         r,present=client(f,'bounded');assert present
         assert [json.loads(r.delivery()[1])['nonce'] for _ in range(2)]==[0,1]
-        # A real competing SQLite writer makes COMMIT unavailable, without
-        # blocking network event threads or manufacturing a successful receipt.
-        blocked=sqlite3.connect(f.root/'sessions.db');blocked.execute('BEGIN IMMEDIATE')
-        w,_=client(f,'blocked-writer',clean=True,expiry=0,expected=1)
-        blocked.rollback();blocked.close()
         print('PASS disk backlog exhaustion closes publisher without positive PUBACK',flush=True)
-
-    with Fixture(binary,persistence={}) as f:
-        r,_=client(f,'disk-fault');assert r.sub('fixture/disk')==1;r.disconnect();time.sleep(.05)
+    if fault_library:
+        journal_faults(binary, fault_library)
+    with Fixture(binary,persistence=dict(checkpoint_interval_ms=200,segment_bytes=4096),http_workers=4,http_queue_capacity=64) as f:
+        f.wildcards=True
+        r,_=client(f,'checkpoint-reader',receive=8);assert r.sub('fixture/#')==1;r.disconnect()
         w,_=client(f,'writer',clean=True,expiry=0)
-        lock=sqlite3.connect(f.root/'sessions.db');lock.execute('BEGIN IMMEDIATE')
-        try:
-            try:w.pub('fixture/disk',f.payload(w,1))
-            except (EOFError,ConnectionError):pass
-            else:raise AssertionError('failed disk transaction was acknowledged')
-        finally:lock.rollback();lock.close()
-        r,present=client(f,'disk-fault');assert present;r.quiet()
-        print('PASS SQLite write failure withholds PUBACK and preserves broker availability',flush=True)
+        expected=[f.payload(w,i) for i in range(200)]
+        for i,data in enumerate(expected):w.pub('fixture/partition-'+str(i%8),data)
+        time.sleep(.4);assert (f.root/'journal'/'CHECKPOINT').exists();restart(f)
+        r,present=client(f,'checkpoint-reader',receive=8);assert present
+        first=[r.delivery(ack=False) for _ in range(8)]
+        assert [m[1] for m in first]==expected[:8]
+        for index in [3,5]:r.ack(first[index][2])
+        time.sleep(.4);restart(f)
+        r,present=client(f,'checkpoint-reader',receive=8);assert present
+        replay=r.delivery();assert replay[1:3]==first[0][1:3] and replay[3]
+        assert [replay[1]]+[r.delivery()[1] for _ in range(197)]==[data for i,data in enumerate(expected) if i not in [3,5]]
+        r.quiet()
+        print('PASS checkpoints, cross-partition ordering, segment reclamation and ACK gaps across SIGKILL',flush=True)
+
+def journal_faults(binary, library):
+    with tempfile.TemporaryDirectory(prefix='mqtts-fault-control-') as control:
+        root=Path(control)
+        environment=dict(os.environ,LD_PRELOAD=library,MQTTS_JOURNAL_FAULT_CONTROL=control)
+        for mode in ['write','sync']:
+            with Fixture(binary,persistence={},process_env=environment) as f:
+                r,_=client(f,'disk-fault');assert r.sub('fixture/disk')==1;r.disconnect();time.sleep(.05)
+                w,_=client(f,'writer',clean=True,expiry=0)
+                (root/mode).write_text('/messages-')
+                try:
+                    try:w.pub('fixture/disk',f.payload(w,1))
+                    except (EOFError,ConnectionError):pass
+                    else:raise AssertionError('failed journal write/sync was acknowledged')
+                finally:(root/mode).unlink()
+                restart(f)
+                r,present=client(f,'disk-fault');assert present
+                if mode=='write':r.quiet()
+                # A completed write with failed sync may replay an unacknowledged
+                # publication; MQTT QoS 1 permits this ambiguity.
+                print('PASS journal',mode,'failure withholds PUBACK; broker restarts',flush=True)
+        with Fixture(binary,persistence={},process_env=environment) as f:
+            r,_=client(f,'ack-fault');assert r.sub('fixture/ack')==1
+            w,_=client(f,'writer',clean=True,expiry=0)
+            w.pub('fixture/ack',f.payload(w,1));first=r.delivery(ack=False)
+            (root/'write').write_text('/sessions-')
+            r.ack(first[2]);time.sleep(.08)
+            (root/'write').unlink();restart(f)
+            r,present=client(f,'ack-fault');assert present
+            replay=r.delivery();assert replay[1:3]==first[1:3] and replay[3]
+            print('PASS failed asynchronous ACK preserves exact packet for replay',flush=True)
+        with Fixture(binary,persistence={},process_env=environment,http_workers=4,http_queue_capacity=64) as f:
+            def partition(topic):
+                value=14695981039346656037
+                for c in topic.encode():value=((value^c)*1099511628211)&((1<<64)-1)
+                return value%4
+            topics=['fixture/slow','fixture/fast']
+            while partition(topics[0])==partition(topics[1]):topics[1]+='x'
+            slow,_=client(f,'slow');assert slow.sub(topics[0])==1
+            fast,_=client(f,'fast');assert fast.sub(topics[1])==1
+            a,_=client(f,'a',clean=True,expiry=0);b,_=client(f,'b',clean=True,expiry=0)
+            # Warm current authorization before faulting a disk worker.
+            a.pub(topics[0],f.payload(a,0));slow.delivery()
+            b.pub(topics[1],f.payload(b,0));fast.delivery()
+            marker=root/'delay';marker.write_text('/messages-'+str(partition(topics[0]))+'/')
+            errors=[]
+            def send_slow():
+                try:a.pub(topics[0],f.payload(a,1))
+                except BaseException as error:errors.append(error)
+            blocked=threading.Thread(target=send_slow);blocked.start()
+            try:
+                time.sleep(.1);assert blocked.is_alive()
+                started=time.monotonic();b.pub(topics[1],f.payload(b,1));assert json.loads(fast.delivery()[1])['nonce']==1
+                assert time.monotonic()-started<.5,'slow partition blocked independent topic'
+                slow.quiet()
+            finally:
+                marker.unlink();blocked.join(timeout=4)
+            assert not blocked.is_alive() and not errors,errors
+            assert json.loads(slow.delivery()[1])['nonce']==1
+            print('PASS stalled partition cannot acknowledge early; independent partition keeps delivering',flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--broker',required=True);run(p.parse_args().broker)
+    p=argparse.ArgumentParser();p.add_argument('--broker',required=True);p.add_argument('--fault-library')
+    a=p.parse_args();run(a.broker,a.fault_library)

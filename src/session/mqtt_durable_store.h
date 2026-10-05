@@ -13,14 +13,26 @@
 #include <vector>
 #include "mqtt_config.h"
 
-struct sqlite3;
 namespace mqtt {
 
-// All SQLite work is owned by one OS thread. Callers wait on eventfd through
-// the coroutine runtime; neither filesystem IO nor a std::future blocks MQTT.
+// Topic-partitioned append logs and separate sharded session journals.
+// Filesystem work is performed by OS workers, never MQTT event threads.
 class DurableStore
 {
  public:
+  class Signal
+  {
+   public:
+    Signal();
+    ~Signal();
+    uint64_t load() const { return revision_.load(std::memory_order_acquire); }
+    void notify();
+    void wait(uint64_t observed, int timeout_ms);
+
+   private:
+    int fd_ = -1;
+    std::atomic<uint64_t> revision_{1};
+  };
   struct Delivery
   {
     int64_t sequence = 0;
@@ -32,12 +44,14 @@ class DurableStore
   struct Result
   {
     bool ok = false, present = false, stale = false, wake = false;
-    std::shared_ptr<std::atomic<uint64_t>> revision;
+    std::shared_ptr<Signal> revision;
     uint64_t epoch = 0;
     std::string error;
     std::vector<std::pair<std::string, uint8_t>> subscriptions;
     std::vector<std::string> targets;
     std::vector<Delivery> deliveries;
+    // Shared lifetime bounds delivery copies even when a socket remains slow.
+    std::shared_ptr<void> reservation;
   };
   explicit DurableStore(const PersistenceConfig& config);
   ~DurableStore();
@@ -53,38 +67,20 @@ class DurableStore
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
   Result acknowledge(const std::string& client, uint64_t epoch, uint16_t packet_id,
                      bool wait_for_commit = true);
-  bool has_subscriptions() const { return subscription_count_.load() != 0; }
-  uint32_t max_session_expiry() const { return config_.max_session_expiry_seconds; }
+  bool has_subscriptions() const;
+  uint32_t max_session_expiry() const;
   static int64_t now_ms();
+  struct Statistics
+  {
+    size_t sessions = 0, pending = 0, bytes = 0;
+  };
+  Statistics statistics() const;
+  // Maintenance/administration API; performs blocking disk work outside MQTT threads.
+  void checkpoint();
+  void import_legacy(const std::string& exported);
 
  private:
-  struct Request;
-  Request* active_request_ = nullptr;
-  bool reserve_result(size_t bytes);
-  PersistenceConfig config_;
-  sqlite3* db_ = nullptr;
-  int lock_fd_ = -1;
-  std::mutex mutex_;
-  std::condition_variable changed_;
-  std::deque<std::shared_ptr<Request>> queue_;
-  size_t outstanding_ = 0, bytes_ = 0, bulk_bytes_ = 0;
-  bool stopping_ = false;
-  std::thread worker_;
-  std::atomic<size_t> subscription_count_{0};
-  std::unordered_map<std::string, std::shared_ptr<std::atomic<uint64_t>>> signals_;
-  std::unordered_map<std::string, uint64_t> failed_epochs_;
-  Result execute(size_t bytes, std::function<Result(sqlite3*)> fn, bool bulk = false,
-                 bool wait_for_commit = true, const std::string& failure_client = "",
-                 uint64_t failure_epoch = 0);
-  void work();
-  void sweep(sqlite3* db, bool startup = false);
-  struct TopicNode
-  {
-    std::unordered_map<std::string, size_t> children;
-    std::vector<std::string> clients;
-  };
-  std::vector<TopicNode> topic_index_;
-  bool index_dirty_ = true;
-  std::vector<std::string> match_targets(sqlite3* db, const std::string& topic);
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 }  // namespace mqtt

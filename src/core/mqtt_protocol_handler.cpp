@@ -1782,7 +1782,8 @@ void MQTTProtocolHandler::pump_durable()
     while (durable_running_ && connected_ && socket_ && socket_->is_connected()) {
       uint64_t revision = durable_revision_ ? durable_revision_->load() : 0;
       if (!fetch_again && revision == observed) {
-        runtime::current_runtime().wait(-1, 0, 5);
+        if (durable_revision_)
+          durable_revision_->wait(observed, 100);
         continue;
       }
       observed = revision;
