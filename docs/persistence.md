@@ -124,6 +124,16 @@ CRC. New segment directory entries are synced. Recovery truncates only an incomp
 final frame in the last segment; a complete checksum mismatch, damaged sealed frame,
 missing post-checkpoint serial or missing referenced segment refuses startup.
 
+A full-length invalid final frame is deliberately **not** auto-truncated. Without a
+separate trustworthy commit watermark, its location or checksum cannot establish
+whether the publisher received PUBACK before corruption occurred. Automatically
+discarding it could silently lose an acknowledged publication. Only structurally
+incomplete final frames are repaired automatically. On complete-frame corruption,
+stop the broker, preserve the whole directory and inspect storage health; recover
+from a verified backup or an explicitly reviewed offline repair. Never bypass CRC
+validation or truncate the last frame merely to make startup succeed. Tests cover
+both incomplete-tail recovery and preservation of complete CRC/magic/zero-fill damage.
+
 Checkpoints briefly freeze admission, fence and seal every log, and copy committed
 state and shared live-payload references. Admission resumes before snapshot encoding or disk I/O.
 Event coroutines use cooperative lock acquisition and do not block their OS thread

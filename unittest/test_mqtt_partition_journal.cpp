@@ -98,6 +98,25 @@ int main()
     rejected = true;
   }
   assert(rejected);
+  assert(fs::file_size(last) == good_size);
+  // A complete zero-filled last frame is indistinguishable from corruption
+  // of an acknowledged frame. Recovery must preserve evidence, not truncate it.
+  {
+    std::ofstream file(last, std::ios::binary | std::ios::trunc);
+    file << std::string(good_size, '\0');
+  }
+  rejected = false;
+  try {
+    AppendLog log(root + "/append", 4096, 16384);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected && fs::file_size(last) == good_size);
+  {
+    std::ifstream file(last, std::ios::binary);
+    std::string preserved((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    assert(preserved == std::string(good_size, '\0'));
+  }
   {
     AppendLog log(root + "/quota", 4096, 8192);
     assert(log.append(std::string(6000, 'x'), noop)->wait());
