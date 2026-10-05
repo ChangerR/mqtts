@@ -820,15 +820,19 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
     (void)auth_manager_->check_publish(*current_auth_context_, packet->topic_name, packet->payload, auth_result);
 
     if (auth::AuthResult::SUCCESS != auth_result) {
-      LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions",
+      LOG_WARN("Client {}:{} publish authorization failed for topic '{}'",
                client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
       auth_denied = true;
+      const bool denied = auth_result == auth::AuthResult::ACCESS_DENIED ||
+                          auth_result == auth::AuthResult::INVALID_CREDENTIALS ||
+                          auth_result == auth::AuthResult::USER_NOT_FOUND;
+      const auto reason = denied ? ReasonCode::NotAuthorized : ReasonCode::UnspecifiedError;
       if (negotiated_protocol_version_ < 5 || packet->qos == 0) {
-        ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        ret = denied ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_AUTH_UNAVAILABLE;
       } else if (1 == packet->qos) {
-        ret = send_puback(packet->packet_id, ReasonCode::NotAuthorized);
+        ret = send_puback(packet->packet_id, reason);
       } else if (2 == packet->qos) {
-        ret = send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
+        ret = send_pubrec(packet->packet_id, reason);
       } else {
         ret = MQ_SUCCESS;
       }

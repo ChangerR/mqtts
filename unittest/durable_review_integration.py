@@ -103,6 +103,25 @@ def sender_loop_avoidance(binary):
     print('PASS MQTT 3/5 sender loop avoidance in durable and live fanout', flush=True)
 
 
+def publish_negative_ack(binary):
+    for websocket in (False, True):
+        for qos in (1, 2):
+            with Fixture(binary, cache_ttl_ms=0, failure_cooldown_ms=100) as f:
+                writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=websocket)
+                reader, _ = client(f, 'reader', clean=True, expiry=0)
+                assert reader.sub('fixture/errors') == 1
+                for mode, reason in [('denied', 0x87), ('offline', 0x80)]:
+                    f.revoked = {'writer'} if mode == 'denied' else set()
+                    f.mode = 'offline' if mode == 'offline' else 'normal'
+                    writer.send(packet(0x30 | (qos << 1), utf('fixture/errors') + b'\0\7\0' + f.payload(writer, qos)))
+                    head, body = writer.read()
+                    assert head == (0x40 if qos == 1 else 0x50) and body[:3] == bytes([0, 7, reason]), (head, body)
+                    writer.send(b'\xc0\0')
+                    assert writer.read() == (0xd0, b'')
+                    reader.quiet()
+    print('PASS TCP/WS MQTT 5 negative PUBACK/PUBREC, denial vs outage, and connection reuse', flush=True)
+
+
 def qos_zero_takeover(binary):
     for version in (4, 5):
         with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
@@ -277,6 +296,7 @@ if __name__ == '__main__':
     authorization_failures(args.broker)
     qos_zero_takeover(args.broker)
     sender_loop_avoidance(args.broker)
+    publish_negative_ack(args.broker)
     poison_messages(args.broker)
     stored_wire_budget(args.broker)
     expired_inflight(args.broker)
