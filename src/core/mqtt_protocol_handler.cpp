@@ -665,12 +665,13 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     uint32_t expiry = packet->protocol_version < 5
                           ? (packet->flags.clean_start ? 0 : store->max_session_expiry())
                           : packet->properties.session_expiry_interval;
-    auto opened =
-        store->connect(from_mqtt_string(packet->client_id), from_mqtt_string(packet->username),
-                       packet->flags.clean_start, expiry);
+    const auto& principal = current_auth_context_ ? current_auth_context_->user_info.username
+                                                  : packet->username;
+    auto opened = store->connect(from_mqtt_string(packet->client_id), from_mqtt_string(principal),
+                                  packet->flags.clean_start, expiry);
     if (!opened.ok) {
-      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
-      reject_reason = ReasonCode::ServerUnavailable;
+      ret = opened.not_authorized ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = opened.not_authorized ? ReasonCode::NotAuthorized : ReasonCode::ServerUnavailable;
       need_reject = true;
     } else {
       durable_epoch_ = opened.epoch;

@@ -681,8 +681,11 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
           v.erase_session(old);
           old.reset();
         }
-        if (old && old->owner != owner)
-          throw std::runtime_error("persistent session belongs to another identity");
+        if (old && old->owner != owner) {
+          r->not_authorized = true;
+          r->error = "persistent session belongs to another identity";
+          return {};
+        }
         if (!old && expiry == 0) {
           *r = success();
           return {};

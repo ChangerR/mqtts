@@ -218,7 +218,8 @@ int main()
     assert(store.subscribe("reader", a.epoch, "room/#", 1).ok);
     assert(store.subscribe("reader", a.epoch, "room/+", 1).ok);
     assert(store.disconnect("reader", a.epoch).ok);
-    assert(!store.connect("reader", "attacker", true, 60).ok);
+    auto takeover = store.connect("reader", "attacker", true, 60);
+    assert(!takeover.ok && takeover.not_authorized);
     assert(store.publish("room/one", "payload", "publisher", 0).targets.size() == 1);
     auto b = store.connect("reader", "owner", false, 60);
     assert(b.ok && b.present && b.subscriptions.size() == 2);

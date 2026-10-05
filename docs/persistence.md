@@ -86,6 +86,14 @@ incarnation. Replay checks current READ authorization for every message, includi
 revocation and cached authorization outage limits. The prior five-minute ceiling
 and original authorization session expiry remain unchanged.
 
+Ownership uses the authenticated principal returned by the auth provider. A mismatch
+returns NotAuthorized (MQTT 5 `0x87`, MQTT 3 `5`), not a retryable server outage.
+Untrusted deployments require authentication that binds the credential, principal
+and exact Client ID; the gRPC module enforces this. HTTP providers must enforce the
+same binding even when authenticating a bearer token. Without an auth manager there
+is no authenticated ownership boundary; that mode is only suitable for trusted test
+environments and must not be exposed as a protected multi-user persistent service.
+
 Session expiry is capped at 24 hours by default. Online deadlines are journaled by
 one-second heartbeats; recovery uses the last persisted deadline and never grants a
 new lease from restart time. Delayed disk work can shorten that recovery window.

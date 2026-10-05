@@ -43,7 +43,7 @@ class DurableStore
   };
   struct Result
   {
-    bool ok = false, present = false, stale = false, wake = false;
+    bool ok = false, present = false, stale = false, wake = false, not_authorized = false;
     std::shared_ptr<Signal> revision;
     uint64_t epoch = 0;
     std::string error;

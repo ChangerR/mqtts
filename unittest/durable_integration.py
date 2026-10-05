@@ -94,7 +94,9 @@ def run(binary, fault_library):
             # Browser transport must enter the same durable path.
             w,_=client(f,'browser',5,clean=True,expiry=0,websocket=True)
             data=f.payload(w,100);w.pub('fixture/browser',data);assert r.delivery()[1]==data
-            client(f,'reader',version,owner='different-owner',expected=1)
+            intruder=DurableClient(f.port,version,False);f.clients.append(intruder)
+            code,_=intruder.connect_session('reader',owner='different-owner')
+            assert code==(0x87 if version==5 else 5),code
             # Revoked current READ prevents delivery even for a persisted filter.
             f.revoked.add('reader');f.revision='revoked';time.sleep(.25)
             data=f.payload(w,101);w.pub('fixture/revoked',data);r.quiet()
