@@ -14,10 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libyaml-cpp-dev \
     libsqlite3-dev \
     libhiredis-dev \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libgrpc++-dev \
+    protobuf-compiler-grpc \
+    libcurl4-openssl-dev \
+    nlohmann-json3-dev \
+    python3 \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-RUN set -eux; \
+RUN --mount=type=secret,id=proxy_ca set -eux; \
+  if [ -f /run/secrets/proxy_ca ]; then export GIT_SSL_CAINFO=/run/secrets/proxy_ca; fi; \
   rm -rf /tmp/llhttp; \
   git clone --depth 1 --branch "${LLHTTP_VERSION}" https://github.com/nodejs/llhttp.git /tmp/llhttp; \
   printf '%s\n' \
@@ -43,7 +51,7 @@ WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  && cmake --build build --target mqtts
+  && cmake --build build --target mqtts mqtts-store-import --parallel 3
 
 FROM ubuntu:22.04
 
@@ -52,21 +60,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libyaml-cpp0.7 \
     libsqlite3-0 \
     libhiredis0.14 \
+    libprotobuf23 \
+    libgrpc++1 \
+    libcurl4 \
     netcat-openbsd \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -s /bin/false -d /app mqtts \
-  && mkdir -p /app/bin /app/lib /app/config /app/logs \
-  && chown -R mqtts:mqtts /app
+  && mkdir -p /app/bin /app/lib /app/config /app/logs /data \
+  && chown -R mqtts:mqtts /app /data
 
 COPY --from=builder /src/build/mqtts /app/bin/mqtts
-COPY --from=builder /src/build/3rd/gperftools/libtcmalloc_minimal.so /app/lib/libtcmalloc_minimal.so
+COPY --from=builder /src/build/mqtts-store-import /app/bin/mqtts-store-import
 COPY --from=builder /usr/local/lib/libllhttp.so* /app/lib/
 COPY mqtts.yaml /app/config/mqtts.yaml
 
 RUN chmod +x /app/bin/mqtts \
-  && chown -R mqtts:mqtts /app
+  && chown -R mqtts:mqtts /app /data
 
 ENV LD_LIBRARY_PATH=/app/lib
 

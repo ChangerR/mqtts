@@ -9,10 +9,12 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <limits>
+#include <chrono>
 
 #include "mqtt_runtime.h"
 
@@ -139,9 +141,11 @@ int MQTTSocket::connect(const char* ip, int port)
   return ret;
 }
 
-int MQTTSocket::send(const uint8_t* buf, int len)
+int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
 {
   int ret = MQ_SUCCESS;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(std::max(1, timeout_ms));
 
   if (!connected_) {
     LOG_ERROR("Socket not connected");
@@ -149,12 +153,28 @@ int MQTTSocket::send(const uint8_t* buf, int len)
   } else {
     int total_sent = 0;
     while (total_sent < len && MQ_SUCC(ret)) {
-      int sent = ::send(fd_, buf + total_sent, len - total_sent, MSG_NOSIGNAL);
+      if (!connected_ || fd_ < 0 || std::chrono::steady_clock::now() >= deadline) {
+        ret = MQ_ERR_SOCKET_SEND;
+        break;
+      }
+      int sent = ::send(fd_, buf + total_sent, len - total_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
       if (sent < 0) {
         if (errno == EINTR)
           continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          if (mqtt::runtime::current_runtime().wait_writable(fd_, -1) < 0) {
+          // libco permits one epoll waiter per descriptor. The receive
+          // coroutine may already be waiting on fd_; a second registration
+          // can lose the write wakeup and stall until its timeout. A duplicate
+          // descriptor gives the send coroutine an independent poll entry.
+          // libco does not forward F_DUPFD_CLOEXEC in its fcntl hook.
+          int write_poll = static_cast<int>(::syscall(SYS_fcntl, fd_, F_DUPFD_CLOEXEC, 0));
+          auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now()).count();
+          int ready = write_poll < 0 ? -1 : mqtt::runtime::current_runtime().wait_writable(
+              write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
+          if (write_poll >= 0)
+            ::close(write_poll);
+          if (ready < 0) {
             LOG_ERROR("Failed to wait for socket to become writable - {}", strerror(errno));
             connected_ = false;
             ret = MQ_ERR_SOCKET_SEND;
@@ -165,10 +185,15 @@ int MQTTSocket::send(const uint8_t* buf, int len)
           connected_ = false;  // Mark socket as disconnected
           ret = MQ_ERR_SOCKET_SEND;
         }
+      } else if (sent == 0) {
+        ret = MQ_ERR_SOCKET_SEND;
       } else {
         total_sent += sent;
       }
     }
+    // A partial MQTT frame cannot be resumed as a new packet on this socket.
+    if (MQ_FAIL(ret))
+      close();
   }
 
   return ret;
@@ -299,6 +324,8 @@ int MQTTSocket::close()
     if (connected_) {
       LOG_DEBUG("Closing connection to {}:{}", get_peer_addr(), get_peer_port());
     }
+    // Wake duplicated send poll descriptors before closing the original fd.
+    ::shutdown(fd_, SHUT_RDWR);
     ::close(fd_);
     fd_ = -1;
     connected_ = false;

@@ -16,6 +16,29 @@ namespace mqtt {
 /**
  * @brief 服务器配置
  */
+struct PersistenceConfig {
+  bool enabled = false;
+  // Preserve the legacy basename so upgrades refuse an old SQLite file instead
+  // of silently starting an empty store at a different default location.
+  std::string path = "mqtts-sessions.db";
+  size_t partitions = 4;
+  size_t segment_bytes = 16 * 1024 * 1024;
+  uint64_t max_disk_bytes = 4ULL * 1024 * 1024 * 1024;
+  uint32_t checkpoint_interval_ms = 30000;
+  uint32_t max_session_expiry_seconds = 86400;
+  size_t max_sessions = 10000;
+  size_t max_subscriptions_per_session = 128;
+  size_t max_messages = 100000;
+  size_t max_messages_per_session = 10000;
+  size_t max_bytes_per_session = 32 * 1024 * 1024;
+  // Isolation permits a reported gap while keeping previously accepted records.
+  std::string overflow_policy = "reject";
+  size_t max_bytes = 256 * 1024 * 1024;
+  size_t max_requests = 1024;
+  size_t max_request_bytes = 16 * 1024 * 1024;
+  size_t max_inflight = 32;
+};
+
 struct ServerConfig
 {
   std::string bind_address = "0.0.0.0";  // 绑定地址
@@ -181,6 +204,7 @@ struct AuthConfig
  */
 struct Config
 {
+  PersistenceConfig persistence;
   ServerConfig server;
   MQTTProtocolConfig mqtt;
   MemoryConfig memory;

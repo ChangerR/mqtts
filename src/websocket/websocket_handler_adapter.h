@@ -22,7 +22,8 @@ public:
                             uint8_t qos = 0,
                             bool retain = false,
                             bool dup = false,
-                            const mqtt::Properties& properties = mqtt::Properties()) override;
+                            const mqtt::Properties& properties = mqtt::Properties(),
+                            std::shared_ptr<mqtt::auth::AuthorizationRequest>* pending = nullptr) override;
 
     // We don't need to override process() since this is only used for message forwarding
     // The actual processing is done by the WebSocketProtocolHandler

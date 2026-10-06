@@ -1,0 +1,32 @@
+server:
+  bind_address: "127.0.0.1"
+  port: 1883
+  thread_count: 2
+mqtt:
+  allow_mqtt3x: true
+  max_packet_size: 1048576
+monitoring:
+  enabled: false
+auth:
+  enabled: true
+  allow_anonymous: false
+  cache_enabled: false
+  providers:
+    - type: http
+      settings:
+        authentication_url: http://127.0.0.1:9000/authentication
+        authorization_url: http://127.0.0.1:9000/authorization
+        token_env: MQTTS_HTTP_AUTH_TOKEN
+        timeout_ms: 2000
+        # Optional: forward opaque bytes to the policy service. Default: none.
+        publish_payload: none
+        max_payload_bytes: 1048576
+        # Optional local leases (also require explicit policy-response consent).
+        # cache_ttl_ms: 10000
+        # cache_max_age_ms: 300000
+        # cache_max_entries: 16384
+        # cache_version_url: http://127.0.0.1:9000/policy-version
+        # cache_version_interval_ms: 250
+        http_workers: 4
+        http_queue_capacity: 64
+        http_queue_bytes: 16777216

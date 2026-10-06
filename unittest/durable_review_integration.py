@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Regression cases for persistent-session review findings, using real sockets."""
+import argparse
+import json
+import struct
+import zlib
+import os
+from pathlib import Path
+import tempfile
+import time
+from durable_integration import DurableClient, client, restart
+from http_auth_cache_integration import Fixture
+from http_auth_integration import packet, utf
+
+
+def eventually(check, timeout=4):
+    deadline = time.monotonic() + timeout
+    while not check():
+        assert time.monotonic() < deadline, 'condition did not complete'
+        time.sleep(.02)
+
+
+def maintenance(binary, fault):
+    with tempfile.TemporaryDirectory(prefix='mqtts-review-fault-') as directory:
+        control = Path(directory)
+        environment = dict(os.environ, LD_PRELOAD=fault, MQTTS_JOURNAL_FAULT_CONTROL=directory)
+        with Fixture(binary, persistence=dict(checkpoint_interval_ms=200), process_env=environment) as f:
+            reader, _ = client(f, 'reader')
+            assert reader.sub('fixture/review') == 1
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            writer.pub('fixture/review', f.payload(writer, 0))
+            reader.delivery()
+            (control/'write').write_text('/CHECKPOINT.tmp')
+            try:
+                eventually(lambda: 'maintenance will retry' in (f.root/'broker.log').read_text())
+                client(f, 'clean-during-checkpoint-error', clean=True, expiry=0)
+                for nonce in range(1, 5):
+                    data = f.payload(writer, nonce)
+                    writer.pub('fixture/review', data)
+                    assert reader.delivery()[1] == data
+            finally:
+                (control/'write').unlink()
+            eventually(lambda: (f.root/'journal'/'CHECKPOINT').exists(), timeout=5)
+            # Freeze only the checkpoint file's fsync, never an append writer.
+            (control/'checkpoint_delay').write_text('/CHECKPOINT.tmp')
+            try:
+                eventually(lambda: (control/'checkpoint-entered').exists())
+                until = time.monotonic() + .8
+                nonce = 5
+                while time.monotonic() < until:
+                    data = f.payload(writer, nonce)
+                    writer.pub('fixture/review', data)
+                    assert reader.delivery()[1] == data
+                    nonce += 1
+                    time.sleep(.01)
+                client(f, 'clean-during-checkpoint-delay', clean=True, expiry=0)
+                # A post-snapshot publication must survive checkpoint install
+                # and reclamation even when the reader has not ACKed it.
+                data = f.payload(writer, nonce)
+                writer.pub('fixture/review', data)
+                first = reader.delivery(ack=False)
+            finally:
+                (control/'checkpoint_delay').unlink()
+            time.sleep(.35)
+            restart(f)
+            reader, present = client(f, 'reader')
+            assert present
+            replay = reader.delivery()
+            assert replay[1:3] == first[1:3]
+            reader.quiet()
+            print('PASS checkpoint failure retry, >500ms fsync isolation, and concurrent-append crash recovery', flush=True)
+        with Fixture(binary, persistence={}, process_env=environment) as f:
+            reader, _ = client(f, 'reader')
+            assert reader.sub('fixture/failure') == 1
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            (control/'write').write_text('/messages-')
+            try:
+                try:
+                    writer.pub('fixture/failure', f.payload(writer, 0))
+                except (EOFError, ConnectionError):
+                    pass
+                else:
+                    raise AssertionError('failed append received success')
+                client(f, 'clean-after-journal-failure', clean=True, expiry=0)
+                client(f, 'durable-after-journal-failure', expected=1)
+            finally:
+                (control/'write').unlink()
+            print('PASS terminal append failure rejects durable traffic without rejecting new clean clients', flush=True)
+
+
+def sender_loop_avoidance(binary):
+    for version in (4, 5):
+        for persistent in (False, True):
+            with Fixture(binary, persistence={} if persistent else None) as f:
+                writer, _ = client(f, 'writer', version=version, clean=not persistent, expiry=60 if persistent else 0)
+                reader, _ = client(f, 'reader', version=version, clean=not persistent, expiry=60 if persistent else 0)
+                assert writer.sub('fixture/echo') == 1
+                assert reader.sub('fixture/echo') == 1
+                data = f.payload(writer, 1)
+                writer.pub('fixture/echo', data)
+                assert reader.delivery()[1] == data
+                writer.quiet()
+    print('PASS MQTT 3/5 sender loop avoidance in durable and live fanout', flush=True)
+
+
+def publish_negative_ack(binary):
+    for websocket in (False, True):
+        for qos in (1, 2):
+            with Fixture(binary, cache_ttl_ms=0, failure_cooldown_ms=100) as f:
+                writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=websocket)
+                reader, _ = client(f, 'reader', clean=True, expiry=0)
+                assert reader.sub('fixture/errors') == 1
+                for mode, reason in [('denied', 0x87), ('offline', 0x80)]:
+                    f.revoked = {'writer'} if mode == 'denied' else set()
+                    f.mode = 'offline' if mode == 'offline' else 'normal'
+                    writer.send(packet(0x30 | (qos << 1), utf('fixture/errors') + b'\0\7\0' + f.payload(writer, qos)))
+                    head, body = writer.read()
+                    assert head == (0x40 if qos == 1 else 0x50) and body[:3] == bytes([0, 7, reason]), (head, body)
+                    writer.send(b'\xc0\0')
+                    assert writer.read() == (0xd0, b'')
+                    reader.quiet()
+    print('PASS TCP/WS MQTT 5 negative PUBACK/PUBREC, denial vs outage, and connection reuse', flush=True)
+
+
+def overflow_isolation(binary):
+    with Fixture(binary, persistence=dict(max_messages_per_session=2, max_messages=10, overflow_policy='isolate', checkpoint_interval_ms=200)) as f:
+        slow, _ = client(f, 'slow')
+        fast, _ = client(f, 'fast')
+        assert slow.sub('fixture/overflow') == fast.sub('fixture/overflow') == 1
+        slow.disconnect()
+        writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=True)
+        for i in range(6):
+            data = f.payload(writer, i)
+            writer.pub('fixture/overflow', data)
+            assert fast.delivery()[1] == data
+        time.sleep(.3)
+        restart(f)
+        slow, present = client(f, 'slow')
+        assert present and b'mqtts-overflow-from' in slow.connack
+        assert [json.loads(slow.delivery()[1])['nonce'] for _ in range(2)] == [0, 1]
+        assert slow.sub('fixture/overflow') == 0x97
+        slow.quiet()
+        slow.disconnect()
+        # MQTT 3 cannot represent the explicit gap property; never silently resume it.
+        client(f, 'slow', version=4, expected=1)
+        slow, present = client(f, 'slow', clean=True)
+        assert not present and b'mqtts-overflow-from' not in slow.connack
+        assert slow.sub('fixture/overflow') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/overflow', f.payload(writer, 7))
+        assert json.loads(slow.delivery()[1])['nonce'] == 7
+    # An online saturated consumer is notified; the publisher still continues.
+    with Fixture(binary, persistence=dict(max_messages_per_session=1, overflow_policy='isolate')) as f:
+        slow, _ = client(f, 'slow', receive=1)
+        assert slow.sub('fixture/overflow') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/overflow', f.payload(writer, 0))
+        slow.delivery(ack=False)
+        writer.pub('fixture/overflow', f.payload(writer, 1))
+        h,b=slow.read();assert h==0xe0 and b[0]==0x97,(h,b)
+        writer.send(b'\xc0\0');assert writer.read()==(0xd0,b'')
+    print('PASS isolated overflow preserves old backlog, healthy fanout, durable gap and explicit reset', flush=True)
+
+
+def qos_two_boundary(binary):
+    for websocket in (False, True):
+        for version in (4, 5):
+            with Fixture(binary, persistence={}) as f:
+                writer, _ = client(f, 'writer', version=version, clean=True, expiry=0, websocket=websocket)
+                # No durable subscriptions exist; the advertised mode-wide limit still applies.
+                writer.send(packet(0x34, utf('fixture/qos2') + b'\0\7' + (b'\0' if version == 5 else b'') + f.payload(writer, 0)))
+                if version == 5:
+                    head, body = writer.read()
+                    assert head == 0xe0 and body[0] == 0x9b, (head, body)
+                else:
+                    try:
+                        received = writer.read()
+                    except (EOFError, ConnectionError):
+                        pass
+                    else:
+                        raise AssertionError(('MQTT 3 QoS 2 incorrectly acknowledged', received))
+    print('PASS explicit TCP/WS MQTT 3/5 QoS 2 persistence boundary', flush=True)
+
+
+def qos_zero_takeover(binary):
+    for version in (4, 5):
+        with Fixture(binary, persistence={}, server_threads=2, http_workers=4, http_queue_capacity=64) as f:
+            reader, _ = client(f, 'takeover-reader', version=version)
+            assert reader.sub('fixture/takeover', qos=0) == 0
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            for nonce in range(16):
+                previous = reader
+                reader, present = client(f, 'takeover-reader', version=version)
+                assert present
+                previous.close()
+                time.sleep(.03)
+                data = f.payload(writer, nonce)
+                writer.pub('fixture/takeover', data)
+                assert reader.message() == ('fixture/takeover', data)
+    print('PASS MQTT 3/5 QoS 0 subscriptions survive repeated cross-thread takeover', flush=True)
+
+
+def poison_messages(binary):
+    with Fixture(binary, persistence={}, cache_ttl_ms=0, http_workers=4, http_queue_capacity=64) as f:
+        f.wildcards = True
+        reader, _ = client(f, 'reader')
+        assert reader.sub('fixture/#') == 1
+        reader.disconnect()
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        f.denied_deliveries.add(('reader', 'fixture/denied'))
+        writer.pub('fixture/denied', f.payload(writer, 0))
+        writer.pub('fixture/large', json.dumps(dict(actor='writer', data='x'*1024)).encode())
+        good = f.payload(writer, 2)
+        writer.pub('fixture/good', good)
+        reader = DurableClient(f.port, 5); f.clients.append(reader)
+        assert reader.connect_session('reader', maximum=256, receive=1) == (0, True)
+        assert reader.delivery()[1] == good
+        reader.quiet()
+        log = (f.root/'broker.log').read_text()
+        assert 'reason not_authorized' in log and 'reason packet_too_large' in log
+        restart(f)
+        reader, present = client(f, 'reader'); assert present
+        reader.quiet()  # Discard decisions survived a crash and did not loop.
+    with Fixture(binary, persistence={}) as f:
+        f.wildcards = True
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/outage', f.payload(writer, 0))  # Warm only the writer's grant.
+        reader, _ = client(f, 'reader')
+        assert reader.sub('fixture/#') == 1
+        f.mode = 'offline'
+        good = f.payload(writer, 1)
+        writer.pub('fixture/outage', good)
+        reader.quiet()
+        f.mode = 'normal'
+        assert reader.delivery()[1] == good
+        assert 'reason not_authorized' not in (f.root/'broker.log').read_text()
+    # Empty topics and aliases must be rejected equally on TCP and WebSocket.
+    for websocket in (False, True):
+        with Fixture(binary, persistence={}) as f:
+            reader, _ = client(f, 'reader'); assert reader.sub('fixture/invalid') == 1
+            writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=websocket)
+            props = b'\x23\x00\x01'
+            writer.send(packet(0x32, utf('fixture/invalid') + b'\0\1' + bytes([len(props)]) + props + f.payload(writer, 0)))
+            try: result = writer.read()
+            except (EOFError, ConnectionError): pass
+            else: assert result[0] == 0xe0, result
+            reader.quiet()
+    print('PASS permanent deny and oversize discard, transient outage retry, and alias rejection', flush=True)
+
+
+def replace_first_stored_wire(f, replacement):
+    # Emulate a legacy import containing invalid/large wire data. Recompute frame
+    # checksums deliberately; physical corruption must still fail closed.
+    assert not (f.root/'journal'/'CHECKPOINT').exists()
+    replaced = False
+    for path in sorted((f.root/'journal').glob('messages-*/*.log')):
+        source = path.read_bytes(); output = bytearray(); offset = 0
+        while offset < len(source):
+            magic, size, serial, _, _ = struct.unpack_from('<IIQII', source, offset)
+            data = source[offset+24:offset+24+size]
+            if not replaced:
+                assert data[0] == 8
+                wire_size = struct.unpack_from('<I', data, 17)[0]
+                wire = replacement(data[21:21+wire_size])
+                data = data[:17] + struct.pack('<I', len(wire)) + wire + data[21+wire_size:]
+                replaced = True
+            header = struct.pack('<IIQI', magic, len(data), serial, zlib.crc32(data))
+            output += header + struct.pack('<I', zlib.crc32(header)) + data
+            offset += 24 + size
+        path.write_bytes(output)
+    assert replaced
+
+
+def stored_wire_budget(binary):
+    for malformed in (True, False):
+        with Fixture(binary, persistence={}) as f:
+            reader, _ = client(f, 'reader'); assert reader.sub('fixture/record') == 1
+            reader.disconnect()
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            writer.pub('fixture/record', f.payload(writer, 0))
+            next_data = f.payload(writer, 1)
+            writer.pub('fixture/record', next_data)
+            large = b'x' * (1024 * 1024 + 100)
+            replacement = (lambda wire: b'\x20' + wire[1:]) if malformed else (
+                lambda _: packet(0x32, utf('fixture/record') + b'\0\1\0' + large))
+            restart(f, lambda: replace_first_stored_wire(f, replacement))
+            reader, present = client(f, 'reader'); assert present
+            if not malformed: assert reader.delivery()[1] == large
+            assert reader.delivery()[1] == next_data
+            reader.quiet()
+            if malformed: assert 'reason malformed' in (f.root/'broker.log').read_text()
+    print('PASS malformed stored record isolation and replay larger than the 1 MiB client pool', flush=True)
+
+
+def expired_inflight(binary):
+    with Fixture(binary, persistence=dict(checkpoint_interval_ms=200)) as f:
+        reader, _ = client(f, 'reader', receive=1)
+        assert reader.sub('fixture/expiry') == 1
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/expiry', f.payload(writer, 0), expiry=1)
+        first = reader.delivery(ack=False)
+        time.sleep(1.2)  # Cross both message expiry and the maintenance sweep.
+        writer.pub('fixture/expiry', f.payload(writer, 1))
+        reader.quiet()  # The expired in-flight packet still owns receive-window credit.
+        restart(f)
+        reader, present = client(f, 'reader', receive=1); assert present
+        replay = reader.delivery()
+        assert replay[1:3] == first[1:3] and replay[3]
+        second = reader.delivery()
+        assert second[2] != first[2] and json.loads(second[1])['nonce'] == 1
+    with Fixture(binary, persistence={}) as f:
+        f.wildcards = True
+        writer, _ = client(f, 'writer', clean=True, expiry=0)
+        writer.pub('fixture/waiting', f.payload(writer, 0))
+        reader, _ = client(f, 'reader'); assert reader.sub('fixture/#') == 1
+        f.mode = 'offline'
+        writer.pub('fixture/waiting', f.payload(writer, 1), expiry=1)
+        time.sleep(1.2)
+        f.mode = 'normal'
+        time.sleep(.3)
+        reader.quiet()  # Prefetched while auth was unavailable is not an in-flight send.
+        good = f.payload(writer, 2)
+        writer.pub('fixture/waiting', good)
+        assert reader.delivery()[1] == good
+    for persistence in (None, {}):
+        with Fixture(binary, persistence=persistence) as f:
+            reader, _ = client(f, 'reader', clean=True, expiry=0)
+            assert reader.sub('fixture/zero', qos=0) == 0
+            writer, _ = client(f, 'writer', clean=True, expiry=0)
+            writer.pub('fixture/zero', f.payload(writer, 0), expiry=0)
+            reader.quiet()
+    print('PASS message expiry preserves in-flight packet IDs and receive credit through restart', flush=True)
+
+
+def authorization_failures(binary):
+    for version in (4, 5):
+        with Fixture(binary, persistence={}, cache_ttl_ms=0) as f:
+            f.mode = 'offline'
+            cold = DurableClient(f.port, version); f.clients.append(cold)
+            code, _ = cold.connect_session('cold-unavailable', clean=True, expiry=0)
+            assert code == (3 if version == 4 else 0x88), code
+            f.mode = 'normal'
+            f.revoked.add('denied')
+            cold = DurableClient(f.port, version); f.clients.append(cold)
+            code, _ = cold.connect_session('denied', clean=True, expiry=0)
+            assert code == (5 if version == 4 else 0x87), code
+    print('PASS unavailable authentication and authoritative denial use distinct MQTT reason codes', flush=True)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--broker', required=True)
+    parser.add_argument('--fault-library', required=True)
+    args = parser.parse_args()
+    maintenance(args.broker, args.fault_library)
+    authorization_failures(args.broker)
+    qos_zero_takeover(args.broker)
+    sender_loop_avoidance(args.broker)
+    publish_negative_ack(args.broker)
+    overflow_isolation(args.broker)
+    qos_two_boundary(args.broker)
+    poison_messages(args.broker)
+    stored_wire_budget(args.broker)
+    expired_inflight(args.broker)

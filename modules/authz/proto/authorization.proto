@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package mqtts.authz.v1;
+option go_package = "github.com/ChangerR/mqtts/modules/authz/api/authzv1";
+
+// Broker-facing API. No application routes, databases, roles or JSON field
+// names are part of this contract. Management uses a separate credential.
+service Authorization {
+  rpc Authenticate(AuthenticateRequest) returns (Decision);
+  rpc BatchAuthorize(BatchAuthorizeRequest) returns (BatchAuthorizeResponse);
+  rpc GetRevision(RevisionRequest) returns (RevisionResponse);
+}
+service Administration {
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+  UNAVAILABLE = 3;
+}
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  PUBLISH = 1;
+  SUBSCRIBE = 2;
+}
+message Decision {
+  Outcome outcome = 1;
+  uint64 expires_at_ms = 2;
+  uint32 cache_ttl_ms = 3;
+  uint32 cache_max_age_ms = 4;
+  string cache_revision = 5;
+}
+message AuthenticateRequest {
+  string username = 1;
+  string password = 2;
+  string client_id = 3;
+}
+message AuthorizeRequest {
+  uint64 request_id = 1;
+  string username = 2;
+  string client_id = 3;
+  Action action = 4;
+  string topic = 5;
+  bytes payload = 6;
+  bool has_payload = 7;
+}
+message BatchAuthorizeRequest { repeated AuthorizeRequest requests = 1; }
+message AuthorizationResult {
+  uint64 request_id = 1;
+  Decision decision = 2;
+}
+message BatchAuthorizeResponse { repeated AuthorizationResult results = 1; }
+message RevisionRequest { string known_revision = 1; }
+message RevisionResponse {
+  string revision = 1;
+  // A bounded delta from known_revision. Unknown/restarted/too-old histories
+  // return is_delta=false and require global invalidation. Old peers therefore
+  // retain the original safe global-revision behavior.
+  repeated string invalidated_usernames = 2;
+  bool is_delta = 3;
+}
+
+// Optional generic JSON bindings chosen by the policy publisher. Every present
+// path must match. required_any additionally requires at least one path. A topic
+// binding compares to the original MQTT topic instead of equals_string.
+message JsonBinding {
+  repeated string paths = 1;
+  string equals_string = 2;
+  bool equals_topic = 3;
+  bool required_any = 4;
+}
+message PayloadPolicy {
+  repeated JsonBinding bindings = 1;
+  bool case_insensitive_keys = 2;
+}
+message Permission {
+  Action action = 1;
+  string topic_filter = 2;
+  PayloadPolicy payload_policy = 3;
+}
+message Session {
+  string username = 1;
+  string client_id = 2;
+  bytes password_sha256 = 3;
+  uint64 expires_at_ms = 4;
+  // Projection lease: at most five minutes ahead. A publisher outage cannot
+  // keep renewing policy grants. Renewing this never extends session expiry.
+  uint64 policy_valid_until_ms = 5;
+  bool enabled = 6;
+  repeated Permission permissions = 7;
+  string namespace = 8;
+  // Opaque source metadata for reconciliation; not interpreted by this module.
+  bytes source_context = 9;
+}
+message ApplyRequest {
+  // Policy version captured before source reads. New identities and lease-only
+  // renewals leave it stable; permission/source changes invalidate stale reads.
+  string expected_version = 1;
+  repeated Session upserts = 2;
+  repeated string deletes = 3;
+  // Only inserts absent usernames. Existing sessions cannot be overwritten.
+  // Does not require a version, and does not invalidate other sessions' grants.
+  bool create_only = 4;
+}
+message ApplyResponse {
+  string version = 1;
+  string policy_revision = 2;
+}
+message ListSessionsRequest {
+  string namespace = 1;
+  string after_username = 2;
+  uint32 page_size = 3;
+}
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+  string version = 2;
+  string next_cursor = 3;
+}

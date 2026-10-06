@@ -127,6 +127,8 @@ void SendWorkerPool::stop()
     while (!workers_[i]->task_queue.empty()) {
       workers_[i]->task_queue.pop();
     }
+    workers_[i]->pending_count = 0;
+    workers_[i]->client_order.clear();
   }
 
   running_.store(false);
@@ -139,19 +141,22 @@ int SendWorkerPool::submit_task(const WorkerSendTask& task)
     return MQ_ERR_INVALID_ARGS;
   }
 
-  size_t worker_id = select_worker();
+  size_t worker_id = select_worker(task.get_target_client_id());
   WorkerData* worker = workers_[worker_id].get();
 
   {
     CoroLockGuard lock(&worker->queue_mutex);  // 使用协程锁
 
-    if (worker->task_queue.size() >= max_queue_size_) {
+    if (worker->pending_count >= max_queue_size_) {
       LOG_WARN("Worker {} queue full, dropping task for client: {}", worker_id,
                from_mqtt_string(task.target_client_id));
       return MQ_ERR_TIMEOUT_V2;
     }
 
     worker->task_queue.push(task);
+    worker->task_queue.back().ticket = ++worker->next_ticket;
+    worker->client_order[from_mqtt_string(task.get_target_client_id())].push_back(worker->next_ticket);
+    ++worker->pending_count;
   }
 
   // 通知Worker有新任务
@@ -171,8 +176,7 @@ SendWorkerPool::Statistics SendWorkerPool::get_statistics() const
     stats.total_processed += workers_[i]->processed_count.load();
     stats.total_failed += workers_[i]->failed_count.load();
 
-    CoroLockGuard lock(&workers_[i]->queue_mutex);  // 使用协程锁
-    stats.pending_tasks += workers_[i]->task_queue.size();
+    stats.pending_tasks += workers_[i]->pending_count.load();
   }
 
   return stats;
@@ -183,6 +187,7 @@ void SendWorkerPool::worker_main(size_t worker_id)
   LOG_INFO("Worker {} started", worker_id);
 
   WorkerData* worker = workers_[worker_id].get();
+  size_t deferred_scanned = 0;
 
   while (!should_stop_.load()) {
     WorkerSendTask task;
@@ -201,11 +206,45 @@ void SendWorkerPool::worker_main(size_t worker_id)
     if (has_task) {
       // 处理任务
       auto start_time = std::chrono::steady_clock::now();
-      bool success = process_send_task(task, worker_id);
+      const std::string client = from_mqtt_string(task.get_target_client_id());
+      bool behind_head = false;
+      {
+        CoroLockGuard lock(&worker->queue_mutex);
+        const auto order = worker->client_order.find(client);
+        behind_head = order != worker->client_order.end() && order->second.front() != task.ticket;
+      }
+      const bool too_early = start_time < task.retry_after;
+      const int result = behind_head || too_early ? MQ_ERR_AUTH_PENDING : process_send_task(task, worker_id);
       auto end_time = std::chrono::steady_clock::now();
 
+      if (result == MQ_ERR_AUTH_PENDING) {
+        // The HTTP future stays with this task. Rotate it behind unrelated
+        // clients without spending a send coroutine on an HTTP wait. The head
+        // gate preserves order even when later topics already have cached ACLs.
+        if (!behind_head && !too_early) task.retry_after = end_time + std::chrono::milliseconds(5);
+        {
+          CoroLockGuard lock(&worker->queue_mutex);
+          worker->task_queue.push(std::move(task));
+        }
+        if (++deferred_scanned >= worker->pending_count.load()) {
+          deferred_scanned = 0;
+          worker->task_available.wait(1);
+        }
+        continue;
+      }
+      deferred_scanned = 0;
+      {
+        CoroLockGuard lock(&worker->queue_mutex);
+        const auto order = worker->client_order.find(client);
+        if (order != worker->client_order.end()) {
+          order->second.pop_front();
+          if (order->second.empty()) worker->client_order.erase(order);
+        }
+        --worker->pending_count;
+      }
+
       // 更新统计信息
-      if (success) {
+      if (result == MQ_SUCCESS) {
         worker->processed_count.fetch_add(1);
       } else {
         worker->failed_count.fetch_add(1);
@@ -229,11 +268,11 @@ void SendWorkerPool::worker_main(size_t worker_id)
   LOG_INFO("Worker {} stopped", worker_id);
 }
 
-bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker_id)
+int SendWorkerPool::process_send_task(WorkerSendTask& task, size_t worker_id)
 {
   if (!session_manager_) {
     LOG_ERROR("Worker {}: session manager not available", worker_id);
-    return false;
+    return MQ_ERR_INVALID_STATE;
   }
 
   try {
@@ -241,7 +280,7 @@ bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker
     if (!safe_handler.is_valid()) {
       LOG_WARN("Worker {}: handler not found for client: {}", worker_id,
                from_mqtt_string(task.get_target_client_id()));
-      return false;
+      return MQ_ERR_SESSION_INVALID_HANDLER;
     }
 
     // 计算任务在队列中的等待时间
@@ -252,60 +291,48 @@ bool SendWorkerPool::process_send_task(const WorkerSendTask& task, size_t worker
     if (queue_time.count() > 5000) {  // 5秒超时
       LOG_WARN("Worker {}: task expired (waited {}ms) for client: {}", worker_id,
                queue_time.count(), from_mqtt_string(task.get_target_client_id()));
-      return false;
+      return MQ_ERR_TIMEOUT_V2;
     }
 
     // 检查任务是否有效
     if (!task.is_valid()) {
       LOG_ERROR("Worker {}: invalid task for client: {}", worker_id,
                 from_mqtt_string(task.target_client_id));
-      return false;
+      return MQ_ERR_PARAM_V2;
     }
 
     // 实际发送PUBLISH消息（使用共享内容）
     MQTTProtocolHandler* handler = safe_handler.get();
     int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(),
-                                       task.is_retain(), task.is_dup(), task.get_properties());
+                                       task.is_retain(), task.is_dup(), task.get_properties(), &task.authorization);
+
+    if (result == MQ_ERR_AUTH_PENDING) return result;
 
     if (result == MQ_SUCCESS) {
       LOG_DEBUG(
           "Worker {}: successfully sent shared message to client: {} (topic: {}, queue time: {}ms)",
           worker_id, from_mqtt_string(task.get_target_client_id()),
           from_mqtt_string(task.get_topic()), queue_time.count());
-      return true;
+      return MQ_SUCCESS;
     } else {
       LOG_ERROR(
           "Worker {}: failed to send shared message to client: {}, error: {} (topic: {}, queue "
           "time: {}ms)",
           worker_id, from_mqtt_string(task.get_target_client_id()), result,
           from_mqtt_string(task.get_topic()), queue_time.count());
-      return false;
+      return result;
     }
 
   } catch (const std::exception& e) {
     LOG_ERROR("Worker {}: exception processing task for client {}: {}", worker_id,
               from_mqtt_string(task.get_target_client_id()), e.what());
-    return false;
+    return MQ_ERR_INTERNAL;
   }
 }
 
-size_t SendWorkerPool::select_worker() const
+size_t SendWorkerPool::select_worker(const MQTTString& client_id) const
 {
-  size_t min_queue_size = SIZE_MAX;
-  size_t selected_worker = 0;
-
-  // 选择队列长度最短的Worker
-  for (size_t i = 0; i < worker_count_; ++i) {
-    CoroLockGuard lock(&workers_[i]->queue_mutex);  // 使用协程锁
-    size_t queue_size = workers_[i]->task_queue.size();
-
-    if (queue_size < min_queue_size) {
-      min_queue_size = queue_size;
-      selected_worker = i;
-    }
-  }
-
-  return selected_worker;
+  return std::hash<std::string>()(from_mqtt_string(client_id)) % worker_count_;
 }
 
 }  // namespace mqtt

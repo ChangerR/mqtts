@@ -44,6 +44,7 @@ struct Properties
 {
   // 会话相关属性
   uint32_t session_expiry_interval = 0;
+  bool has_session_expiry_interval = false;
   uint16_t receive_maximum = 0;
   uint32_t maximum_packet_size = 0;
   uint16_t topic_alias_maximum = 0;
@@ -68,6 +69,7 @@ struct Properties
   // 发布相关属性 - 使用自定义分配器
   uint8_t payload_format_indicator = 0;
   uint32_t message_expiry_interval = 0;
+  bool has_message_expiry_interval = false;
   MQTTString content_type;
   MQTTString response_topic;
   MQTTByteVector correlation_data;
@@ -99,14 +101,14 @@ struct Properties
   // 拷贝构造函数
   Properties(const Properties& other, MQTTAllocator* allocator = nullptr)
       : session_expiry_interval(other.session_expiry_interval),
+        has_session_expiry_interval(other.has_session_expiry_interval),
         receive_maximum(other.receive_maximum),
         maximum_packet_size(other.maximum_packet_size),
         topic_alias_maximum(other.topic_alias_maximum),
         topic_alias(other.topic_alias),
         request_response_information(other.request_response_information),
         request_problem_information(other.request_problem_information),
-        user_properties(other.user_properties.begin(), other.user_properties.end(),
-                        MQTTSTLAllocator<MQTTStringPair>(allocator)),
+        user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),
         authentication_method(other.authentication_method.begin(),
                               other.authentication_method.end(), MQTTStrAllocator(allocator)),
         authentication_data(other.authentication_data.begin(), other.authentication_data.end(),
@@ -123,6 +125,7 @@ struct Properties
                       MQTTStrAllocator(allocator)),
         payload_format_indicator(other.payload_format_indicator),
         message_expiry_interval(other.message_expiry_interval),
+        has_message_expiry_interval(other.has_message_expiry_interval),
         content_type(other.content_type.begin(), other.content_type.end(),
                      MQTTStrAllocator(allocator)),
         response_topic(other.response_topic.begin(), other.response_topic.end(),
@@ -137,6 +140,13 @@ struct Properties
         subscription_identifier_available(other.subscription_identifier_available),
         shared_subscription_available(other.shared_subscription_available)
   {
+    // A vector allocator does not propagate into strings inside std::pair.
+    // Deep-copy them too, so a queued message cannot retain a client allocator.
+    user_properties.reserve(other.user_properties.size());
+    for (const auto& property : other.user_properties) {
+      user_properties.emplace_back(MQTTString(property.first, MQTTStrAllocator(allocator)),
+                                   MQTTString(property.second, MQTTStrAllocator(allocator)));
+    }
   }
 };
 

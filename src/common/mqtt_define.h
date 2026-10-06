@@ -43,6 +43,7 @@
 #define MQ_ERR_PUBLISH_QOS -403
 #define MQ_ERR_PUBLISH_RETAIN -404
 #define MQ_ERR_PUBLISH_NOT_AUTHORIZED -405
+#define MQ_ERR_PUBLISH_QUOTA -406
 
 // MQTT Subscribe error codes (-500 to -599)
 #define MQ_ERR_SUBSCRIBE -500
@@ -75,6 +76,8 @@
 #define MQ_ERR_AUTH_TOKEN_INVALID -710
 #define MQ_ERR_AUTH_TOKEN_EXPIRED -711
 #define MQ_ERR_AUTH_NONCE_REPLAY -712
+#define MQ_ERR_AUTH_PENDING -713
+#define MQ_ERR_AUTH_UNAVAILABLE -714
 
 // Topic Tree error codes (-800 to -899)
 #define MQ_ERR_TOPIC_TREE -800
@@ -210,6 +213,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Invalid retain flag";
     case MQ_ERR_PUBLISH_NOT_AUTHORIZED:
       return "Not authorized to publish";
+    case MQ_ERR_PUBLISH_QUOTA:
+      return "Publish quota exceeded";
 
     // Subscribe errors
     case MQ_ERR_SUBSCRIBE:
@@ -262,6 +267,10 @@ static inline const char* mqtt_error_string(int error_code)
       return "Token has expired";
     case MQ_ERR_AUTH_NONCE_REPLAY:
       return "Token nonce replay detected";
+    case MQ_ERR_AUTH_PENDING:
+      return "Authorization pending";
+    case MQ_ERR_AUTH_UNAVAILABLE:
+      return "Authorization unavailable";
 
     // Topic tree errors
     case MQ_ERR_TOPIC_TREE:

@@ -420,6 +420,12 @@ TEST_F(GlobalSessionManagerRouterTest, StrictClusterSubscribeRollbackOnRouterFai
     ASSERT_EQ(session_manager_->find_topic_subscribers(topic_filter, subscribers), MQ_SUCCESS);
     ASSERT_TRUE(subscribers.empty());
     ASSERT_EQ(mock_client->get_subscribe_calls(), 1);
+    ASSERT_EQ(session_manager_->subscribe_topic(topic_filter, client_id, 1), MQ_SUCCESS);
+    ASSERT_EQ(session_manager_->subscribe_topic_with_router(topic_filter, client_id, 0), MQ_ERR_ROUTER_PROTOCOL);
+    ASSERT_EQ(session_manager_->find_topic_subscribers(topic_filter, subscribers), MQ_SUCCESS);
+    ASSERT_EQ(subscribers.size(), 1);
+    ASSERT_EQ(subscribers.front().qos, 1);
+
 }
 
 TEST_F(GlobalSessionManagerRouterTest, StrictClusterUnsubscribeRollbackOnRouterFailure) {

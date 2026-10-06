@@ -6,6 +6,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
+#include <map>
 #include "mqtt_allocator.h"
 #include "mqtt_define.h"
 #include "mqtt_stl_allocator.h"
@@ -24,7 +25,8 @@ enum class AuthResult {
   TOPIC_ACCESS_DENIED,   // 主题访问被拒绝
   INTERNAL_ERROR,        // 内部错误
   TIMEOUT,               // 超时
-  RATE_LIMITED          // 频率限制
+  RATE_LIMITED,         // 频率限制
+  PENDING               // 异步授权尚未完成，不是允许或拒绝
 };
 
 /**
@@ -46,6 +48,9 @@ struct UserInfo {
   MQTTString client_ip;
   uint16_t client_port;
   bool is_super_user;
+  uint64_t expires_at_ms = 0;
+  std::string provider_name;
+  uint64_t authorization_session = 0;
   
   UserInfo(MQTTAllocator* allocator) 
     : username(MQTTStrAllocator(allocator)),
@@ -107,6 +112,15 @@ struct AuthStats {
   uint64_t topic_access_denied;
   uint64_t cache_hits;
   uint64_t cache_misses;
+  uint64_t cache_stale_hits = 0;
+  uint64_t cache_evictions = 0;
+  uint64_t rpc_requests = 0, rpc_failures = 0, rpc_rejected = 0;
+  uint64_t rpc_batches = 0, rpc_batch_items = 0;
+  uint64_t http_requests = 0;
+  uint64_t http_failures = 0;
+  uint64_t http_rejected = 0;
+  uint64_t cache_refreshes = 0;
+  uint64_t circuit_opened = 0;
   
   AuthStats() : total_login_attempts(0), successful_logins(0), failed_logins(0),
                 total_topic_checks(0), topic_access_granted(0), topic_access_denied(0),
@@ -122,6 +136,12 @@ struct AuthStats {
  * 3. 用户权限管理
  * 4. 性能统计
  */
+class AuthorizationRequest {
+public:
+  virtual ~AuthorizationRequest() = default;
+  virtual AuthResult poll(const UserInfo&, const MQTTString& topic) = 0;
+};
+
 class IAuthProvider {
 public:
   virtual ~IAuthProvider() = default;
@@ -164,6 +184,16 @@ public:
   virtual AuthResult check_topic_access(const UserInfo& user_info,
                                        const MQTTString& topic,
                                        Permission permission) = 0;
+  virtual AuthResult check_publish(const UserInfo& user_info, const MQTTString& topic,
+                                   const MQTTByteVector& payload) {
+    (void)payload;
+    return check_topic_access(user_info, topic, Permission::WRITE);
+  }
+  virtual AuthResult check_delivery_access(const UserInfo& user, const MQTTString& topic,
+                                           std::shared_ptr<AuthorizationRequest>& pending) {
+    pending.reset();
+    return check_topic_access(user, topic, Permission::READ);
+  }
 
   virtual int get_user_permissions(const MQTTString& username,
                                    std::vector<TopicPermission>& permissions)
@@ -203,6 +233,7 @@ public:
    * @return true健康，false不健康
    */
   virtual bool is_healthy() const = 0;
+  virtual bool requires_online_authorization() const { return false; }
 };
 
 /**
@@ -281,6 +312,9 @@ public:
                          const MQTTString& topic,
                          Permission permission,
                          AuthResult& auth_result);
+  int check_publish(const ClientAuthContext&, const MQTTString&, const MQTTByteVector&, AuthResult&);
+  int check_delivery(const ClientAuthContext&, const MQTTString&,
+                     std::shared_ptr<AuthorizationRequest>&, AuthResult&);
 
   /**
    * @brief 获取所有提供者的统计信息
@@ -297,7 +331,7 @@ public:
 
 private:
   struct ProviderEntry {
-    std::unique_ptr<IAuthProvider> provider;
+    std::shared_ptr<IAuthProvider> provider;
     int priority;
     
     ProviderEntry(std::unique_ptr<IAuthProvider> p, int prio) 
@@ -307,6 +341,7 @@ private:
   MQTTAllocator* allocator_;
   std::vector<ProviderEntry> providers_;
   mutable std::mutex providers_mutex_;
+  std::vector<ProviderEntry> providers_snapshot() const;
   
   // 缓存相关
   bool cache_enabled_;

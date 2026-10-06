@@ -1351,6 +1351,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         properties.payload_format_indicator = buffer[bytes_read++];
         break;
       case PropertyType::MessageExpiryInterval:
+        properties.has_message_expiry_interval = true;
         properties.message_expiry_interval = (buffer[bytes_read] << 24) |
                                              (buffer[bytes_read + 1] << 16) |
                                              (buffer[bytes_read + 2] << 8) | buffer[bytes_read + 3];
@@ -1395,6 +1396,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       }
       case PropertyType::SessionExpiryInterval:
+        properties.has_session_expiry_interval = true;
         properties.session_expiry_interval = (buffer[bytes_read] << 24) |
                                              (buffer[bytes_read + 1] << 16) |
                                              (buffer[bytes_read + 2] << 8) | buffer[bytes_read + 3];
@@ -2414,7 +2416,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
     properties_total_length += 1 + 1;  // PropertyType + value
   }
 
-  if (properties.message_expiry_interval != 0) {
+  if (properties.message_expiry_interval != 0 || properties.has_message_expiry_interval) {
     properties_total_length += 1 + 4;  // PropertyType + 4 bytes
   }
 
@@ -2441,7 +2443,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
     } while (value != 0);
   }
 
-  if (properties.session_expiry_interval != 0) {
+  if (properties.session_expiry_interval != 0 || properties.has_session_expiry_interval) {
     properties_total_length += 1 + 4;  // PropertyType + 4 bytes
   }
 
@@ -2543,7 +2545,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
       return ret;
   }
 
-  if (properties.message_expiry_interval != 0) {
+  if (properties.message_expiry_interval != 0 || properties.has_message_expiry_interval) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MessageExpiryInterval));
     if (ret != 0)
       return ret;
@@ -2605,7 +2607,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
     } while (value != 0);
   }
 
-  if (properties.session_expiry_interval != 0) {
+  if (properties.session_expiry_interval != 0 || properties.has_session_expiry_interval) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SessionExpiryInterval));
     if (ret != 0)
       return ret;

@@ -238,6 +238,7 @@ int WebSocketMQTTBridge::register_handler(const std::string& client_id, WebSocke
 
     handlers_[client_id] = handler;
     client_protocol_versions_.erase(client_id);
+    auth_contexts_.erase(client_id);
     LOG_INFO("Registered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -267,6 +268,7 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
     handlers_.erase(client_id);
     pending_binary_buffers_.erase(client_id);
     client_protocol_versions_.erase(client_id);
+    auth_contexts_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -279,6 +281,7 @@ WebSocketProtocolHandler* WebSocketMQTTBridge::get_handler(const std::string& cl
 
 int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, const std::string& message) {
     stats_.ws_messages_received++;
+    if (auth_manager_) return MQ_ERR_CONNECT_NOT_AUTHORIZED; // Authenticated mode uses MQTT CONNECT, never legacy text commands.
 
     LOG_DEBUG("Handling WebSocket text message from {}: {}", client_id, message);
 
@@ -594,6 +597,7 @@ int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqt
 
 int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet) {
     stats_.mqtt_messages_received++;
+    if (!topic_allowed(client_id, mqtt::from_mqtt_string(packet.topic_name), mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
 
     LOG_DEBUG("Forwarding MQTT publish to WebSocket client {}: topic={}, qos={}",
               client_id, packet.topic_name, packet.qos);
@@ -650,6 +654,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
 }
 
 int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos) {
+    if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
     if (!session_manager_) {
         LOG_ERROR("Session manager not initialized");
         return MQ_ERR_SESSION_MANAGER_NOT_READY;
@@ -693,33 +698,63 @@ int WebSocketMQTTBridge::unsubscribe_topic(const std::string& client_id, const s
 }
 
 int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std::string& topic,
-                                         const std::vector<uint8_t>& payload, uint8_t qos, bool retain) {
-    if (!session_manager_) {
-        LOG_ERROR("Session manager not initialized");
-        return MQ_ERR_SESSION_MANAGER_NOT_READY;
+                                         const std::vector<uint8_t>& payload, uint8_t qos,
+                                         bool retain, const mqtt::Properties& properties)
+{
+  if (auth_manager_) {
+    const auto found = auth_contexts_.find(client_id);
+    if (found == auth_contexts_.end())
+      return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    const auto context = found->second;
+    mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+    auth_manager_->check_publish(*context, mqtt::to_mqtt_string(topic, allocator_),
+                                 mqtt::to_mqtt_bytes(payload, allocator_), result);
+    if (result != mqtt::auth::AuthResult::SUCCESS) {
+      const bool denied = result == mqtt::auth::AuthResult::ACCESS_DENIED ||
+                          result == mqtt::auth::AuthResult::INVALID_CREDENTIALS ||
+                          result == mqtt::auth::AuthResult::USER_NOT_FOUND;
+      return denied ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_AUTH_UNAVAILABLE;
     }
+  }
+  if (!session_manager_) {
+    LOG_ERROR("Session manager not initialized");
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
 
-    LOG_DEBUG("Publishing MQTT message from WebSocket client {}: topic={}, qos={}",
-              client_id, topic, qos);
+  LOG_DEBUG("Publishing MQTT message from WebSocket client {}: topic={}, qos={}", client_id, topic,
+            qos);
 
-    // Create MQTT publish packet
-    mqtt::PublishPacket packet(allocator_);
-    packet.topic_name = mqtt::to_mqtt_string(topic, allocator_);
-    packet.payload = mqtt::to_mqtt_bytes(payload, allocator_);
-    packet.qos = qos;
-    packet.retain = retain;
-    packet.dup = false;
+  // Create MQTT publish packet
+  mqtt::PublishPacket packet(allocator_);
+  packet.topic_name = mqtt::to_mqtt_string(topic, allocator_);
+  packet.payload = mqtt::to_mqtt_bytes(payload, allocator_);
+  packet.qos = qos;
+  packet.retain = retain;
+  packet.dup = false;
+  packet.properties = properties;
 
-    // Forward to MQTT broker via session manager
-    mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic, allocator_);
-    mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-    int ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
+  // Forward to MQTT broker via session manager
+  mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic, allocator_);
+  mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
+  int ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
 
-    if (ret == MQ_SUCCESS) {
-        stats_.mqtt_messages_sent++;
-    }
+  if (ret >= 0) {
+    stats_.mqtt_messages_sent++;
+    return MQ_SUCCESS;  // Session manager returns the recipient count.
+  }
 
-    return ret;
+  return ret;
+}
+
+bool WebSocketMQTTBridge::topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission) {
+    if (!auth_manager_) return true;
+    const auto found = auth_contexts_.find(client_id);
+    if (found == auth_contexts_.end()) return false;
+    // Keep the context alive across coroutine-aware HTTP I/O.
+    const auto context = found->second;
+    mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+    auth_manager_->check_topic_access(*context, mqtt::to_mqtt_string(topic, allocator_), permission, result);
+    return result == mqtt::auth::AuthResult::SUCCESS;
 }
 
 // MQTT packet handlers (for binary protocol mode)
@@ -757,12 +792,37 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
     }
 
+    if (client_protocol_versions_.count(client_id)) return MQ_ERR_PROTOCOL;
     client_protocol_versions_[client_id] = packet->protocol_version;
-
     mqtt::ConnAckPacket connack(allocator_);
     connack.type = mqtt::PacketType::CONNACK;
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::Success;
+    if (session_manager_ && session_manager_->durable_store()) {
+      connack.properties.maximum_qos = 1;
+      // Persistent consumers use TCP; reject unsupported WS session semantics.
+      if ((packet->protocol_version < 5 && !packet->flags.clean_start) ||
+          packet->properties.session_expiry_interval)
+        connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
+    }
+    if (packet->client_id.empty()) connack.reason_code = mqtt::ReasonCode::ClientIdentifierNotValid;
+    if (auth_manager_ && connack.reason_code == mqtt::ReasonCode::Success) {
+        auto context = std::make_shared<mqtt::auth::ClientAuthContext>(allocator_);
+        mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+        mqtt::MQTTString address{mqtt::MQTTStrAllocator(allocator_)};
+        const int authenticated = auth_manager_->authenticate_user(packet->username, packet->password, packet->client_id, address, 0, result, *context);
+        if (authenticated != MQ_SUCCESS || result != mqtt::auth::AuthResult::SUCCESS) {
+            connack.reason_code = mqtt::ReasonCode::NotAuthorized;
+        } else {
+            auth_contexts_[client_id] = std::move(context);
+        }
+    }
+    if (connack.reason_code != mqtt::ReasonCode::Success) {
+        send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        auth_contexts_.erase(client_id);
+        return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    }
     int ret = send_serialized_mqtt_packet(client_id, connack);
     if (ret != MQ_SUCCESS) {
         client_protocol_versions_.erase(client_id);
@@ -779,24 +839,27 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
 
     for (const auto& sub : packet->subscriptions) {
         std::string topic_filter = mqtt::from_mqtt_string(sub.first);
-        int sub_ret = subscribe_topic(client_id, topic_filter, sub.second);
+        uint8_t qos = sub.second;
+        if (session_manager_ && session_manager_->durable_store() && qos == 2)
+          qos = 1;
+        int sub_ret = subscribe_topic(client_id, topic_filter, qos);
         if (sub_ret == MQ_SUCCESS) {
-            switch (sub.second) {
-                case 0:
-                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
-                    break;
-                case 1:
-                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS1);
-                    break;
-                case 2:
-                    suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS2);
-                    break;
-                default:
-                    suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
-                    break;
-            }
+          switch (qos) {
+            case 0:
+              suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
+              break;
+            case 1:
+              suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS1);
+              break;
+            case 2:
+              suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS2);
+              break;
+            default:
+              suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+              break;
+          }
         } else {
-            suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+            suback.reason_codes.push_back(sub_ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError);
         }
     }
 
@@ -822,18 +885,40 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, c
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
+    if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
+      const auto protocol = client_protocol_versions_.find(client_id);
+      if (protocol != client_protocol_versions_.end() && protocol->second >= 5) {
+        mqtt::DisconnectPacket reply(allocator_);
+        reply.type = mqtt::PacketType::DISCONNECT;
+        reply.reason_code = mqtt::ReasonCode::QoSNotSupported;
+        (void)send_serialized_mqtt_packet(client_id, reply);
+      }
+      auto handler = handlers_.find(client_id);
+      if (handler != handlers_.end()) handler->second->close_connection();
+      return MQ_ERR_PUBLISH_QOS;
+    }
     std::string topic = mqtt::from_mqtt_string(packet->topic_name);
     std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
-    int ret = publish_message(client_id, topic, payload, packet->qos, packet->retain);
-    if (ret != MQ_SUCCESS) {
-        return ret;
+    int ret =
+        publish_message(client_id, topic, payload, packet->qos, packet->retain, packet->properties);
+    const auto protocol = client_protocol_versions_.find(client_id);
+    const bool negative_ack = protocol != client_protocol_versions_.end() && protocol->second >= 5 &&
+        (packet->qos == 1 || packet->qos == 2) &&
+        (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED || ret == MQ_ERR_AUTH_UNAVAILABLE || ret == MQ_ERR_PUBLISH_QUOTA);
+    if (ret != MQ_SUCCESS && !negative_ack) {
+      auto handler = handlers_.find(client_id);
+      if (handler != handlers_.end())
+        handler->second->close_connection();
+      return ret;
     }
 
     if (packet->qos == 1) {
         mqtt::PubAckPacket puback(allocator_);
         puback.type = mqtt::PacketType::PUBACK;
         puback.packet_id = packet->packet_id;
-        puback.reason_code = mqtt::ReasonCode::Success;
+        puback.reason_code = ret == MQ_SUCCESS ? mqtt::ReasonCode::Success :
+            (ret == MQ_ERR_PUBLISH_QUOTA ? mqtt::ReasonCode::QuotaExceeded :
+            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError));
         return send_serialized_mqtt_packet(client_id, puback);
     }
 
@@ -841,7 +926,8 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
         mqtt::PubRecPacket pubrec(allocator_);
         pubrec.type = mqtt::PacketType::PUBREC;
         pubrec.packet_id = packet->packet_id;
-        pubrec.reason_code = mqtt::ReasonCode::Success;
+        pubrec.reason_code = ret == MQ_SUCCESS ? mqtt::ReasonCode::Success :
+            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized : mqtt::ReasonCode::UnspecifiedError);
         return send_serialized_mqtt_packet(client_id, pubrec);
     }
 
@@ -890,6 +976,9 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
             break;
         case mqtt::PacketType::PINGRESP:
             ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet), serialized);
+            break;
+        case mqtt::PacketType::DISCONNECT:
+            ret = parser.serialize_disconnect(reinterpret_cast<const mqtt::DisconnectPacket*>(&packet), serialized);
             break;
         case mqtt::PacketType::PUBACK:
             ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet), serialized);

@@ -44,7 +44,7 @@ void test_parse_text_frame_masked() {
         0x81,  // FIN=1, RSV=000, opcode=0001 (TEXT)
         0x84,  // MASK=1, payload_len=4
         0x12, 0x34, 0x56, 0x78,  // Masking key
-        0x46, 0x41, 0x33, 0x0C   // Masked payload "Test" XOR with mask
+        0x46, 0x51, 0x25, 0x0C   // Masked payload "Test" XOR with mask
     };
 
     MQTTAllocator allocator("test_ws", MQTTMemoryTag::MEM_TAG_CLIENT, 0);

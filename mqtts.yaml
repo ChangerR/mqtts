@@ -54,3 +54,24 @@ monitoring:
   enabled: true  # 是否启用监控
   interval_seconds: 60  # 监控数据收集间隔(秒) 
   json_output_file: "monitoring_data.json"  # 监控数据输出文件路径，空字符串不输出到文件
+
+# Enable on a local persistent volume for TCP QoS 1 consumers. See docs/persistence.md.
+persistence:
+  enabled: false
+  path: /data/sessions.db
+  # This path is now a directory. A legacy SQLite file requires offline migration.
+  partitions: 4
+  segment_bytes: 16777216
+  max_disk_bytes: 4294967296
+  checkpoint_interval_ms: 30000
+  max_session_expiry_seconds: 86400
+  max_sessions: 10000
+  max_subscriptions_per_session: 128
+  max_messages: 100000
+  max_messages_per_session: 10000
+  max_bytes_per_session: 33554432
+  overflow_policy: reject
+  max_bytes: 268435456
+  max_requests: 1024
+  max_request_bytes: 16777216
+  max_inflight: 32

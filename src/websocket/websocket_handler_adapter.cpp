@@ -24,7 +24,9 @@ int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
                                           uint8_t qos,
                                           bool retain,
                                           bool dup,
-                                          const mqtt::Properties& properties) {
+                                          const mqtt::Properties& properties,
+                                          std::shared_ptr<mqtt::auth::AuthorizationRequest>* pending) {
+    (void)pending;
     if (!bridge_) {
         LOG_ERROR("Bridge is null in WebSocketHandlerAdapter");
         return MQ_ERR_PARAM_V2;

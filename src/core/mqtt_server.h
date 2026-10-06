@@ -11,6 +11,7 @@
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
 #include "mqtt_socket.h"
+#include "mqtt_auth_interface.h"
 
 class MQTTServer;
 
@@ -37,6 +38,7 @@ class MQTTServer
   void run();
   void stop();
   bool is_running() const { return running_; }
+  void set_auth_manager(mqtt::auth::AuthManager* manager) { auth_manager_ = manager; }
 
   // 连接管理
   bool can_accept_connection() const;
@@ -65,4 +67,5 @@ class MQTTServer
 
   // 连接管理
   std::atomic<int> current_connections_;
+  mqtt::auth::AuthManager* auth_manager_ = nullptr;
 };

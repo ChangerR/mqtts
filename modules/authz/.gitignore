@@ -1,0 +1,4 @@
+/data/
+/bin/mqtts-authz
+*.db
+*.db.lock

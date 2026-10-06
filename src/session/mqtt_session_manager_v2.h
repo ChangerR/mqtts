@@ -16,6 +16,7 @@
 #include "mqtt_parser.h"
 #include "mqtt_send_worker_pool.h"
 #include "mqtt_session_info.h"
+#include "mqtt_durable_store.h"
 #include "mqtt_stl_allocator.h"
 #include "mqtt_topic_tree.h"
 #include "pthread_rwlock_wrapper.h"
@@ -196,6 +197,10 @@ class GlobalSessionManager
 {
  public:
   GlobalSessionManager();
+  void configure_persistence(const PersistenceConfig& config) {
+    if (config.enabled) durable_store_.reset(new DurableStore(config));
+  }
+  DurableStore* durable_store() const { return durable_store_.get(); }
   ~GlobalSessionManager();
 
   // 禁止拷贝和赋值
@@ -565,6 +570,7 @@ class GlobalSessionManager
   bool is_router_available() const;
 
  private:
+  std::unique_ptr<DurableStore> durable_store_;
   // 运行状态
   enum class ManagerState {
     INITIALIZING,  // 初始化阶段

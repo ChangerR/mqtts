@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
+#include <stdexcept>
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
@@ -194,13 +195,16 @@ int MQTTProtocolHandler::process()
 
 int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
 {
+  if (needed_size > MAX_BUFFER_SIZE || bytes_read_ > MAX_BUFFER_SIZE - needed_size) {
+    LOG_ERROR("Packet exceeds {} byte limit from client {}:{}", MAX_BUFFER_SIZE,
+              client_ip_.c_str(), client_port_);
+    return MQ_ERR_PACKET_TOO_LARGE;
+  }
   if (bytes_read_ + needed_size > current_buffer_size_) {
-    size_t new_size = std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE);
-    if (bytes_read_ + needed_size > new_size) {
-      LOG_ERROR("Packet too large from client {}:{} (needed: {}, max: {})", client_ip_.c_str(),
-                client_port_, bytes_read_ + needed_size, MAX_BUFFER_SIZE);
-      return MQ_ERR_PACKET_TOO_LARGE;
-    }
+    // Remaining Length reveals the complete body size at once. It may need
+    // more than a single doubling even when it is well below the packet cap.
+    const size_t new_size = std::max(bytes_read_ + needed_size,
+                                    std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE));
 
     // Allocate new buffer
     char* new_buffer = (char*)allocator_->allocate(new_size);
@@ -553,6 +557,7 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   int ret = MQ_SUCCESS;
   bool need_reject = false;
   bool session_present = false;
+  std::vector<std::pair<std::string, uint8_t>> restored_subscriptions;
   ReasonCode reject_reason = ReasonCode::Success;
   auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
   MQTTString username{MQTTStrAllocator(allocator_)};
@@ -655,6 +660,39 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
              client_ip_.c_str(), client_port_);
   }
 
+  if (MQ_SUCC(ret) && session_manager_ && session_manager_->durable_store()) {
+    auto* store = session_manager_->durable_store();
+    uint32_t expiry = packet->protocol_version < 5
+                          ? (packet->flags.clean_start ? 0 : store->max_session_expiry())
+                          : packet->properties.session_expiry_interval;
+    const auto& principal = current_auth_context_ ? current_auth_context_->user_info.username
+                                                  : packet->username;
+    auto opened = store->connect(from_mqtt_string(packet->client_id), from_mqtt_string(principal),
+                                  packet->flags.clean_start, expiry);
+    if (opened.ok && opened.overflow_sequence && negotiated_protocol_version_ < 5) {
+      store->disconnect(from_mqtt_string(packet->client_id), opened.epoch);
+      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = ReasonCode::ServerUnavailable;
+      need_reject = true;
+    } else if (!opened.ok) {
+      ret = opened.not_authorized ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = opened.not_authorized ? ReasonCode::NotAuthorized : ReasonCode::ServerUnavailable;
+      need_reject = true;
+    } else {
+      durable_epoch_ = opened.epoch;
+      durable_gap_ = opened.overflow_sequence;
+      durable_revision_ = opened.revision;
+      session_present = opened.present;
+      session_expiry_interval_ = std::min(expiry, store->max_session_expiry());
+      receive_maximum_ =
+          packet->properties.receive_maximum ? packet->properties.receive_maximum : 65535;
+      maximum_packet_size_ = packet->properties.maximum_packet_size
+                                 ? packet->properties.maximum_packet_size
+                                 : 268435455;
+      restored_subscriptions = std::move(opened.subscriptions);
+    }
+  }
+
   if (MQ_SUCC(ret)) {
     client_id_ =
         MQTTString(packet->client_id.begin(), packet->client_id.end(), MQTTStrAllocator(allocator_));
@@ -669,15 +707,26 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     }
   }
 
-  if (MQ_SUCC(ret)) {
-    if (0 == packet->flags.clean_start) {
-      session_present = false;
-      LOG_DEBUG("Clean Start is 0, but no persistent session found for client {}:{}",
-                client_ip_.c_str(), client_port_);
-    } else {
-      session_present = false;
-      LOG_DEBUG("Clean Start is 1, setting session_present to false for client {}:{}",
-                client_ip_.c_str(), client_port_);
+  if (MQ_SUCC(ret) && session_manager_ && session_manager_->durable_store()) {
+    // Ownership must change before filters become visible. Otherwise the old
+    // socket's cleanup can erase the new connection's restored QoS 0 filters.
+    session_manager_->unsubscribe_all_topics(client_id_);
+    try {
+      for (const auto& sub : restored_subscriptions) {
+        auto filter = to_mqtt_string(sub.first, allocator_);
+        if (add_subscription(filter) != MQ_SUCCESS ||
+            session_manager_->subscribe_topic_with_router(filter, client_id_, sub.second) != MQ_SUCCESS)
+          throw std::runtime_error("persistent subscription restore failed");
+      }
+    } catch (const std::exception&) {
+      session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
+      durable_epoch_ = 0;
+      session_manager_->unsubscribe_all_topics(client_id_);
+      session_manager_->unregister_session(client_id_);
+      connected_ = false;
+      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+      reject_reason = ReasonCode::ServerUnavailable;
+      need_reject = true;
     }
   }
 
@@ -702,6 +751,20 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 
   if (MQ_SUCC(ret)) {
     ret = send_connack(ReasonCode::Success, session_present);
+    if (MQ_SUCC(ret) && durable_epoch_) {
+      durable_running_ = true;
+      durable_task_ = runtime::current_runtime().spawn(
+          [](void* arg) -> void* {
+            static_cast<MQTTProtocolHandler*>(arg)->pump_durable();
+            return nullptr;
+          },
+          this, 128 * 1024);
+      if (!durable_task_.is_valid()) {
+        durable_running_ = false;
+        socket_->close();
+        ret = MQ_ERR_MEMORY_ALLOC;
+      }
+    }
   } else if (need_reject && nullptr != packet) {
     ret = reject_connect_request(packet->protocol_version, reject_reason, ret);
   }
@@ -760,17 +823,22 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   }
 
   if (MQ_SUCC(ret) && auth_manager_ && current_auth_context_) {
-    (void)auth_manager_->check_topic_access(*current_auth_context_, packet->topic_name,
-                                            auth::Permission::WRITE, auth_result);
+    (void)auth_manager_->check_publish(*current_auth_context_, packet->topic_name, packet->payload, auth_result);
 
     if (auth::AuthResult::SUCCESS != auth_result) {
-      LOG_WARN("Client {}:{} denied publish to topic '{}': insufficient permissions",
+      LOG_WARN("Client {}:{} publish authorization failed for topic '{}'",
                client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name));
       auth_denied = true;
-      if (1 == packet->qos) {
-        ret = send_puback(packet->packet_id, ReasonCode::NotAuthorized);
+      const bool denied = auth_result == auth::AuthResult::ACCESS_DENIED ||
+                          auth_result == auth::AuthResult::INVALID_CREDENTIALS ||
+                          auth_result == auth::AuthResult::USER_NOT_FOUND;
+      const auto reason = denied ? ReasonCode::NotAuthorized : ReasonCode::UnspecifiedError;
+      if (negotiated_protocol_version_ < 5 || packet->qos == 0) {
+        ret = denied ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_AUTH_UNAVAILABLE;
+      } else if (1 == packet->qos) {
+        ret = send_puback(packet->packet_id, reason);
       } else if (2 == packet->qos) {
-        ret = send_pubrec(packet->packet_id, ReasonCode::NotAuthorized);
+        ret = send_pubrec(packet->packet_id, reason);
       } else {
         ret = MQ_SUCCESS;
       }
@@ -787,6 +855,11 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   }
 
   if (MQ_SUCC(ret) && !auth_denied) {
+    if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
+      if (negotiated_protocol_version_ >= 5)
+        (void)send_disconnect(ReasonCode::QoSNotSupported);
+      return MQ_ERR_PUBLISH_QOS;
+    }
     LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
               client_ip_.c_str(), client_port_, packet->payload.size());
 
@@ -799,6 +872,12 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
       } else {
         LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}",
                  from_mqtt_string(packet->topic_name), forward_ret);
+        if (forward_ret == MQ_ERR_PUBLISH_QUOTA && negotiated_protocol_version_ >= 5 && packet->qos == 1)
+          return send_puback(packet->packet_id, ReasonCode::QuotaExceeded);
+        // No positive acknowledgement before the durable transaction commits.
+        if (socket_)
+          socket_->close();
+        return forward_ret;
       }
     } else {
       LOG_WARN("Session manager not available, cannot forward PUBLISH message for topic: {}",
@@ -822,6 +901,15 @@ int MQTTProtocolHandler::handle_puback(const PubAckPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
+  if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+    auto result = session_manager_->durable_store()->acknowledge(
+        from_mqtt_string(client_id_), durable_epoch_, packet->packet_id, false);
+    if (!result.ok) {
+      if (socket_)
+        socket_->close();
+      return MQ_ERR_INTERNAL;
+    }
+  }
   // 处理PUBACK响应
   if (packet->reason_code != ReasonCode::Success) {
     LOG_WARN("PUBACK with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
@@ -905,6 +993,15 @@ int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
   // 处理取消订阅
   std::vector<ReasonCode> reason_codes;
   for (const MQTTString& topic : packet->topic_filters) {
+    if (durable_epoch_) {
+      auto result = session_manager_->durable_store()->unsubscribe(
+          from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic));
+      if (!result.ok) {
+        if (socket_)
+          socket_->close();
+        return MQ_ERR_INTERNAL;
+      }
+    }
     // 从本地存储中移除订阅
     remove_subscription(topic);
     
@@ -981,6 +1078,15 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
+  if (durable_epoch_ && packet->properties.has_session_expiry_interval) {
+    if (session_expiry_interval_ == 0 && packet->properties.session_expiry_interval != 0) {
+      if (socket_)
+        socket_->close();
+      return MQ_ERR_PACKET_INVALID;
+    }
+    session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_,
+                                                  packet->properties.session_expiry_interval);
+  }
   // Unregister from session manager before marking as disconnected
   cleanup_session_registration("on DISCONNECT packet");
   LOG_INFO("Client {}:{} disconnected with reason code: 0x{:02x}", client_ip_.c_str(), client_port_,
@@ -1038,10 +1144,15 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
       const MQTTString& topic = subscription.first;
       uint8_t qos = subscription.second;
+      // Persistent delivery is QoS 1; MQTT permits granting a lower QoS.
+      if (session_manager_ && session_manager_->durable_store() && qos == 2)
+        qos = 1;
       int add_ret = MQ_SUCCESS;
       int subscribe_ret = MQ_SUCCESS;
       int rollback_ret = MQ_SUCCESS;
       bool local_added = false;
+      const bool existed = std::find(subscriptions_.begin(), subscriptions_.end(), topic) != subscriptions_.end();
+      DurableStore::Result previous;
       ReasonCode reason_code = ReasonCode::UnspecifiedError;
       auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
 
@@ -1081,6 +1192,16 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         }
       }
 
+      if (local_added && durable_epoch_) {
+        auto stored = session_manager_->durable_store()->subscribe(
+            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), qos);
+        if (!stored.ok) {
+          if (!existed) remove_subscription(topic);
+          local_added = false;
+          reason_code = stored.quota_exceeded ? ReasonCode::QuotaExceeded : ReasonCode::UnspecifiedError;
+        }
+        previous = std::move(stored);
+      }
       if (local_added && session_manager_) {
         subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
         if (MQ_SUCC(subscribe_ret)) {
@@ -1092,7 +1213,17 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
               "Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}",
               client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
           reason_code = ReasonCode::UnspecifiedError;
-          rollback_ret = remove_subscription(topic);
+          if (durable_epoch_) {
+            auto* store = session_manager_->durable_store();
+            auto restored = previous.present
+                ? store->subscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), previous.subscriptions.front().second)
+                : store->unsubscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic));
+            if (!restored.ok) {
+              if (socket_) socket_->close();
+              return MQ_ERR_INTERNAL;
+            }
+          }
+          rollback_ret = existed ? MQ_SUCCESS : remove_subscription(topic);
           if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
             LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
                      client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);
@@ -1193,6 +1324,16 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
   packet->type = PacketType::CONNACK;
   packet->reason_code = reason_code;
   packet->session_present = session_present;
+  if (session_manager_ && session_manager_->durable_store())
+    packet->properties.maximum_qos = 1;
+  if (durable_epoch_ && negotiated_protocol_version_ >= 5) {
+    packet->properties.has_session_expiry_interval = true;
+    packet->properties.session_expiry_interval = session_expiry_interval_;
+    if (durable_gap_) {
+      packet->properties.user_properties.emplace_back(to_mqtt_string("mqtts-overflow-from", allocator_),
+          to_mqtt_string(std::to_string(durable_gap_), allocator_));
+    }
+  }
 
   // 序列化包
   int ret = parser_->serialize_connack(packet.get(), *serialize_buffer_);
@@ -1376,7 +1517,8 @@ int MQTTProtocolHandler::add_subscription(const MQTTString& topic)
     ret = MQ_ERR_SUBSCRIBE_TOPIC;
   } else {
     try {
-      subscriptions_.push_back(topic);
+      if (std::find(subscriptions_.begin(), subscriptions_.end(), topic) == subscriptions_.end())
+        subscriptions_.push_back(topic);
       LOG_DEBUG("Added subscription for topic: {}", from_mqtt_string(topic));
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to add subscription for topic {}: {}", from_mqtt_string(topic), e.what());
@@ -1527,6 +1669,17 @@ int MQTTProtocolHandler::send_pingresp()
 
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)
 {
+  durable_running_ = false;
+  // The pump may be waiting for a slow reader. Shut down I/O before joining it.
+  if (socket_)
+    socket_->close();
+  while (durable_task_.is_valid() && !durable_task_.is_finished())
+    runtime::current_runtime().wait(-1, 0, 5);
+  durable_task_.release();
+  if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+    session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
+    durable_epoch_ = 0;
+  }
   if (connected_ && session_manager_ && !client_id_.empty()) {
     // 通知路由器客户端断开连接
     MQTTString disconnect_reason(context ? context : "normal disconnect", MQTTStrAllocator(allocator_));
@@ -1538,8 +1691,22 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
       LOG_DEBUG("Successfully notified router about client disconnect: {}", 
                 from_mqtt_string(client_id_));
     }
-    
-    int ret = session_manager_->unregister_session(client_id_);
+
+    // An older socket must not remove a replacement connection's registration.
+    auto* owner = session_manager_->find_client_manager(client_id_);
+    auto* local = session_manager_->get_thread_manager();
+    bool local_ours = false;
+    if (local) {
+      auto reference = local->get_safe_handler(client_id_);
+      local_ours = reference.get() == this;
+    }
+    bool ours = owner == local && local_ours;
+    if (ours)
+      session_manager_->unsubscribe_all_topics(client_id_);
+    int ret = ours ? session_manager_->unregister_session(client_id_) : MQ_SUCCESS;
+    // A replacement on another event thread still leaves our old local entry.
+    // Remove it before this handler is freed, without touching the new index.
+    if (!ours && local_ours) ret = local->unregister_handler(client_id_);
     if (ret != 0) {
       LOG_WARN("Failed to unregister session for client {} {}, error: {}",
                from_mqtt_string(client_id_), context ? context : "", ret);
@@ -1576,7 +1743,8 @@ int MQTTProtocolHandler::register_session_with_manager()
 
 int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVector& payload,
                                       uint8_t qos, bool retain, bool dup,
-                                      const Properties& properties)
+                                      const Properties& properties,
+                                      std::shared_ptr<auth::AuthorizationRequest>* pending)
 {
   LOG_DEBUG("Sending PUBLISH to client {}:{} (topic: {}, qos: {}, retain: {}, dup: {})",
             client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos, retain, dup);
@@ -1585,6 +1753,24 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
     LOG_ERROR("Cannot send PUBLISH: socket is null for client {}:{}", client_ip_.c_str(),
               client_port_);
     return MQ_ERR_SOCKET;
+  }
+
+  // A persistent connection has exactly one Packet ID owner. Alternate live
+  // paths (including cluster forwarding) must never allocate an ID that a
+  // PUBACK could incorrectly apply to its durable queue.
+  if (durable_epoch_ && qos > 0)
+    return MQ_ERR_PUBLISH_QOS;
+
+  // Recheck an existing subscription before delivery. A revoked account or
+  // removed group member must not keep receiving through a stale subscription.
+  if (auth_manager_) {
+    auth::AuthResult allowed = auth::AuthResult::ACCESS_DENIED;
+    if (current_auth_context_) {
+      if (pending) auth_manager_->check_delivery(*current_auth_context_, topic, *pending, allowed);
+      else auth_manager_->check_topic_access(*current_auth_context_, topic, auth::Permission::READ, allowed);
+    }
+    if (allowed == auth::AuthResult::PENDING) return MQ_ERR_AUTH_PENDING;
+    if (allowed != auth::AuthResult::SUCCESS) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
   }
 
   AllocatedPacket<PublishPacket> packet(allocator_);
@@ -1632,6 +1818,178 @@ int MQTTProtocolHandler::send_publish(const PublishPacket& packet)
 {
   return send_publish(packet.topic_name, packet.payload, packet.qos, packet.retain, packet.dup,
                       packet.properties);
+}
+
+void MQTTProtocolHandler::pump_durable()
+{
+  runtime::current_runtime().enable_async_syscalls();
+  auto* store = session_manager_->durable_store();
+  int64_t cursor = 0;
+  uint64_t observed = 0;
+  bool fetch_again = true;
+  try {
+    while (durable_running_ && connected_ && socket_ && socket_->is_connected()) {
+      uint64_t revision = durable_revision_ ? durable_revision_->load() : 0;
+      if (!fetch_again && revision == observed) {
+        if (durable_revision_)
+          durable_revision_->wait(observed, 100);
+        continue;
+      }
+      observed = revision;
+      fetch_again = false;
+      auto batch =
+          store->fetch(from_mqtt_string(client_id_), durable_epoch_, cursor, receive_maximum_);
+      if (!batch.ok) {
+        if (batch.stale) {
+          socket_->close();
+          break;
+        }
+        runtime::current_runtime().wait(-1, 0, 10);
+        fetch_again = true;
+        continue;
+      }
+      if (batch.overflow_sequence && batch.overflow_sequence != durable_gap_) {
+        if (negotiated_protocol_version_ >= 5)
+          (void)send_disconnect(ReasonCode::QuotaExceeded);
+        socket_->close();
+        break;
+      }
+      // Fetch bounds wire bytes globally. Decode with a separate, proportional
+      // budget so a publisher cannot exhaust the receiver's small client pool.
+      size_t wire_bytes = 0;
+      for (const auto& delivery : batch.deliveries)
+        wire_bytes += delivery.wire.size();
+      MQTTAllocator delivery_allocator("durable_delivery", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                       wire_bytes * 16 + 65536);
+      auto cleanup = [&](PublishPacket* p) {
+        if (p) {
+          p->~PublishPacket();
+          delivery_allocator.deallocate(p, sizeof(PublishPacket));
+        }
+      };
+      using OwnedPublish = std::unique_ptr<PublishPacket, decltype(cleanup)>;
+      std::vector<OwnedPublish> packets;
+      std::vector<std::shared_ptr<auth::AuthorizationRequest>> authorizations(
+          batch.deliveries.size());
+      std::vector<auth::AuthResult> decisions(batch.deliveries.size(), auth::AuthResult::SUCCESS);
+      // Queue the bounded batch before awaiting any one decision. Remote auth
+      // workers can coalesce these into BatchAuthorize without reordering sends.
+      for (size_t i = 0; i < batch.deliveries.size(); ++i) {
+        const auto& wire = batch.deliveries[i].wire;
+        MQTTParser decoder(&delivery_allocator);
+        decoder.set_protocol_version_hint(5);
+        Packet* raw = nullptr;
+        int parsed = wire.empty() || (uint8_t(wire[0]) >> 4) != 3
+                         ? MQ_ERR_PACKET_INVALID
+                         : decoder.parse_packet(reinterpret_cast<const uint8_t*>(wire.data()),
+                                                wire.size(), &raw);
+        packets.emplace_back(parsed == MQ_SUCCESS ? static_cast<PublishPacket*>(raw) : nullptr,
+                             cleanup);
+        if (packets.back() && auth_manager_) {
+          decisions[i] = auth::AuthResult::ACCESS_DENIED;
+          if (current_auth_context_)
+            auth_manager_->check_delivery(*current_auth_context_, packets.back()->topic_name,
+                                          authorizations[i], decisions[i]);
+        }
+      }
+      for (size_t i = 0; i < batch.deliveries.size(); ++i) {
+        const auto& delivery = batch.deliveries[i];
+        if (!durable_running_)
+          break;
+        auto* packet = packets[i].get();
+        auto discard = [&](DurableStore::DiscardReason reason) {
+          auto removed = store->discard(from_mqtt_string(client_id_), durable_epoch_,
+                                        delivery.packet_id, reason);
+          fetch_again = true;
+          if (removed.ok)
+            cursor = delivery.sequence;
+          return removed.ok;
+        };
+        if (!packet) {
+          if (!discard(DurableStore::DiscardReason::Malformed))
+            break;
+          continue;
+        }
+        while (decisions[i] == auth::AuthResult::PENDING && durable_running_ &&
+               socket_->is_connected()) {
+          runtime::current_runtime().wait(-1, 0, 1);
+          auth_manager_->check_delivery(*current_auth_context_, packet->topic_name,
+                                        authorizations[i], decisions[i]);
+        }
+        if (!durable_running_ || !socket_->is_connected())
+          break;
+        auto allowed = decisions[i];
+        if (allowed != auth::AuthResult::SUCCESS) {
+          if (allowed == auth::AuthResult::ACCESS_DENIED ||
+              allowed == auth::AuthResult::TOPIC_ACCESS_DENIED ||
+              allowed == auth::AuthResult::INVALID_CREDENTIALS ||
+              allowed == auth::AuthResult::USER_NOT_FOUND) {
+            if (!discard(DurableStore::DiscardReason::NotAuthorized))
+              break;
+            continue;
+          }
+          // Transport failures, throttling and invalidated in-flight decisions
+          // do not revoke an existing message. Retry after a bounded pause.
+          runtime::current_runtime().wait(-1, 0, 250);
+          fetch_again = true;
+          break;
+        }
+        // Expiry only removes messages whose delivery has not started. An
+        // unacknowledged QoS 1 packet keeps its identity until PUBACK, including
+        // after reconnect. Recovery treats assigned IDs conservatively as sent.
+        if (!delivery.dup && delivery.expires && delivery.expires <= DurableStore::now_ms()) {
+          auto ack =
+              store->acknowledge(from_mqtt_string(client_id_), durable_epoch_, delivery.packet_id);
+          if (ack.ok)
+            cursor = delivery.sequence;
+          fetch_again = true;
+          continue;
+        }
+        packet->packet_id = delivery.packet_id;
+        packet->qos = 1;
+        packet->dup = delivery.dup;
+        if (delivery.expires)
+          packet->properties.message_expiry_interval =
+              uint32_t(std::max<int64_t>(0, (delivery.expires - DurableStore::now_ms() + 999) / 1000));
+        MQTTParser encoder(&delivery_allocator);
+        encoder.set_protocol_version_hint(negotiated_protocol_version_);
+        MQTTBuffer output(&delivery_allocator);
+        int ret = encoder.serialize_publish(packet, output);
+        packets[i].reset();
+        if (ret != MQ_SUCCESS) {
+          if (!discard(DurableStore::DiscardReason::Malformed))
+            break;
+          continue;
+        }
+        if (output.size() > maximum_packet_size_) {
+          if (!discard(DurableStore::DiscardReason::PacketTooLarge))
+            break;
+          continue;
+        }
+        if (!store->begin_delivery(from_mqtt_string(client_id_), durable_epoch_,
+                                   delivery.sequence, delivery.packet_id).ok) {
+          socket_->close();
+          durable_running_ = false;
+          break;
+        }
+        if (send_data_with_lock(reinterpret_cast<const char*>(output.data()), output.size()) !=
+            MQ_SUCCESS) {
+          socket_->close();
+          durable_running_ = false;
+          break;
+        }
+        cursor = delivery.sequence;
+        fetch_again = true;
+      }
+      // Yield between bounded batches even when every socket write is immediate.
+      runtime::current_runtime().wait(-1, 0, 1);
+    }
+  } catch (const std::exception& error) {
+    LOG_ERROR("Persistent delivery failed: {}", error.what());
+    if (socket_)
+      socket_->close();
+  }
+  durable_running_ = false;
 }
 
 }  // namespace mqtt

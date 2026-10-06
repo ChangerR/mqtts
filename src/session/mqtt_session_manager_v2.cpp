@@ -891,8 +891,11 @@ void GlobalSessionManager::update_client_index(const std::string& client_id,
 
 void GlobalSessionManager::remove_client_index(const std::string& client_id)
 {
+  auto* local = get_thread_manager();
   WriteLockGuard lock(client_index_mutex_);
-  client_to_manager_.erase(client_id);
+  auto found = client_to_manager_.find(client_id);
+  if (found != client_to_manager_.end() && found->second == local)
+    client_to_manager_.erase(found);
 }
 
 int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
@@ -928,7 +931,8 @@ int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client
   }
 
   // 使用共享内容加入目标线程的队列
-  thread_manager->enqueue_shared_message(content, target_client_id);
+  const int ret = thread_manager->enqueue_shared_message(content, target_client_id);
+  if (ret != MQ_SUCCESS) return ret;
 
   LOG_DEBUG("Shared message forwarded to client: {}", from_mqtt_string(target_client_id));
   return MQ_SUCCESS;
@@ -989,6 +993,60 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
 {
+  // Inbound topic aliases are not supported (CONNACK advertises a maximum of
+  // zero). Reject unresolved/invalid topics before they can enter the journal,
+  // including the WebSocket bridge's publishing path.
+  if (topic.empty() || topic.find('+') != MQTTString::npos ||
+      topic.find('#') != MQTTString::npos || topic.find('\0') != MQTTString::npos ||
+      packet.properties.topic_alias != 0)
+    return MQ_ERR_PUBLISH_TOPIC;
+  std::vector<std::string> persisted_targets;
+  size_t persisted_count = 0;
+  if (packet.properties.has_message_expiry_interval &&
+      packet.properties.message_expiry_interval == 0)
+    return 0;
+  if (durable_store_) {
+    if (packet.qos > 1)
+      return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
+    if (packet.qos == 1 && durable_store_->has_subscriptions()) {
+      try {
+        MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                     4 * 1024 * 1024);
+        MQTTParser serializer(&wire_allocator);
+        serializer.set_protocol_version_hint(5);
+        PublishPacket copy(&wire_allocator);
+        copy.type = PacketType::PUBLISH;
+        copy.topic_name = packet.topic_name;
+        copy.payload = packet.payload;
+        copy.qos = 1;
+        copy.packet_id = 1;
+        copy.retain = false;
+        copy.dup = false;
+        copy.properties = Properties(packet.properties, &wire_allocator);
+        copy.properties.topic_alias = 0;
+        MQTTBuffer wire(&wire_allocator);
+        if (serializer.serialize_publish(&copy, wire) != MQ_SUCCESS)
+          return MQ_ERR_INTERNAL;
+        int64_t expires =
+            packet.properties.message_expiry_interval
+                ? DurableStore::now_ms() + int64_t(packet.properties.message_expiry_interval) * 1000
+                : 0;
+        auto result = durable_store_->publish(
+            from_mqtt_string(topic),
+            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()),
+            from_mqtt_string(sender_client_id), expires);
+        if (!result.ok) {
+          LOG_WARN("Persistent publish refused: {}", result.error);
+          return result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+        }
+        persisted_count = result.accepted_targets;
+        persisted_targets = std::move(result.targets);
+      } catch (const std::exception& error) {
+        LOG_WARN("Persistent publish failed: {}", error.what());
+        return MQ_ERR_INTERNAL;
+      }
+    }
+  }
   // 使用高性能主题匹配树查找订阅者
   std::vector<SubscriberInfo> subscribers;
   int ret = find_topic_subscribers(topic, subscribers);
@@ -997,24 +1055,41 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
     return 0;
   }
 
-  int forwarded_count = 0;
-
-  std::string sender_id = from_mqtt_string(sender_client_id);
-  for (const SubscriberInfo& subscriber : subscribers) {
-    // 避免回环
-    if (from_mqtt_string(subscriber.client_id) == sender_id) {
-      continue;
+  if (subscribers.empty())
+    return int(persisted_count);
+  int forwarded_count = int(persisted_count);
+  try {
+    // Previously every recipient copied the payload using the publisher's
+    // 1-MiB allocator. A single 4-KiB publish to 500 recipients could exhaust
+    // it and throw out of the MQTT coroutine. One owned snapshot per publish
+    // also survives the publishing connection being closed while delivery waits.
+    SharedMessageContentPtr content(new SharedMessageContent(
+        packet.topic_name, packet.payload, packet.qos, packet.retain, packet.dup,
+        packet.properties, sender_client_id, global_allocator_));
+    const std::string sender_id = from_mqtt_string(sender_client_id);
+    for (const SubscriberInfo& subscriber : subscribers) {
+      const std::string target = from_mqtt_string(subscriber.client_id);
+      if (target == sender_id ||
+          std::binary_search(persisted_targets.begin(), persisted_targets.end(), target))
+        continue;
+      if (subscriber.qos == 0 && packet.qos != 0) {
+        SharedMessageContentPtr downgraded(
+            new SharedMessageContent(packet.topic_name, packet.payload, 0, false, false,
+                                     packet.properties, sender_client_id, global_allocator_));
+        if (forward_publish_shared(subscriber.client_id, downgraded) == MQ_SUCCESS)
+          ++forwarded_count;
+      } else if (forward_publish_shared(subscriber.client_id, content) == MQ_SUCCESS)
+        ++forwarded_count;
     }
-
-    if (forward_publish(subscriber.client_id, packet, sender_client_id) == MQ_SUCCESS) {
-      forwarded_count++;
-    }
+  } catch (const std::bad_alloc&) {
+    LOG_WARN("Insufficient memory while queuing PUBLISH fanout");
+    return MQ_ERR_MEMORY_ALLOC;
   }
 
   LOG_DEBUG("Forwarded PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
 
-  return ret;
+  return forwarded_count;
 }
 
 int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topic,
@@ -1749,10 +1824,9 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
   MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
   bool strict_cluster_mode = false;
 
-  if (MQ_FAIL(subscribe_topic(topic_filter, client_id, qos))) {
-  } else if (router_client_.get() == NULL) {
-    ret = MQ_SUCCESS;
-  } else {
+  // Do not replace an existing local filter until router admission succeeds.
+  // A failed re-SUBSCRIBE must retain its previous QoS and routing entry.
+  if (router_client_.get() != NULL) {
     strict_cluster_mode = cluster_config_.cluster_enabled;
     request.server_id = server_id_;
     request.client_id = client_id;
@@ -1763,12 +1837,10 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
     } else {
       ret = router_client_->subscribe_async(request);
     }
-    if (MQ_SUCCESS != ret && strict_cluster_mode) {
-      (void)unsubscribe_topic(topic_filter, client_id);
-    }
+    if (MQ_SUCCESS != ret)
+      return ret;
   }
-
-  return ret;
+  return subscribe_topic(topic_filter, client_id, qos);
 }
 
 int GlobalSessionManager::unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id)

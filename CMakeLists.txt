@@ -6,14 +6,25 @@ project(mqtts)
 find_package(Git REQUIRED)
 execute_process(
 	COMMAND ${GIT_EXECUTABLE} describe --tags --always
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	ERROR_QUIET
 	OUTPUT_VARIABLE GIT_TAG
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 execute_process(
 	COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	ERROR_QUIET
 	OUTPUT_VARIABLE GIT_HASH
 	OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+
+if(NOT GIT_TAG)
+    set(GIT_TAG "source-build")
+endif()
+if(NOT GIT_HASH)
+    set(GIT_HASH "unknown")
+endif()
 
 # 获取构建时间
 string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")
@@ -32,7 +43,7 @@ include_directories(${CMAKE_BINARY_DIR}/generated)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # 设置静态链接
-set(BUILD_SHARED_LIBS OFF)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 
 # 设置编译器标志，包含调试信息
 set(CMAKE_CXX_STANDARD 11)
@@ -99,6 +110,22 @@ add_subdirectory(3rd EXCLUDE_FROM_ALL)
 # 查找认证相关依赖
 find_package(PkgConfig REQUIRED)
 find_package(Protobuf REQUIRED)
+pkg_check_modules(GRPC REQUIRED IMPORTED_TARGET grpc++)
+find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+set(AUTHZ_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/modules/authz/proto/authorization.proto")
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.h"
+           "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.h"
+    COMMAND protobuf::protoc --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/modules/authz/proto
+            --cpp_out=${CMAKE_CURRENT_BINARY_DIR} --grpc_out=${CMAKE_CURRENT_BINARY_DIR}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${AUTHZ_PROTO}
+    DEPENDS ${AUTHZ_PROTO}
+    VERBATIM
+)
+add_library(mqtt_authz_proto STATIC "${CMAKE_CURRENT_BINARY_DIR}/authorization.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/authorization.grpc.pb.cc")
+target_compile_features(mqtt_authz_proto PUBLIC cxx_std_17)
+target_include_directories(mqtt_authz_proto PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(mqtt_authz_proto PUBLIC protobuf::libprotobuf PkgConfig::GRPC)
 
 protobuf_generate_cpp(MQTT_ROUTER_PROTO_SRCS MQTT_ROUTER_PROTO_HDRS src/router/mqtt_router.proto)
 protobuf_generate_cpp(MQTT_FORWARDING_PROTO_SRCS MQTT_FORWARDING_PROTO_HDRS src/forwarding/mqtt_forwarding.proto)
@@ -135,6 +162,8 @@ add_library(mqtt_parser STATIC
     src/common/logger.cpp
     src/common/mqtt_buffer.cpp
     src/common/mqtt_config.cpp
+    src/session/mqtt_durable_store.cpp
+    src/session/mqtt_append_log.cpp
     src/session/mqtt_session_manager_v2.cpp
 	src/session/mqtt_session_info.cpp
     src/topic/mqtt_topic_tree.cpp
@@ -176,7 +205,12 @@ target_link_libraries(mqtt_router mqtt_runtime)
 target_link_libraries(mqtt_router mqtt_proto)
 
 # 添加mqtt_auth库
+add_executable(mqtts-store-import src/app/mqtts_store_import.cpp src/common/logger.cpp)
+target_link_libraries(mqtts-store-import mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)
+
 add_library(mqtt_auth STATIC
+    src/auth/mqtt_auth_remote.cpp
+    src/auth/mqtt_auth_factory.cpp
     src/auth/mqtt_auth_manager.cpp
     src/auth/mqtt_auth_sqlite.cpp
     src/auth/mqtt_auth_redis.cpp
@@ -185,6 +219,8 @@ add_library(mqtt_auth STATIC
     src/common/logger.cpp
     src/common/mqtt_buffer.cpp
 )
+
+target_link_libraries(mqtt_auth mqtt_authz_proto)
 
 # 查找SQLite3 (可选)
 find_package(SQLite3 QUIET)
@@ -202,7 +238,7 @@ if(SQLite3_FOUND)
 endif()
 
 if(HIREDIS_FOUND)
-    target_link_libraries(mqtt_auth ${HIREDIS_LIBRARIES})
+    target_link_libraries(mqtt_auth ${HIREDIS_LINK_LIBRARIES})
     target_include_directories(mqtt_auth PUBLIC ${HIREDIS_INCLUDE_DIRS})
     target_compile_definitions(mqtt_auth PRIVATE HAVE_HIREDIS)
 endif()
@@ -213,11 +249,18 @@ if(OpenSSL_FOUND)
 endif()
 
 target_link_libraries(mqtt_auth mqtt_runtime)
+find_package(CURL REQUIRED)
+find_package(nlohmann_json REQUIRED)
+target_link_libraries(mqtt_auth CURL::libcurl nlohmann_json::nlohmann_json)
+target_link_libraries(mqtt_parser mqtt_auth)
 
 # 查找yaml-cpp库的静态版本
 pkg_check_modules(YAML_CPP REQUIRED IMPORTED_TARGET yaml-cpp)
+foreach(target mqtt_parser mqtt_router mqtt_auth)
+    target_link_directories(${target} PUBLIC ${YAML_CPP_LIBRARY_DIRS})
+endforeach()
 
-pkg_check_modules(LLHTTP REQUIRED llhttp)
+pkg_search_module(LLHTTP REQUIRED llhttp libllhttp)
 
 target_include_directories(mqtt_parser PUBLIC
     ${MQTTS_INCLUDE_DIRS}

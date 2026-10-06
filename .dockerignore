@@ -1,4 +1,10 @@
 build/
 build-container/
+build-native/
+.git/
 logs/
 .DS_Store
+modules/authz/data/
+modules/authz/bin/
+**/*.db
+**/*.db.lock

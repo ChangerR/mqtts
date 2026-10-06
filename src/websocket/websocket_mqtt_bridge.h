@@ -9,6 +9,7 @@
 #include "mqtt_packet.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_stl_allocator.h"
+#include "mqtt_auth_interface.h"
 
 namespace websocket {
 
@@ -77,13 +78,14 @@ public:
 
     // Publish MQTT message
     int publish_message(const std::string& client_id, const std::string& topic,
-                       const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false);
+                       const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false, const mqtt::Properties& properties = mqtt::Properties());
 
     // Configuration
     void set_message_format(MessageFormat format) { format_ = format; }
     MessageFormat get_message_format() const { return format_; }
     void set_allow_mqtt3x(bool allow_mqtt3x) { allow_mqtt3x_ = allow_mqtt3x; }
     bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
+    void set_auth_manager(mqtt::auth::AuthManager* manager) { auth_manager_ = manager; }
 
     // Statistics
     BridgeStatistics& get_statistics() { return stats_; }
@@ -115,6 +117,7 @@ private:
     int handle_mqtt_disconnect(const std::string& client_id);
     int send_serialized_mqtt_packet(const std::string& client_id, const mqtt::Packet& packet);
     void destroy_packet(mqtt::Packet* packet);
+    bool topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission);
 
     // Send response to WebSocket client
     int send_to_websocket(const std::string& client_id, const std::string& text);
@@ -158,6 +161,8 @@ private:
     // Statistics
     BridgeStatistics stats_;
     bool allow_mqtt3x_ = true;
+    mqtt::auth::AuthManager* auth_manager_ = nullptr;
+    std::unordered_map<std::string, std::shared_ptr<mqtt::auth::ClientAuthContext>> auth_contexts_;
 };
 
 }  // namespace websocket

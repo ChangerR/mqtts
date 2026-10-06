@@ -20,8 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libyaml-cpp-dev \
     libsqlite3-dev \
     libhiredis-dev \
+    libcurl4-openssl-dev \
+    nlohmann-json3-dev \
     protobuf-compiler \
     libprotobuf-dev \
+    libgrpc++-dev \
+    protobuf-compiler-grpc \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 

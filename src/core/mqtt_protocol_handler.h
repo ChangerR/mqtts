@@ -9,14 +9,16 @@
 #include <vector>
 #include "logger.h"
 #include "mqtt_allocator.h"
+#include "mqtt_auth_interface.h"
+#include "mqtt_buffer.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_define.h"
+#include "mqtt_durable_store.h"
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
-#include "mqtt_buffer.h"
+#include "mqtt_runtime.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
-#include "mqtt_auth_interface.h"
 
 namespace mqtt {
 
@@ -84,14 +86,21 @@ class MQTTProtocolHandler
   // Publish message sender
   virtual int send_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos = 0,
                    bool retain = false, bool dup = false,
-                   const Properties& properties = Properties());
+                   const Properties& properties = Properties(),
+                   std::shared_ptr<auth::AuthorizationRequest>* pending = nullptr);
   virtual int send_publish(const PublishPacket& packet);
 
   // Session management
   virtual bool is_connected() const { return connected_; }
   void set_client_id(const MQTTString& client_id) { client_id_ = client_id; }
   const MQTTString& get_client_id() const { return client_id_; }
-  uint16_t get_next_packet_id() { return next_packet_id_++; }
+  uint16_t get_next_packet_id()
+  {
+    uint16_t id = next_packet_id_++;
+    if (next_packet_id_ == 0)
+      next_packet_id_ = 1;
+    return id;
+  }
 
   // Topic subscription management
   int add_subscription(const MQTTString& topic);
@@ -132,6 +141,12 @@ class MQTTProtocolHandler
   int client_port_;
   MQTTString client_id_;
   bool connected_;
+  uint64_t durable_epoch_ = 0;
+  int64_t durable_gap_ = 0;
+  bool durable_running_ = false;
+  runtime::TaskHandle durable_task_;
+  std::shared_ptr<DurableStore::Signal> durable_revision_;
+  void pump_durable();
   uint16_t next_packet_id_;
 
   // Topic subscriptions

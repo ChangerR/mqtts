@@ -28,9 +28,9 @@ cmake --build build-container -- -j"$(nproc)"
 ctest --test-dir build-container --output-on-failure --timeout 120
 ./build-container/mqtts -c mqtts.yaml        # broker on 0.0.0.0:1883
 ```
-- CMake `configure` re-applies `3rd/libco.patch` to the libco submodule each run (adds the
-  missing `co_comm.cpp` to the static lib). This leaves the `3rd/libco` submodule with a
-  modified working tree — that is expected; do not commit the submodule change.
+- CMake adds missing `co_comm.cpp` directly to the libco targets, including source
+  archives without Git metadata. Older builds may have applied `3rd/libco.patch`
+  to the submodule working tree; do not commit that submodule change.
 - The linker prints harmless `coctx_swap.S.o: missing .note.GNU-stack section` warnings.
 
 ### MQTT client gotcha

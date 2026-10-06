@@ -2,6 +2,20 @@
 
 MQTTS 是一个基于 C++ 的 MQTT 服务端实现，支持 MQTT v5.0，并兼容 MQTT 3.1 / 3.1.1（默认开启）。
 
+支持 TCP / WebSocket 统一认证、发布/订阅及每次投递权限检查。
+[独立授权模块](modules/authz/README.md) 位于 `modules/authz`，拥有独立 Go 进程、
+持久化授权库和镜像，通过 Protobuf/gRPC 提供批量授权及权限管理。
+Broker 不读取应用数据库，也不嵌入业务角色、Topic 或消息字段。
+
+HTTP 和 gRPC provider 共用分片缓存、有界工作队列、熔断及异步投递授权。
+缓存命中不调用远程服务；故障不会延长原会话和最多5分钟的授权租约。
+原有可选 [HTTP 契约](docs/http-auth.md) 继续兼容。
+
+可选的 [持久会话与 QoS 1 投递](docs/persistence.md) 使用内置 Topic 分区追加日志、
+独立会话日志、批量刷盘和有界内存，支持 TCP 消费者离线及 Broker 重启恢复。
+消息持久化不依赖 SQLite、Kafka 或应用数据库；旧存储需要先离线迁移。
+TCP / WebSocket 发布者共用落盘路径，补发仍检查当前授权。
+
 ## 容器优先约定（重要）
 
 由于项目目标环境是 Linux，而当前开发机可能是 macOS，后续开发与任务验证统一遵循：

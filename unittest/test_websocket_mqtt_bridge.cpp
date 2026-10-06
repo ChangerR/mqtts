@@ -56,7 +56,7 @@ std::vector<uint8_t> serialize_pingreq(MQTTAllocator& allocator) {
     return std::vector<uint8_t>(buffer.data(), buffer.data() + buffer.size());
 }
 
-void test_handle_puback_packet_success() {
+void test_reject_puback_before_connect() {
     std::cout << "Testing PUBACK handling in WebSocket MQTT bridge..." << std::endl;
 
     MQTTAllocator allocator("test_ws_bridge_puback", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
@@ -66,14 +66,14 @@ void test_handle_puback_packet_success() {
     std::vector<uint8_t> puback = serialize_puback(allocator, 42);
     int ret = bridge.handle_websocket_binary("ws_client_puback", puback);
 
-    assert(ret == MQ_SUCCESS);
-    assert(bridge.get_statistics().translation_errors.load() == 0);
+    assert(ret == MQ_ERR_PROTOCOL);
+    assert(bridge.get_statistics().translation_errors.load() == 1);
     assert(bridge.get_statistics().ws_messages_received.load() == 1);
 
     std::cout << "PUBACK handling test passed" << std::endl;
 }
 
-void test_handle_fragmented_pingresp_packet_success() {
+void test_reject_fragmented_pingresp_before_connect() {
     std::cout << "\nTesting fragmented MQTT packet handling..." << std::endl;
 
     MQTTAllocator allocator("test_ws_bridge_fragment", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
@@ -90,14 +90,14 @@ void test_handle_fragmented_pingresp_packet_success() {
     assert(ret == MQ_SUCCESS);
 
     ret = bridge.handle_websocket_binary("ws_client_fragment", second_half);
-    assert(ret == MQ_SUCCESS);
-    assert(bridge.get_statistics().translation_errors.load() == 0);
+    assert(ret == MQ_ERR_PROTOCOL);
+    assert(bridge.get_statistics().translation_errors.load() == 1);
     assert(bridge.get_statistics().ws_messages_received.load() == 2);
 
     std::cout << "Fragmented packet handling test passed" << std::endl;
 }
 
-void test_handle_multiple_packets_in_one_frame_success() {
+void test_reject_multiple_packets_before_connect() {
     std::cout << "\nTesting multi-packet handling in one binary frame..." << std::endl;
 
     MQTTAllocator allocator("test_ws_bridge_multi", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
@@ -113,8 +113,8 @@ void test_handle_multiple_packets_in_one_frame_success() {
     combined.insert(combined.end(), pubcomp.begin(), pubcomp.end());
 
     int ret = bridge.handle_websocket_binary("ws_client_multi", combined);
-    assert(ret == MQ_SUCCESS);
-    assert(bridge.get_statistics().translation_errors.load() == 0);
+    assert(ret == MQ_ERR_PROTOCOL);
+    assert(bridge.get_statistics().translation_errors.load() == 1);
     assert(bridge.get_statistics().ws_messages_received.load() == 1);
 
     std::cout << "Multi-packet frame handling test passed" << std::endl;
@@ -140,9 +140,9 @@ void test_first_packet_must_be_connect() {
 int main() {
     std::cout << "=== WebSocket MQTT Bridge Unit Tests ===" << std::endl;
 
-    test_handle_puback_packet_success();
-    test_handle_fragmented_pingresp_packet_success();
-    test_handle_multiple_packets_in_one_frame_success();
+    test_reject_puback_before_connect();
+    test_reject_fragmented_pingresp_before_connect();
+    test_reject_multiple_packets_before_connect();
     test_first_packet_must_be_connect();
 
     std::cout << "\nAll WebSocket MQTT bridge tests passed!" << std::endl;
