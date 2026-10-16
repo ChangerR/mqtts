@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0-2 到 P0-7 的内存行为。TCP 与 WebSocket 二进制都覆盖。遗嘱延迟只在 TCP 持久化会话上跑。保留消息落盘不在这里。"""
+"""P0-2 到 P0-7 的协议行为。TCP 与 WebSocket 二进制都覆盖。遗嘱延迟和保留消息落盘只在 TCP 持久化会话上跑。"""
 import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -133,6 +133,22 @@ class Broker:
         if not found:
             raise AssertionError('no session log for %s\n%s' % (client_id, self.tail()))
         return found[-1]
+
+    def restart(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=3)
+        self.proc = subprocess.Popen(
+            [self.proc.args[0], '-c', str(self.root / 'config.json')], stdout=self.log, stderr=self.log)
+        deadline = time.monotonic() + 8
+        while True:
+            if self.proc.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError('broker did not listen after restart:\n' + self.tail())
+            try:
+                with socket.create_connection(('127.0.0.1', self.port), timeout=0.1):
+                    return
+            except OSError:
+                time.sleep(0.02)
 
     def close(self):
         if self.proc.poll() is None:
@@ -1825,8 +1841,10 @@ def retain_messages(binary, websocket):
             try:
                 if connect_user(writer, 'writer-' + tag, 'writer-' + tag, RetainAuth.password) != 0:
                     raise AssertionError('writer auth')
-                publish_retain(writer, 'secret/hidden', b'no', 5)
-                publish_retain(writer, 'public/ok', b'yes', 5)
+                publish_retain(writer, 'secret/hidden', b'no', 5, qos=1, packet_id=1)
+                expect_puback(writer, 0x00)
+                publish_retain(writer, 'public/ok', b'yes', 5, qos=1, packet_id=2)
+                expect_puback(writer, 0x00)
                 if connect_user(reader, 'reader-' + tag, 'reader-' + tag, RetainAuth.password) != 0:
                     raise AssertionError('reader auth')
                 subscribe(reader, '#', 5)
@@ -1970,6 +1988,67 @@ def will_delay_and_no_local(binary):
     print('PASS P0-6 delay', flush=True)
 
 
+def retain_durable(binary):
+    """持久化：重启后保留消息还在；持久会话的 QoS 1 走定向队列，PUBACK 后不再重发。"""
+    broker = Broker(binary, 1, 30, 10, persistence=True, max_qos=1)
+    try:
+        publisher = Client(broker.port, False)
+        try:
+            connect(publisher, 'ret-disk-pub', 5, 30)
+            publish_retain(publisher, 'keep/async', b'later', 5, qos=0)
+            publish_retain(publisher, 'keep/disk', b'saved', 5, qos=1, packet_id=1)
+            expect_puback(publisher, 0x00)
+            publish_retain(publisher, 'keep/gone', b'temp', 5, qos=1, packet_id=2)
+            expect_puback(publisher, 0x00)
+            publish_retain(publisher, 'keep/gone', b'', 5, qos=1, packet_id=3)
+            expect_puback(publisher, 0x00)
+        finally:
+            publisher.close()
+        broker.restart()
+        reader = Client(broker.port, False)
+        try:
+            open_session(reader, session_packet('ret-disk-sub', False, 60))
+            if subscribe(reader, 'keep/#', 5, qos=1) != 1:
+                raise AssertionError('durable retain grant')
+            found = {}
+            for _ in range(2):
+                header, body = reader.read(3)
+                topic, packet_id, payload = publish_meta(header, body, 5)
+                qos = (header >> 1) & 3
+                if header & 1 != 1:
+                    raise AssertionError('retain bit missing on %s header 0x%02x' % (topic, header))
+                found[(topic, qos)] = payload
+                if qos:
+                    puback(reader, packet_id)
+            if found != {('keep/async', 0): b'later', ('keep/disk', 1): b'saved'}:
+                raise AssertionError(found)
+            quiet(reader, 0.3)
+            # PUBACK 的删除是异步落盘的。等它提交后再杀进程，重启不得重发。
+            time.sleep(0.5)
+        finally:
+            reader.close()
+        broker.restart()
+        again = Client(broker.port, False)
+        try:
+            present = open_session(again, session_packet('ret-disk-sub', False, 60))
+            if present[0] & 1 != 1:
+                raise AssertionError('session not present after retained PUBACK')
+            quiet(again, 0.6)
+        finally:
+            again.close()
+        fresh = Client(broker.port, False)
+        try:
+            connect(fresh, 'ret-disk-fresh', 5, 30)
+            subscribe(fresh, 'keep/disk', 5)
+            expect_retained(fresh, 'keep/disk', b'saved', 5)
+            quiet(fresh, 0.3)
+        finally:
+            fresh.close()
+    finally:
+        broker.close()
+    print('PASS P0-7 retain journal restart and directed QoS 1', flush=True)
+
+
 def run(binary):
     for websocket in (False, True):
         will_rejections(binary, websocket)
@@ -1993,6 +2072,7 @@ def run(binary):
         packet_id_wrap(binary, websocket)
         print('PASS P0-3 websocket=%s' % websocket, flush=True)
     will_delay_and_no_local(binary)
+    retain_durable(binary)
 
 
 def main():

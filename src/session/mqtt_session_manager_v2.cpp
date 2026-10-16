@@ -1012,12 +1012,59 @@ std::unique_lock<std::recursive_mutex> GlobalSessionManager::lock_retain_replay(
   return std::unique_lock<std::recursive_mutex>(retain_replay_mu_);
 }
 
-void GlobalSessionManager::remember_retained(const PublishPacket& packet, const MQTTString& sender)
+void GlobalSessionManager::configure_persistence(const PersistenceConfig& config)
 {
-  if (!packet.retain || !retain_store_) {
+  if (!config.enabled) {
     return;
   }
+  durable_store_.reset(new DurableStore(config));
+  // 监听打开之前恢复。configure_persistence 在 server.start 之前调用。
+  restore_retained_messages();
+}
+
+void GlobalSessionManager::restore_retained_messages()
+{
+  if (!durable_store_ || !retain_store_) {
+    return;
+  }
+  const std::vector<DurableStore::RetainedMessage> stored = durable_store_->retained_messages();
+  MQTTAllocator restore_allocator("retain_restore", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+  const int64_t now_ms = DurableStore::now_ms();
+  for (size_t i = 0; i < stored.size(); ++i) {
+    const DurableStore::RetainedMessage& item = stored[i];
+    PublishPacket packet(&restore_allocator);
+    packet.type = PacketType::PUBLISH;
+    packet.topic_name = to_mqtt_string(item.topic, &restore_allocator);
+    std::vector<uint8_t> bytes(item.payload.begin(), item.payload.end());
+    packet.payload = to_mqtt_bytes(bytes, &restore_allocator);
+    packet.qos = item.qos;
+    packet.retain = true;
+    packet.dup = false;
+    if (item.expires_ms > now_ms) {
+      const int64_t remain_ms = item.expires_ms - now_ms;
+      const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
+      packet.properties.has_message_expiry_interval = true;
+      packet.properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
+    }
+    const RetainWriteResult result = retain_store_->store(
+        packet, to_mqtt_string(item.sender, &restore_allocator), retain_config_,
+        std::chrono::steady_clock::now());
+    note_retained_delta(result.message_delta, result.byte_delta);
+    if (result.kind == RetainWriteResult::Rejected && result.warn) {
+      LOG_WARN("Recovered retained message on topic {} was not stored: {}", item.topic, result.warn);
+    }
+  }
+}
+
+int GlobalSessionManager::remember_retained(const PublishPacket& packet, const MQTTString& sender)
+{
+  if (!packet.retain || !retain_store_) {
+    return 0;
+  }
   const std::string topic = from_mqtt_string(packet.topic_name);
+  const bool deleting =
+      packet.payload.empty() || (packet.properties.has_message_expiry_interval &&
+                                 packet.properties.message_expiry_interval == 0);
   const RetainWriteResult result =
       retain_store_->store(packet, sender, retain_config_, std::chrono::steady_clock::now());
   note_retained_delta(result.message_delta, result.byte_delta);
@@ -1026,7 +1073,32 @@ void GlobalSessionManager::remember_retained(const PublishPacket& packet, const 
     if (result.warn) {
       LOG_WARN("Retained message on topic {} was not stored: {}", topic, result.warn);
     }
+    return 0;
   }
+  if (durable_store_ && deleting) {
+    const bool wait = packet.qos > 0;
+    const DurableStore::Result committed = durable_store_->clear_retained(topic, wait);
+    if (wait && !committed.ok) {
+      LOG_WARN("Retained delete was not durable: {}", committed.error);
+      return committed.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+    }
+  } else if (durable_store_ &&
+             (result.kind == RetainWriteResult::Stored || result.kind == RetainWriteResult::Replaced)) {
+    int64_t expires = 0;
+    if (packet.properties.has_message_expiry_interval) {
+      expires = DurableStore::now_ms() +
+                static_cast<int64_t>(packet.properties.message_expiry_interval) * 1000;
+    }
+    const bool wait = packet.qos > 0;
+    const std::string payload(packet.payload.begin(), packet.payload.end());
+    const DurableStore::Result committed = durable_store_->put_retained(
+        topic, packet.qos, payload, from_mqtt_string(sender), expires, wait);
+    if (wait && !committed.ok) {
+      LOG_WARN("Retained message on topic {} was not durable: {}", topic, committed.error);
+      return committed.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+    }
+  }
+  return 0;
 }
 
 int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
@@ -1077,6 +1149,50 @@ int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQ
       if (item.has_expiry) {
         outbound->has_absolute_expiry = true;
         outbound->absolute_expiry = item.expires_at;
+      }
+      if (qos > 0 && durable_store_) {
+        int64_t expires = 0;
+        if (item.has_expiry) {
+          const int64_t remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        item.expires_at - std::chrono::steady_clock::now())
+                                        .count();
+          if (remain_ms <= 0) {
+            continue;
+          }
+          expires = DurableStore::now_ms() + remain_ms;
+        }
+        MQTTAllocator wire_allocator("retain_directed", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                     4 * 1024 * 1024);
+        MQTTParser serializer(&wire_allocator);
+        serializer.set_protocol_version_hint(5);
+        PublishPacket wire_packet(&wire_allocator);
+        wire_packet.type = PacketType::PUBLISH;
+        wire_packet.topic_name = item.content->topic_name;
+        wire_packet.payload = item.content->payload;
+        wire_packet.qos = 1;
+        wire_packet.packet_id = 1;
+        wire_packet.retain = true;
+        wire_packet.dup = false;
+        wire_packet.properties = Properties(properties, &wire_allocator);
+        wire_packet.properties.topic_alias = 0;
+        wire_packet.properties.has_topic_alias = false;
+        MQTTBuffer wire(&wire_allocator);
+        if (serializer.serialize_publish(&wire_packet, wire) != MQ_SUCCESS) {
+          LOG_WARN("Failed to serialize retained publish for {}", from_mqtt_string(client_id));
+          continue;
+        }
+        const DurableStore::Result queued = durable_store_->enqueue_directed(
+            from_mqtt_string(client_id),
+            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()), expires);
+        if (!queued.ok) {
+          LOG_WARN("Directed retained delivery failed for {}: {}", from_mqtt_string(client_id),
+                   queued.error);
+          continue;
+        }
+        if (queued.present) {
+          ++delivered;
+          continue;
+        }
       }
       if (forward_publish_shared(client_id, outbound) == MQ_SUCCESS) {
         ++delivered;
@@ -1536,9 +1652,12 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       }
     }
   }
-  // 持久化拒绝已经返回。这里才改保留库，空载荷和过期间隔 0 都会删掉旧值。
-  if (packet.retain)
-    remember_retained(packet, sender_client_id);
+  // 会话日志接受之后才改保留库。QoS>0 会等保留日志提交，PUBACK 不早于它。
+  if (packet.retain) {
+    const int retained = remember_retained(packet, sender_client_id);
+    if (retained != 0)
+      return retained;
+  }
   if (expired_now)
     return 0;
   int ret = lookup;

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 #include "mqtt_append_log.h"
@@ -189,7 +190,108 @@ static void test_native_upgrade(const std::string& path, uint32_t version)
     assert(c.subscriptions[0].second.retain_handling == 0);
     assert(batch.deliveries.size() == 1);
     assert(batch.deliveries[0].wire == "v2-payload" && batch.deliveries[0].packet_id == 7);
+    assert(store.retained_messages().empty());
   }
+}
+
+static std::vector<std::filesystem::path> log_files(const std::string& directory)
+{
+  std::vector<std::filesystem::path> logs;
+  for (const auto& entry : std::filesystem::directory_iterator(directory))
+    if (entry.path().extension() == ".log")
+      logs.push_back(entry.path());
+  return logs;
+}
+
+static void test_retain_journal(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.segment_bytes = 8192;
+  cfg.max_disk_bytes = 1024 * 1024;
+  cfg.checkpoint_interval_ms = 600000;
+  const int64_t soon = DurableStore::now_ms() + 60000;
+  {
+    DurableStore store(cfg);
+    assert(store.retained_messages().empty());
+    assert(store.put_retained("keep/t", 1, "saved", "pub", 0, true).ok);
+    assert(store.put_retained("keep/async", 0, "later", "pub", 0, false).ok);
+    assert(store.put_retained("keep/disk", 1, "qos1", "writer", soon, true).ok);
+    assert(store.put_retained("keep/gone", 1, "temp", "pub", 0, true).ok);
+    assert(store.clear_retained("keep/gone", true).ok);
+    assert(store.put_retained("keep/expired", 1, "old", "pub", DurableStore::now_ms() - 1, true).ok);
+    assert(store.statistics().retained == 3);
+    auto session = store.connect("reader", "owner", false, 60);
+    assert(session.ok);
+    assert(store.subscribe("reader", session.epoch, "keep/#", 1).ok);
+    auto queued = store.enqueue_directed("reader", "directed-wire", soon);
+    assert(queued.ok && queued.present && queued.accepted_targets == 1);
+    auto absent = store.enqueue_directed("missing", "directed-wire", 0);
+    assert(absent.ok && !absent.present);
+    auto batch = store.fetch("reader", session.epoch, 0, 8);
+    assert(batch.ok && batch.deliveries.size() == 1);
+    assert(batch.deliveries[0].wire == "directed-wire");
+    assert(batch.deliveries[0].expires == soon);
+    assert(store.acknowledge("reader", session.epoch, batch.deliveries[0].packet_id).ok);
+    store.checkpoint();
+    assert(store.statistics().retain_log_bytes == 0);
+    assert(store.statistics().retained == 3);
+  }
+  {
+    DurableStore store(cfg);
+    auto kept = store.retained_messages();
+    assert(kept.size() == 3);
+    bool saw_saved = false, saw_async = false, saw_disk = false, saw_gone = false;
+    for (const auto& item : kept) {
+      if (item.topic == "keep/t") {
+        saw_saved = item.payload == "saved" && item.qos == 1 && item.sender == "pub" &&
+                    item.expires_ms == 0;
+      } else if (item.topic == "keep/async")
+        saw_async = item.payload == "later" && item.qos == 0;
+      else if (item.topic == "keep/disk")
+        saw_disk = item.payload == "qos1" && item.expires_ms == soon;
+      else if (item.topic == "keep/gone" || item.topic == "keep/expired")
+        saw_gone = true;
+    }
+    assert(saw_saved && saw_async && saw_disk && !saw_gone);
+    auto session = store.connect("reader", "owner", false, 60);
+    assert(session.present);
+    assert(store.fetch("reader", session.epoch, 0, 8).deliveries.empty());
+    assert(store.statistics().pending == 0);
+  }
+  // A complete corrupt frame stays on disk. A torn tail is the incomplete
+  // header/body case AppendLog already repairs.
+  auto logs = log_files(path + "/retain");
+  if (logs.empty()) {
+    DurableStore store(cfg);
+    assert(store.put_retained("keep/tail", 0, "body", "pub", 0, true).ok);
+  }
+  logs = log_files(path + "/retain");
+  assert(logs.size() == 1);
+  const auto good_size = std::filesystem::file_size(logs[0]);
+  {
+    std::ofstream out(logs[0], std::ios::binary | std::ios::app);
+    out.write("torn", 4);
+  }
+  {
+    DurableStore store(cfg);
+    assert(store.retained_messages().size() == 3 || store.retained_messages().size() == 4);
+  }
+  assert(std::filesystem::file_size(logs[0]) == good_size);
+  {
+    std::fstream file(logs[0], std::ios::binary | std::ios::in | std::ios::out);
+    file.seekp(24);
+    file.put('!');
+  }
+  bool rejected = false;
+  try {
+    DurableStore store(cfg);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(std::filesystem::file_size(logs[0]) == good_size);
 }
 
 static void test_subscription_options(const std::string& path)
@@ -608,6 +710,7 @@ int main()
   test_native_upgrade(std::string(dir) + "/upgrade-3", 3);
   test_native_upgrade(std::string(dir) + "/upgrade-4", 4);
   test_subscription_options(std::string(dir) + "/options");
+  test_retain_journal(std::string(dir) + "/retain");
   test_legacy_subscription_journal(std::string(dir) + "/legacy-options");
   test_overflow_isolation(std::string(dir) + "/overflow");
   test_incremental_routing_and_expiry(std::string(dir) + "/indexes");

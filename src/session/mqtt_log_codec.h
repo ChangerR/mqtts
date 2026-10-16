@@ -128,5 +128,68 @@ inline void read_legacy_subscription_options(Decoder& d, StoredSubscription& sub
     return;
   read_subscription_options(d, sub);
 }
+
+// Retain log version 1. A missing retain log is an empty set (journals written
+// before retain persistence). Subscription records are unchanged.
+constexpr uint8_t kStoredRetainVersion = 1;
+constexpr uint8_t kRetainSet = 1;
+constexpr uint8_t kRetainClear = 2;
+struct StoredRetain
+{
+  std::string topic;
+  uint8_t qos = 0;
+  int64_t expires_ms = 0;
+  std::string payload;
+  std::string sender;
+};
+inline void write_retain_set(Encoder& e, const StoredRetain& item)
+{
+  e.u8(kRetainSet);
+  e.u8(kStoredRetainVersion);
+  e.text(item.topic);
+  e.u8(item.qos);
+  e.u64(static_cast<uint64_t>(item.expires_ms));
+  e.text(item.payload);
+  e.text(item.sender);
+}
+inline void write_retain_clear(Encoder& e, const std::string& topic)
+{
+  e.u8(kRetainClear);
+  e.u8(kStoredRetainVersion);
+  e.text(topic);
+}
+// cleared is true for a delete record. The decoder must consume the whole body.
+inline StoredRetain read_retain_record(Decoder& d, bool& cleared)
+{
+  const uint8_t kind = d.u8();
+  const uint8_t version = d.u8();
+  if (version != kStoredRetainVersion)
+    throw std::runtime_error("unsupported retain record version");
+  StoredRetain item;
+  item.topic = d.text();
+  if (item.topic.empty() || item.topic.find('+') != std::string::npos ||
+      item.topic.find('#') != std::string::npos || item.topic.find('\0') != std::string::npos)
+    throw std::runtime_error("invalid retained topic");
+  if (kind == kRetainClear) {
+    cleared = true;
+    d.end();
+    return item;
+  }
+  if (kind != kRetainSet)
+    throw std::runtime_error("invalid retain journal record");
+  cleared = false;
+  item.qos = d.u8();
+  if (item.qos > 2)
+    throw std::runtime_error("invalid retained qos");
+  item.expires_ms = static_cast<int64_t>(d.u64());
+  if (item.expires_ms < 0)
+    throw std::runtime_error("invalid retained expiry");
+  item.payload = d.text();
+  if (item.payload.empty())
+    throw std::runtime_error("empty retained payload");
+  item.sender = d.text();
+  d.end();
+  return item;
+}
 }  // namespace journal
 }  // namespace mqtt
