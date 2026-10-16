@@ -59,7 +59,11 @@ int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
     }
 
     // mqtt 子协议和 TCP 共用报文上限、接收窗口和报文标识符。
+    // 授权仍走桥上原来的读权限复查，撤销后的订阅不能继续收到消息。
     if (bridge_->get_message_format() == MessageFormat::MQTT_PACKET) {
+        if (!bridge_->outbound_read_allowed(client_id_, mqtt::from_mqtt_string(topic))) {
+            return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        }
         return mqtt::MQTTProtocolHandler::send_publish(topic, payload, qos, retain, dup, properties,
                                                        pending);
     }

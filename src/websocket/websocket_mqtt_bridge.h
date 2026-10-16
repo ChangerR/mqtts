@@ -75,6 +75,10 @@ public:
 
     // Handle incoming MQTT messages (from session manager)
     int handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet);
+    // mqtt 二进制子协议的出站改走协议处理器，但仍要先做原来的投递授权复查。
+    bool outbound_read_allowed(const std::string& client_id, const std::string& topic) {
+        return topic_allowed(client_id, topic, mqtt::auth::Permission::READ);
+    }
 
     // Topic subscription management
     int subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos = 0);
