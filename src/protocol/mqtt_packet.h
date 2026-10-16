@@ -78,6 +78,8 @@ struct Properties
 
   // 订阅相关属性
   uint8_t maximum_qos = 0;
+  // maximum_qos 为 0 时序列化器无法区分“省略（表示 2）”和“通告 0”，用这个标志写出 0。
+  bool has_maximum_qos = false;
   bool retain_available = true;
   bool wildcard_subscription_available = true;
   bool subscription_identifier_available = true;
@@ -135,6 +137,7 @@ struct Properties
         subscription_identifier(other.subscription_identifier),
         will_delay_interval(other.will_delay_interval),
         maximum_qos(other.maximum_qos),
+        has_maximum_qos(other.has_maximum_qos),
         retain_available(other.retain_available),
         wildcard_subscription_available(other.wildcard_subscription_available),
         subscription_identifier_available(other.subscription_identifier_available),

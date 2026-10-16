@@ -9,6 +9,7 @@
 #include "mqtt_memory_tags.h"
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
+#include "mqtt_connack_limits.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_socket.h"
 namespace mqtt {
@@ -63,7 +64,10 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       session_manager_(nullptr),
       auth_manager_(nullptr),
       current_user_info_(nullptr),
-      current_auth_context_(nullptr)
+      current_auth_context_(nullptr),
+      protocol_limits_(nullptr),
+      client_keep_alive_(0),
+      client_requested_session_expiry_(false)
 {
   // Allocate initial buffer
   buffer_ = (char*)allocator_->allocate(INITIAL_BUFFER_SIZE);
@@ -329,8 +333,21 @@ int MQTTProtocolHandler::read_packet()
   return MQ_SUCCESS;
 }
 
+const ProtocolLimits& MQTTProtocolHandler::effective_limits() const
+{
+  if (protocol_limits_) {
+    return *protocol_limits_;
+  }
+  static const ProtocolLimits defaults = ProtocolLimits::defaults();
+  return defaults;
+}
+
 int MQTTProtocolHandler::parse_packet()
 {
+  if (session_manager_) {
+    session_manager_->note_bytes_received(bytes_read_);
+  }
+
   // Complete packet received, parse it
   Packet* packet = nullptr;
   LOG_DEBUG("Parsing packet from client {}:{}, type: 0x{:02x}, size: {}", client_ip_.c_str(),
@@ -596,6 +613,8 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   if (MQ_SUCC(ret)) {
     negotiated_protocol_version_ = packet->protocol_version;
     parser_->set_protocol_version_hint(negotiated_protocol_version_);
+    client_keep_alive_ = packet->keep_alive;
+    client_requested_session_expiry_ = packet->properties.has_session_expiry_interval;
   }
 
   if (MQ_SUCC(ret) && packet->client_id.empty()) {
@@ -807,6 +826,9 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
     LOG_ERROR("Invalid PUBLISH packet from client {}:{}", client_ip_.c_str(), client_port_);
     ret = MQ_ERR_PACKET_INVALID;
   } else {
+    if (session_manager_) {
+      session_manager_->note_publish_received(packet->payload.size());
+    }
     LOG_DEBUG("Processing PUBLISH from client {}:{} (topic: {}, qos: {}, retain: {})",
               client_ip_.c_str(), client_port_, from_mqtt_string(packet->topic_name), packet->qos,
               packet->retain);
@@ -1272,6 +1294,9 @@ int MQTTProtocolHandler::send_data_with_lock(const char* data, size_t size, int 
         LOG_ERROR("Failed to send data to client {}:{}, error: {}", client_ip_.c_str(),
                   client_port_, result);
       } else {
+        if (session_manager_) {
+          session_manager_->note_bytes_sent(size);
+        }
         LOG_DEBUG("Successfully sent {} bytes to client {}:{}", size, client_ip_.c_str(),
                   client_port_);
       }
@@ -1324,8 +1349,9 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
   packet->type = PacketType::CONNACK;
   packet->reason_code = reason_code;
   packet->session_present = session_present;
-  if (session_manager_ && session_manager_->durable_store())
-    packet->properties.maximum_qos = 1;
+  const bool persistence = session_manager_ && session_manager_->durable_store();
+  apply_connack_capabilities(*packet, effective_limits(), negotiated_protocol_version_,
+                             client_keep_alive_, client_requested_session_expiry_, persistence);
   if (durable_epoch_ && negotiated_protocol_version_ >= 5) {
     packet->properties.has_session_expiry_interval = true;
     packet->properties.session_expiry_interval = session_expiry_interval_;
@@ -1807,6 +1833,9 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
     LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
   } else {
+    if (session_manager_) {
+      session_manager_->note_publish_sent(payload.size());
+    }
     LOG_DEBUG("Successfully sent PUBLISH packet to client {}:{} (size: {}, packet_id: {})",
               client_ip_.c_str(), client_port_, serialize_buffer_->size(), packet->packet_id);
   }
@@ -1954,6 +1983,7 @@ void MQTTProtocolHandler::pump_durable()
         MQTTParser encoder(&delivery_allocator);
         encoder.set_protocol_version_hint(negotiated_protocol_version_);
         MQTTBuffer output(&delivery_allocator);
+        const uint64_t payload_bytes = packet->payload.size();
         int ret = encoder.serialize_publish(packet, output);
         packets[i].reset();
         if (ret != MQ_SUCCESS) {
@@ -1977,6 +2007,9 @@ void MQTTProtocolHandler::pump_durable()
           socket_->close();
           durable_running_ = false;
           break;
+        }
+        if (session_manager_) {
+          session_manager_->note_publish_sent(payload_bytes);
         }
         cursor = delivery.sequence;
         fetch_again = true;

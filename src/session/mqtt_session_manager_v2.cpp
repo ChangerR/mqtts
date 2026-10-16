@@ -779,6 +779,74 @@ int GlobalSessionManager::finalize_thread_registration()
   return MQ_SUCCESS;
 }
 
+ProtocolCounters* GlobalSessionManager::current_thread_counters()
+{
+  if (cached_manager_owner_ == this && cached_thread_manager_) {
+    return &cached_thread_manager_->protocol_counters();
+  }
+  if (state_.load() != ManagerState::RUNNING) {
+    return nullptr;
+  }
+  ThreadLocalSessionManager* local = get_thread_manager();
+  return local ? &local->protocol_counters() : nullptr;
+}
+
+void GlobalSessionManager::note_publish_received(uint64_t payload_bytes)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (!counters) {
+    return;
+  }
+  counters->publish_received.fetch_add(1, std::memory_order_relaxed);
+  counters->publish_received_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
+}
+
+void GlobalSessionManager::note_publish_sent(uint64_t payload_bytes)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (!counters) {
+    return;
+  }
+  counters->publish_sent.fetch_add(1, std::memory_order_relaxed);
+  counters->publish_sent_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
+}
+
+void GlobalSessionManager::note_bytes_received(uint64_t bytes)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (!counters) {
+    return;
+  }
+  counters->bytes_received.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void GlobalSessionManager::note_bytes_sent(uint64_t bytes)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (!counters) {
+    return;
+  }
+  counters->bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void GlobalSessionManager::collect_protocol_counters(ProtocolCounterSnapshot& out) const
+{
+  out = ProtocolCounterSnapshot();
+  std::vector<const ProtocolCounters*> blocks;
+  {
+    ReadLockGuard lock(managers_mutex_);
+    blocks.reserve(thread_manager_array_.size());
+    for (ThreadLocalSessionManager* manager : thread_manager_array_) {
+      if (manager) {
+        blocks.push_back(&manager->protocol_counters());
+      }
+    }
+  }
+  for (const ProtocolCounters* block : blocks) {
+    out.add(*block);
+  }
+}
+
 ThreadLocalSessionManager* GlobalSessionManager::get_thread_manager()
 {
   // 优先使用线程本地缓存，避免锁和哈希查找

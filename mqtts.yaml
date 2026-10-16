@@ -8,26 +8,35 @@ server:
   thread_count: 2  # 线程数
 
 # MQTT协议配置
+# keep_alive_default 已废弃。写进配置会打 WARN，并且不会生效。
 mqtt:
-  max_packet_size: 1048576  # 最大包大小(字节)
-  keep_alive_default: 60  # 默认保活时间(秒)
-  keep_alive_max: 3600  # 最大保活时间(秒)
-  max_qos: 2  # 最大QoS级别
-  retain_available: true  # 支持retain消息
-  wildcard_subscription_available: true  # 支持通配符订阅
-  subscription_identifier_available: true  # 支持订阅标识符
-  shared_subscription_available: false  # 支持共享订阅
-  topic_alias_maximum: 65535  # 主题别名最大值
-  receive_maximum: 65535  # 接收最大值
+  max_packet_size: 1048576  # 最大包大小(字节)。不得超过 memory.client_max_size - 64KiB。CONNACK 通告此值
+  keep_alive_max: 3600  # 保活上限(秒)。v5 客户端 Keep Alive 为 0 或超过此值时，CONNACK 带 Server Keep Alive。超时断开在后续条目实现
+  connect_timeout_seconds: 10  # 等待 CONNECT 的秒数。只保存配置，超时关闭在后续条目实现
+  implicit_no_local: false  # 默认 false。true 是“总是排除发布者”的兼容开关。本项只保存配置，不改变投递
+  max_qos: 2  # 最大 QoS。开启持久化时 CONNACK Maximum QoS 不超过 1
+  retain_available: true  # CONNACK Retain Available。保留消息库在后续条目实现
+  wildcard_subscription_available: true  # CONNACK Wildcard Subscription Available
+  subscription_identifier_available: false  # 本版本不实现。设为 true 时启动失败
+  shared_subscription_available: false  # 本版本不实现。设为 true 时启动失败
+  topic_alias_maximum: 65535  # CONNACK Topic Alias Maximum。别名映射在后续条目实现
+  receive_maximum: 65535  # 必须 >= 1。CONNACK Receive Maximum
   allow_mqtt3x: true  # 允许 MQTT 3.1 / 3.1.1 客户端
 
 # 内存配置
 memory:
-  client_max_size: 1048576  # 客户端最大内存大小(字节)
+  client_max_size: 1114112  # 1MiB + 64KiB，给最大报文留出每连接状态空间
+
+# 保留消息限额。存储在后续条目实现，这里的值会被读入并冻结。
+retain:
+  max_messages: 100000
+  max_payload_bytes: 1048576  # 默认等于 max_packet_size
+  max_total_bytes: 268435456  # 256MiB
+  max_deliver_per_subscribe: 1000
 
 # WebSocket服务器配置
-# 注意：当前版本通过 server.port 处理 MQTT + WebSocket(HTTP Upgrade)。
-# 下列 websocket 配置为兼容预留项，端口映射建议将宿主机 18080 转发到容器 1883。
+# 当前版本通过 server.port 处理 MQTT + WebSocket(HTTP Upgrade)。
+# 下面每个键启动时都会 WARN，并被忽略。端口映射请把宿主机 WebSocket 端口转到 server.port。
 websocket:
   enabled: true  # 是否启用WebSocket服务器
   bind_address: "127.0.0.1"  # 绑定地址

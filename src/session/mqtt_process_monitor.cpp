@@ -16,11 +16,7 @@ ProcessMonitor::ProcessMonitor(GlobalSessionManager* session_manager, int interv
       verbose_output_(false),
       json_output_file_(""),
       running_(false),
-      start_time_(std::chrono::steady_clock::now()),
-      messages_sent_(0),
-      messages_received_(0),
-      bytes_sent_(0),
-      bytes_received_(0)
+      start_time_(std::chrono::steady_clock::now())
 {
     if (interval_seconds_ <= 0) {
         interval_seconds_ = 5;  // 默认5秒
@@ -109,11 +105,13 @@ int ProcessMonitor::get_process_stats(ProcessStats& stats)
     collect_connection_stats(stats);
     collect_topic_stats(stats);
     
-    // 收集吞吐量统计
-    stats.messages_sent = messages_sent_.load();
-    stats.messages_received = messages_received_.load();
-    stats.bytes_sent = bytes_sent_.load();
-    stats.bytes_received = bytes_received_.load();
+    if (session_manager_) {
+        session_manager_->collect_protocol_counters(stats.protocol);
+    }
+    stats.messages_sent = static_cast<size_t>(stats.protocol.publish_sent);
+    stats.messages_received = static_cast<size_t>(stats.protocol.publish_received);
+    stats.bytes_sent = static_cast<size_t>(stats.protocol.bytes_sent);
+    stats.bytes_received = static_cast<size_t>(stats.protocol.bytes_received);
     
     return MQ_SUCCESS;
 }
@@ -262,8 +260,12 @@ void ProcessMonitor::print_process_stats(const ProcessStats& stats)
     
     ss << std::string(80, '=') << "\n";
     
-    // 输出到日志
-    // LOG_INFO("{}", ss.str());
+    LOG_INFO(
+        "protocol counters: publish_received={} publish_received_bytes={} publish_sent={} "
+        "publish_sent_bytes={} bytes_received={} bytes_sent={}",
+        stats.protocol.publish_received, stats.protocol.publish_received_bytes,
+        stats.protocol.publish_sent, stats.protocol.publish_sent_bytes,
+        stats.protocol.bytes_received, stats.protocol.bytes_sent);
 }
 
 std::string ProcessMonitor::format_bytes(size_t bytes)
@@ -308,18 +310,6 @@ void ProcessMonitor::set_verbose_output(bool enabled)
 {
     verbose_output_ = enabled;
     LOG_INFO("Process monitor verbose output {}", enabled ? "enabled" : "disabled");
-}
-
-void ProcessMonitor::add_sent_stats(size_t message_count, size_t bytes)
-{
-    messages_sent_.fetch_add(message_count);
-    bytes_sent_.fetch_add(bytes);
-}
-
-void ProcessMonitor::add_received_stats(size_t message_count, size_t bytes)
-{
-    messages_received_.fetch_add(message_count);
-    bytes_received_.fetch_add(bytes);
 }
 
 void ProcessMonitor::set_json_output_file(const std::string& json_file_path)
@@ -386,6 +376,26 @@ std::string ProcessMonitor::generate_json_stats(const ProcessStats& stats)
         json << "    \"avg_bytes_per_sec\": " << std::fixed << std::setprecision(2) << bytes_per_sec;
     }
     json << "\n  },\n";
+    json << "  \"protocol\": {\n";
+    json << "    \"publish_received\": " << stats.protocol.publish_received << ",\n";
+    json << "    \"publish_received_bytes\": " << stats.protocol.publish_received_bytes << ",\n";
+    json << "    \"publish_sent\": " << stats.protocol.publish_sent << ",\n";
+    json << "    \"publish_sent_bytes\": " << stats.protocol.publish_sent_bytes << ",\n";
+    json << "    \"bytes_received\": " << stats.protocol.bytes_received << ",\n";
+    json << "    \"bytes_sent\": " << stats.protocol.bytes_sent << ",\n";
+    json << "    \"keepalive_timeouts\": " << stats.protocol.keepalive_timeouts << ",\n";
+    json << "    \"connect_timeouts\": " << stats.protocol.connect_timeouts << ",\n";
+    json << "    \"session_takeovers\": " << stats.protocol.session_takeovers << ",\n";
+    json << "    \"malformed_packet_disconnects\": " << stats.protocol.malformed_packet_disconnects << ",\n";
+    json << "    \"outbound_packet_size_drops\": " << stats.protocol.outbound_packet_size_drops << ",\n";
+    json << "    \"inflight_window_delays\": " << stats.protocol.inflight_window_delays << ",\n";
+    json << "    \"wills_published\": " << stats.protocol.wills_published << ",\n";
+    json << "    \"wills_rejected\": " << stats.protocol.wills_rejected << ",\n";
+    json << "    \"retained_messages\": " << stats.protocol.retained_messages << ",\n";
+    json << "    \"retained_bytes\": " << stats.protocol.retained_bytes << ",\n";
+    json << "    \"retained_not_stored\": " << stats.protocol.retained_not_stored << ",\n";
+    json << "    \"retained_delivery_truncated\": " << stats.protocol.retained_delivery_truncated << "\n";
+    json << "  },\n";
     
     // 事件转发统计
     json << "  \"event_forwarding\": {\n";

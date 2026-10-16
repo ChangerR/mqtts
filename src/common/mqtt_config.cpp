@@ -1,17 +1,228 @@
 #include "mqtt_config.h"
 #include <yaml-cpp/yaml.h>
+#include <string>
 #include "logger.h"
 
 namespace mqtt {
+namespace {
+
+bool key_in(const std::vector<const char*>& keys, const std::string& key)
+{
+  for (const char* item : keys) {
+    if (key == item) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const std::vector<const char*> kServerKeys = {"bind_address", "port", "max_connections", "backlog",
+                                              "thread_count"};
+const std::vector<const char*> kMqttKeys = {
+    "max_packet_size",
+    "keep_alive_max",
+    "connect_timeout_seconds",
+    "implicit_no_local",
+    "max_qos",
+    "retain_available",
+    "wildcard_subscription_available",
+    "subscription_identifier_available",
+    "shared_subscription_available",
+    "topic_alias_maximum",
+    "receive_maximum",
+    "allow_mqtt3x"};
+const std::vector<const char*> kMqttDeprecated = {"keep_alive_default"};
+const std::vector<const char*> kMemoryKeys = {"client_max_size"};
+const std::vector<const char*> kRetainKeys = {"max_messages", "max_payload_bytes", "max_total_bytes",
+                                              "max_deliver_per_subscribe"};
+const std::vector<const char*> kLogKeys = {"level", "file_path", "max_file_size", "max_files",
+                                           "flush_immediately"};
+const std::vector<const char*> kMonitoringKeys = {"enabled", "interval_seconds", "verbose_output",
+                                                  "json_output_file"};
+const std::vector<const char*> kPersistenceKeys = {
+    "enabled",
+    "path",
+    "partitions",
+    "segment_bytes",
+    "max_disk_bytes",
+    "checkpoint_interval_ms",
+    "max_session_expiry_seconds",
+    "max_sessions",
+    "max_subscriptions_per_session",
+    "max_messages",
+    "max_messages_per_session",
+    "max_bytes_per_session",
+    "overflow_policy",
+    "max_bytes",
+    "max_requests",
+    "max_request_bytes",
+    "max_inflight"};
+const std::vector<const char*> kAuthKeys = {"enabled", "allow_anonymous", "cache_enabled",
+                                            "cache_ttl_seconds", "providers", "sqlite", "redis"};
+const std::vector<const char*> kSqliteKeys = {"db_path",           "connection_pool_size",
+                                              "max_retry_count",   "retry_delay_ms",
+                                              "query_timeout_ms",  "enable_wal_mode",
+                                              "enable_foreign_keys", "cache_size_kb"};
+const std::vector<const char*> kRedisKeys = {
+    "host",           "port",         "password",        "database",
+    "connection_pool_size", "max_retry_count", "retry_delay_ms", "connect_timeout_ms",
+    "command_timeout_ms", "keepalive_interval_s", "key_prefix", "cache_ttl_seconds"};
+const std::vector<const char*> kProviderKeys = {"type", "priority", "enabled", "settings"};
+
+}  // namespace
 
 ConfigManager::ConfigManager() = default;
 
 ConfigManager::~ConfigManager() = default;
 
+void ConfigManager::note_warning(const std::string& message)
+{
+  warnings_.push_back(message);
+  LOG_WARN("{}", message);
+}
+
+void ConfigManager::note_error(const std::string& message)
+{
+  last_error_ = message;
+  LOG_ERROR("{}", message);
+}
+
+void ConfigManager::warn_leaves(const YAML::Node& node, const std::string& path, const char* reason)
+{
+  if (!node || node.IsNull()) {
+    return;
+  }
+  if (node.IsMap()) {
+    if (node.size() == 0) {
+      note_warning("配置键 " + path + " " + reason);
+      return;
+    }
+    for (auto it = node.begin(); it != node.end(); ++it) {
+      std::string key = it->first.as<std::string>();
+      warn_leaves(it->second, path.empty() ? key : path + "." + key, reason);
+    }
+    return;
+  }
+  if (node.IsSequence()) {
+    if (node.size() == 0) {
+      note_warning("配置键 " + path + " " + reason);
+      return;
+    }
+    int index = 0;
+    for (const auto& item : node) {
+      warn_leaves(item, path + "[" + std::to_string(index++) + "]", reason);
+    }
+    return;
+  }
+  note_warning("配置键 " + path + " " + reason);
+}
+
+void ConfigManager::audit_map(const YAML::Node& node, const std::string& path,
+                              const std::vector<const char*>& effective,
+                              const std::vector<const char*>& deprecated)
+{
+  if (!node || node.IsNull()) {
+    return;
+  }
+  if (!node.IsMap()) {
+    note_warning("配置键 " + path + " 应为映射，已忽略");
+    return;
+  }
+  for (auto it = node.begin(); it != node.end(); ++it) {
+    const std::string key = it->first.as<std::string>();
+    const std::string child = path.empty() ? key : path + "." + key;
+    if (key_in(deprecated, key)) {
+      note_warning("配置键 " + child + " 已废弃并忽略");
+    } else if (!key_in(effective, key)) {
+      warn_leaves(it->second, child, "未识别，已忽略");
+    }
+  }
+}
+
+void ConfigManager::audit_auth(const YAML::Node& node)
+{
+  if (!node || node.IsNull()) {
+    return;
+  }
+  if (!node.IsMap()) {
+    note_warning("配置键 auth 应为映射，已忽略");
+    return;
+  }
+  for (auto it = node.begin(); it != node.end(); ++it) {
+    const std::string key = it->first.as<std::string>();
+    if (key == "sqlite") {
+      audit_map(it->second, "auth.sqlite", kSqliteKeys, {});
+    } else if (key == "redis") {
+      audit_map(it->second, "auth.redis", kRedisKeys, {});
+    } else if (key == "providers") {
+      if (!it->second.IsSequence()) {
+        note_warning("配置键 auth.providers 应为列表，已忽略");
+        continue;
+      }
+      int index = 0;
+      for (const auto& provider : it->second) {
+        const std::string path = "auth.providers[" + std::to_string(index++) + "]";
+        if (!provider.IsMap()) {
+          note_warning("配置键 " + path + " 应为映射，已忽略");
+          continue;
+        }
+        for (auto field = provider.begin(); field != provider.end(); ++field) {
+          const std::string field_key = field->first.as<std::string>();
+          if (field_key == "settings") {
+            continue;
+          }
+          if (!key_in(kProviderKeys, field_key)) {
+            warn_leaves(field->second, path + "." + field_key, "未识别，已忽略");
+          }
+        }
+      }
+    } else if (!key_in(kAuthKeys, key)) {
+      warn_leaves(it->second, "auth." + key, "未识别，已忽略");
+    }
+  }
+}
+
+void ConfigManager::audit_config(const YAML::Node& root)
+{
+  if (!root || !root.IsMap()) {
+    return;
+  }
+  for (auto it = root.begin(); it != root.end(); ++it) {
+    const std::string key = it->first.as<std::string>();
+    if (key == "server") {
+      audit_map(it->second, "server", kServerKeys, {});
+    } else if (key == "mqtt") {
+      audit_map(it->second, "mqtt", kMqttKeys, kMqttDeprecated);
+    } else if (key == "memory") {
+      audit_map(it->second, "memory", kMemoryKeys, {});
+    } else if (key == "retain") {
+      audit_map(it->second, "retain", kRetainKeys, {});
+    } else if (key == "log") {
+      audit_map(it->second, "log", kLogKeys, {});
+    } else if (key == "monitoring") {
+      audit_map(it->second, "monitoring", kMonitoringKeys, {});
+    } else if (key == "persistence") {
+      audit_map(it->second, "persistence", kPersistenceKeys, {});
+    } else if (key == "auth") {
+      audit_auth(it->second);
+    } else if (key == "websocket") {
+      warn_leaves(it->second, "websocket",
+                  "已忽略：WebSocket 复用 server.port，本段不生效");
+    } else if (key == "event_forwarding") {
+      warn_leaves(it->second, "event_forwarding", "本版本不生效：事件转发未接线");
+    } else {
+      warn_leaves(it->second, key, "未识别，已忽略");
+    }
+  }
+}
+
 int ConfigManager::load_from_file(const std::string& config_file)
 {
+  warnings_.clear();
+  last_error_.clear();
   try {
     YAML::Node root = YAML::LoadFile(config_file);
+    audit_config(root);
 
     // 解析各个配置段
     if (root["server"]) {
@@ -24,6 +235,10 @@ int ConfigManager::load_from_file(const std::string& config_file)
 
     if (root["memory"]) {
       parse_memory_config(root["memory"]);
+    }
+
+    if (root["retain"]) {
+      parse_retain_config(root["retain"]);
     }
 
     if (root["log"]) {
@@ -40,11 +255,6 @@ int ConfigManager::load_from_file(const std::string& config_file)
 
     if (root["auth"]) {
       parse_auth_config(root["auth"]);
-    }
-
-    if (root["websocket"]) {
-      LOG_WARN("检测到 websocket 配置段。当前版本使用 server 监听端口处理 WebSocket，"
-               "请将宿主机 WebSocket 端口转发到容器 server.port。");
     }
 
     if (root["persistence"]) {
@@ -86,6 +296,13 @@ int ConfigManager::load_from_file(const std::string& config_file)
       if (p["max_inflight"])
         config_.persistence.max_inflight = p["max_inflight"].as<size_t>();
     }
+    if (config_.retain.max_payload_bytes == 0) {
+      config_.retain.max_payload_bytes = config_.mqtt.max_packet_size;
+    }
+    if (!last_error_.empty()) {
+      LOG_ERROR("配置验证失败");
+      return -1;
+    }
     // 验证配置
     int ret = validate();
     if (ret != 0) {
@@ -105,7 +322,7 @@ int ConfigManager::load_from_file(const std::string& config_file)
   }
 }
 
-int ConfigManager::validate() const
+int ConfigManager::validate()
 {
   const auto& p = config_.persistence;
   if (p.enabled &&
@@ -117,39 +334,64 @@ int ConfigManager::validate() const
        (p.overflow_policy != "reject" && p.overflow_policy != "isolate") ||
        !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
        !p.max_inflight || p.max_inflight > 65535)) {
-    LOG_ERROR("Invalid bounded persistence configuration");
+    note_error("Invalid bounded persistence configuration");
     return -1;
   }
   // 验证服务器配置
   if (config_.server.port == 0 || config_.server.port > 65535) {
-    LOG_ERROR("无效的端口号: {}", config_.server.port);
+    note_error("无效的端口号: " + std::to_string(config_.server.port));
     return -1;
   }
 
   if (config_.server.max_connections <= 0) {
-    LOG_ERROR("无效的最大连接数: {}", config_.server.max_connections);
+    note_error("无效的最大连接数: " + std::to_string(config_.server.max_connections));
     return -1;
   }
 
   if (config_.server.thread_count <= 0) {
-    LOG_ERROR("无效的线程数: {}", config_.server.thread_count);
+    note_error("无效的线程数: " + std::to_string(config_.server.thread_count));
     return -1;
   }
 
   // 验证MQTT配置
   if (config_.mqtt.max_packet_size == 0) {
-    LOG_ERROR("最大包大小不能为0");
+    note_error("最大包大小不能为0");
     return -1;
   }
 
   if (config_.mqtt.max_qos > 2) {
-    LOG_ERROR("无效的最大QoS级别: {}", config_.mqtt.max_qos);
+    note_error("无效的最大QoS级别: " + std::to_string(config_.mqtt.max_qos));
+    return -1;
+  }
+
+  if (config_.mqtt.shared_subscription_available) {
+    note_error("mqtt.shared_subscription_available 本版本不支持，不能为 true");
+    return -1;
+  }
+
+  if (config_.mqtt.subscription_identifier_available) {
+    note_error("mqtt.subscription_identifier_available 本版本不支持，不能为 true");
+    return -1;
+  }
+
+  if (config_.mqtt.receive_maximum < 1) {
+    note_error("mqtt.receive_maximum 必须大于等于 1");
+    return -1;
+  }
+
+  constexpr size_t kPacketHeadroom = 64 * 1024;
+  if (config_.memory.client_max_size <= kPacketHeadroom ||
+      static_cast<size_t>(config_.mqtt.max_packet_size) >
+          config_.memory.client_max_size - kPacketHeadroom) {
+    note_error("mqtt.max_packet_size (" + std::to_string(config_.mqtt.max_packet_size) +
+               ") 不得超过 memory.client_max_size (" +
+               std::to_string(config_.memory.client_max_size) + ") - 64KiB");
     return -1;
   }
 
   // 验证内存配置
   if (config_.memory.client_max_size == 0) {
-    LOG_ERROR("客户端内存大小不能为0");
+    note_error("客户端内存大小不能为0");
     return -1;
   }
   return 0;
@@ -181,15 +423,32 @@ void ConfigManager::parse_server_config(const YAML::Node& node)
 void ConfigManager::parse_mqtt_config(const YAML::Node& node)
 {
   if (node["max_packet_size"]) {
-    config_.mqtt.max_packet_size = node["max_packet_size"].as<uint32_t>();
+    const uint64_t value = node["max_packet_size"].as<uint64_t>();
+    if (value == 0 || value > 0xffffffffu) {
+      note_error("mqtt.max_packet_size 必须在 1 到 4294967295 之间");
+      config_.mqtt.max_packet_size = 0;
+    } else {
+      config_.mqtt.max_packet_size = static_cast<uint32_t>(value);
+    }
   }
 
-  if (node["keep_alive_default"]) {
-    config_.mqtt.keep_alive_default = node["keep_alive_default"].as<uint16_t>();
-  }
+  // keep_alive_default 已废弃，审计阶段已经 WARN，这里不再写入。
 
   if (node["keep_alive_max"]) {
-    config_.mqtt.keep_alive_max = node["keep_alive_max"].as<uint16_t>();
+    const uint64_t value = node["keep_alive_max"].as<uint64_t>();
+    if (value > 65535) {
+      note_error("mqtt.keep_alive_max 不得超过 65535");
+    } else {
+      config_.mqtt.keep_alive_max = static_cast<uint16_t>(value);
+    }
+  }
+
+  if (node["connect_timeout_seconds"]) {
+    config_.mqtt.connect_timeout_seconds = node["connect_timeout_seconds"].as<uint32_t>();
+  }
+
+  if (node["implicit_no_local"]) {
+    config_.mqtt.implicit_no_local = node["implicit_no_local"].as<bool>();
   }
 
   if (node["max_qos"]) {
@@ -215,11 +474,22 @@ void ConfigManager::parse_mqtt_config(const YAML::Node& node)
   }
 
   if (node["topic_alias_maximum"]) {
-    config_.mqtt.topic_alias_maximum = node["topic_alias_maximum"].as<uint16_t>();
+    const uint64_t value = node["topic_alias_maximum"].as<uint64_t>();
+    if (value > 65535) {
+      note_error("mqtt.topic_alias_maximum 不得超过 65535");
+    } else {
+      config_.mqtt.topic_alias_maximum = static_cast<uint16_t>(value);
+    }
   }
 
   if (node["receive_maximum"]) {
-    config_.mqtt.receive_maximum = node["receive_maximum"].as<uint16_t>();
+    const uint64_t value = node["receive_maximum"].as<uint64_t>();
+    if (value < 1 || value > 65535) {
+      note_error("mqtt.receive_maximum 必须在 1 到 65535 之间");
+      config_.mqtt.receive_maximum = 0;
+    } else {
+      config_.mqtt.receive_maximum = static_cast<uint16_t>(value);
+    }
   }
 
   if (node["allow_mqtt3x"]) {
@@ -231,6 +501,22 @@ void ConfigManager::parse_memory_config(const YAML::Node& node)
 {
   if (node["client_max_size"]) {
     config_.memory.client_max_size = node["client_max_size"].as<size_t>();
+  }
+}
+
+void ConfigManager::parse_retain_config(const YAML::Node& node)
+{
+  if (node["max_messages"]) {
+    config_.retain.max_messages = node["max_messages"].as<size_t>();
+  }
+  if (node["max_payload_bytes"]) {
+    config_.retain.max_payload_bytes = node["max_payload_bytes"].as<size_t>();
+  }
+  if (node["max_total_bytes"]) {
+    config_.retain.max_total_bytes = node["max_total_bytes"].as<size_t>();
+  }
+  if (node["max_deliver_per_subscribe"]) {
+    config_.retain.max_deliver_per_subscribe = node["max_deliver_per_subscribe"].as<size_t>();
   }
 }
 
