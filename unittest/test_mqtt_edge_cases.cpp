@@ -496,15 +496,9 @@ TEST_F(MQTTv5EdgeCasesTest, SubscribeWithInvalidOptions)
     Packet* packet = nullptr;
     int ret = parser->parse_packet(subscribe_invalid_options, sizeof(subscribe_invalid_options), &packet);
     
-    // Should parse but with normalized options
-    EXPECT_EQ(ret, MQ_SUCCESS);
-    EXPECT_NE(packet, nullptr);
-    EXPECT_EQ(packet->type, PacketType::SUBSCRIBE);
-    
-    SubscribePacket* subscribe = static_cast<SubscribePacket*>(packet);
-    EXPECT_EQ(subscribe->subscriptions.size(), 1);
-    // QoS should be normalized (extracted from lower 2 bits)
-    EXPECT_LE(subscribe->subscriptions[0].second & 0x03, 3);  // Accept 0-3 range
+    // Reserved bits and Retain Handling 3 are a malformed packet.
+    EXPECT_EQ(ret, MQ_ERR_PACKET_INVALID);
+    EXPECT_EQ(packet, nullptr);
 }
 
 // ============= Reason Code Edge Cases =============

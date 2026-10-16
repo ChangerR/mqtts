@@ -290,15 +290,56 @@ struct PublishPacket : public Packet
   }
 };
 
+// MQTT v5 subscription options. Bits: QoS 0-1, No Local 2, RAP 3, Retain Handling 4-5.
+struct SubscriptionOptions
+{
+  uint8_t qos = 0;
+  bool no_local = false;
+  bool retain_as_published = false;
+  uint8_t retain_handling = 0;
+
+  uint8_t encode() const
+  {
+    return static_cast<uint8_t>((qos & 0x03) | (no_local ? 0x04 : 0) |
+                                (retain_as_published ? 0x08 : 0) |
+                                ((retain_handling & 0x03) << 4));
+  }
+};
+
+struct TopicSubscription
+{
+  MQTTString topic_filter;
+  SubscriptionOptions options;
+
+  TopicSubscription(const MQTTString& filter, int qos) : topic_filter(filter)
+  {
+    options.qos = static_cast<uint8_t>(qos);
+  }
+
+  TopicSubscription(const MQTTString& filter, SubscriptionOptions requested)
+      : topic_filter(filter), options(requested)
+  {
+  }
+};
+
+inline bool is_shared_subscription_filter(const MQTTString& filter)
+{
+  return filter.size() >= 7 && filter.compare(0, 7, "$share/") == 0;
+}
+
+inline bool topic_filter_has_wildcard(const MQTTString& filter)
+{
+  return filter.find('+') != MQTTString::npos || filter.find('#') != MQTTString::npos;
+}
+
 // MQTT v5 Subscribe Packet
 struct SubscribePacket : public Packet
 {
   uint16_t packet_id;
-  MQTTVector<std::pair<MQTTString, uint8_t>> subscriptions;
+  MQTTVector<TopicSubscription> subscriptions;
 
   SubscribePacket(MQTTAllocator* allocator = nullptr)
-      : Packet(allocator),
-        subscriptions(MQTTSTLAllocator<std::pair<MQTTString, uint8_t>>(allocator))
+      : Packet(allocator), subscriptions(MQTTSTLAllocator<TopicSubscription>(allocator))
   {
   }
 };

@@ -65,8 +65,10 @@ class DurableStore
   Result subscribe(const std::string& client, uint64_t epoch, const std::string& filter,
                    uint8_t qos);
   Result unsubscribe(const std::string& client, uint64_t epoch, const std::string& filter);
+  // exclude_sender is decided by the caller from in-memory subscription options.
+  // The on-disk subscription record still stores only QoS.
   Result publish(const std::string& topic, const std::string& wire, const std::string& sender,
-                 int64_t expires);
+                 int64_t expires, bool exclude_sender = true);
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
   Result begin_delivery(const std::string& client, uint64_t epoch, int64_t sequence,
                         uint16_t packet_id);

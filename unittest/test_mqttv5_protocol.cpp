@@ -187,14 +187,14 @@ TEST_F(MQTTv5ProtocolTest, SubscribePacketOptions)
   EXPECT_EQ(packet.packet_id, 456);
   EXPECT_EQ(packet.subscriptions.size(), 3);
 
-  EXPECT_EQ(from_mqtt_string(packet.subscriptions[0].first), "sensor/+/temperature");
-  EXPECT_EQ(packet.subscriptions[0].second, 0);
+  EXPECT_EQ(from_mqtt_string(packet.subscriptions[0].topic_filter), "sensor/+/temperature");
+  EXPECT_EQ(packet.subscriptions[0].options.qos, 0);
 
-  EXPECT_EQ(from_mqtt_string(packet.subscriptions[1].first), "device/#");
-  EXPECT_EQ(packet.subscriptions[1].second, 1);
+  EXPECT_EQ(from_mqtt_string(packet.subscriptions[1].topic_filter), "device/#");
+  EXPECT_EQ(packet.subscriptions[1].options.qos, 1);
 
-  EXPECT_EQ(from_mqtt_string(packet.subscriptions[2].first), "alert/critical");
-  EXPECT_EQ(packet.subscriptions[2].second, 2);
+  EXPECT_EQ(from_mqtt_string(packet.subscriptions[2].topic_filter), "alert/critical");
+  EXPECT_EQ(packet.subscriptions[2].options.qos, 2);
 
   EXPECT_EQ(packet.properties.subscription_identifier, 42);
 }

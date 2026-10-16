@@ -213,6 +213,9 @@ class GlobalSessionManager
   void configure_persistence(const PersistenceConfig& config) {
     if (config.enabled) durable_store_.reset(new DurableStore(config));
   }
+  // 启动时冻结。true 时恢复“总是不把消息投回发布者”的旧行为。
+  void set_implicit_no_local(bool enabled) { implicit_no_local_ = enabled; }
+  bool implicit_no_local() const { return implicit_no_local_; }
   DurableStore* durable_store() const { return durable_store_.get(); }
   ~GlobalSessionManager();
 
@@ -320,6 +323,8 @@ class GlobalSessionManager
    * @return 0成功，非0失败
    */
   int subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+  int subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id,
+                      const SubscriptionOptions& options);
 
   /**
    * @brief 客户端取消订阅主题
@@ -564,7 +569,11 @@ class GlobalSessionManager
    * @return MQ_SUCCESS成功，其他值失败
    */
   int subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+  int subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id,
+                                  const SubscriptionOptions& options);
   int subscribe_topic_cluster(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+  int subscribe_topic_cluster(const MQTTString& topic_filter, const MQTTString& client_id,
+                              const SubscriptionOptions& options);
 
   /**
    * @brief 通过路由器取消订阅主题
@@ -597,6 +606,7 @@ class GlobalSessionManager
 
  private:
   std::unique_ptr<DurableStore> durable_store_;
+  bool implicit_no_local_ = false;
   // 运行状态
   enum class ManagerState {
     INITIALIZING,  // 初始化阶段

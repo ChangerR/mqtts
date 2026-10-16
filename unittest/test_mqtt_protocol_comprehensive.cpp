@@ -252,10 +252,52 @@ TEST_F(MQTTv5ComprehensiveTest, SubscribePacketBasic)
     SubscribePacket* subscribe = static_cast<SubscribePacket*>(packet);
     EXPECT_EQ(subscribe->packet_id, 1);
     EXPECT_EQ(subscribe->subscriptions.size(), 2);
-    EXPECT_EQ(subscribe->subscriptions[0].first, "test/topic");
-    EXPECT_EQ(subscribe->subscriptions[0].second, 1);
-    EXPECT_EQ(subscribe->subscriptions[1].first, "another");
-    EXPECT_EQ(subscribe->subscriptions[1].second, 2);
+    EXPECT_EQ(subscribe->subscriptions[0].topic_filter, "test/topic");
+    EXPECT_EQ(subscribe->subscriptions[0].options.qos, 1);
+    EXPECT_EQ(subscribe->subscriptions[1].topic_filter, "another");
+    EXPECT_EQ(subscribe->subscriptions[1].options.qos, 2);
+}
+
+TEST_F(MQTTv5ComprehensiveTest, SubscribeOptionsRoundTrip)
+{
+    SubscriptionOptions rich;
+    rich.qos = 1;
+    rich.no_local = true;
+    rich.retain_as_published = true;
+    rich.retain_handling = 2;
+    SubscribePacket subscribe(test_allocator);
+    subscribe.type = PacketType::SUBSCRIBE;
+    subscribe.packet_id = 7;
+    subscribe.subscriptions.emplace_back(MQTTString("a/b", MQTTStrAllocator(test_allocator)), rich);
+
+    MQTTBuffer buffer(test_allocator);
+    ASSERT_EQ(parser->serialize_subscribe(&subscribe, buffer), MQ_SUCCESS);
+    Packet* parsed = nullptr;
+    ASSERT_EQ(parser->parse_packet(buffer.data(), buffer.size(), &parsed), MQ_SUCCESS);
+    SubscribePacket* result = static_cast<SubscribePacket*>(parsed);
+    ASSERT_EQ(result->subscriptions.size(), 1u);
+    EXPECT_TRUE(result->subscriptions[0].options.no_local);
+    EXPECT_TRUE(result->subscriptions[0].options.retain_as_published);
+    EXPECT_EQ(result->subscriptions[0].options.retain_handling, 2);
+    EXPECT_EQ(result->subscriptions[0].options.qos, 1);
+    EXPECT_EQ(result->subscriptions[0].options.encode(), 0x2D);
+}
+
+TEST_F(MQTTv5ComprehensiveTest, SubscribeReservedBitsAreMalformed)
+{
+    uint8_t retain_handling_three[] = {
+        0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, 'a', 0x30
+    };
+    Packet* packet = nullptr;
+    EXPECT_EQ(parser->parse_packet(retain_handling_three, sizeof(retain_handling_three), &packet),
+              MQ_ERR_PACKET_INVALID);
+
+    parser->set_protocol_version_hint(4);
+    uint8_t legacy_no_local[] = {
+        0x82, 0x06, 0x00, 0x01, 0x00, 0x01, 'a', 0x04
+    };
+    EXPECT_EQ(parser->parse_packet(legacy_no_local, sizeof(legacy_no_local), &packet),
+              MQ_ERR_PACKET_INVALID);
 }
 
 // ============= SUBACK Packet Tests =============
@@ -623,8 +665,8 @@ TEST_F(MQTTv5ComprehensiveTest, LegacySubscribeWithoutProperties)
     SubscribePacket* subscribe = static_cast<SubscribePacket*>(packet);
     ASSERT_EQ(subscribe->subscriptions.size(), 1u);
     EXPECT_EQ(subscribe->packet_id, 1);
-    EXPECT_EQ(subscribe->subscriptions[0].first, "a/b");
-    EXPECT_EQ(subscribe->subscriptions[0].second, 1);
+    EXPECT_EQ(subscribe->subscriptions[0].topic_filter, "a/b");
+    EXPECT_EQ(subscribe->subscriptions[0].options.qos, 1);
 }
 
 TEST_F(MQTTv5ComprehensiveTest, LegacyUnsubscribeWithoutProperties)

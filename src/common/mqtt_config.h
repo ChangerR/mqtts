@@ -57,7 +57,7 @@ struct MQTTProtocolConfig
   uint16_t keep_alive_default = 60;               // 已废弃，配置里出现时忽略并 WARN
   uint16_t keep_alive_max = 3600;                 // 最大保活时间(秒)
   uint32_t connect_timeout_seconds = 10;          // 连接建立后等待完整 CONNECT 的秒数，超时直接关闭
-  bool implicit_no_local = false;                 // 兼容开关。投递行为在后续条目实现，默认不排除发布者
+  bool implicit_no_local = false;                 // 兼容开关。默认 false，发布者会收到自己的消息
   uint8_t max_qos = 2;                            // 最大QoS级别
   bool retain_available = true;                   // 是否支持retain消息
   bool wildcard_subscription_available = true;    // 是否支持通配符订阅

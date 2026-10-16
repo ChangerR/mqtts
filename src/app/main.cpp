@@ -22,6 +22,7 @@ int run_mqtt_server(const mqtt::Config& config)
 
   // 初始化全局会话管理器
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+  session_manager.set_implicit_no_local(config.mqtt.implicit_no_local);
 
   try { session_manager.configure_persistence(config.persistence); }
   catch (const std::exception& error) { LOG_ERROR("Persistence initialization failed: {}", error.what()); return 1; }

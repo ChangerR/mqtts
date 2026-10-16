@@ -283,9 +283,9 @@ TEST_F(MQTTv5SerializationTest, SubscribePacketSerialization)
     subscribe.properties.subscription_identifier = 20;
     
     // Add subscriptions
-    subscribe.subscriptions.push_back(std::make_pair(MQTTString("topic/filter1", MQTTStrAllocator(test_allocator)), 0));
-    subscribe.subscriptions.push_back(std::make_pair(MQTTString("topic/filter2", MQTTStrAllocator(test_allocator)), 1));
-    subscribe.subscriptions.push_back(std::make_pair(MQTTString("topic/filter3", MQTTStrAllocator(test_allocator)), 2));
+    subscribe.subscriptions.emplace_back(MQTTString("topic/filter1", MQTTStrAllocator(test_allocator)), 0);
+    subscribe.subscriptions.emplace_back(MQTTString("topic/filter2", MQTTStrAllocator(test_allocator)), 1);
+    subscribe.subscriptions.emplace_back(MQTTString("topic/filter3", MQTTStrAllocator(test_allocator)), 2);
 
     // Serialize packet
     MQTTBuffer buffer(test_allocator);
@@ -304,12 +304,12 @@ TEST_F(MQTTv5SerializationTest, SubscribePacketSerialization)
     EXPECT_EQ(parsed_subscribe->packet_id, 456);
     EXPECT_EQ(parsed_subscribe->properties.subscription_identifier, 20);
     EXPECT_EQ(parsed_subscribe->subscriptions.size(), 3);
-    EXPECT_EQ(parsed_subscribe->subscriptions[0].first, "topic/filter1");
-    EXPECT_EQ(parsed_subscribe->subscriptions[0].second, 0);
-    EXPECT_EQ(parsed_subscribe->subscriptions[1].first, "topic/filter2");
-    EXPECT_EQ(parsed_subscribe->subscriptions[1].second, 1);
-    EXPECT_EQ(parsed_subscribe->subscriptions[2].first, "topic/filter3");
-    EXPECT_EQ(parsed_subscribe->subscriptions[2].second, 2);
+    EXPECT_EQ(parsed_subscribe->subscriptions[0].topic_filter, "topic/filter1");
+    EXPECT_EQ(parsed_subscribe->subscriptions[0].options.qos, 0);
+    EXPECT_EQ(parsed_subscribe->subscriptions[1].topic_filter, "topic/filter2");
+    EXPECT_EQ(parsed_subscribe->subscriptions[1].options.qos, 1);
+    EXPECT_EQ(parsed_subscribe->subscriptions[2].topic_filter, "topic/filter3");
+    EXPECT_EQ(parsed_subscribe->subscriptions[2].options.qos, 2);
 }
 
 // ============= SUBACK Packet Serialization Tests =============
@@ -636,7 +636,7 @@ TEST_F(MQTTv5SerializationTest, RoundTripAllPacketTypes)
                 auto subscribe = std::make_unique<SubscribePacket>(test_allocator);
                 subscribe->type = type;
                 subscribe->packet_id = 1;
-                subscribe->subscriptions.push_back(std::make_pair(MQTTString("test", MQTTStrAllocator(test_allocator)), 0));
+                subscribe->subscriptions.emplace_back(MQTTString("test", MQTTStrAllocator(test_allocator)), 0);
                 packet = std::move(subscribe);
                 break;
             }

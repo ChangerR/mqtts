@@ -24,8 +24,9 @@ class DurableClient(Client):
         head,body=self.read();assert head==0x20
         self.connack=body
         return body[1],bool(body[0]&1)
-    def sub(self, topic, qos=1):
-        self.send(packet(0x82,b'\0\1'+(b'\0' if self.version==5 else b'')+utf(topic)+bytes([qos])))
+    def sub(self, topic, qos=1, options=None):
+        flags = qos if options is None else options
+        self.send(packet(0x82,b'\0\1'+(b'\0' if self.version==5 else b'')+utf(topic)+bytes([flags])))
         h,b=self.read();assert h==0x90
         return b[-1]
     def pub(self, topic, data, expiry=None):

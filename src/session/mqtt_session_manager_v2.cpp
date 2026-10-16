@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <unordered_map>
 #include "logger.h"
 #include "mqtt_define.h"
 #include "mqtt_protocol_handler.h"
@@ -1267,6 +1268,44 @@ int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& t
   return forwarded_count;
 }
 
+namespace {
+struct PlannedDelivery
+{
+  MQTTString client_id;
+  uint8_t qos = 0;
+  bool retain = false;
+  uint8_t subscription_qos = 0;
+};
+
+std::vector<PlannedDelivery> plan_subscription_deliveries(
+    const std::vector<SubscriberInfo>& subscribers, const std::string& sender_id,
+    uint8_t message_qos, bool message_retain, bool implicit_no_local)
+{
+  std::vector<PlannedDelivery> planned;
+  std::unordered_map<std::string, size_t> index;
+  for (const SubscriberInfo& subscriber : subscribers) {
+    const std::string id = from_mqtt_string(subscriber.client_id);
+    // No Local is decided per subscription before overlapping filters are merged.
+    if (id == sender_id && (implicit_no_local || subscriber.no_local))
+      continue;
+    const uint8_t delivery_qos = std::min(subscriber.qos, message_qos);
+    const bool retain = subscriber.retain_as_published && message_retain;
+    const auto found = index.find(id);
+    if (found == index.end()) {
+      index.emplace(id, planned.size());
+      planned.push_back(
+          PlannedDelivery{subscriber.client_id, delivery_qos, retain, subscriber.qos});
+    } else if (subscriber.qos > planned[found->second].subscription_qos) {
+      PlannedDelivery& chosen = planned[found->second];
+      chosen.qos = delivery_qos;
+      chosen.retain = retain;
+      chosen.subscription_qos = subscriber.qos;
+    }
+  }
+  return planned;
+}
+}  // namespace
+
 int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
@@ -1283,6 +1322,23 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   if (packet.properties.has_message_expiry_interval &&
       packet.properties.message_expiry_interval == 0)
     return 0;
+  const std::string sender_id = from_mqtt_string(sender_client_id);
+  std::vector<SubscriberInfo> subscribers;
+  const int lookup = find_topic_subscribers(topic, subscribers);
+  std::vector<PlannedDelivery> planned;
+  if (lookup == MQ_SUCCESS) {
+    planned = plan_subscription_deliveries(subscribers, sender_id, packet.qos, packet.retain,
+                                           implicit_no_local_);
+  }
+  bool sender_uses_durable_queue = false;
+  if (lookup == MQ_SUCCESS) {
+    for (const PlannedDelivery& delivery : planned) {
+      if (delivery.qos > 0 && from_mqtt_string(delivery.client_id) == sender_id) {
+        sender_uses_durable_queue = true;
+        break;
+      }
+    }
+  }
   if (durable_store_) {
     if (packet.qos > 1)
       return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
@@ -1298,6 +1354,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         copy.payload = packet.payload;
         copy.qos = 1;
         copy.packet_id = 1;
+        // One shared wire cannot carry a different retain flag per subscriber.
+        // Per-subscription RAP on this path waits for the subscription-record format.
         copy.retain = false;
         copy.dup = false;
         copy.properties = Properties(packet.properties, &wire_allocator);
@@ -1312,7 +1370,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         auto result = durable_store_->publish(
             from_mqtt_string(topic),
             std::string(reinterpret_cast<const char*>(wire.data()), wire.size()),
-            from_mqtt_string(sender_client_id), expires);
+            from_mqtt_string(sender_client_id), expires, !sender_uses_durable_queue);
         if (!result.ok) {
           LOG_WARN("Persistent publish refused: {}", result.error);
           return result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
@@ -1325,15 +1383,13 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       }
     }
   }
-  // 使用高性能主题匹配树查找订阅者
-  std::vector<SubscriberInfo> subscribers;
-  int ret = find_topic_subscribers(topic, subscribers);
+  int ret = lookup;
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
     return 0;
   }
 
-  if (subscribers.empty())
+  if (planned.empty())
     return int(persisted_count);
   int forwarded_count = int(persisted_count);
   try {
@@ -1344,19 +1400,25 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
     SharedMessageContentPtr content(new SharedMessageContent(
         packet.topic_name, packet.payload, packet.qos, packet.retain, packet.dup,
         packet.properties, sender_client_id, global_allocator_));
-    const std::string sender_id = from_mqtt_string(sender_client_id);
-    for (const SubscriberInfo& subscriber : subscribers) {
-      const std::string target = from_mqtt_string(subscriber.client_id);
-      if (target == sender_id ||
-          std::binary_search(persisted_targets.begin(), persisted_targets.end(), target))
+    std::unordered_map<uint8_t, SharedMessageContentPtr> shaped;
+    for (const PlannedDelivery& delivery : planned) {
+      const std::string target = from_mqtt_string(delivery.client_id);
+      if (std::binary_search(persisted_targets.begin(), persisted_targets.end(), target))
         continue;
-      if (subscriber.qos == 0 && packet.qos != 0) {
-        SharedMessageContentPtr downgraded(
-            new SharedMessageContent(packet.topic_name, packet.payload, 0, false, false,
-                                     packet.properties, sender_client_id, global_allocator_));
-        if (forward_publish_shared(subscriber.client_id, downgraded) == MQ_SUCCESS)
-          ++forwarded_count;
-      } else if (forward_publish_shared(subscriber.client_id, content) == MQ_SUCCESS)
+      SharedMessageContentPtr outbound = content;
+      if (delivery.qos != packet.qos || delivery.retain != packet.retain) {
+        const uint8_t key = static_cast<uint8_t>((delivery.qos << 1) | (delivery.retain ? 1 : 0));
+        auto found = shaped.find(key);
+        if (found == shaped.end()) {
+          outbound = SharedMessageContentPtr(new SharedMessageContent(
+              packet.topic_name, packet.payload, delivery.qos, delivery.retain, packet.dup,
+              packet.properties, sender_client_id, global_allocator_));
+          shaped.emplace(key, outbound);
+        } else {
+          outbound = found->second;
+        }
+      }
+      if (forward_publish_shared(delivery.client_id, outbound) == MQ_SUCCESS)
         ++forwarded_count;
     }
   } catch (const std::bad_alloc&) {
@@ -1386,29 +1448,39 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
     return 0;
   }
 
-  if (subscribers.empty()) {
+  const std::string sender_id = from_mqtt_string(content->sender_client_id);
+  const std::vector<PlannedDelivery> planned = plan_subscription_deliveries(
+      subscribers, sender_id, content->qos, content->retain, implicit_no_local_);
+  if (planned.empty()) {
     LOG_DEBUG("No subscribers found for topic: {}", from_mqtt_string(topic));
     return 0;
   }
 
-  // 过滤掉发送者自己（避免回环）
-  std::vector<MQTTString> filtered_subscribers;
-  std::string sender_id = from_mqtt_string(content->sender_client_id);
-
-  for (const SubscriberInfo& subscriber : subscribers) {
-    if (from_mqtt_string(subscriber.client_id) != sender_id) {
-      filtered_subscribers.push_back(subscriber.client_id);
+  int forwarded_count = 0;
+  try {
+    std::unordered_map<uint8_t, SharedMessageContentPtr> shaped;
+    std::unordered_map<uint8_t, std::vector<MQTTString>> groups;
+    for (const PlannedDelivery& delivery : planned) {
+      const uint8_t key = static_cast<uint8_t>((delivery.qos << 1) | (delivery.retain ? 1 : 0));
+      groups[key].push_back(delivery.client_id);
+      if (shaped.find(key) == shaped.end()) {
+        if (delivery.qos == content->qos && delivery.retain == content->retain) {
+          shaped.emplace(key, content);
+        } else {
+          shaped.emplace(key, SharedMessageContentPtr(new SharedMessageContent(
+                                  content->topic_name, content->payload, delivery.qos,
+                                  delivery.retain, content->dup, content->properties,
+                                  content->sender_client_id, global_allocator_)));
+        }
+      }
     }
+    for (const auto& group : groups) {
+      forwarded_count += batch_forward_publish(group.second, shaped[group.first]);
+    }
+  } catch (const std::bad_alloc&) {
+    LOG_WARN("Insufficient memory while queuing shared PUBLISH fanout");
+    return MQ_ERR_MEMORY_ALLOC;
   }
-
-  if (filtered_subscribers.empty()) {
-    LOG_DEBUG("No valid subscribers found for topic: {} (after filtering sender)",
-              from_mqtt_string(topic));
-    return 0;
-  }
-
-  // 使用批量转发优化
-  int forwarded_count = batch_forward_publish(filtered_subscribers, content);
 
   LOG_DEBUG("Forwarded shared PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
@@ -1532,7 +1604,12 @@ bool GlobalSessionManager::match_topic_filter(const MQTTString& topic,
     return false;
   }
 
-  // 如果过滤器是 '#'，匹配所有主题
+  // A root '+' or '#' does not match a topic whose first character is '$'.
+  if (!topic.empty() && topic[0] == '$' && (filter[0] == '#' || filter[0] == '+')) {
+    return false;
+  }
+
+  // 如果过滤器是 '#'，匹配所有非 '$' 主题
   if (filter == MQTTString(1, '#')) {
     return true;
   }
@@ -1630,15 +1707,24 @@ int GlobalSessionManager::get_message_cache_size(size_t& cache_size) const
 int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter,
                                           const MQTTString& client_id, uint8_t qos)
 {
+  SubscriptionOptions options;
+  options.qos = qos;
+  return subscribe_topic(topic_filter, client_id, options);
+}
+
+int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter,
+                                          const MQTTString& client_id,
+                                          const SubscriptionOptions& options)
+{
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
     return MQ_ERR_INTERNAL;
   }
 
-  int result = topic_tree_->subscribe(topic_filter, client_id, qos);
+  int result = topic_tree_->subscribe(topic_filter, client_id, options);
   if (result == MQ_SUCCESS) {
     LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", from_mqtt_string(client_id),
-              from_mqtt_string(topic_filter), qos);
+              from_mqtt_string(topic_filter), options.qos);
   } else {
     LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}",
               from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
@@ -2089,14 +2175,30 @@ int GlobalSessionManager::notify_router_client_disconnect(const MQTTString& clie
 
 int GlobalSessionManager::subscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos)
 {
-  int ret = MQ_SUCCESS;
-  ret = subscribe_topic_cluster(topic_filter, client_id, qos);
-  return ret;
+  SubscriptionOptions options;
+  options.qos = qos;
+  return subscribe_topic_with_router(topic_filter, client_id, options);
+}
+
+int GlobalSessionManager::subscribe_topic_with_router(const MQTTString& topic_filter,
+                                                     const MQTTString& client_id,
+                                                     const SubscriptionOptions& options)
+{
+  return subscribe_topic_cluster(topic_filter, client_id, options);
 }
 
 int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter,
                                                   const MQTTString& client_id,
                                                   uint8_t qos)
+{
+  SubscriptionOptions options;
+  options.qos = qos;
+  return subscribe_topic_cluster(topic_filter, client_id, options);
+}
+
+int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter,
+                                                  const MQTTString& client_id,
+                                                  const SubscriptionOptions& options)
 {
   int ret = MQ_SUCCESS;
   MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
@@ -2104,12 +2206,13 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
 
   // Do not replace an existing local filter until router admission succeeds.
   // A failed re-SUBSCRIBE must retain its previous QoS and routing entry.
+  // Router RPC stays QoS-only; cluster delivery does not carry No Local / RAP.
   if (router_client_.get() != NULL) {
     strict_cluster_mode = cluster_config_.cluster_enabled;
     request.server_id = server_id_;
     request.client_id = client_id;
     request.topic_filter = topic_filter;
-    request.qos = qos;
+    request.qos = options.qos;
     if (strict_cluster_mode) {
       ret = router_client_->subscribe(request);
     } else {
@@ -2118,7 +2221,7 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
     if (MQ_SUCCESS != ret)
       return ret;
   }
-  return subscribe_topic(topic_filter, client_id, qos);
+  return subscribe_topic(topic_filter, client_id, options);
 }
 
 int GlobalSessionManager::unsubscribe_topic_with_router(const MQTTString& topic_filter, const MQTTString& client_id)
@@ -2133,7 +2236,6 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
   int ret = MQ_SUCCESS;
   MQTTRouterRpcClient::UnsubscribeRequest request(global_allocator_);
   bool strict_cluster_mode = false;
-  uint8_t subscribed_qos = 0;
 
   if (router_client_.get() == NULL) {
     ret = unsubscribe_topic(topic_filter, client_id);
@@ -2145,10 +2247,14 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
     if (strict_cluster_mode) {
       std::vector<SubscriberInfo> subscribers;
       ret = find_topic_subscribers(topic_filter, subscribers);
+      SubscriptionOptions restored;
       if (MQ_SUCCESS == ret) {
         for (size_t i = 0; i < subscribers.size(); ++i) {
           if (subscribers[i].client_id == client_id) {
-            subscribed_qos = subscribers[i].qos;
+            restored.qos = subscribers[i].qos;
+            restored.no_local = subscribers[i].no_local;
+            restored.retain_as_published = subscribers[i].retain_as_published;
+            restored.retain_handling = subscribers[i].retain_handling;
             break;
           }
         }
@@ -2156,7 +2262,7 @@ int GlobalSessionManager::unsubscribe_topic_cluster(const MQTTString& topic_filt
         if (MQ_SUCCESS == ret) {
           ret = router_client_->unsubscribe(request);
           if (MQ_SUCCESS != ret) {
-            int restore_ret = subscribe_topic(topic_filter, client_id, subscribed_qos);
+            int restore_ret = subscribe_topic(topic_filter, client_id, restored);
             if (MQ_SUCCESS != restore_ret) {
               LOG_WARN("Failed to restore local subscription after router unsubscribe failure, topic={}, client_id={}, restore_ret={}",
                        from_mqtt_string(topic_filter), from_mqtt_string(client_id), restore_ret);

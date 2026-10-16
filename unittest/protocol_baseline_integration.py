@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0-2 连接生命周期，以及 P0-3 报文上限与流控。TCP 与 WebSocket 二进制都覆盖。"""
+"""P0-2 连接生命周期、P0-3 流控，以及 P0-4 订阅选项。TCP 与 WebSocket 二进制都覆盖。"""
 import argparse
 import base64
 import hashlib
@@ -45,7 +45,8 @@ def remaining(data, index):
 
 class Broker:
     def __init__(self, binary, threads, keep_alive_max, connect_timeout,
-                 max_packet_size=1048576, receive_maximum=65535, max_qos=2, monitor=False):
+                 max_packet_size=1048576, receive_maximum=65535, max_qos=2, monitor=False,
+                 implicit_no_local=False, wildcard_subscription_available=True):
         self.root = Path(tempfile.mkdtemp(prefix='mqtts-p02-'))
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
@@ -60,6 +61,8 @@ class Broker:
                 'keep_alive_max': keep_alive_max,
                 'connect_timeout_seconds': connect_timeout,
                 'allow_mqtt3x': True,
+                'implicit_no_local': implicit_no_local,
+                'wildcard_subscription_available': wildcard_subscription_available,
             },
             'memory': {'client_max_size': max(1114112, max_packet_size + 65536)},
             'log': {'level': 'info', 'file_path': str(self.root / 'broker.log'), 'flush_immediately': True},
@@ -837,8 +840,233 @@ def packet_id_wrap(binary, websocket):
         broker.close()
 
 
+def sub_code(client, topic, version, flags, packet_id=1):
+    body = struct.pack('!H', packet_id) + (b'\x00' if version >= 5 else b'') + utf(topic) + bytes([flags])
+    client.send(packet(0x82, body))
+    header, result = client.read(3)
+    if header != 0x90:
+        raise AssertionError('SUBACK 0x%02x %s' % (header, result.hex()))
+    return result[-1]
+
+
+def subscription_options(binary, websocket):
+    broker = Broker(binary, 1, 30, 10)
+    try:
+        watcher = Client(broker.port, websocket)
+        sender = Client(broker.port, websocket)
+        try:
+            connect(watcher, 'opt-watch', 5, 30)
+            subscribe(watcher, 'opt/echo', 5, qos=0)
+            connect(sender, 'opt-self', 5, 30)
+            if sub_code(sender, 'opt/echo', 5, 0) != 0:
+                raise AssertionError('No Local 0 was not granted')
+            publish(sender, 'opt/echo', b'own', 5)
+            topic, payload = publish_of(*sender.read(2), 5)
+            if topic != 'opt/echo' or payload != b'own':
+                raise AssertionError('publisher with No Local 0 missed %s %s' % (topic, payload))
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if payload != b'own':
+                raise AssertionError(payload)
+            if sub_code(sender, 'opt/echo', 5, 0x04, packet_id=2) != 0:
+                raise AssertionError('No Local 1 was not granted')
+            publish(sender, 'opt/echo', b'hide', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if payload != b'hide':
+                raise AssertionError(payload)
+            quiet(sender, 0.3)
+        finally:
+            watcher.close()
+            sender.close()
+        legacy = Client(broker.port, websocket)
+        try:
+            connect(legacy, 'opt-3x', 4, 30)
+            subscribe(legacy, 'opt/echo', 4, qos=0)
+            publish(legacy, 'opt/echo', b'v3', 4)
+            topic, payload = publish_of(*legacy.read(2), 4)
+            if topic != 'opt/echo' or payload != b'v3':
+                raise AssertionError('3.x client missed its own publish')
+        finally:
+            legacy.close()
+
+        low = Client(broker.port, websocket)
+        high = Client(broker.port, websocket)
+        try:
+            connect(low, 'opt-qos', 5, 30)
+            if sub_code(low, 'opt/qos', 5, 1) != 1:
+                raise AssertionError('QoS 1 grant')
+            connect(high, 'opt-qos-pub', 5, 30)
+            publish_qos(high, 'opt/qos', b'ab', 5, 2, 1)
+            header, body = high.read(2)
+            if header != 0x50:
+                raise AssertionError('PUBREC 0x%02x' % header)
+            header, body = low.read(2)
+            if (header >> 1) & 3 != 1:
+                raise AssertionError('downgraded header 0x%02x' % header)
+            topic, payload = publish_of(header, body, 5)
+            if topic != 'opt/qos' or payload != b'ab':
+                raise AssertionError((topic, payload))
+        finally:
+            low.close()
+            high.close()
+
+        overlap = Client(broker.port, websocket)
+        try:
+            connect(overlap, 'opt-over', 5, 30)
+            overlap.send(packet(
+                0x82, b'\x00\x09\x00' + utf('opt/a/#') + b'\x00' + utf('opt/a/b') + b'\x01'))
+            header, body = overlap.read(2)
+            if header != 0x90 or body[3:] != b'\x00\x01':
+                raise AssertionError('overlap SUBACK %s' % body.hex())
+            publish_qos(overlap, 'opt/a/b', b'once', 5, 1, 3)
+            header, _ = overlap.read(2)
+            if header != 0x40:
+                raise AssertionError('overlap PUBACK 0x%02x' % header)
+            header, body = overlap.read(2)
+            if (header >> 1) & 3 != 1:
+                raise AssertionError('overlap delivery qos 0x%02x' % header)
+            topic, payload = publish_of(header, body, 5)
+            if topic != 'opt/a/b' or payload != b'once':
+                raise AssertionError((topic, payload))
+            quiet(overlap, 0.3)
+        finally:
+            overlap.close()
+
+        dollar = Client(broker.port, websocket)
+        other = Client(broker.port, websocket)
+        try:
+            connect(dollar, 'opt-dollar', 5, 30)
+            subscribe(dollar, '#', 5, qos=0)
+            connect(other, 'opt-dollar-pub', 5, 30)
+            publish(other, '$test/x', b'secret', 5)
+            publish(other, 'opt/plain', b'visible', 5)
+            topic, payload = publish_of(*dollar.read(2), 5)
+            if topic != 'opt/plain' or payload != b'visible':
+                raise AssertionError('root # matched %s %s' % (topic, payload))
+            quiet(dollar, 0.3)
+            subscribe(dollar, '$test/#', 5, qos=0)
+            publish(other, '$test/x', b'seen', 5)
+            topic, payload = publish_of(*dollar.read(2), 5)
+            if topic != '$test/x' or payload != b'seen':
+                raise AssertionError((topic, payload))
+        finally:
+            dollar.close()
+            other.close()
+
+        rap_off = Client(broker.port, websocket)
+        rap_on = Client(broker.port, websocket)
+        rap_pub = Client(broker.port, websocket)
+        try:
+            connect(rap_off, 'opt-rap0', 5, 30)
+            connect(rap_on, 'opt-rap1', 5, 30)
+            if sub_code(rap_off, 'opt/rap', 5, 0x00) != 0 or sub_code(rap_on, 'opt/rap', 5, 0x08) != 0:
+                raise AssertionError('RAP grant')
+            connect(rap_pub, 'opt-rap-pub', 5, 30)
+            rap_pub.send(packet(0x31, utf('opt/rap') + b'\x00' + b'kept'))
+            off_header, off_body = rap_off.read(2)
+            on_header, on_body = rap_on.read(2)
+            if off_header & 1 or not (on_header & 1):
+                raise AssertionError('retain flags off=0x%02x on=0x%02x' % (off_header, on_header))
+            if publish_of(off_header, off_body, 5)[1] != b'kept' or publish_of(on_header, on_body, 5)[1] != b'kept':
+                raise AssertionError('RAP payload')
+        finally:
+            rap_off.close()
+            rap_on.close()
+            rap_pub.close()
+
+        shared = Client(broker.port, websocket)
+        try:
+            connect(shared, 'opt-share', 5, 30)
+            if sub_code(shared, '$share/g/t', 5, 0) != 0x9E:
+                raise AssertionError('shared v5')
+            subscribe(shared, 'opt/after-share', 5, qos=0)
+        finally:
+            shared.close()
+        shared3 = Client(broker.port, websocket)
+        try:
+            connect(shared3, 'opt-share3', 4, 30)
+            if sub_code(shared3, '$share/g/t', 4, 0) != 0x80:
+                raise AssertionError('shared 3.x')
+        finally:
+            shared3.close()
+
+        identified = Client(broker.port, websocket)
+        try:
+            connect(identified, 'opt-subid', 5, 30)
+            identified.send(packet(0x82, b'\x00\x01\x02\x0b\x01' + utf('opt/sid') + b'\x00'))
+            header, body = identified.read(2)
+            if disconnect_reason(header, body) != 0xA1:
+                raise AssertionError('subscription identifier 0x%02x %s' % (header, body.hex()))
+            identified.expect_closed(1)
+        finally:
+            identified.close()
+
+        bad = Client(broker.port, websocket)
+        try:
+            connect(bad, 'opt-bad', 5, 30)
+            bad.send(packet(0x82, b'\x00\x01\x00' + utf('opt/bad') + b'\x30'))
+            header, body = bad.read(2)
+            if disconnect_reason(header, body) != 0x81:
+                raise AssertionError('retain handling 3 -> 0x%02x' % header)
+            bad.expect_closed(1)
+        finally:
+            bad.close()
+        bad3 = Client(broker.port, websocket)
+        try:
+            connect(bad3, 'opt-bad3', 4, 30)
+            bad3.send(packet(0x82, b'\x00\x01' + utf('opt/bad') + b'\x04'))
+            bad3.expect_closed(1)
+        finally:
+            bad3.close()
+    finally:
+        broker.close()
+
+    plain = Broker(binary, 1, 30, 10, wildcard_subscription_available=False)
+    try:
+        client = Client(plain.port, websocket)
+        try:
+            connect(client, 'opt-wild', 5, 30)
+            if sub_code(client, 'opt/+/x', 5, 0) != 0xA2:
+                raise AssertionError('wildcard v5')
+            if sub_code(client, 'opt/exact', 5, 0, packet_id=2) != 0:
+                raise AssertionError('exact filter rejected')
+        finally:
+            client.close()
+        client3 = Client(plain.port, websocket)
+        try:
+            connect(client3, 'opt-wild3', 4, 30)
+            if sub_code(client3, 'opt/#', 4, 0) != 0x80:
+                raise AssertionError('wildcard 3.x')
+        finally:
+            client3.close()
+    finally:
+        plain.close()
+
+    compat = Broker(binary, 1, 30, 10, implicit_no_local=True)
+    try:
+        sender = Client(compat.port, websocket)
+        watcher = Client(compat.port, websocket)
+        try:
+            connect(sender, 'opt-compat', 5, 30)
+            connect(watcher, 'opt-compat-watch', 5, 30)
+            if sub_code(sender, 'opt/compat', 5, 0) != 0:
+                raise AssertionError('compat subscribe')
+            subscribe(watcher, 'opt/compat', 5, qos=0)
+            publish(sender, 'opt/compat', b'nope', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if payload != b'nope':
+                raise AssertionError(payload)
+            quiet(sender, 0.3)
+        finally:
+            sender.close()
+            watcher.close()
+    finally:
+        compat.close()
+    print('PASS P0-4 websocket=%s' % websocket, flush=True)
+
+
 def run(binary):
     for websocket in (False, True):
+        subscription_options(binary, websocket)
         silent_close(binary, websocket)
         keepalive_idle(binary, websocket, 5)
         keepalive_idle(binary, websocket, 4)
