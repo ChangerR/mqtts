@@ -49,6 +49,8 @@ struct Properties
   uint32_t maximum_packet_size = 0;
   uint16_t topic_alias_maximum = 0;
   uint16_t topic_alias = 0;
+  // 区分“没有 Topic Alias 属性”和“属性存在且值为 0”。值为 0 是非法别名。
+  bool has_topic_alias = false;
   bool request_response_information = false;
   bool request_problem_information = false;
 
@@ -108,6 +110,7 @@ struct Properties
         maximum_packet_size(other.maximum_packet_size),
         topic_alias_maximum(other.topic_alias_maximum),
         topic_alias(other.topic_alias),
+        has_topic_alias(other.has_topic_alias),
         request_response_information(other.request_response_information),
         request_problem_information(other.request_problem_information),
         user_properties(MQTTSTLAllocator<MQTTStringPair>(allocator)),

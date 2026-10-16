@@ -49,6 +49,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       connected_(false),
       subscriptions_(MQTTSTLAllocator<LocalSubscription>(allocator)),
       allocator_(allocator),
+      inbound_aliases_(allocator),
       parser_(nullptr),
       session_expiry_interval_(0),
       receive_maximum_(65535),
@@ -1110,7 +1111,23 @@ int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)
   return MQ_SUCCESS;
 }
 
-int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
+InboundTopicAliases::Result MQTTProtocolHandler::apply_inbound_topic_alias(PublishPacket* packet)
+{
+  if (packet == nullptr) {
+    return InboundTopicAliases::Result::Invalid;
+  }
+  const InboundTopicAliases::Result result = inbound_aliases_.apply(
+      packet->properties.has_topic_alias, packet->properties.topic_alias,
+      effective_limits().topic_alias_maximum, packet->topic_name);
+  if (result == InboundTopicAliases::Result::Unused ||
+      result == InboundTopicAliases::Result::Resolved) {
+    packet->properties.topic_alias = 0;
+    packet->properties.has_topic_alias = false;
+  }
+  return result;
+}
+
+int MQTTProtocolHandler::handle_publish(PublishPacket* packet)
 {
   int ret = MQ_SUCCESS;
   bool auth_denied = false;
@@ -1131,6 +1148,16 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
   if (MQ_SUCC(ret) && !connected_) {
     LOG_ERROR("Client {}:{} not connected", client_ip_.c_str(), client_port_);
     ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  }
+
+  if (MQ_SUCC(ret)) {
+    const InboundTopicAliases::Result alias = apply_inbound_topic_alias(packet);
+    const ReasonCode alias_reason = inbound_alias_disconnect_reason(alias);
+    if (alias_reason != ReasonCode::Success) {
+      LOG_WARN("Inbound topic alias rejected for client {}:{} reason 0x{:02x}", client_ip_.c_str(),
+               client_port_, static_cast<uint8_t>(alias_reason));
+      return close_for_flow(alias_reason, MQ_ERR_FLOW_CLOSED);
+    }
   }
 
   if (MQ_SUCC(ret) && packet->topic_name.empty()) {

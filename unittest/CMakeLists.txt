@@ -205,6 +205,11 @@ add_test(NAME test_websocket_frame COMMAND test_websocket_frame)
 add_test(NAME test_websocket_mqtt_bridge COMMAND test_websocket_mqtt_bridge)
 add_test(NAME test_http_parser COMMAND test_http_parser)
 
+add_executable(test_mqtt_topic_alias test_mqtt_topic_alias.cpp)
+target_include_directories(test_mqtt_topic_alias PRIVATE ${TEST_INCLUDE_DIRS})
+target_link_libraries(test_mqtt_topic_alias PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+add_test(NAME test_mqtt_topic_alias COMMAND test_mqtt_topic_alias)
+
 add_executable(test_phase0_baseline test_phase0_baseline.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)

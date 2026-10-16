@@ -1507,6 +1507,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         bytes_read += 2;
         break;
       case PropertyType::TopicAlias:
+        properties.has_topic_alias = true;
         properties.topic_alias = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
         bytes_read += 2;
         break;

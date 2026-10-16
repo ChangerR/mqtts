@@ -20,6 +20,7 @@
 #include "mqtt_config.h"
 #include "mqtt_connection_watch.h"
 #include "mqtt_flow_control.h"
+#include "mqtt_topic_alias.h"
 #include "mqtt_socket.h"
 #include "mqtt_takeover.h"
 #include "mqtt_stl_allocator.h"
@@ -79,7 +80,10 @@ class MQTTProtocolHandler
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
   int handle_connack(const ConnAckPacket* packet);
-  int handle_publish(const PublishPacket* packet);
+  int handle_publish(PublishPacket* packet);
+  // 认证之前解析入站别名。成功时主题已替换，topic_alias 已清零。
+  // 失败时不关闭连接，由 TCP 和 WebSocket 各自发送 DISCONNECT。
+  InboundTopicAliases::Result apply_inbound_topic_alias(PublishPacket* packet);
   int handle_puback(const PubAckPacket* packet);
   int handle_pubrec(const PubRecPacket* packet);
   int handle_pubrel(const PubRelPacket* packet);
@@ -205,6 +209,7 @@ class MQTTProtocolHandler
 
   // Memory management
   MQTTAllocator* allocator_;
+  InboundTopicAliases inbound_aliases_;
   MQTTParser* parser_;
 
   // MQTT 5.0 session state
