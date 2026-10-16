@@ -208,8 +208,11 @@ class AsyncClient:
         finally:
             self.pending.pop(ident, None)
 
-    async def subscribe(self, topic):
-        return await self.request(0x82, lambda ident: ident+b'\0'+utf(topic)+b'\x01')
+    async def subscribe(self, topic, no_local=False):
+        # QoS 1. Bit 2 is No Local. Benchmarks pass no_local=True so a publisher
+        # subscribed to the same filter is excluded, matching the historical fan-out.
+        options = 0x05 if no_local else 0x01
+        return await self.request(0x82, lambda ident: ident+b'\0'+utf(topic)+bytes([options]))
 
     async def publish(self, topic, data):
         return await self.request(0x32, lambda ident: utf(topic)+ident+b'\0'+data)

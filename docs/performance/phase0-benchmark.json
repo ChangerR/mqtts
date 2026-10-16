@@ -1,0 +1,828 @@
+{
+  "subscriber_no_local": 1,
+  "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.",
+  "topic_alias_maximum": 65535,
+  "measured_on": "2026-10-16",
+  "broker": "build-container/mqtts",
+  "build_type": "RelWithDebInfo",
+  "host": {
+    "cpu": 4,
+    "memory_gib": 16,
+    "filesystem_findmnt": "ext4 on /dev/vdb",
+    "filesystem_stat": "ext2/ext3",
+    "historical_filesystem": "overlayfs",
+    "caveat": "Historical durable figures in durable-concurrency.md were taken on overlayfs. This VM's workspace is ext4. stat -f reports ext2/ext3 for that filesystem. Absolute throughput is higher here; the comparison is only used to test the phase 0 gates, not as a code speedup."
+  },
+  "gates": {
+    "fixed_rate_p99_worsen_at_most": 0.1,
+    "saturation_throughput_drop_at_most": 0.05,
+    "retain0_publish_path": "no material difference versus the empty retain store on the same process; judged with the same 10% p99 band",
+    "fixed_rate_publish_to_receive_p99": [
+      {
+        "offered_per_second": 1000,
+        "historical_ms": 5.894,
+        "measured_ms": 3.5,
+        "ratio": 0.5938,
+        "pass": true
+      },
+      {
+        "offered_per_second": 3000,
+        "historical_ms": 38.879,
+        "measured_ms": 4.149,
+        "ratio": 0.1067,
+        "pass": true
+      }
+    ],
+    "saturation_delivered_per_second": [
+      {
+        "scenario": "instrumented window 4",
+        "historical": 7201,
+        "measured": 16967,
+        "pass": true
+      },
+      {
+        "scenario": "500 pairs warm authorization",
+        "historical": 7800,
+        "measured": 17457,
+        "pass": true
+      },
+      {
+        "scenario": "500 pairs authorization unavailable",
+        "historical": 8211,
+        "measured": 16393,
+        "pass": true
+      },
+      {
+        "scenario": "fan-in warm authorization",
+        "historical": 6405,
+        "measured": 10316,
+        "pass": true
+      },
+      {
+        "scenario": "fan-in authorization unavailable",
+        "historical": 6113,
+        "measured": 10476,
+        "pass": true
+      }
+    ]
+  },
+  "durable_latency": {
+    "storage": "native partition log v2",
+    "message_partitions": 4,
+    "state_partitions": 4,
+    "io_workers": 8,
+    "event_threads": 2,
+    "payload_bytes": 4096,
+    "seconds_per_rate": 30,
+    "subscriber_no_local": 1,
+    "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.",
+    "measurements": [
+      {
+        "filesystem": "ext2/ext3",
+        "scenario": "one publisher and one persistent consumer",
+        "connections": 2,
+        "offered_messages_per_second": null,
+        "delivered": 256,
+        "elapsed_s": 0.619,
+        "delivered_per_second": 414,
+        "publish_to_receive_ms": {
+          "p50": 2.164,
+          "p95": 3.221,
+          "p99": 3.448,
+          "max": 3.58
+        },
+        "publish_to_puback_ms": {
+          "p50": 1.728,
+          "p95": 2.566,
+          "p99": 2.695,
+          "max": 3.492
+        },
+        "client_event_loop_lag_ms": {
+          "p50": 0.429,
+          "p95": 1.047,
+          "p99": 1.077,
+          "max": 1.077
+        },
+        "broker_thread_cpu_percent": [
+          3.2,
+          1.6,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "remote_authorization_calls": 0
+      },
+      {
+        "filesystem": "ext2/ext3",
+        "scenario": "1000 connections at 1000 messages/s",
+        "connections": 1000,
+        "offered_messages_per_second": 1000,
+        "delivered": 30000,
+        "elapsed_s": 30.001,
+        "delivered_per_second": 1000,
+        "publish_to_receive_ms": {
+          "p50": 1.559,
+          "p95": 2.749,
+          "p99": 3.5,
+          "max": 13.573
+        },
+        "publish_to_puback_ms": {
+          "p50": 1.575,
+          "p95": 2.64,
+          "p99": 3.187,
+          "max": 13.648
+        },
+        "client_event_loop_lag_ms": {
+          "p50": 0.492,
+          "p95": 1.038,
+          "p99": 1.102,
+          "max": 1.662
+        },
+        "broker_thread_cpu_percent": [
+          8.4,
+          8.4,
+          1.5,
+          1.5,
+          1.5
+        ],
+        "remote_authorization_calls": 0,
+        "schedule_lag_ms": {
+          "p50": 0.451,
+          "p95": 1.034,
+          "p99": 1.112,
+          "max": 3.435
+        },
+        "peak_active_tasks": 15
+      },
+      {
+        "filesystem": "ext2/ext3",
+        "scenario": "1000 connections at 3000 messages/s",
+        "connections": 1000,
+        "offered_messages_per_second": 3000,
+        "delivered": 90000,
+        "elapsed_s": 30.002,
+        "delivered_per_second": 3000,
+        "publish_to_receive_ms": {
+          "p50": 1.693,
+          "p95": 3.274,
+          "p99": 4.149,
+          "max": 16.593
+        },
+        "publish_to_puback_ms": {
+          "p50": 1.705,
+          "p95": 2.983,
+          "p99": 3.644,
+          "max": 15.524
+        },
+        "client_event_loop_lag_ms": {
+          "p50": 0.33,
+          "p95": 0.967,
+          "p99": 1.088,
+          "max": 1.233
+        },
+        "broker_thread_cpu_percent": [
+          19.0,
+          18.9,
+          3.7,
+          3.7,
+          3.7
+        ],
+        "remote_authorization_calls": 0,
+        "schedule_lag_ms": {
+          "p50": 0.35,
+          "p95": 1.01,
+          "p99": 1.152,
+          "max": 2.215
+        },
+        "peak_active_tasks": 37
+      },
+      {
+        "filesystem": "ext2/ext3",
+        "scenario": "1000 connections, saturated window 4",
+        "connections": 1000,
+        "offered_messages_per_second": null,
+        "delivered": 64000,
+        "elapsed_s": 3.772,
+        "delivered_per_second": 16967,
+        "publish_to_receive_ms": {
+          "p50": 48.593,
+          "p95": 69.141,
+          "p99": 77.893,
+          "max": 126.968
+        },
+        "publish_to_puback_ms": {
+          "p50": 62.783,
+          "p95": 83.222,
+          "p99": 88.496,
+          "max": 134.436
+        },
+        "client_event_loop_lag_ms": {
+          "p50": 45.858,
+          "p95": 69.072,
+          "p99": 72.412,
+          "max": 72.412
+        },
+        "broker_thread_cpu_percent": [
+          62.0,
+          61.2,
+          8.0,
+          8.0,
+          7.7
+        ],
+        "remote_authorization_calls": 0
+      }
+    ]
+  },
+  "durable_concurrency": [
+    {
+      "scenario": "durable healthy",
+      "connections": 1000,
+      "active_publishers": 500,
+      "mqtt_threads": 2,
+      "per_publisher_window": 4,
+      "content_bytes": 4096,
+      "delivered": 64000,
+      "authorization_requests": 0,
+      "delivered_per_second": 17457,
+      "elapsed_s": 3.666,
+      "p50_ms": 48.776,
+      "p95_ms": 67.368,
+      "p99_ms": 71.218,
+      "max_ms": 99.812,
+      "filesystem": "ext2/ext3",
+      "persistent_consumers": 500,
+      "durability": "partitioned append log, fdatasync before ACK",
+      "message_partitions": 4,
+      "state_partitions": 4,
+      "disk_threads": 8,
+      "io_queue_limit": 1024,
+      "io_queue_bytes": 16777216,
+      "subscriber_no_local": 1,
+      "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default."
+    },
+    {
+      "scenario": "durable cached authorization outage",
+      "connections": 1000,
+      "active_publishers": 500,
+      "mqtt_threads": 2,
+      "per_publisher_window": 4,
+      "content_bytes": 4096,
+      "delivered": 64000,
+      "authorization_requests": 0,
+      "delivered_per_second": 16393,
+      "elapsed_s": 3.904,
+      "p50_ms": 53.563,
+      "p95_ms": 75.207,
+      "p99_ms": 78.7,
+      "max_ms": 96.785,
+      "filesystem": "ext2/ext3",
+      "persistent_consumers": 500,
+      "durability": "partitioned append log, fdatasync before ACK",
+      "message_partitions": 4,
+      "state_partitions": 4,
+      "disk_threads": 8,
+      "io_queue_limit": 1024,
+      "io_queue_bytes": 16777216,
+      "subscriber_no_local": 1,
+      "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default."
+    }
+  ],
+  "durable_fan_in": [
+    {
+      "scenario": "durable healthy",
+      "connections": 129,
+      "active_publishers": 128,
+      "mqtt_threads": 2,
+      "per_publisher_window": 4,
+      "content_bytes": 4096,
+      "delivered": 8192,
+      "authorization_requests": 0,
+      "delivered_per_second": 10316,
+      "elapsed_s": 0.794,
+      "p50_ms": 43.396,
+      "p95_ms": 52.225,
+      "p99_ms": 75.132,
+      "max_ms": 85.455,
+      "filesystem": "ext2/ext3",
+      "persistent_consumers": 1,
+      "durability": "partitioned append log, fdatasync before ACK",
+      "message_partitions": 4,
+      "state_partitions": 4,
+      "disk_threads": 8,
+      "io_queue_limit": 1024,
+      "io_queue_bytes": 16777216,
+      "subscriber_no_local": 1,
+      "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default."
+    },
+    {
+      "scenario": "durable cached authorization outage",
+      "connections": 129,
+      "active_publishers": 128,
+      "mqtt_threads": 2,
+      "per_publisher_window": 4,
+      "content_bytes": 4096,
+      "delivered": 8192,
+      "authorization_requests": 0,
+      "delivered_per_second": 10476,
+      "elapsed_s": 0.782,
+      "p50_ms": 43.402,
+      "p95_ms": 53.45,
+      "p99_ms": 57.695,
+      "max_ms": 63.003,
+      "filesystem": "ext2/ext3",
+      "persistent_consumers": 1,
+      "durability": "partitioned append log, fdatasync before ACK",
+      "message_partitions": 4,
+      "state_partitions": 4,
+      "disk_threads": 8,
+      "io_queue_limit": 1024,
+      "io_queue_bytes": 16777216,
+      "subscriber_no_local": 1,
+      "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default."
+    }
+  ],
+  "grpc_stress": {
+    "settings": {
+      "broker": "/workspace/build-container/mqtts",
+      "authz_fixture": "/tmp/mqtts-authz-fixture",
+      "pairs": 500,
+      "seconds": 60.0,
+      "outage_seconds": 15.0,
+      "rate": 4000,
+      "cold_seconds": 10.0,
+      "cold_rate": 1000,
+      "payload_bytes": 4096,
+      "fanout_messages": 100,
+      "queue_capacity": 1024,
+      "report": "/tmp/mqtt-grpc-stress.json"
+    },
+    "transport": "loopback TCP MQTT + plaintext gRPC",
+    "mqtt_threads": 2,
+    "rpc_workers": 4,
+    "rpc_queue_capacity": 1024,
+    "cache_ttl_ms": 10000,
+    "subscriber_no_local": 1,
+    "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.",
+    "cpu_max": null,
+    "memory_max": null,
+    "phases": [
+      {
+        "scenario": "simultaneous CONNECT",
+        "attempted": 1000,
+        "accepted": 1000,
+        "rejected_or_failed": 0,
+        "elapsed_s": 1.28,
+        "accepted_latency": {
+          "p50_ms": 1046.491,
+          "p95_ms": 1234.944,
+          "p99_ms": 1261.261,
+          "max_ms": 1261.546
+        },
+        "examples": [],
+        "authentication_rpcs": 1000,
+        "connections_after_controlled_retry": 1000
+      },
+      {
+        "scenario": "sustained, including 10-second cache refresh",
+        "offered": 240000,
+        "offered_per_second": 4000,
+        "elapsed_s": 60.0,
+        "outcomes": {
+          "delivered": 240000
+        },
+        "errors": [],
+        "delivered_per_second": 4000.0,
+        "send_latency": {
+          "p50_ms": 0.453,
+          "p95_ms": 1.805,
+          "p99_ms": 2.272,
+          "max_ms": 22.857
+        },
+        "schedule_latency": {
+          "p50_ms": 1.211,
+          "p95_ms": 2.423,
+          "p99_ms": 6.457,
+          "max_ms": 29.042
+        },
+        "resources": {
+          "broker": {
+            "peak_rss_mib": 85.1,
+            "peak_fds": 1011,
+            "peak_threads": 17,
+            "cpu_cores": 0.301
+          },
+          "authz": {
+            "peak_rss_mib": 25.8,
+            "peak_fds": 9,
+            "peak_threads": 8,
+            "cpu_cores": 0.009
+          },
+          "generator": {
+            "peak_rss_mib": 60.8,
+            "peak_fds": 1008,
+            "peak_threads": 1,
+            "cpu_cores": 0.418
+          }
+        },
+        "authorization": {
+          "batches": 2397,
+          "items": 5212,
+          "max_batch": 32
+        }
+      },
+      {
+        "scenario": "authz paused beyond cache freshness",
+        "offered": 60000,
+        "offered_per_second": 4000,
+        "elapsed_s": 15.0,
+        "outcomes": {
+          "delivered": 60000
+        },
+        "errors": [],
+        "delivered_per_second": 3999.9,
+        "send_latency": {
+          "p50_ms": 0.493,
+          "p95_ms": 1.874,
+          "p99_ms": 2.527,
+          "max_ms": 24.939
+        },
+        "schedule_latency": {
+          "p50_ms": 1.234,
+          "p95_ms": 2.535,
+          "p99_ms": 7.054,
+          "max_ms": 28.819
+        },
+        "resources": {
+          "broker": {
+            "peak_rss_mib": 85.4,
+            "peak_fds": 1011,
+            "peak_threads": 17,
+            "cpu_cores": 0.331
+          },
+          "authz": {
+            "peak_rss_mib": 19.4,
+            "peak_fds": 9,
+            "peak_threads": 8,
+            "cpu_cores": 0.0
+          },
+          "generator": {
+            "peak_rss_mib": 50.1,
+            "peak_fds": 1008,
+            "peak_threads": 1,
+            "cpu_cores": 0.442
+          }
+        }
+      },
+      {
+        "scenario": "authorization recovery after resume",
+        "probe_denied": 0,
+        "elapsed_s": 1.204
+      },
+      {
+        "scenario": "every publish requires gRPC authorization",
+        "offered": 10000,
+        "offered_per_second": 1000,
+        "elapsed_s": 10.001,
+        "outcomes": {
+          "delivered": 10000
+        },
+        "errors": [],
+        "delivered_per_second": 999.9,
+        "send_latency": {
+          "p50_ms": 2.555,
+          "p95_ms": 3.451,
+          "p99_ms": 4.024,
+          "max_ms": 24.706
+        },
+        "schedule_latency": {
+          "p50_ms": 2.881,
+          "p95_ms": 4.258,
+          "p99_ms": 8.179,
+          "max_ms": 25.188
+        },
+        "resources": {
+          "broker": {
+            "peak_rss_mib": 89.0,
+            "peak_fds": 1013,
+            "peak_threads": 17,
+            "cpu_cores": 0.309
+          },
+          "authz": {
+            "peak_rss_mib": 20.2,
+            "peak_fds": 9,
+            "peak_threads": 8,
+            "cpu_cores": 0.222
+          },
+          "generator": {
+            "peak_rss_mib": 48.1,
+            "peak_fds": 1008,
+            "peak_threads": 1,
+            "cpu_cores": 0.216
+          }
+        },
+        "authorization": {
+          "batches": 10208,
+          "items": 10500,
+          "max_batch": 32
+        }
+      },
+      {
+        "scenario": "cold burst after revision change, 800 ms service delay",
+        "cold_attempted": 498,
+        "cold_outcomes": {
+          "publish_denied": 498
+        },
+        "elapsed_s": 2.005,
+        "authorization_batches": 5,
+        "authorization_items": 79,
+        "peak_service_rpcs": 5,
+        "warm": {
+          "scenario": "warm pair during slow cold authorization burst",
+          "offered": 200,
+          "offered_per_second": 100,
+          "elapsed_s": 1.993,
+          "outcomes": {
+            "delivered": 200
+          },
+          "errors": [],
+          "delivered_per_second": 100.4,
+          "send_latency": {
+            "p50_ms": 2.229,
+            "p95_ms": 2.771,
+            "p99_ms": 3.442,
+            "max_ms": 8.219
+          },
+          "schedule_latency": {
+            "p50_ms": 2.855,
+            "p95_ms": 4.424,
+            "p99_ms": 20.53,
+            "max_ms": 20.72
+          },
+          "resources": {
+            "broker": {
+              "peak_rss_mib": 92.1,
+              "peak_fds": 1509,
+              "peak_threads": 17,
+              "cpu_cores": 0.06
+            },
+            "authz": {
+              "peak_rss_mib": 22.7,
+              "peak_fds": 9,
+              "peak_threads": 8,
+              "cpu_cores": 0.005
+            },
+            "generator": {
+              "peak_rss_mib": 48.1,
+              "peak_fds": 1008,
+              "peak_threads": 1,
+              "cpu_cores": 0.1
+            }
+          }
+        }
+      },
+      {
+        "scenario": "recovery and revocation",
+        "recovered": true,
+        "revoked_subscribe_denied": true
+      },
+      {
+        "scenario": "group fanout",
+        "subscribers": 499,
+        "published": 100,
+        "delivered": 49900,
+        "elapsed_s": 1.315,
+        "delivered_per_second": 37959.9,
+        "latency": {
+          "p50_ms": 7.814,
+          "p95_ms": 12.424,
+          "p99_ms": 13.106,
+          "max_ms": 16.133
+        }
+      }
+    ],
+    "regression_checks_passed": true,
+    "connect_burst_lossless": true
+  },
+  "retain": {
+    "subscriber_no_local": 1,
+    "no_local_note": "MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.",
+    "broker": "/workspace/build-container/mqtts",
+    "event_threads": 2,
+    "persistence": false,
+    "auth": false,
+    "payload_bytes_retain0": 4096,
+    "retained_messages": 100000,
+    "retained_payload_bytes": 10,
+    "retain_limits": {
+      "max_messages": 100000,
+      "max_deliver_per_subscribe": 1000,
+      "max_total_bytes": 268435456
+    },
+    "topic_alias_maximum": 65535,
+    "fill_send_s": 0.182,
+    "stored_when_loaded": {
+      "publish_received": 102100,
+      "publish_received_bytes": 9601600,
+      "publish_sent": 2100,
+      "publish_sent_bytes": 8601600,
+      "bytes_received": 11345788,
+      "bytes_sent": 8649975,
+      "keepalive_timeouts": 0,
+      "connect_timeouts": 0,
+      "session_takeovers": 0,
+      "malformed_packet_disconnects": 0,
+      "outbound_packet_size_drops": 0,
+      "inflight_window_delays": 0,
+      "wills_published": 0,
+      "wills_rejected": 0,
+      "retained_messages": 100000,
+      "retained_bytes": 1000000,
+      "retained_not_stored": 0,
+      "retained_delivery_truncated": 0
+    },
+    "retain0_empty_store": {
+      "samples": 2000,
+      "publish_to_receive_ms": {
+        "p50": 1.129,
+        "p95": 1.33,
+        "p99": 1.382,
+        "max": 1.478
+      }
+    },
+    "retain0_store_loaded": {
+      "samples": 2000,
+      "publish_to_receive_ms": {
+        "p50": 1.131,
+        "p95": 1.334,
+        "p99": 1.399,
+        "max": 1.704
+      }
+    },
+    "retain0_p99_loaded_over_empty": 1.0123,
+    "retain0_p99_within_10_percent": true,
+    "wildcard": {
+      "filter": "store/#",
+      "trials": 15,
+      "expected_deliveries": 1000,
+      "subscribe_to_last_ms": {
+        "p50": 94.752,
+        "p95": 126.626,
+        "p99": 126.626,
+        "max": 126.626
+      },
+      "suback_to_last_ms": {
+        "p50": 94.69,
+        "p95": 126.383,
+        "p99": 126.383,
+        "max": 126.383
+      },
+      "subscribe_to_first_ms": {
+        "p50": 70.47,
+        "p95": 100.339,
+        "p99": 100.339,
+        "max": 100.339
+      },
+      "first_topic": "store/000000",
+      "last_topic": "store/000999",
+      "truncated_counter_after_trials": 15,
+      "retained_messages_after_trials": 100000,
+      "trials_raw": [
+        {
+          "subscribe_to_suback_ms": 0.04,
+          "subscribe_to_first_ms": 76.368,
+          "subscribe_to_last_ms": 100.14,
+          "suback_to_last_ms": 100.1,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.062,
+          "subscribe_to_first_ms": 70.165,
+          "subscribe_to_last_ms": 94.752,
+          "suback_to_last_ms": 94.69,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.243,
+          "subscribe_to_first_ms": 100.339,
+          "subscribe_to_last_ms": 126.626,
+          "suback_to_last_ms": 126.383,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.315,
+          "subscribe_to_first_ms": 77.498,
+          "subscribe_to_last_ms": 102.266,
+          "suback_to_last_ms": 101.951,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.058,
+          "subscribe_to_first_ms": 90.476,
+          "subscribe_to_last_ms": 114.058,
+          "suback_to_last_ms": 114.0,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.063,
+          "subscribe_to_first_ms": 69.071,
+          "subscribe_to_last_ms": 92.921,
+          "suback_to_last_ms": 92.857,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.357,
+          "subscribe_to_first_ms": 87.862,
+          "subscribe_to_last_ms": 112.493,
+          "suback_to_last_ms": 112.136,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.43,
+          "subscribe_to_first_ms": 69.086,
+          "subscribe_to_last_ms": 92.983,
+          "suback_to_last_ms": 92.553,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.049,
+          "subscribe_to_first_ms": 71.818,
+          "subscribe_to_last_ms": 94.92,
+          "suback_to_last_ms": 94.871,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.055,
+          "subscribe_to_first_ms": 68.303,
+          "subscribe_to_last_ms": 92.657,
+          "suback_to_last_ms": 92.602,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.443,
+          "subscribe_to_first_ms": 69.045,
+          "subscribe_to_last_ms": 92.46,
+          "suback_to_last_ms": 92.018,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.063,
+          "subscribe_to_first_ms": 68.785,
+          "subscribe_to_last_ms": 93.377,
+          "suback_to_last_ms": 93.314,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.05,
+          "subscribe_to_first_ms": 68.673,
+          "subscribe_to_last_ms": 92.536,
+          "suback_to_last_ms": 92.486,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.05,
+          "subscribe_to_first_ms": 72.991,
+          "subscribe_to_last_ms": 96.633,
+          "suback_to_last_ms": 96.583,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        },
+        {
+          "subscribe_to_suback_ms": 0.071,
+          "subscribe_to_first_ms": 70.47,
+          "subscribe_to_last_ms": 93.752,
+          "suback_to_last_ms": 93.681,
+          "delivered": 1000,
+          "first_topic": "store/000000",
+          "last_topic": "store/000999"
+        }
+      ]
+    }
+  }
+}

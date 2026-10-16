@@ -121,7 +121,7 @@ async def run(fixture, count, rates, seconds, saturated_messages):
             reader=await PersistentClient.connect(fixture.port,'reader-'+str(index));clients.append(reader)
             writer=await AsyncClient.connect(fixture.port,'writer-'+str(index));clients.append(writer)
             pair=TimedPair(reader,writer,index,4096)
-            assert await reader.subscribe(pair.topic)==1
+            assert await reader.subscribe(pair.topic, no_local=True)==1
             await pair.transfer()
             return pair
     try:
@@ -154,6 +154,9 @@ def main():
             fixture.fresh=300000
             results.extend(asyncio.run(run(fixture,count,rates,args.seconds,args.saturated_messages)))
     Path(args.report).write_text(json.dumps(dict(storage='native partition log v2',message_partitions=4,state_partitions=4,
-        io_workers=8,event_threads=2,payload_bytes=4096,seconds_per_rate=args.seconds,measurements=results),indent=2)+'\n')
+        io_workers=8,event_threads=2,payload_bytes=4096,seconds_per_rate=args.seconds,
+        subscriber_no_local=1,
+        no_local_note='MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.',
+        measurements=results),indent=2)+'\n')
 
 if __name__=='__main__':main()
