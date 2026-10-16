@@ -587,6 +587,79 @@ TEST(Phase0Takeover, ReservationBlocksASecondClaim)
   delete original;
 }
 
+TEST(Phase0Flow, PacketIdsSkipInflightAndWrap)
+{
+  mqtt::ConnectionFlow flow;
+  flow.observe_client(2, 1024);
+  const auto first = flow.allocate_outbound(nullptr, nullptr);
+  const auto second = flow.allocate_outbound(nullptr, nullptr);
+  const auto blocked = flow.allocate_outbound(nullptr, nullptr);
+  ASSERT_EQ(first.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+  ASSERT_EQ(first.id, 1);
+  ASSERT_EQ(second.id, 2);
+  EXPECT_EQ(blocked.status, mqtt::ConnectionFlow::AllocateStatus::WindowFull);
+  EXPECT_EQ(flow.outbound_inflight(), 2);
+
+  flow.release_outbound(1);
+  const auto third = flow.allocate_outbound(nullptr, nullptr);
+  EXPECT_EQ(third.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+  EXPECT_EQ(third.id, 3);
+  EXPECT_FALSE(flow.outbound_holds(1));
+
+  mqtt::ConnectionFlow wide;
+  wide.observe_client(65535, 268435455);
+  uint16_t oldest = 0;
+  for (int i = 0; i < 65535; ++i) {
+    const auto allocated = wide.allocate_outbound(nullptr, nullptr);
+    ASSERT_EQ(allocated.status, mqtt::ConnectionFlow::AllocateStatus::Ready) << i;
+    ASSERT_EQ(allocated.id, static_cast<uint16_t>(i + 1));
+    if (i == 0) {
+      oldest = allocated.id;
+    }
+  }
+  EXPECT_EQ(wide.allocate_outbound(nullptr, nullptr).status,
+            mqtt::ConnectionFlow::AllocateStatus::WindowFull);
+  wide.release_outbound(oldest);
+  const auto reused = wide.allocate_outbound(nullptr, nullptr);
+  EXPECT_EQ(reused.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+  EXPECT_EQ(reused.id, oldest);
+  EXPECT_EQ(wide.allocate_outbound(nullptr, nullptr).status,
+            mqtt::ConnectionFlow::AllocateStatus::WindowFull);
+}
+
+TEST(Phase0Flow, OutboundAllocationSkipsIdsHeldElsewhere)
+{
+  mqtt::ConnectionFlow flow;
+  const auto skipped = flow.allocate_outbound(
+      [](uint16_t id, void*) { return id == 1 ? 1 : 0; }, nullptr);
+  EXPECT_EQ(skipped.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+  EXPECT_EQ(skipped.id, 2);
+  EXPECT_FALSE(flow.outbound_holds(1));
+
+  const auto busy = flow.allocate_outbound(
+      [](uint16_t, void*) { return 2; }, nullptr);
+  EXPECT_EQ(busy.status, mqtt::ConnectionFlow::AllocateStatus::Busy);
+  EXPECT_EQ(flow.outbound_inflight(), 1);
+}
+
+TEST(Phase0Flow, InboundQos2DedupAndReceiveMaximum)
+{
+  mqtt::ConnectionFlow flow;
+  flow.set_server_limits(128, 1, 2);
+  EXPECT_FALSE(flow.inbound_too_large(128));
+  EXPECT_TRUE(flow.inbound_too_large(129));
+  EXPECT_EQ(flow.admit_qos2(7), mqtt::ConnectionFlow::Qos2Admit::Forward);
+  EXPECT_EQ(flow.admit_qos2(7), mqtt::ConnectionFlow::Qos2Admit::Duplicate);
+  EXPECT_EQ(flow.admit_qos2(8), mqtt::ConnectionFlow::Qos2Admit::Exceeded);
+  EXPECT_EQ(flow.inbound_qos2_waiting(), 1);
+  flow.release_qos2(7);
+  EXPECT_EQ(flow.admit_qos2(8), mqtt::ConnectionFlow::Qos2Admit::Forward);
+  flow.observe_client(1, 100);
+  EXPECT_TRUE(flow.outbound_too_large(101));
+  EXPECT_FALSE(flow.outbound_too_large(100));
+  EXPECT_EQ(flow.max_qos(), 2);
+}
+
 int main(int argc, char** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

@@ -29,6 +29,9 @@ public:
     // The actual processing is done by the WebSocketProtocolHandler
     void request_session_takeover(const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) override;
 
+protected:
+    int transmit_serialized(const uint8_t* data, size_t size) override;
+
 private:
     MQTTAllocator* adapter_allocator_;
     WebSocketMQTTBridge* bridge_;

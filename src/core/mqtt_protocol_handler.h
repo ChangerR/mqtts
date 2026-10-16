@@ -19,6 +19,7 @@
 #include "mqtt_runtime.h"
 #include "mqtt_config.h"
 #include "mqtt_connection_watch.h"
+#include "mqtt_flow_control.h"
 #include "mqtt_socket.h"
 #include "mqtt_takeover.h"
 #include "mqtt_stl_allocator.h"
@@ -61,6 +62,7 @@ class MQTTProtocolHandler
     if (limits) {
       allow_mqtt3x_ = limits->allow_mqtt3x;
     }
+    sync_server_flow_limits();
   }
   const ProtocolLimits& effective_limits() const;
   bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
@@ -114,12 +116,18 @@ class MQTTProtocolHandler
   virtual bool is_connected() const { return connected_; }
   void set_client_id(const MQTTString& client_id) { client_id_ = client_id; }
   const MQTTString& get_client_id() const { return client_id_; }
-  uint16_t get_next_packet_id()
+  uint16_t get_next_packet_id();
+
+  // 客户端在 CONNECT 里声明的接收窗口和最大报文。所有会话都记录，不只是持久化会话。
+  void observe_client_flow(uint8_t protocol_version, uint16_t receive_maximum,
+                          uint32_t maximum_packet_size);
+  uint8_t granted_qos_limit() const;
+  ConnectionFlow::Qos2Admit admit_inbound_qos2(uint16_t packet_id);
+  void release_inbound_qos2(uint16_t packet_id);
+  void release_outbound_packet_id(uint16_t packet_id);
+  bool outbound_packet_id_inflight(uint16_t packet_id) const
   {
-    uint16_t id = next_packet_id_++;
-    if (next_packet_id_ == 0)
-      next_packet_id_ = 1;
-    return id;
+    return flow_.outbound_holds(packet_id);
   }
 
   // Topic subscription management
@@ -167,7 +175,7 @@ class MQTTProtocolHandler
   runtime::TaskHandle durable_task_;
   std::shared_ptr<DurableStore::Signal> durable_revision_;
   void pump_durable();
-  uint16_t next_packet_id_;
+  ConnectionFlow flow_;
 
   // Topic subscriptions
   MQTTVector<MQTTString> subscriptions_;
@@ -227,7 +235,15 @@ class MQTTProtocolHandler
 
   void arm_connection_watch();
   int fail_protocol(ReasonCode reason, int err);
+  int close_for_flow(ReasonCode reason, int err);
   void signal_takeover_done();
+  void sync_server_flow_limits();
+  uint32_t inbound_packet_limit() const;
+  static int claim_outbound_packet_id(uint16_t id, void* arg);
+  ConnectionFlow::Allocation allocate_outbound_packet_id();
+
+ protected:
+  virtual int transmit_serialized(const uint8_t* data, size_t size);
 };
 
 }  // namespace mqtt

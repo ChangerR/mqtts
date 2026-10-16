@@ -165,7 +165,8 @@ class SendWorkerPool
    * @brief 处理单个发送任务
    * @param task 任务
    * @param worker_id Worker ID
-   * @return MQ_SUCCESS, MQ_ERR_AUTH_PENDING, or a terminal error
+   * @return MQ_SUCCESS, MQ_ERR_AUTH_PENDING, MQ_ERR_INFLIGHT_WINDOW,
+   *         MQ_ERR_PACKET_DROPPED, or a terminal error
    */
   int process_send_task(WorkerSendTask& task, size_t worker_id);
 

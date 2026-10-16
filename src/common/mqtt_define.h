@@ -45,6 +45,9 @@
 #define MQ_ERR_PUBLISH_RETAIN -404
 #define MQ_ERR_PUBLISH_NOT_AUTHORIZED -405
 #define MQ_ERR_PUBLISH_QUOTA -406
+#define MQ_ERR_INFLIGHT_WINDOW -407
+#define MQ_ERR_PACKET_DROPPED -408
+#define MQ_ERR_FLOW_CLOSED -409
 
 // MQTT Subscribe error codes (-500 to -599)
 #define MQ_ERR_SUBSCRIBE -500
@@ -218,6 +221,12 @@ static inline const char* mqtt_error_string(int error_code)
       return "Not authorized to publish";
     case MQ_ERR_PUBLISH_QUOTA:
       return "Publish quota exceeded";
+    case MQ_ERR_INFLIGHT_WINDOW:
+      return "Outbound receive window is full";
+    case MQ_ERR_PACKET_DROPPED:
+      return "Outbound packet dropped";
+    case MQ_ERR_FLOW_CLOSED:
+      return "Connection closed by flow control";
 
     // Subscribe errors
     case MQ_ERR_SUBSCRIBE:

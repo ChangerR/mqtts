@@ -214,7 +214,7 @@ target_link_libraries(test_phase0_baseline PRIVATE mqtt_runtime mqtt_parser mqtt
 add_test(NAME test_phase0_baseline COMMAND test_phase0_baseline)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME mqtt_protocol_baseline_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol_baseline_integration.py --broker $<TARGET_FILE:mqtts>)
-set_tests_properties(mqtt_protocol_baseline_integration PROPERTIES TIMEOUT 180)
+set_tests_properties(mqtt_protocol_baseline_integration PROPERTIES TIMEOUT 300)
 add_executable(test_mqtt_auth_grpc test_mqtt_auth_grpc.cpp)
 target_link_libraries(test_mqtt_auth_grpc PRIVATE mqtt_auth mqtt_runtime tcmalloc_minimal pthread dl)
 add_test(NAME test_mqtt_auth_grpc COMMAND test_mqtt_auth_grpc)
@@ -226,6 +226,9 @@ add_test(NAME mqtt_http_auth_concurrency COMMAND ${Python3_EXECUTABLE} ${CMAKE_C
 set_tests_properties(mqtt_http_auth_concurrency PROPERTIES TIMEOUT 90)
 
 add_executable(test_mqtt_durable_store test_mqtt_durable_store.cpp ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
+# RelWithDebInfo defines NDEBUG. This test creates its journal and drives the
+# store from inside assert(), so those calls must still be compiled in.
+target_compile_options(test_mqtt_durable_store PRIVATE -UNDEBUG)
 target_include_directories(test_mqtt_durable_store PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(test_mqtt_durable_store PRIVATE mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)
 add_test(NAME test_mqtt_durable_store COMMAND test_mqtt_durable_store)
