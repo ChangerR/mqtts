@@ -233,6 +233,8 @@ target_include_directories(test_mqtt_durable_store PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(test_mqtt_durable_store PRIVATE mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)
 add_test(NAME test_mqtt_durable_store COMMAND test_mqtt_durable_store)
 add_executable(test_mqtt_partition_journal test_mqtt_partition_journal.cpp ${CMAKE_SOURCE_DIR}/src/common/logger.cpp)
+# Same as test_mqtt_durable_store: mkdtemp and the checks live inside assert().
+target_compile_options(test_mqtt_partition_journal PRIVATE -UNDEBUG)
 target_include_directories(test_mqtt_partition_journal PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(test_mqtt_partition_journal PRIVATE cxx_std_17)
 target_link_libraries(test_mqtt_partition_journal PRIVATE mqtt_parser mqtt_runtime tcmalloc_minimal pthread dl)

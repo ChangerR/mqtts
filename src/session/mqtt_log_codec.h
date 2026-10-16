@@ -66,6 +66,7 @@ class Decoder
     if (pos_ != data_.size())
       throw std::runtime_error("journal trailing fields");
   }
+  size_t remaining() const { return data_.size() - pos_; }
 
  private:
   const std::string& data_;
@@ -78,5 +79,54 @@ class Decoder
 };
 uint32_t checksum(const char* data, size_t size);
 uint64_t topic_hash(const std::string& text);
+
+// Version 1 subscription body: filter, QoS, version, MQTT option bits.
+// A journal record that ends after QoS is the legacy body; options decode as 0.
+constexpr uint8_t kStoredSubscriptionVersion = 1;
+struct StoredSubscription
+{
+  uint8_t qos = 0;
+  bool no_local = false;
+  bool retain_as_published = false;
+  uint8_t retain_handling = 0;
+};
+inline uint8_t subscription_flags(const StoredSubscription& sub)
+{
+  return static_cast<uint8_t>((sub.qos & 0x03) | (sub.no_local ? 0x04 : 0) |
+                              (sub.retain_as_published ? 0x08 : 0) |
+                              ((sub.retain_handling & 0x03) << 4));
+}
+inline void apply_subscription_flags(StoredSubscription& sub, uint8_t flags)
+{
+  if ((flags & 0xC0) != 0 || ((flags >> 4) & 0x03) == 3)
+    throw std::runtime_error("invalid stored subscription options");
+  if ((flags & 0x03) != (sub.qos & 0x03))
+    throw std::runtime_error("stored subscription QoS mismatch");
+  sub.no_local = (flags & 0x04) != 0;
+  sub.retain_as_published = (flags & 0x08) != 0;
+  sub.retain_handling = static_cast<uint8_t>((flags >> 4) & 0x03);
+}
+inline void write_subscription_record(Encoder& e, const std::string& filter,
+                                      const StoredSubscription& sub)
+{
+  e.text(filter);
+  e.u8(sub.qos);
+  e.u8(kStoredSubscriptionVersion);
+  e.u8(subscription_flags(sub));
+}
+inline void read_subscription_options(Decoder& d, StoredSubscription& sub)
+{
+  const uint8_t version = d.u8();
+  if (version != kStoredSubscriptionVersion)
+    throw std::runtime_error("unsupported subscription record version");
+  apply_subscription_flags(sub, d.u8());
+}
+// Legacy journal subscriptions have no tail. A versioned tail must be complete.
+inline void read_legacy_subscription_options(Decoder& d, StoredSubscription& sub)
+{
+  if (d.remaining() == 0)
+    return;
+  read_subscription_options(d, sub);
+}
 }  // namespace journal
 }  // namespace mqtt

@@ -532,7 +532,11 @@ void test_persistent_connection_has_one_packet_id_owner()
         }, &context);
         assert(task.join(2000) == 0);
         auto resumed = manager.durable_store()->connect("persistent-reader", "owner", false, 60);
-        assert(resumed.ok && resumed.subscriptions.size() == 1 && resumed.subscriptions[0].second == 1);
+        assert(resumed.ok && resumed.subscriptions.size() == 1 &&
+               resumed.subscriptions[0].second.qos == 1);
+        assert(!resumed.subscriptions[0].second.no_local);
+        assert(!resumed.subscriptions[0].second.retain_as_published);
+        assert(resumed.subscriptions[0].second.retain_handling == 0);
 
     }
     std::filesystem::remove_all(root);

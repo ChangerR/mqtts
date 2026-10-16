@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include "mqtt_config.h"
+#include "mqtt_log_codec.h"
 
 namespace mqtt {
 
@@ -50,7 +51,7 @@ class DurableStore
     int64_t overflow_sequence = 0;
     size_t accepted_targets = 0;
     std::string error;
-    std::vector<std::pair<std::string, uint8_t>> subscriptions;
+    std::vector<std::pair<std::string, journal::StoredSubscription>> subscriptions;
     std::vector<std::string> targets;
     std::vector<Delivery> deliveries;
     // Shared lifetime bounds delivery copies even when a socket remains slow.
@@ -63,12 +64,20 @@ class DurableStore
   Result connect(const std::string& client, const std::string& owner, bool clean, uint32_t expiry);
   Result disconnect(const std::string& client, uint64_t epoch, int64_t expiry_override = -1);
   Result subscribe(const std::string& client, uint64_t epoch, const std::string& filter,
-                   uint8_t qos);
+                   const journal::StoredSubscription& subscription);
+  Result subscribe(const std::string& client, uint64_t epoch, const std::string& filter,
+                   uint8_t qos)
+  {
+    journal::StoredSubscription subscription;
+    subscription.qos = qos;
+    return subscribe(client, epoch, filter, subscription);
+  }
   Result unsubscribe(const std::string& client, uint64_t epoch, const std::string& filter);
-  // exclude_sender is decided by the caller from in-memory subscription options.
-  // The on-disk subscription record still stores only QoS.
+  // implicit_no_local forces the publisher out, matching mqtt.implicit_no_local.
+  // Otherwise the publisher is skipped only when every matching stored subscription
+  // has No Local set. Legacy records decode with that flag clear.
   Result publish(const std::string& topic, const std::string& wire, const std::string& sender,
-                 int64_t expires, bool exclude_sender = true);
+                 int64_t expires, bool implicit_no_local = false);
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
   Result begin_delivery(const std::string& client, uint64_t epoch, int64_t sequence,
                         uint16_t packet_id);

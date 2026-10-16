@@ -47,6 +47,18 @@ def run(binary, importer):
             first=r.delivery();assert first[1]==expected[0] and first[2]==41 and first[3]
             assert r.delivery()[1]==expected[1];r.quiet()
             restart(f);r,present=client(f,'reader');assert present;r.quiet()
+            # Legacy rows have no option columns, so No Local stays clear and the
+            # restored session receives its own publish.
+            data=json.dumps(dict(actor='reader',nonce=7,data='legacy-self')).encode()
+            r.send(packet(0x32,utf('fixture/migrated')+b'\0\1\0'+data))
+            saw_ack=saw_echo=False
+            for _ in range(2):
+                head,body=r.read()
+                if head==0x40: saw_ack=body[:2]==b'\0\1' and (len(body)==2 or body[2]<128)
+                elif head>>4==3: saw_echo=body.endswith(data) and (head&1)==0
+                else: raise AssertionError((head,body))
+            assert saw_ack and saw_echo
+            r.quiet()
             client(f,'reader',owner='attacker',clean=True,expected=1)
         assert hashlib.sha256(source.read_bytes()).hexdigest()==before
         print('PASS read-only migration, ownership lock, destination refusal, session/Packet ID/ACK replay',flush=True)

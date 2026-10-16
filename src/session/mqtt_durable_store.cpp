@@ -158,7 +158,7 @@ struct DurableStore::Impl
     bool online = false, busy = false;
     uint16_t next_packet = 1;
     size_t bytes = 0;
-    std::map<std::string, uint8_t> subscriptions;
+    std::map<std::string, journal::StoredSubscription> subscriptions;
     std::map<int64_t, DeliveryState> pending;
     std::unordered_map<uint16_t, int64_t> packets;
     std::unordered_set<uint16_t> live_packet_ids;
@@ -166,10 +166,15 @@ struct DurableStore::Impl
     std::unordered_map<int64_t, uint16_t> recovery_claims;
     std::shared_ptr<Signal> signal;
   };
+  struct IndexedSubscription
+  {
+    std::shared_ptr<Session> session;
+    std::string filter;
+  };
   struct TopicNode
   {
     std::unordered_map<std::string, size_t> children;
-    std::unordered_map<std::string, std::shared_ptr<Session>> clients;
+    std::unordered_map<std::string, IndexedSubscription> clients;
   };
   PersistenceConfig config;
   mutable std::mutex mutex;
@@ -179,7 +184,8 @@ struct DurableStore::Impl
   std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
-  uint32_t format_version = 4;
+  static constexpr uint32_t kFormatVersion = 5;
+  uint32_t format_version = kFormatVersion;
   std::atomic<size_t> checkpoint_bytes{0};
   size_t pending = 0, bytes = 0, unique_bytes = 0, requests = 0, request_bytes = 0,
          metadata_bytes = 0, metadata_reserved = 0;
@@ -338,7 +344,7 @@ struct DurableStore::Impl
       offset = end + 1;
     }
     if (add) {
-      index[node].clients[s->client] = s;
+      index[node].clients[s->client] = IndexedSubscription{s, filter};
       return;
     }
     index[node].clients.erase(s->client);
@@ -351,12 +357,12 @@ struct DurableStore::Impl
       node = it->first;
     }
   }
-  void set_subscription(const std::shared_ptr<Session>& s, const std::string& filter, uint8_t qos,
-                        bool remove = false)
+  void set_subscription(const std::shared_ptr<Session>& s, const std::string& filter,
+                        const journal::StoredSubscription& sub, bool remove = false)
   {
     auto previous = s->subscriptions.find(filter);
     if (previous != s->subscriptions.end()) {
-      if (previous->second) {
+      if (previous->second.qos) {
         index_subscription(s, filter, false);
         --subscriptions;
       }
@@ -364,9 +370,9 @@ struct DurableStore::Impl
       s->subscriptions.erase(previous);
     }
     if (!remove) {
-      s->subscriptions[filter] = qos;
+      s->subscriptions[filter] = sub;
       metadata_bytes += subscription_cost(filter);
-      if (qos) {
+      if (sub.qos) {
         index_subscription(s, filter, true);
         ++subscriptions;
       }
@@ -401,7 +407,7 @@ struct DurableStore::Impl
       metadata_bytes += session_cost(s.second);
       for (const auto& sub : s.second->subscriptions) {
         metadata_bytes += subscription_cost(sub.first);
-        if (sub.second) {
+        if (sub.second.qos) {
           ++count;
           index_subscription(s.second, sub.first, true);
         }
@@ -459,7 +465,7 @@ struct DurableStore::Impl
       if (s->overflow_sequence)
         --isolated_sessions;
       while (!s->subscriptions.empty())
-        set_subscription(s, s->subscriptions.begin()->first, 0, true);
+        set_subscription(s, s->subscriptions.begin()->first, {}, true);
       metadata_bytes -= session_cost(s);
     }
     sessions.erase(s->client);
@@ -590,7 +596,12 @@ struct DurableStore::Impl
       }
     }
   }
-  std::vector<std::shared_ptr<Session>> match(const std::string& topic);
+  struct SubscriptionHit
+  {
+    std::shared_ptr<Session> session;
+    journal::StoredSubscription options;
+  };
+  std::vector<SubscriptionHit> match(const std::string& topic);
   void mark_overflow(const std::shared_ptr<Session>& s, int64_t sequence)
   {
     if (s->overflow_sequence)
@@ -610,6 +621,8 @@ struct DurableStore::Impl
   void heartbeat();
   void validate_state();
 };
+
+constexpr uint32_t DurableStore::Impl::kFormatVersion;
 
 DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
 {
@@ -654,7 +667,7 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
       if (d.text() != "MQTTS-PARTITION-LOG")
         throw std::runtime_error("invalid journal format");
       format_version = d.u32();
-      if ((format_version < 2 || format_version > 4) || d.u32() != config.partitions)
+      if ((format_version < 2 || format_version > kFormatVersion) || d.u32() != config.partitions)
         throw std::runtime_error(
             "journal format/partition count differs; offline migration required");
       d.end();
@@ -670,13 +683,14 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
     message_cuts.resize(config.partitions);
     state_cuts.resize(config.partitions);
     restore();
-    if (format_version < 4) {
+    // Subscription tails and checkpoint 5 are not readable by an older binary.
+    if (format_version < kFormatVersion) {
       Encoder marker;
       marker.text("MQTTS-PARTITION-LOG");
-      marker.u32(4);
+      marker.u32(kFormatVersion);
       marker.u32(uint32_t(config.partitions));
       journal::atomic_file(config.path + "/FORMAT", checked(marker.data));
-      format_version = 4;
+      format_version = kFormatVersion;
     }
     maintenance = std::thread(&Impl::maintain, this);
   } catch (...) {
@@ -892,7 +906,8 @@ DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_
   });
 }
 DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t epoch,
-                                             const std::string& filter, uint8_t qos)
+                                             const std::string& filter,
+                                             const journal::StoredSubscription& subscription)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
@@ -901,6 +916,8 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
       *r = stale();
       return {};
     }
+    if (subscription.qos > 2 || subscription.retain_handling > 2)
+      throw std::runtime_error("invalid stored subscription options");
     if (!s->subscriptions.count(filter) &&
         s->subscriptions.size() >= v.config.max_subscriptions_per_session)
       throw journal::AdmissionFull("persistent subscription limit");
@@ -912,24 +929,24 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
     size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
     const auto previous = s->subscriptions.find(filter);
     const bool existed = previous != s->subscriptions.end();
-    const uint8_t previous_qos = existed ? previous->second : 0;
+    const journal::StoredSubscription previous_sub =
+        existed ? previous->second : journal::StoredSubscription();
     Encoder e;
     e.u8(SUBSCRIBE);
     e.text(client);
     e.u64(s->generation);
-    e.text(filter);
-    e.u8(qos);
+    journal::write_subscription_record(e, filter, subscription);
     auto ticket =
         v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
           v.metadata_reserved -= reservation;
           s->busy = false;
           if (!ok)
             return;
-          v.set_subscription(s, filter, qos);
+          v.set_subscription(s, filter, subscription);
           *r = success();
           r->present = existed;
           if (existed)
-            r->subscriptions.emplace_back(filter, previous_qos);
+            r->subscriptions.emplace_back(filter, previous_sub);
         });
     v.metadata_reserved += reservation;
     s->busy = true;
@@ -956,7 +973,7 @@ DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64
           s->busy = false;
           if (!ok)
             return;
-          v.set_subscription(s, filter, 0, true);
+          v.set_subscription(s, filter, {}, true);
           *r = success();
         });
     s->busy = true;
@@ -964,10 +981,16 @@ DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64
   });
 }
 
-std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::match(
+std::vector<DurableStore::Impl::SubscriptionHit> DurableStore::Impl::match(
     const std::string& topic)
 {
-  std::set<std::shared_ptr<Session>> targets;
+  std::vector<SubscriptionHit> hits;
+  auto consider = [&](const IndexedSubscription& indexed) {
+    auto found = indexed.session->subscriptions.find(indexed.filter);
+    if (found == indexed.session->subscriptions.end() || !found->second.qos)
+      return;
+    hits.push_back(SubscriptionHit{indexed.session, found->second});
+  };
   std::vector<std::pair<size_t, size_t>> todo;
   todo.emplace_back(0, 0);
   while (!todo.empty()) {
@@ -978,10 +1001,10 @@ std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::ma
     auto hash = node.children.find("#");
     if (!system && hash != node.children.end())
       for (const auto& s : index[hash->second].clients)
-        targets.insert(s.second);
+        consider(s.second);
     if (item.second > topic.size()) {
       for (const auto& s : node.clients)
-        targets.insert(s.second);
+        consider(s.second);
       continue;
     }
     size_t end = topic.find('/', item.second),
@@ -994,30 +1017,45 @@ std::vector<std::shared_ptr<DurableStore::Impl::Session>> DurableStore::Impl::ma
     if (!system && plus != node.children.end())
       todo.emplace_back(plus->second, next);
   }
-  std::vector<std::shared_ptr<Session>> live;
-  for (const auto& s : targets) {
-    if (s->busy)
-      throw Deferred();
-    if (s->online || s->deadline > DurableStore::now_ms())
-      live.push_back(s);
-  }
-  return live;
+  return hits;
 }
 DurableStore::Result DurableStore::publish(const std::string& topic, const std::string& wire,
                                            const std::string& sender, int64_t expires,
-                                           bool exclude_sender)
+                                           bool implicit_no_local)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
     *r = success();
     if (expires > 0 && expires <= now_ms())
       return {};
-    auto targets = v.match(topic);
-    if (exclude_sender) {
-      targets.erase(std::remove_if(
-                        targets.begin(), targets.end(),
-                        [&](const std::shared_ptr<Impl::Session>& s) { return s->client == sender; }),
-                    targets.end());
+    struct Selected
+    {
+      std::shared_ptr<Impl::Session> session;
+      bool deliver = false;
+    };
+    std::vector<Selected> selected;
+    std::unordered_map<Impl::Session*, size_t> index;
+    for (const auto& hit : v.match(topic)) {
+      auto found = index.find(hit.session.get());
+      if (found == index.end()) {
+        if (hit.session->busy)
+          throw Deferred();
+        if (!(hit.session->online || hit.session->deadline > now_ms()))
+          continue;
+        index.emplace(hit.session.get(), selected.size());
+        selected.push_back(Selected{hit.session, false});
+        found = index.find(hit.session.get());
+      }
+      const bool sender_hit = hit.session->client == sender;
+      // No Local is applied per subscription before overlapping filters merge.
+      if (!sender_hit || !hit.options.no_local)
+        selected[found->second].deliver = true;
+    }
+    std::vector<std::shared_ptr<Impl::Session>> targets;
+    for (const auto& item : selected) {
+      if (item.session->client == sender && (implicit_no_local || !item.deliver))
+        continue;
+      targets.push_back(item.session);
     }
     if (targets.empty())
       return {};
@@ -1382,11 +1420,13 @@ void DurableStore::Impl::replay_control(const std::string& data, bool acknowledg
     }
   } else if (kind == SUBSCRIBE) {
     auto filter = d.text();
-    auto qos = d.u8();
-    if (qos > 2)
+    journal::StoredSubscription sub;
+    sub.qos = d.u8();
+    if (sub.qos > 2)
       throw std::runtime_error("invalid stored subscription QoS");
+    journal::read_legacy_subscription_options(d, sub);
     if (s)
-      s->subscriptions[filter] = qos;
+      s->subscriptions[filter] = sub;
   } else if (kind == UNSUBSCRIBE) {
     auto filter = d.text();
     if (s)
@@ -1492,10 +1532,12 @@ void DurableStore::Impl::restore()
     auto body = unchecked(file);
     Decoder d(body);
     const auto magic = d.text();
-    const bool gaps = magic == "MQTTS-CHECKPOINT-4";
+    const bool subscription_options = magic == "MQTTS-CHECKPOINT-5";
+    const bool gaps = subscription_options || magic == "MQTTS-CHECKPOINT-4";
     const bool embedded = gaps || magic == "MQTTS-CHECKPOINT-3";
     if ((!embedded && magic != "MQTTS-CHECKPOINT-2") || (embedded && format_version < 3) ||
-        (gaps && format_version < 4) || d.u32() != config.partitions)
+        (gaps && format_version < 4) || (subscription_options && format_version < 5) ||
+        d.u32() != config.partitions)
       throw std::runtime_error("checkpoint format/partition mismatch");
     checkpoint_bytes = file.size();
     next_id = d.u64();
@@ -1555,8 +1597,13 @@ void DurableStore::Impl::restore()
         throw std::runtime_error("checkpoint subscription limit");
       for (uint32_t j = 0; j < subs; ++j) {
         auto filter = d.text();
-        auto qos = d.u8();
-        s->subscriptions[filter] = qos;
+        journal::StoredSubscription sub;
+        sub.qos = d.u8();
+        if (sub.qos > 2)
+          throw std::runtime_error("invalid stored subscription QoS");
+        if (subscription_options)
+          journal::read_subscription_options(d, sub);
+        s->subscriptions[filter] = sub;
       }
       uint32_t entries = d.u32();
       if (entries > config.max_messages_per_session)
@@ -1660,7 +1707,7 @@ void DurableStore::Impl::checkpoint()
       int64_t overflow_sequence;
       bool online;
       uint16_t next_packet;
-      std::map<std::string, uint8_t> subscriptions;
+      std::map<std::string, journal::StoredSubscription> subscriptions;
       std::vector<std::pair<std::shared_ptr<Message>, uint16_t>> pending;
     };
     uint64_t snapshot_id;
@@ -1699,7 +1746,7 @@ void DurableStore::Impl::checkpoint()
       frozen = false;
     }
     Encoder e;
-    e.text("MQTTS-CHECKPOINT-4");
+    e.text("MQTTS-CHECKPOINT-5");
     e.u32(uint32_t(config.partitions));
     e.u64(snapshot_id);
     for (size_t p = 0; p < config.partitions; ++p) {
@@ -1732,10 +1779,8 @@ void DurableStore::Impl::checkpoint()
       e.u32(s.next_packet);
       e.u64(s.overflow_sequence);
       e.u32(uint32_t(s.subscriptions.size()));
-      for (const auto& sub : s.subscriptions) {
-        e.text(sub.first);
-        e.u8(sub.second);
-      }
+      for (const auto& sub : s.subscriptions)
+        journal::write_subscription_record(e, sub.first, sub.second);
       e.u32(uint32_t(s.pending.size()));
       for (const auto& entry : s.pending) {
         e.u64(entry.first->id);
@@ -1897,8 +1942,12 @@ void DurableStore::import_legacy(const std::string& exported)
         throw std::runtime_error("source exceeds import subscription limit");
       for (uint32_t j = 0; j < subs; ++j) {
         auto topic = d.text();
-        auto qos = d.u8();
-        s->subscriptions[topic] = qos;
+        journal::StoredSubscription sub;
+        sub.qos = d.u8();
+        if (sub.qos > 2)
+          throw std::runtime_error("invalid stored subscription QoS");
+        // SQLite export has no option columns. Missing options stay clear.
+        s->subscriptions[topic] = sub;
       }
       if (!v.sessions.emplace(s->client, s).second)
         throw std::runtime_error("duplicate legacy session");
