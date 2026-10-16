@@ -2569,6 +2569,9 @@ void MQTTProtocolHandler::pump_durable()
           continue;
         }
         if (output.size() > maximum_packet_size_) {
+          if (session_manager_) {
+            session_manager_->note_outbound_packet_size_drop();
+          }
           if (!discard(DurableStore::DiscardReason::PacketTooLarge))
             break;
           continue;

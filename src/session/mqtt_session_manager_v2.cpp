@@ -809,6 +809,7 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
   if (it != thread_managers_.end()) {
     LOG_WARN("Thread manager already registered for thread: {}",
              std::hash<std::thread::id>{}(thread_id));
+    claim_retained_seed(it->second->protocol_counters());
     return it->second.get();
   }
 
@@ -829,6 +830,7 @@ ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::th
 
   thread_managers_[thread_id] = std::move(manager);
   thread_manager_array_.push_back(manager_ptr);
+  claim_retained_seed(manager_ptr->protocol_counters());
 
   // 设置线程本地缓存
   cached_manager_owner_ = this;
@@ -977,6 +979,43 @@ void GlobalSessionManager::set_retain_config(const RetainConfig& config)
   }
 }
 
+void GlobalSessionManager::account_retained_result(const RetainWriteResult& result)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    note_retained_delta(result.message_delta, result.byte_delta);
+    if (result.kind == RetainWriteResult::Rejected) {
+      note_retained_not_stored();
+    }
+    return;
+  }
+  if (result.message_delta != 0) {
+    retained_seed_messages_.fetch_add(result.message_delta, std::memory_order_relaxed);
+  }
+  if (result.byte_delta != 0) {
+    retained_seed_bytes_.fetch_add(result.byte_delta, std::memory_order_relaxed);
+  }
+  if (result.kind == RetainWriteResult::Rejected) {
+    retained_seed_not_stored_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::claim_retained_seed(ProtocolCounters& counters)
+{
+  const int64_t messages = retained_seed_messages_.exchange(0, std::memory_order_relaxed);
+  const int64_t bytes = retained_seed_bytes_.exchange(0, std::memory_order_relaxed);
+  const uint64_t rejected = retained_seed_not_stored_.exchange(0, std::memory_order_relaxed);
+  if (messages != 0) {
+    counters.retained_messages.fetch_add(static_cast<uint64_t>(messages), std::memory_order_relaxed);
+  }
+  if (bytes != 0) {
+    counters.retained_bytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+  }
+  if (rejected != 0) {
+    counters.retained_not_stored.fetch_add(rejected, std::memory_order_relaxed);
+  }
+}
+
 void GlobalSessionManager::note_retained_delta(int64_t messages, int64_t bytes)
 {
   // 恢复发生在事件线程注册之前。记在有符号总量上，避免后来的负增量把未初始化的计数绕回。
@@ -1062,7 +1101,7 @@ void GlobalSessionManager::restore_retained_messages()
     const RetainWriteResult result = retain_store_->store(
         packet, to_mqtt_string(item.sender, &restore_allocator), retain_config_,
         std::chrono::steady_clock::now());
-    note_retained_delta(result.message_delta, result.byte_delta);
+    account_retained_result(result);
     if (result.kind == RetainWriteResult::Rejected && result.warn) {
       LOG_WARN("Recovered retained message on topic {} was not stored: {}", item.topic, result.warn);
     }

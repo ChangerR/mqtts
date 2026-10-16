@@ -262,10 +262,20 @@ void ProcessMonitor::print_process_stats(const ProcessStats& stats)
     
     LOG_INFO(
         "protocol counters: publish_received={} publish_received_bytes={} publish_sent={} "
-        "publish_sent_bytes={} bytes_received={} bytes_sent={}",
+        "publish_sent_bytes={} bytes_received={} bytes_sent={} keepalive_timeouts={} "
+        "connect_timeouts={} session_takeovers={} malformed_packet_disconnects={} "
+        "outbound_packet_size_drops={} inflight_window_delays={} wills_published={} "
+        "wills_rejected={} retained_messages={} retained_bytes={} retained_not_stored={} "
+        "retained_delivery_truncated={}",
         stats.protocol.publish_received, stats.protocol.publish_received_bytes,
         stats.protocol.publish_sent, stats.protocol.publish_sent_bytes,
-        stats.protocol.bytes_received, stats.protocol.bytes_sent);
+        stats.protocol.bytes_received, stats.protocol.bytes_sent,
+        stats.protocol.keepalive_timeouts, stats.protocol.connect_timeouts,
+        stats.protocol.session_takeovers, stats.protocol.malformed_packet_disconnects,
+        stats.protocol.outbound_packet_size_drops, stats.protocol.inflight_window_delays,
+        stats.protocol.wills_published, stats.protocol.wills_rejected,
+        stats.protocol.retained_messages, stats.protocol.retained_bytes,
+        stats.protocol.retained_not_stored, stats.protocol.retained_delivery_truncated);
 }
 
 std::string ProcessMonitor::format_bytes(size_t bytes)
