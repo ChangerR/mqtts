@@ -68,7 +68,7 @@ struct MQTTProtocolConfig
   bool allow_mqtt3x = true;                       // 是否允许 MQTT 3.1 / 3.1.1
 };
 
-// 保留消息限额。存储本身在后续条目实现，这里只冻结配置。
+// 保留消息限额。内存库按这些值截断；落盘格式不在这份改动里。
 struct RetainConfig
 {
   size_t max_messages = 100000;

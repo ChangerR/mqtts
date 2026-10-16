@@ -1216,6 +1216,12 @@ int MQTTProtocolHandler::handle_publish(PublishPacket* packet)
   }
 
   sync_server_flow_limits();
+  if (MQ_SUCC(ret) && packet->retain && !effective_limits().retain_available) {
+    LOG_WARN("Client {}:{} published with retain while retain is disabled", client_ip_.c_str(),
+             client_port_);
+    return close_for_flow(ReasonCode::RetainNotSupported, MQ_ERR_FLOW_CLOSED);
+  }
+
   if (MQ_SUCC(ret) && packet->qos > granted_qos_limit()) {
     LOG_WARN("PUBLISH QoS {} exceeds maximum {} from client {}:{}", packet->qos, granted_qos_limit(),
              client_ip_.c_str(), client_port_);
@@ -1577,6 +1583,14 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     return negotiated_protocol_version_ >= 5 ? code : ReasonCode::UnspecifiedError;
   };
 
+  struct RetainedGrant
+  {
+    MQTTString topic;
+    SubscriptionOptions options;
+    bool existed;
+  };
+  std::vector<RetainedGrant> retained_grants;
+
   if (MQ_SUCC(ret)) {
     for (const TopicSubscription& subscription : packet->subscriptions) {
       const MQTTString& topic = subscription.topic_filter;
@@ -1699,6 +1713,7 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
       reason_codes.push_back(reason_code);
       if (static_cast<ReasonCode>(granted.qos) == reason_code) {
+        retained_grants.push_back(RetainedGrant{topic, granted, existed});
         LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}",
                   client_ip_.c_str(), client_port_, from_mqtt_string(topic), granted.qos);
       }
@@ -1707,6 +1722,13 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
   if (MQ_SUCC(ret)) {
     ret = send_suback(packet->packet_id, reason_codes);
+  }
+
+  if (MQ_SUCC(ret) && session_manager_) {
+    for (size_t i = 0; i < retained_grants.size(); ++i) {
+      const RetainedGrant& grant = retained_grants[i];
+      (void)session_manager_->deliver_retained(client_id_, grant.topic, grant.options, grant.existed);
+    }
   }
 
   return ret;
