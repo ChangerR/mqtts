@@ -13,6 +13,7 @@
 #define MQ_ERR_SOCKET_SEND -7
 #define MQ_ERR_SOCKET_RECV -8
 #define MQ_ERR_SOCKET_ACCEPT_WOULDBLOCK -9
+#define MQ_ERR_SOCKET_TIMEOUT -10
 
 // Memory error codes (-100 to -199)
 #define MQ_ERR_MEMORY_ALLOC -100
@@ -161,6 +162,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Socket receive error";
     case MQ_ERR_SOCKET_ACCEPT_WOULDBLOCK:
       return "Socket accept would block";
+    case MQ_ERR_SOCKET_TIMEOUT:
+      return "Socket read timed out";
 
     // Memory errors
     case MQ_ERR_MEMORY_ALLOC:

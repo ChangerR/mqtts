@@ -27,6 +27,7 @@ public:
 
     // We don't need to override process() since this is only used for message forwarding
     // The actual processing is done by the WebSocketProtocolHandler
+    void request_session_takeover(const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) override;
 
 private:
     MQTTAllocator* adapter_allocator_;

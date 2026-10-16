@@ -327,6 +327,57 @@ int ThreadLocalSessionManager::enqueue_shared_messages(
   return ret;
 }
 
+int ThreadLocalSessionManager::enqueue_takeover(const std::string& client_id,
+                                                MQTTProtocolHandler* newcomer,
+                                                const std::shared_ptr<SessionTakeoverGate>& gate)
+{
+  if (!initialized_) {
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  if (!gate) {
+    return MQ_ERR_PARAM_V2;
+  }
+
+  SessionTakeoverRequest request;
+  request.client_id = client_id;
+  request.newcomer = newcomer;
+  request.gate = gate;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    takeover_requests_.push(std::move(request));
+  }
+  return MQ_SUCCESS;
+}
+
+int ThreadLocalSessionManager::process_control_messages()
+{
+  if (!initialized_) {
+    return 0;
+  }
+
+  int processed = 0;
+  while (true) {
+    SessionTakeoverRequest request;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (takeover_requests_.empty()) {
+        break;
+      }
+      request = std::move(takeover_requests_.front());
+      takeover_requests_.pop();
+    }
+
+    SafeHandlerRef current = get_safe_handler(to_mqtt_string(request.client_id, allocator_));
+    if (!current.is_valid() || current.get() == request.newcomer) {
+      request.gate->done.store(true, std::memory_order_release);
+    } else {
+      current->request_session_takeover(request.gate);
+    }
+    processed++;
+  }
+  return processed;
+}
+
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
 {
   // 如果队列为空，等待新消息
@@ -829,6 +880,38 @@ void GlobalSessionManager::note_bytes_sent(uint64_t bytes)
   counters->bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void GlobalSessionManager::note_connect_timeout()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->connect_timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_keepalive_timeout()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->keepalive_timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_session_takeover()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->session_takeovers.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_malformed_disconnect()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->malformed_packet_disconnects.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void GlobalSessionManager::collect_protocol_counters(ProtocolCounterSnapshot& out) const
 {
   out = ProtocolCounterSnapshot();
@@ -897,6 +980,42 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
     return MQ_ERR_SESSION_THREAD_MISMATCH;
   }
 
+  // 先把旧连接的线程记下来并放开索引锁，再投递接管。等待期间不能持有任何 OS 锁。
+  ThreadLocalSessionManager* existing = nullptr;
+  {
+    ReadLockGuard lock(client_index_mutex_);
+    auto found = client_to_manager_.find(client_id_str);
+    if (found != client_to_manager_.end()) {
+      existing = found->second;
+    }
+  }
+  if (existing) {
+    auto gate = std::make_shared<SessionTakeoverGate>();
+    const int posted = existing->enqueue_takeover(client_id_str, handler, gate);
+    if (posted != MQ_SUCCESS) {
+      return posted;
+    }
+    const int timeout_ms = existing->get_session_removal_timeout_ms();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!gate->done.load(std::memory_order_acquire)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        LOG_WARN("Timed out waiting for session takeover of {}", client_id_str);
+        return MQ_ERR_TIMEOUT_V2;
+      }
+      int slice_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+      if (slice_ms > 10) {
+        slice_ms = 10;
+      }
+      if (slice_ms < 1) {
+        slice_ms = 1;
+      }
+      runtime::current_runtime().wait(-1, 0, slice_ms);
+    }
+  }
+
   // 在线程管理器中注册handler
   int result = thread_manager->register_handler(client_id, handler);
   if (result != MQ_SUCCESS) {
@@ -906,7 +1025,8 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
   // 更新客户端索引（使用写锁，但这个操作相对较少）
   update_client_index(client_id_str, thread_manager);
 
-  LOG_INFO("Session registered globally: {}", client_id_str);
+  LOG_INFO("Session registered globally: {} thread {}", client_id_str,
+           std::hash<std::thread::id>{}(thread_manager->get_thread_id()));
   return MQ_SUCCESS;
 }
 

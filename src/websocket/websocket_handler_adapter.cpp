@@ -19,6 +19,17 @@ WebSocketHandlerAdapter::~WebSocketHandlerAdapter() {
     // Don't delete bridge_ or ws_handler_, they're managed elsewhere
 }
 
+void WebSocketHandlerAdapter::request_session_takeover(
+    const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) {
+    if (ws_handler_) {
+        ws_handler_->request_session_takeover(gate);
+        return;
+    }
+    if (gate) {
+        gate->done.store(true, std::memory_order_release);
+    }
+}
+
 int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
                                           const mqtt::MQTTByteVector& payload,
                                           uint8_t qos,

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include "mqtt_buffer.h"
 #include "logger.h"
@@ -17,6 +18,9 @@ class MQTTSocket
   int send(const uint8_t* buf, int len, int timeout_ms = 5000);
   int send(const mqtt::MQTTBuffer& buffer);
   int recv(char* buf, int& len);
+  // deadline_ms 是 steady_clock 的绝对毫秒。小于 0 表示一直等到有数据或对端关闭。
+  // 截止时间到了仍没有字节时返回 MQ_ERR_SOCKET_TIMEOUT，不把套接字标成断开。
+  int recv(char* buf, int& len, int64_t deadline_ms);
   int recv(mqtt::MQTTBuffer& buffer, int& len);
   bool is_websocket_upgrade_request(int timeout_ms = 1000);
   int close();

@@ -7,7 +7,7 @@
 namespace mqtt {
 
 // 按冻结的协议限额填写 CONNACK。v5 写出真实能力；3.x 没有属性，调用方仍须把解析器设成 3.x。
-// 保活改写只体现在 Server Keep Alive 通告上，超时断开属于后续条目。
+// 保活改写同时决定 Server Keep Alive 通告和连接上的保活计时。
 inline void apply_connack_capabilities(ConnAckPacket& packet, const ProtocolLimits& limits,
                                        uint8_t protocol_version, uint16_t client_keep_alive,
                                        bool client_requested_session_expiry, bool persistence_enabled)

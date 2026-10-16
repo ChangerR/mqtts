@@ -1,5 +1,7 @@
 #include "websocket_mqtt_bridge.h"
 #include "mqtt_connack_limits.h"
+#include "mqtt_connection_watch.h"
+#include "mqtt_protocol_handler.h"
 #include <algorithm>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -236,6 +238,8 @@ WebSocketMQTTBridge::~WebSocketMQTTBridge() {
     subscriptions_.clear();
     pending_binary_buffers_.clear();
     client_protocol_versions_.clear();
+    session_handlers_.clear();
+    mqtt_client_ids_.clear();
 }
 
 int WebSocketMQTTBridge::init(mqtt::GlobalSessionManager* session_manager) {
@@ -258,9 +262,33 @@ int WebSocketMQTTBridge::register_handler(const std::string& client_id, WebSocke
     handlers_[client_id] = handler;
     client_protocol_versions_.erase(client_id);
     auth_contexts_.erase(client_id);
+    mqtt_client_ids_.erase(client_id);
     LOG_INFO("Registered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
+}
+
+void WebSocketMQTTBridge::bind_session_handler(const std::string& client_id,
+                                              mqtt::MQTTProtocolHandler* handler) {
+    session_handlers_[client_id] = handler;
+}
+
+uint8_t WebSocketMQTTBridge::mqtt_protocol_version(const std::string& client_id) const {
+    auto found = client_protocol_versions_.find(client_id);
+    if (found == client_protocol_versions_.end()) {
+        return 5;
+    }
+    return found->second;
+}
+
+int WebSocketMQTTBridge::send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason) {
+    if (mqtt_protocol_version(client_id) < 5 || format_ != MessageFormat::MQTT_PACKET) {
+        return MQ_SUCCESS;
+    }
+    mqtt::DisconnectPacket packet(allocator_);
+    packet.type = mqtt::PacketType::DISCONNECT;
+    packet.reason_code = reason;
+    return send_serialized_mqtt_packet(client_id, packet);
 }
 
 int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
@@ -277,10 +305,14 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
         subscriptions_.erase(sub_it);
     }
 
-    // Unregister from session manager
+    // Unregister from session manager. MQTT Client ID 和传输层 id 可能不是同一个。
     if (session_manager_) {
-        mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-        session_manager_->unregister_session(mqtt_client_id);
+        auto mqtt_id = mqtt_client_ids_.find(client_id);
+        if (mqtt_id != mqtt_client_ids_.end() && mqtt_id->second != client_id) {
+            session_manager_->unregister_session(mqtt::to_mqtt_string(mqtt_id->second, allocator_));
+        }
+        mqtt::MQTTString transport_id = mqtt::to_mqtt_string(client_id, allocator_);
+        session_manager_->unregister_session(transport_id);
     }
 
     // Remove handler
@@ -288,6 +320,8 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
     pending_binary_buffers_.erase(client_id);
     client_protocol_versions_.erase(client_id);
     auth_contexts_.erase(client_id);
+    session_handlers_.erase(client_id);
+    mqtt_client_ids_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -412,6 +446,10 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             LOG_ERROR("Invalid MQTT packet framing for client {}: {}", client_id, ret);
             stats_.translation_errors++;
             pending.clear();
+            if (session_manager_) {
+                session_manager_->note_malformed_disconnect();
+            }
+            (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::MalformedPacket);
             return ret;
         }
 
@@ -435,6 +473,13 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             LOG_ERROR("Failed to parse MQTT packet for client {}: {}", client_id, ret);
             stats_.translation_errors++;
             pending.erase(pending.begin(), pending.begin() + packet_len);
+            if (session_manager_) {
+                session_manager_->note_malformed_disconnect();
+            }
+            const mqtt::ReasonCode reason = (ret == MQ_ERR_PROTOCOL)
+                                                ? mqtt::ReasonCode::ProtocolError
+                                                : mqtt::ReasonCode::MalformedPacket;
+            (void)send_mqtt_disconnect(client_id, reason);
             return ret;
         }
 
@@ -444,6 +489,10 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             destroy_packet(packet);
             pending.erase(pending.begin(), pending.begin() + packet_len);
             stats_.translation_errors++;
+            if (session_manager_) {
+                session_manager_->note_malformed_disconnect();
+            }
+            (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
             return MQ_ERR_PROTOCOL;
         }
 
@@ -520,9 +569,18 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
 
         destroy_packet(packet);
         pending.erase(pending.begin(), pending.begin() + packet_len);
+        if (auto* handler = get_handler(client_id)) {
+            handler->observe_mqtt_packet();
+        }
 
         if (ret != MQ_SUCCESS) {
             stats_.translation_errors++;
+            if (ret == MQ_ERR_PACKET_TYPE) {
+                if (session_manager_) {
+                    session_manager_->note_malformed_disconnect();
+                }
+                (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
+            }
             return ret;
         }
     }
@@ -825,7 +883,13 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
     }
 
-    if (client_protocol_versions_.count(client_id)) return MQ_ERR_PROTOCOL;
+    if (client_protocol_versions_.count(client_id)) {
+        if (session_manager_) {
+            session_manager_->note_malformed_disconnect();
+        }
+        (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
+        return MQ_ERR_PROTOCOL;
+    }
     client_protocol_versions_[client_id] = packet->protocol_version;
     mqtt::ConnAckPacket connack(allocator_);
     connack.type = mqtt::PacketType::CONNACK;
@@ -850,11 +914,32 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         }
     }
     fill_connack(connack, packet);
+    if (connack.reason_code == mqtt::ReasonCode::Success && session_manager_) {
+        auto found = session_handlers_.find(client_id);
+        mqtt::MQTTProtocolHandler* session_handler =
+            found == session_handlers_.end() ? nullptr : found->second;
+        if (session_handler) {
+            const std::string mqtt_id = mqtt::from_mqtt_string(packet->client_id);
+            const int registered = session_manager_->register_session(
+                mqtt::to_mqtt_string(mqtt_id, allocator_), session_handler);
+            if (registered != MQ_SUCCESS) {
+                connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
+            } else {
+                mqtt_client_ids_[client_id] = mqtt_id;
+            }
+        }
+    }
     if (connack.reason_code != mqtt::ReasonCode::Success) {
         send_serialized_mqtt_packet(client_id, connack);
         client_protocol_versions_.erase(client_id);
         auth_contexts_.erase(client_id);
-        return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        return connack.reason_code == mqtt::ReasonCode::ServerUnavailable
+                   ? MQ_ERR_TIMEOUT_V2
+                   : MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    }
+    if (auto* handler = get_handler(client_id)) {
+        handler->observe_mqtt_connect(mqtt::negotiated_keep_alive_seconds(
+            packet->keep_alive, effective_limits().keep_alive_max, packet->protocol_version));
     }
     int ret = send_serialized_mqtt_packet(client_id, connack);
     if (ret != MQ_SUCCESS) {

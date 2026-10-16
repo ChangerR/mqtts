@@ -18,7 +18,9 @@
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
 #include "mqtt_config.h"
+#include "mqtt_connection_watch.h"
 #include "mqtt_socket.h"
+#include "mqtt_takeover.h"
 #include "mqtt_stl_allocator.h"
 
 namespace mqtt {
@@ -62,6 +64,15 @@ class MQTTProtocolHandler
   }
   const ProtocolLimits& effective_limits() const;
   bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
+
+  void set_connection_established(std::chrono::steady_clock::time_point when)
+  {
+    established_ = when;
+    established_set_ = true;
+  }
+
+  // 由旧连接所在事件线程的事件循环回调调用。只打标记并唤醒读协程，不在回调里发送。
+  virtual void request_session_takeover(const std::shared_ptr<SessionTakeoverGate>& gate);
 
   // Packet handlers
   int handle_connect(const ConnectPacket* packet);
@@ -205,6 +216,18 @@ class MQTTProtocolHandler
   const ProtocolLimits* protocol_limits_;
   uint16_t client_keep_alive_;
   bool client_requested_session_expiry_;
+
+  ConnectionWatch watch_;
+  std::chrono::steady_clock::time_point established_{};
+  bool established_set_ = false;
+  std::shared_ptr<SessionTakeoverGate> takeover_gate_;
+  std::atomic<bool> takeover_pending_{false};
+  bool cleanup_finished_ = false;
+  bool protocol_fault_noted_ = false;
+
+  void arm_connection_watch();
+  int fail_protocol(ReasonCode reason, int err);
+  void signal_takeover_done();
 };
 
 }  // namespace mqtt

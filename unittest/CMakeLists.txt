@@ -213,6 +213,8 @@ target_compile_definitions(test_phase0_baseline PRIVATE MQTTS_SOURCE_DIR="${CMAK
 target_link_libraries(test_phase0_baseline PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
 add_test(NAME test_phase0_baseline COMMAND test_phase0_baseline)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME mqtt_protocol_baseline_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol_baseline_integration.py --broker $<TARGET_FILE:mqtts>)
+set_tests_properties(mqtt_protocol_baseline_integration PROPERTIES TIMEOUT 180)
 add_executable(test_mqtt_auth_grpc test_mqtt_auth_grpc.cpp)
 target_link_libraries(test_mqtt_auth_grpc PRIVATE mqtt_auth mqtt_runtime tcmalloc_minimal pthread dl)
 add_test(NAME test_mqtt_auth_grpc COMMAND test_mqtt_auth_grpc)

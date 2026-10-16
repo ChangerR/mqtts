@@ -13,6 +13,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_message_queue.h"
+#include "mqtt_takeover.h"
 #include "mqtt_protocol_counters.h"
 #include "mqtt_parser.h"
 #include "mqtt_send_worker_pool.h"
@@ -104,6 +105,11 @@ class ThreadLocalSessionManager
    */
   int process_pending_messages_nowait(int max_process_count = 0);
 
+  // 跨线程会话接管。只入队，由本事件线程的事件循环回调执行。
+  int enqueue_takeover(const std::string& client_id, MQTTProtocolHandler* newcomer,
+                       const std::shared_ptr<SessionTakeoverGate>& gate);
+  int process_control_messages();
+
   /**
    * @brief 等待新消息到达（协程友好的阻塞等待）
    * @param timeout_ms 超时时间（毫秒），-1表示无限等待
@@ -182,6 +188,7 @@ class ThreadLocalSessionManager
   // 消息队列需要支持多线程访问（其他线程会向此队列写入消息）
   mutable std::mutex queue_mutex_;
   std::queue<PendingMessage> pending_messages_;
+  std::queue<SessionTakeoverRequest> takeover_requests_;
 
   CoroCondition new_message_cond_;
   std::atomic<bool> has_new_messages_;
@@ -397,6 +404,10 @@ class GlobalSessionManager
   void note_publish_sent(uint64_t payload_bytes);
   void note_bytes_received(uint64_t bytes);
   void note_bytes_sent(uint64_t bytes);
+  void note_connect_timeout();
+  void note_keepalive_timeout();
+  void note_session_takeover();
+  void note_malformed_disconnect();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
   /**

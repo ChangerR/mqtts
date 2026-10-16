@@ -11,8 +11,8 @@ server:
 # keep_alive_default 已废弃。写进配置会打 WARN，并且不会生效。
 mqtt:
   max_packet_size: 1048576  # 最大包大小(字节)。不得超过 memory.client_max_size - 64KiB。CONNACK 通告此值
-  keep_alive_max: 3600  # 保活上限(秒)。v5 客户端 Keep Alive 为 0 或超过此值时，CONNACK 带 Server Keep Alive。超时断开在后续条目实现
-  connect_timeout_seconds: 10  # 等待 CONNECT 的秒数。只保存配置，超时关闭在后续条目实现
+  keep_alive_max: 3600  # 保活上限(秒)。v5 客户端 Keep Alive 为 0 或超过此值时改写为该值，CONNACK 带 Server Keep Alive；1.5 倍时间内无控制报文则断开
+  connect_timeout_seconds: 10  # 连接建立后等待完整 CONNECT 的秒数，超时直接关闭，不回报文
   implicit_no_local: false  # 默认 false。true 是“总是排除发布者”的兼容开关。本项只保存配置，不改变投递
   max_qos: 2  # 最大 QoS。开启持久化时 CONNACK Maximum QoS 不超过 1
   retain_available: true  # CONNACK Retain Available。保留消息库在后续条目实现
