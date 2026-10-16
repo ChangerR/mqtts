@@ -210,6 +210,13 @@ target_include_directories(test_mqtt_topic_alias PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(test_mqtt_topic_alias PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
 add_test(NAME test_mqtt_topic_alias COMMAND test_mqtt_topic_alias)
 
+add_executable(test_mqtt_will test_mqtt_will.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)
+target_include_directories(test_mqtt_will PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_link_libraries(test_mqtt_will PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+add_test(NAME test_mqtt_will COMMAND test_mqtt_will)
+
 add_executable(test_phase0_baseline test_phase0_baseline.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)

@@ -412,6 +412,34 @@ int AuthManager::check_publish(const ClientAuthContext& context, const MQTTStrin
     return check_topic_access(context, topic, Permission::WRITE, result);
 }
 
+int AuthManager::check_publish(const ClientAuthContext& context, const MQTTString& topic,
+                               const MQTTByteVector& payload,
+                               std::shared_ptr<AuthorizationRequest>& pending, AuthResult& result) {
+    result = AuthResult::ACCESS_DENIED;
+    const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    if ((context.expires_at_ms && now >= context.expires_at_ms) ||
+        (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) {
+        pending.reset();
+        return MQ_SUCCESS;
+    }
+    if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos) {
+        pending.reset();
+        return MQ_SUCCESS;
+    }
+    for (const auto& entry : providers_snapshot()) {
+        if (context.user_info.provider_name == entry.provider->get_provider_name() && entry.provider->requires_online_authorization()) {
+            result = entry.provider->is_healthy()
+                         ? entry.provider->begin_publish_check(context.user_info, topic, payload, pending)
+                         : AuthResult::INTERNAL_ERROR;
+            if (result != AuthResult::PENDING) pending.reset();
+            return MQ_SUCCESS;
+        }
+    }
+    pending.reset();
+    return check_topic_access(context, topic, Permission::WRITE, result);
+}
+
 void AuthManager::set_cache_enabled(bool enabled, int cache_ttl_seconds) {
     cache_enabled_ = enabled;
     cache_ttl_seconds_ = cache_ttl_seconds;

@@ -21,6 +21,7 @@
 #include "mqtt_durable_store.h"
 #include "mqtt_stl_allocator.h"
 #include "mqtt_topic_tree.h"
+#include "mqtt_will.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
 #include "mqtt_event_forwarding_service.h"
@@ -217,6 +218,10 @@ class GlobalSessionManager
   void set_implicit_no_local(bool enabled) { implicit_no_local_ = enabled; }
   bool implicit_no_local() const { return implicit_no_local_; }
   DurableStore* durable_store() const { return durable_store_.get(); }
+  WillScheduler& will_scheduler() { return will_scheduler_; }
+  const WillScheduler& will_scheduler() const { return will_scheduler_; }
+  // 在事件循环回调里调用。flush_all 为真时发布本线程尚未到期的遗嘱。
+  void process_due_wills(auth::AuthManager* auth, bool flush_all);
   ~GlobalSessionManager();
 
   // 禁止拷贝和赋值
@@ -415,6 +420,8 @@ class GlobalSessionManager
   void note_malformed_disconnect();
   void note_outbound_packet_size_drop();
   void note_inflight_window_delay();
+  void note_will_published();
+  void note_will_rejected();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
   /**
@@ -607,6 +614,7 @@ class GlobalSessionManager
  private:
   std::unique_ptr<DurableStore> durable_store_;
   bool implicit_no_local_ = false;
+  WillScheduler will_scheduler_;
   // 运行状态
   enum class ManagerState {
     INITIALIZING,  // 初始化阶段

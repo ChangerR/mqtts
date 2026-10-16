@@ -2,6 +2,10 @@
 #include "mqtt_connack_limits.h"
 #include "mqtt_connection_watch.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_will.h"
+#include <chrono>
+#include <new>
+#include <thread>
 #include <algorithm>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -231,6 +235,14 @@ void WebSocketMQTTBridge::fill_connack(mqtt::ConnAckPacket& connack, const mqtt:
 }
 
 WebSocketMQTTBridge::~WebSocketMQTTBridge() {
+    std::vector<std::string> transports;
+    transports.reserve(handlers_.size());
+    for (const auto& pair : handlers_) {
+        transports.push_back(pair.first);
+    }
+    for (const auto& transport_id : transports) {
+        dispose_will(transport_id);
+    }
     // Unregister all handlers
     for (auto& pair : handlers_) {
         if (session_manager_) {
@@ -296,6 +308,8 @@ int WebSocketMQTTBridge::send_mqtt_disconnect(const std::string& client_id, mqtt
 }
 
 int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
+    // 先发布遗嘱，No Local 才能看见这条连接自己的订阅。
+    dispose_will(client_id);
     // Unsubscribe from all topics
     auto sub_it = subscriptions_.find(client_id);
     if (sub_it != subscriptions_.end()) {
@@ -326,6 +340,7 @@ int WebSocketMQTTBridge::unregister_handler(const std::string& client_id) {
     auth_contexts_.erase(client_id);
     session_handlers_.erase(client_id);
     mqtt_client_ids_.erase(client_id);
+    connection_wills_.erase(client_id);
     LOG_INFO("Unregistered WebSocket handler for client {}", client_id);
 
     return MQ_SUCCESS;
@@ -535,7 +550,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
                 ret = MQ_SUCCESS;
                 break;
             case mqtt::PacketType::DISCONNECT:
-                ret = handle_mqtt_disconnect(client_id);
+                ret = handle_mqtt_disconnect(client_id, static_cast<const mqtt::DisconnectPacket*>(packet));
                 break;
             case mqtt::PacketType::PUBACK:
                 {
@@ -976,6 +991,22 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
     }
     if (packet->client_id.empty()) connack.reason_code = mqtt::ReasonCode::ClientIdentifierNotValid;
+    if (packet->flags.will_flag && connack.reason_code == mqtt::ReasonCode::Success) {
+        uint8_t qos_limit = effective_limits().max_qos;
+        auto session = session_handlers_.find(client_id);
+        if (session != session_handlers_.end() && session->second) {
+            qos_limit = session->second->granted_qos_limit();
+        }
+        const mqtt::WillConnectDecision decision = mqtt::validate_will_connect(
+            packet->flags.will_qos, packet->flags.will_retain != 0,
+            mqtt::from_mqtt_string(packet->will_topic), qos_limit,
+            effective_limits().retain_available);
+        if (!decision.accept) {
+            LOG_WARN("CONNECT will rejected for WebSocket client {} reason 0x{:02x}", client_id,
+                     static_cast<uint8_t>(decision.reason));
+            connack.reason_code = decision.reason;
+        }
+    }
     if (auth_manager_ && connack.reason_code == mqtt::ReasonCode::Success) {
         auto context = std::make_shared<mqtt::auth::ClientAuthContext>(allocator_);
         mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
@@ -1000,6 +1031,17 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
                 connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
             } else {
                 mqtt_client_ids_[client_id] = mqtt_id;
+                // 旧连接清理已经结束。在下一次让出之前取消或立刻到期它的延迟遗嘱。
+                session_manager_->will_scheduler().observe_connect(mqtt_id, packet->flags.clean_start != 0);
+                try {
+                    remember_connection_will(client_id, mqtt_id, packet);
+                } catch (const std::bad_alloc&) {
+                    LOG_WARN("Will allocation failed for WebSocket client {}", mqtt_id);
+                    session_manager_->unregister_session(mqtt::to_mqtt_string(mqtt_id, allocator_));
+                    mqtt_client_ids_.erase(client_id);
+                    connection_wills_.erase(client_id);
+                    connack.reason_code = mqtt::ReasonCode::QuotaExceeded;
+                }
             }
         }
     }
@@ -1212,8 +1254,90 @@ int WebSocketMQTTBridge::handle_mqtt_pingreq(const std::string& client_id) {
     return send_serialized_mqtt_packet(client_id, pingresp);
 }
 
-int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id) {
-    LOG_INFO("Received MQTT DISCONNECT from WebSocket client {}", client_id);
+bool WebSocketMQTTBridge::remember_connection_will(const std::string& transport_id,
+                                                   const std::string& mqtt_client_id,
+                                                   const mqtt::ConnectPacket* packet) {
+    ConnectionWill stored;
+    stored.mqtt_client_id = mqtt_client_id;
+    if (packet && packet->protocol_version >= 5) {
+        stored.session_expiry_seconds = packet->properties.session_expiry_interval;
+    }
+    if (packet && packet->flags.will_flag) {
+        stored.body = mqtt::will_body_from_connect(*packet);
+        stored.present = true;
+    }
+    connection_wills_[transport_id] = std::move(stored);
+    return true;
+}
+
+void WebSocketMQTTBridge::dispose_will(const std::string& transport_id) {
+    auto found = connection_wills_.find(transport_id);
+    if (found == connection_wills_.end() || found->second.settled) {
+        return;
+    }
+    ConnectionWill& will = found->second;
+    will.settled = true;
+    if (!will.present || will.discard || !session_manager_ || will.mqtt_client_id.empty()) {
+        return;
+    }
+    const bool persistent = session_manager_->durable_store() != nullptr;
+    const uint32_t delay = mqtt::effective_will_delay_seconds(
+        persistent, will.body.delay_seconds, will.session_expiry_seconds);
+    const mqtt::WillBody body = will.body;
+    const std::string mqtt_client_id = will.mqtt_client_id;
+    if (delay == 0) {
+        const auto auth_found = auth_contexts_.find(transport_id);
+        const mqtt::auth::ClientAuthContext* auth =
+            auth_found == auth_contexts_.end() ? nullptr : auth_found->second.get();
+        const mqtt::WillPublishOutcome outcome = mqtt::publish_will(
+            session_manager_, auth_manager_, auth, transport_id, body, std::function<bool()>());
+        if (outcome == mqtt::WillPublishOutcome::Published) {
+            session_manager_->note_will_published();
+        } else if (outcome == mqtt::WillPublishOutcome::Rejected) {
+            session_manager_->note_will_rejected();
+        }
+        return;
+    }
+
+    std::unique_ptr<mqtt::WillScheduler::Entry> entry(new mqtt::WillScheduler::Entry());
+    entry->client_id = mqtt_client_id;
+    entry->forward_id = transport_id;
+    entry->due = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+    entry->owner = std::this_thread::get_id();
+    entry->body = body;
+    const auto auth_found = auth_contexts_.find(transport_id);
+    if (auth_found != auth_contexts_.end() && auth_found->second &&
+        !mqtt::copy_auth_context(*auth_found->second, entry->auth)) {
+        LOG_WARN("Failed to copy auth context for delayed will of {}", mqtt_client_id);
+        session_manager_->note_will_rejected();
+        return;
+    }
+    session_manager_->will_scheduler().schedule(std::move(entry));
+    LOG_INFO("Scheduled WebSocket will for {} in {} seconds", mqtt_client_id, delay);
+}
+
+int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id,
+                                                const mqtt::DisconnectPacket* packet) {
+    LOG_INFO("Received MQTT DISCONNECT from WebSocket client {} reason 0x{:02x}", client_id,
+             packet ? static_cast<uint8_t>(packet->reason_code) : 0);
+    auto found = connection_wills_.find(client_id);
+    if (packet && found != connection_wills_.end()) {
+        if (session_manager_ && session_manager_->durable_store() &&
+            packet->properties.has_session_expiry_interval &&
+            found->second.session_expiry_seconds == 0 &&
+            packet->properties.session_expiry_interval != 0) {
+            // 和 TCP 一样：会话过期从 0 改成非 0 是协议错误，遗嘱仍然发布。
+            auto handler = handlers_.find(client_id);
+            if (handler != handlers_.end() && handler->second) {
+                handler->second->close_connection();
+            }
+            return MQ_ERR_PACKET_INVALID;
+        }
+        if (packet->properties.has_session_expiry_interval) {
+            found->second.session_expiry_seconds = packet->properties.session_expiry_interval;
+        }
+        found->second.discard = packet->reason_code == mqtt::ReasonCode::NormalDisconnection;
+    }
     unregister_handler(client_id);
     return MQ_SUCCESS;
 }

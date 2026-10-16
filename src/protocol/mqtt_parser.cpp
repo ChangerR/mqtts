@@ -1118,6 +1118,7 @@ int MQTTParser::parse_disconnect(const uint8_t* buffer, size_t length, Disconnec
   DisconnectPacket* disconnect =
       new (allocator_->allocate(sizeof(DisconnectPacket))) DisconnectPacket();
   disconnect->type = PacketType::DISCONNECT;
+  disconnect->reason_code = ReasonCode::NormalDisconnection;
 
   size_t pos = 0;
 
