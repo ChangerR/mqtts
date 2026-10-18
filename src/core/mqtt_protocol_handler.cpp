@@ -13,6 +13,7 @@
 #include "mqtt_connection_watch.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_socket.h"
+#include <mutex>
 #include <sys/socket.h>
 namespace mqtt {
 
@@ -1590,6 +1591,8 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     bool existed;
   };
   std::vector<RetainedGrant> retained_grants;
+  // 从订阅进入主题树开始持有，直到保留快照入队。SUBACK 也在锁内，避免 PUBLISH 抢在 SUBACK 前面。
+  std::unique_lock<std::recursive_mutex> retained_replay;
 
   if (MQ_SUCC(ret)) {
     for (const TopicSubscription& subscription : packet->subscriptions) {
@@ -1682,6 +1685,9 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         previous = std::move(stored);
       }
       if (local_added && session_manager_) {
+        if (!retained_replay.owns_lock()) {
+          retained_replay = session_manager_->lock_retain_replay();
+        }
         subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, granted);
         if (MQ_SUCC(subscribe_ret)) {
           LOG_DEBUG(

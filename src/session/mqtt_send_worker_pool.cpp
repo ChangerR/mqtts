@@ -313,6 +313,17 @@ int SendWorkerPool::process_send_task(WorkerSendTask& task, size_t worker_id)
 
     // 实际发送PUBLISH消息（使用共享内容）
     MQTTProtocolHandler* handler = safe_handler.get();
+    if (task.shared_content->has_absolute_expiry) {
+      if (now >= task.shared_content->absolute_expiry) {
+        return MQ_SUCCESS;
+      }
+      const int64_t remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    task.shared_content->absolute_expiry - now)
+                                    .count();
+      const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
+      task.shared_content->properties.has_message_expiry_interval = true;
+      task.shared_content->properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
+    }
     int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(),
                                        task.is_retain(), task.is_dup(), task.get_properties(), &task.authorization);
 

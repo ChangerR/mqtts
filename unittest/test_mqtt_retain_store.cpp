@@ -174,6 +174,53 @@ TEST(RetainStore, ExpiryAndLimits)
             mqtt::RetainWriteResult::Rejected);
 }
 
+TEST(RetainStore, LeadingEmptyLevelImmediateExpiryAndQuota)
+{
+  MQTTAllocator allocator("retain-slash", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+  mqtt::RetainStore store(&allocator);
+  const mqtt::MQTTString sender = mqtt::to_mqtt_string("pub", &allocator);
+  const mqtt::RetainConfig limits = limits_of(10, 100, 1000);
+  const auto now = clock_type::time_point(std::chrono::seconds(10));
+
+  mqtt::PublishPacket slash = publish(&allocator, "/", "root");
+  mqtt::PublishPacket slash_foo = publish(&allocator, "/foo", "bar");
+  slash_foo.properties.has_message_expiry_interval = true;
+  slash_foo.properties.message_expiry_interval = 2;
+  EXPECT_EQ(store.store(slash, sender, limits, now).kind, mqtt::RetainWriteResult::Stored);
+  EXPECT_EQ(store.store(slash_foo, sender, limits, now).kind, mqtt::RetainWriteResult::Stored);
+  EXPECT_EQ(topics_of(store.match("/", 10, now)), (std::vector<std::string>{"/"}));
+  EXPECT_EQ(topics_of(store.match("/foo", 10, now)), (std::vector<std::string>{"/foo"}));
+  EXPECT_EQ(topics_of(store.match("+/+", 10, now)), (std::vector<std::string>{"/", "/foo"}));
+  EXPECT_EQ(topics_of(store.match("#", 10, now)), (std::vector<std::string>{"/", "/foo"}));
+
+  const mqtt::RetainMatchResult expired = store.match("/foo", 10, now + std::chrono::seconds(2));
+  EXPECT_TRUE(expired.messages.empty());
+  EXPECT_EQ(expired.message_delta, -1);
+  EXPECT_EQ(store.message_count(), 1u);
+  EXPECT_EQ(topics_of(store.match("#", 10, now + std::chrono::seconds(2))),
+            (std::vector<std::string>{"/"}));
+
+  mqtt::PublishPacket immediate = publish(&allocator, "/", "gone");
+  immediate.properties.has_message_expiry_interval = true;
+  immediate.properties.message_expiry_interval = 0;
+  EXPECT_EQ(store.store(immediate, sender, limits, now).kind, mqtt::RetainWriteResult::Removed);
+  EXPECT_EQ(store.message_count(), 0u);
+  EXPECT_TRUE(store.match("/", 10, now).messages.empty());
+
+  mqtt::RetainConfig tight = limits_of(1, 100, 1000);
+  mqtt::PublishPacket short_lived = publish(&allocator, "quota/old", "x");
+  short_lived.properties.has_message_expiry_interval = true;
+  short_lived.properties.message_expiry_interval = 1;
+  EXPECT_EQ(store.store(short_lived, sender, tight, now).kind, mqtt::RetainWriteResult::Stored);
+  const mqtt::RetainWriteResult freed =
+      store.store(publish(&allocator, "quota/new", "y"), sender, tight, now + std::chrono::seconds(1));
+  EXPECT_EQ(freed.kind, mqtt::RetainWriteResult::Stored);
+  EXPECT_EQ(freed.message_delta, 0);
+  EXPECT_EQ(store.message_count(), 1u);
+  EXPECT_EQ(topics_of(store.match("quota/+", 10, now + std::chrono::seconds(1))),
+            (std::vector<std::string>{"quota/new"}));
+}
+
 TEST(RetainStore, ConcurrentReadersAndWriters)
 {
   MQTTAllocator allocator("retain-race", MQTTMemoryTag::MEM_TAG_RETAIN, 0);

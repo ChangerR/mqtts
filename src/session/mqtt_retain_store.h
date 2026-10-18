@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,11 +40,20 @@ struct RetainWriteResult
 
 struct RetainedCopy
 {
+  std::string topic;
   SharedMessageContentPtr content;
   bool has_expiry;
   std::chrono::steady_clock::time_point expires_at;
 
   RetainedCopy() : has_expiry(false) {}
+};
+
+struct RetainedTopicOrder
+{
+  bool operator()(const RetainedCopy& left, const RetainedCopy& right) const
+  {
+    return left.topic < right.topic;
+  }
 };
 
 struct RetainMatchResult
@@ -71,7 +81,7 @@ class RetainStore
   RetainWriteResult store(const PublishPacket& packet, const MQTTString& sender,
                           const RetainConfig& limits, std::chrono::steady_clock::time_point now);
   RetainWriteResult remove(const std::string& topic);
-  // 匹配非过期消息。过期项在读锁外用写锁清掉。结果按主题名排序，超过 limit 时截断。
+  // 匹配非过期消息。遍历时只保留字典序最小的 limit 条。过期项在读锁外用写锁清掉。
   RetainMatchResult match(const std::string& filter, size_t limit,
                           std::chrono::steady_clock::time_point now);
 
@@ -99,20 +109,35 @@ class RetainStore
   bool warned_;
   std::chrono::steady_clock::time_point last_warn_;
 
+  // 字典序最大的主题在堆顶，堆大小不超过本次投递上限。
+  struct MatchPick
+  {
+    size_t limit;
+    bool truncated;
+    std::priority_queue<RetainedCopy, std::vector<RetainedCopy>, RetainedTopicOrder> best;
+
+    MatchPick() : limit(0), truncated(false) {}
+  };
+
   static std::vector<std::string> split(const std::string& topic);
-  static std::string join_topic(const std::string& parent, const std::string& segment);
+  // at_root 为真时 parent 是 trie 根，不能用 parent.empty() 判断，否则前导空层级会被吃掉。
+  static std::string join_topic(const std::string& parent, const std::string& segment, bool at_root);
   Node* descend(Node* node, const std::vector<std::string>& segments, bool create);
   bool erase_at(Node* node, const std::vector<std::string>& segments, size_t index, size_t& bytes);
   void destroy_node(Node* node);
   const char* warn_locked(const char* reason);
+  void offer(MatchPick& pick, RetainedCopy copy) const;
   void consider(Node* node, const std::string& topic, std::chrono::steady_clock::time_point now,
-                std::vector<RetainedCopy>& live, std::vector<std::string>& expired) const;
-  void collect(Node* node, const std::string& topic, bool skip_dollar,
-               std::chrono::steady_clock::time_point now, std::vector<RetainedCopy>& live,
+                MatchPick& pick, std::vector<std::string>& expired) const;
+  void collect(Node* node, const std::string& topic, bool at_root,
+               std::chrono::steady_clock::time_point now, MatchPick& pick,
                std::vector<std::string>& expired) const;
   void walk(Node* node, const std::string& topic, const std::vector<std::string>& filter, size_t index,
-            bool root_level, std::chrono::steady_clock::time_point now, std::vector<RetainedCopy>& live,
+            bool root_level, std::chrono::steady_clock::time_point now, MatchPick& pick,
             std::vector<std::string>& expired) const;
+  void reclaim_expired(Node* node, const std::string& topic, bool at_root,
+                       std::chrono::steady_clock::time_point now, int64_t& message_delta,
+                       int64_t& byte_delta);
   void purge(const std::vector<std::string>& topics, std::chrono::steady_clock::time_point now,
              int64_t& message_delta, int64_t& byte_delta);
 };

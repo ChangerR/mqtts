@@ -773,6 +773,37 @@ int MQTTRouterRpcHandler::handle_publish_route(const PublishRequest& request, Ro
         if (MQ_SUCCESS == ret) {
             response.targets.swap(available_targets);
         }
+        // 保留消息要复制到每个在线节点，不能只发给当前有订阅者的节点。
+        if (MQ_SUCCESS == ret && request.retain && node_registry_ != NULL) {
+            ServerInfoMap active_nodes;
+            int nodes_ret = node_registry_->get_active_nodes(active_nodes);
+            if (MQ_FAIL(nodes_ret)) {
+                ret = nodes_ret;
+            } else {
+                for (ServerInfoMap::iterator it = active_nodes.begin(); it != active_nodes.end(); ++it) {
+                    if (it->second.server_id == request.publisher_server_id) {
+                        continue;
+                    }
+                    bool present = false;
+                    for (size_t i = 0; i < response.targets.size(); ++i) {
+                        if (response.targets[i].server_id == it->second.server_id) {
+                            present = true;
+                            break;
+                        }
+                    }
+                    if (present) {
+                        continue;
+                    }
+                    RouteTarget extra(allocator_);
+                    extra.server_id = it->second.server_id;
+                    extra.host = it->second.host;
+                    extra.port = it->second.port;
+                    extra.forwarding_port = it->second.forwarding_port;
+                    extra.qos = request.qos;
+                    response.targets.push_back(extra);
+                }
+            }
+        }
         if (MQ_SUCCESS == ret && response.targets.empty()) {
             ret = MQ_ERR_ROUTER_ROUTE_EMPTY;
         }

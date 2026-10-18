@@ -430,6 +430,10 @@ class GlobalSessionManager
   void note_retained_delivery_truncated();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
+  // 订阅变为可见之前加锁，直到 deliver_retained 入队结束再放开。
+  // 和保留发布的“写入 + 扇出”互斥，避免新订阅先看到新值再补上旧快照。
+  std::unique_lock<std::recursive_mutex> lock_retain_replay();
+
   // SUBACK 之后调用。retain 恒为 1，QoS 取订阅和消息的较小值。
   // 持久化会话的 QoS>0 仍走在线发送，会被在线路径拒绝；定向入队留到保留日志那份 PR。
   int deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
@@ -627,6 +631,8 @@ class GlobalSessionManager
   bool implicit_no_local_ = false;
   RetainConfig retain_config_;
   std::unique_ptr<RetainStore> retain_store_;
+  // 递归锁：订阅侧持有它再调用 deliver_retained，投递内部会再锁一次。
+  std::recursive_mutex retain_replay_mu_;
   WillScheduler will_scheduler_;
   // 运行状态
   enum class ManagerState {

@@ -4,6 +4,7 @@
 #include "mqtt_protocol_handler.h"
 #include "mqtt_will.h"
 #include <chrono>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <algorithm>
@@ -379,6 +380,10 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                         mqtt::SubscriptionOptions options;
                         options.qos = static_cast<uint8_t>(qos);
                         bool existed = false;
+                        std::unique_lock<std::recursive_mutex> retained_replay;
+                        if (session_manager_) {
+                            retained_replay = session_manager_->lock_retain_replay();
+                        }
                         ret = subscribe_topic(client_id, topic, options, &existed);
                         if (ret == MQ_SUCCESS && session_manager_) {
                             session_manager_->deliver_retained(
@@ -1133,6 +1138,7 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
         bool existed;
     };
     std::vector<GrantedRetain> retained_grants;
+    std::unique_lock<std::recursive_mutex> retained_replay;
 
     auto session = session_handlers_.find(client_id);
     mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
@@ -1160,6 +1166,9 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
             granted.qos = qos_cap;
         }
         bool existed = false;
+        if (!retained_replay.owns_lock() && session_manager_) {
+            retained_replay = session_manager_->lock_retain_replay();
+        }
         int sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
         if (sub_ret == MQ_SUCCESS) {
           retained_grants.push_back(GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed});

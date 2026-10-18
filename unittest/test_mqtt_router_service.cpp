@@ -383,6 +383,75 @@ TEST_F(MQTTRouterRpcHandlerRouteTest, PublishRouteShouldSkipExpiredNodes) {
     ASSERT_EQ(response.targets[0].forwarding_port, active_server.forwarding_port);
 }
 
+TEST_F(MQTTRouterRpcHandlerRouteTest, RetainedPublishReachesNodesWithoutSubscribers) {
+    MQTTString topic_filter("cluster/retain", MQTTStrAllocator(test_allocator_));
+    MQTTString publish_topic("cluster/retain", MQTTStrAllocator(test_allocator_));
+    MQTTString subscriber_server_id("server_sub", MQTTStrAllocator(test_allocator_));
+    MQTTString idle_server_id("server_idle", MQTTStrAllocator(test_allocator_));
+    MQTTString publisher_server_id("server_pub", MQTTStrAllocator(test_allocator_));
+    MQTTString client_id("client_sub", MQTTStrAllocator(test_allocator_));
+    ServerInfo subscriber_server(test_allocator_);
+    ServerInfo idle_server(test_allocator_);
+    ServerInfo publisher_server(test_allocator_);
+
+    ASSERT_EQ(topic_tree_->subscribe(subscriber_server_id, topic_filter, client_id, 1), MQ_SUCCESS);
+
+    const uint64_t now = current_time_ms();
+    subscriber_server.server_id = subscriber_server_id;
+    subscriber_server.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    subscriber_server.port = 1883;
+    subscriber_server.forwarding_port = 2883;
+    subscriber_server.is_active = true;
+    subscriber_server.last_heartbeat_ms = now;
+    idle_server.server_id = idle_server_id;
+    idle_server.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    idle_server.port = 1884;
+    idle_server.forwarding_port = 2884;
+    idle_server.is_active = true;
+    idle_server.last_heartbeat_ms = now;
+    publisher_server.server_id = publisher_server_id;
+    publisher_server.host = MQTTString("127.0.0.1", MQTTStrAllocator(test_allocator_));
+    publisher_server.port = 1885;
+    publisher_server.forwarding_port = 2885;
+    publisher_server.is_active = true;
+    publisher_server.last_heartbeat_ms = now;
+    ASSERT_EQ(node_registry_->upsert_node(subscriber_server), MQ_SUCCESS);
+    ASSERT_EQ(node_registry_->upsert_node(idle_server), MQ_SUCCESS);
+    ASSERT_EQ(node_registry_->upsert_node(publisher_server), MQ_SUCCESS);
+
+    MQTTRouterRpcHandler::PublishRequest live(test_allocator_);
+    MQTTRouterRpcHandler::RouteResponse live_response(test_allocator_);
+    live.topic = publish_topic;
+    live.retain = false;
+    live.publisher_server_id = publisher_server_id;
+    ASSERT_EQ(handler_->handle_publish_route(live, live_response), MQ_SUCCESS);
+    ASSERT_EQ(live_response.targets.size(), 1u);
+    ASSERT_EQ(live_response.targets[0].server_id, subscriber_server_id);
+
+    MQTTRouterRpcHandler::PublishRequest retained(test_allocator_);
+    MQTTRouterRpcHandler::RouteResponse retained_response(test_allocator_);
+    retained.topic = publish_topic;
+    retained.retain = true;
+    retained.qos = 1;
+    retained.publisher_server_id = publisher_server_id;
+    ASSERT_EQ(handler_->handle_publish_route(retained, retained_response), MQ_SUCCESS);
+    ASSERT_EQ(retained_response.targets.size(), 2u);
+    bool saw_subscriber = false;
+    bool saw_idle = false;
+    bool saw_publisher = false;
+    for (size_t i = 0; i < retained_response.targets.size(); ++i) {
+        if (retained_response.targets[i].server_id == subscriber_server_id) saw_subscriber = true;
+        if (retained_response.targets[i].server_id == idle_server_id) {
+            saw_idle = true;
+            ASSERT_EQ(retained_response.targets[i].forwarding_port, idle_server.forwarding_port);
+        }
+        if (retained_response.targets[i].server_id == publisher_server_id) saw_publisher = true;
+    }
+    EXPECT_TRUE(saw_subscriber);
+    EXPECT_TRUE(saw_idle);
+    EXPECT_FALSE(saw_publisher);
+}
+
 class MQTTRedoLogManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {

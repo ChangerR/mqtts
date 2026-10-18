@@ -54,9 +54,9 @@ std::vector<std::string> RetainStore::split(const std::string& topic)
   return parts;
 }
 
-std::string RetainStore::join_topic(const std::string& parent, const std::string& segment)
+std::string RetainStore::join_topic(const std::string& parent, const std::string& segment, bool at_root)
 {
-  if (parent.empty()) {
+  if (at_root) {
     return segment;
   }
   return parent + "/" + segment;
@@ -154,8 +154,9 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
   if (packet.payload.empty()) {
     return remove(topic);
   }
+  // 过期间隔为 0：先替换再立刻删除，不能把旧值留在库里。
   if (packet.properties.has_message_expiry_interval && packet.properties.message_expiry_interval == 0) {
-    return result;
+    return remove(topic);
   }
 
   const size_t payload_bytes = packet.payload.size();
@@ -186,6 +187,9 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
 
   const std::vector<std::string> segments = split(topic);
   WriteLockGuard lock(mutex_);
+  int64_t reclaimed_messages = 0;
+  int64_t reclaimed_bytes = 0;
+  reclaim_expired(&root_, "", true, now, reclaimed_messages, reclaimed_bytes);
   Node* existing = descend(&root_, segments, false);
   const bool replacing = existing && existing->has_message;
   const size_t old_bytes = replacing ? existing->payload_bytes : 0;
@@ -199,6 +203,8 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
   }
   if (reject) {
     result.kind = RetainWriteResult::Rejected;
+    result.message_delta = reclaimed_messages;
+    result.byte_delta = reclaimed_bytes;
     result.warn = warn_locked(reject);
     return result;
   }
@@ -221,13 +227,31 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
   message_count_ = new_count;
   total_bytes_ = new_bytes;
   result.kind = replacing ? RetainWriteResult::Replaced : RetainWriteResult::Stored;
-  result.message_delta = replacing ? 0 : 1;
-  result.byte_delta = static_cast<int64_t>(payload_bytes) - static_cast<int64_t>(old_bytes);
+  result.message_delta = reclaimed_messages + (replacing ? 0 : 1);
+  result.byte_delta =
+      reclaimed_bytes + static_cast<int64_t>(payload_bytes) - static_cast<int64_t>(old_bytes);
   return result;
 }
 
+void RetainStore::offer(MatchPick& pick, RetainedCopy copy) const
+{
+  if (pick.limit == 0) {
+    pick.truncated = true;
+    return;
+  }
+  if (pick.best.size() < pick.limit) {
+    pick.best.push(std::move(copy));
+    return;
+  }
+  if (copy.topic < pick.best.top().topic) {
+    pick.best.pop();
+    pick.best.push(std::move(copy));
+  }
+  pick.truncated = true;
+}
+
 void RetainStore::consider(Node* node, const std::string& topic, std::chrono::steady_clock::time_point now,
-                           std::vector<RetainedCopy>& live, std::vector<std::string>& expired) const
+                           MatchPick& pick, std::vector<std::string>& expired) const
 {
   if (!node || !node->has_message || topic.empty()) {
     return;
@@ -237,35 +261,36 @@ void RetainStore::consider(Node* node, const std::string& topic, std::chrono::st
     return;
   }
   RetainedCopy copy;
+  copy.topic = topic;
   copy.content = node->content;
   copy.has_expiry = node->has_expiry;
   copy.expires_at = node->expires_at;
-  live.push_back(copy);
+  offer(pick, std::move(copy));
 }
 
-void RetainStore::collect(Node* node, const std::string& topic, bool skip_dollar,
-                          std::chrono::steady_clock::time_point now, std::vector<RetainedCopy>& live,
+void RetainStore::collect(Node* node, const std::string& topic, bool at_root,
+                          std::chrono::steady_clock::time_point now, MatchPick& pick,
                           std::vector<std::string>& expired) const
 {
-  consider(node, topic, now, live, expired);
+  consider(node, topic, now, pick, expired);
   for (std::unordered_map<std::string, Node*>::const_iterator it = node->children.begin();
        it != node->children.end(); ++it) {
-    if (skip_dollar && !it->first.empty() && it->first[0] == '$') {
+    if (at_root && !it->first.empty() && it->first[0] == '$') {
       continue;
     }
-    collect(it->second, join_topic(topic, it->first), false, now, live, expired);
+    collect(it->second, join_topic(topic, it->first, at_root), false, now, pick, expired);
   }
 }
 
 void RetainStore::walk(Node* node, const std::string& topic, const std::vector<std::string>& filter,
                        size_t index, bool root_level, std::chrono::steady_clock::time_point now,
-                       std::vector<RetainedCopy>& live, std::vector<std::string>& expired) const
+                       MatchPick& pick, std::vector<std::string>& expired) const
 {
   if (!node) {
     return;
   }
   if (index == filter.size()) {
-    consider(node, topic, now, live, expired);
+    consider(node, topic, now, pick, expired);
     return;
   }
   const std::string& segment = filter[index];
@@ -273,7 +298,7 @@ void RetainStore::walk(Node* node, const std::string& topic, const std::vector<s
     if (index + 1 != filter.size()) {
       return;
     }
-    collect(node, topic, root_level, now, live, expired);
+    collect(node, topic, root_level, now, pick, expired);
     return;
   }
   if (segment == "+") {
@@ -282,7 +307,8 @@ void RetainStore::walk(Node* node, const std::string& topic, const std::vector<s
       if (root_level && !it->first.empty() && it->first[0] == '$') {
         continue;
       }
-      walk(it->second, join_topic(topic, it->first), filter, index + 1, false, now, live, expired);
+      walk(it->second, join_topic(topic, it->first, root_level), filter, index + 1, false, now, pick,
+           expired);
     }
     return;
   }
@@ -290,7 +316,50 @@ void RetainStore::walk(Node* node, const std::string& topic, const std::vector<s
   if (found == node->children.end()) {
     return;
   }
-  walk(found->second, join_topic(topic, segment), filter, index + 1, false, now, live, expired);
+  walk(found->second, join_topic(topic, segment, root_level), filter, index + 1, false, now, pick, expired);
+}
+
+void RetainStore::reclaim_expired(Node* node, const std::string& topic, bool at_root,
+                                  std::chrono::steady_clock::time_point now, int64_t& message_delta,
+                                  int64_t& byte_delta)
+{
+  if (!node) {
+    return;
+  }
+  if (node->has_message && !topic.empty() && node->has_expiry && now >= node->expires_at) {
+    if (total_bytes_ >= node->payload_bytes) {
+      total_bytes_ -= node->payload_bytes;
+    } else {
+      total_bytes_ = 0;
+    }
+    byte_delta -= static_cast<int64_t>(node->payload_bytes);
+    if (message_count_ > 0) {
+      --message_count_;
+    }
+    --message_delta;
+    node->content.reset();
+    node->has_message = false;
+    node->has_expiry = false;
+    node->payload_bytes = 0;
+  }
+  std::vector<std::string> names;
+  names.reserve(node->children.size());
+  for (std::unordered_map<std::string, Node*>::const_iterator it = node->children.begin();
+       it != node->children.end(); ++it) {
+    names.push_back(it->first);
+  }
+  for (size_t i = 0; i < names.size(); ++i) {
+    std::unordered_map<std::string, Node*>::iterator found = node->children.find(names[i]);
+    if (found == node->children.end()) {
+      continue;
+    }
+    reclaim_expired(found->second, join_topic(topic, names[i], at_root), false, now, message_delta,
+                    byte_delta);
+    if (found->second->children.empty() && !found->second->has_message) {
+      delete found->second;
+      node->children.erase(found);
+    }
+  }
 }
 
 void RetainStore::purge(const std::vector<std::string>& topics, std::chrono::steady_clock::time_point now,
@@ -332,19 +401,21 @@ RetainMatchResult RetainStore::match(const std::string& filter, size_t limit,
     return result;
   }
   std::vector<std::string> expired;
+  MatchPick pick;
+  pick.limit = limit;
   {
     ReadLockGuard lock(mutex_);
-    walk(&root_, "", split(filter), 0, true, now, result.messages, expired);
+    walk(&root_, "", split(filter), 0, true, now, pick, expired);
   }
   purge(expired, now, result.message_delta, result.byte_delta);
-  std::sort(result.messages.begin(), result.messages.end(),
-            [](const RetainedCopy& left, const RetainedCopy& right) {
-              return from_mqtt_string(left.content->topic_name) < from_mqtt_string(right.content->topic_name);
-            });
-  if (result.messages.size() > limit) {
-    result.truncated = true;
-    result.messages.resize(limit);
+  result.truncated = pick.truncated;
+  result.messages.reserve(pick.best.size());
+  while (!pick.best.empty()) {
+    result.messages.push_back(pick.best.top());
+    pick.best.pop();
   }
+  std::sort(result.messages.begin(), result.messages.end(),
+            [](const RetainedCopy& left, const RetainedCopy& right) { return left.topic < right.topic; });
   return result;
 }
 

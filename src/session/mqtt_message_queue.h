@@ -24,6 +24,9 @@ struct SharedMessageContent
   bool retain;                                      // 保留标志
   Properties properties;                            // MQTT v5 属性
   std::chrono::steady_clock::time_point timestamp;  // 消息创建时间戳
+  // 保留消息的绝对过期时刻。发送前再核对一次，热路径在标志为假时不改属性。
+  bool has_absolute_expiry;
+  std::chrono::steady_clock::time_point absolute_expiry;
 
   // 原始发送者信息
   MQTTString sender_client_id;  // 发送者客户端ID
@@ -52,6 +55,7 @@ struct SharedMessageContent
         retain(msg_retain),
         properties(props, allocator),
         timestamp(std::chrono::steady_clock::now()),
+        has_absolute_expiry(false),
         sender_client_id(sender, MQTTStrAllocator(allocator))
   {
     ref_count.store(0);  // 初始化为0，第一次被智能指针包装时会增加到1
