@@ -80,6 +80,67 @@ TEST(WillScheduler, CancelDropsAndCleanStartFires)
   EXPECT_TRUE(scheduler.generation_matches("same", fired[0]->generation));
 }
 
+TEST(WillScheduler, AlreadyDueWillSurvivesSessionResume)
+{
+  mqtt::WillScheduler scheduler;
+  const auto past = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+  scheduler.schedule(entry_for("due", "due", past));
+  scheduler.observe_connect("due", false, true);
+  EXPECT_TRUE(scheduler.generation_matches("due", 1));
+  const auto fired =
+      scheduler.take_due(std::this_thread::get_id(), std::chrono::steady_clock::now(), false);
+  ASSERT_EQ(fired.size(), 1u);
+  EXPECT_EQ(fired[0]->client_id, "due");
+}
+
+TEST(WillScheduler, EndedSessionPublishesWillImmediately)
+{
+  mqtt::WillScheduler scheduler;
+  const auto later = std::chrono::steady_clock::now() + std::chrono::hours(1);
+  scheduler.schedule(entry_for("gone", "gone", later));
+  scheduler.observe_connect("gone", false, false);
+  const auto fired =
+      scheduler.take_due(std::this_thread::get_id(), std::chrono::steady_clock::now(), false);
+  ASSERT_EQ(fired.size(), 1u);
+  EXPECT_EQ(fired[0]->forward_id, "gone");
+}
+
+TEST(WillScheduler, CleanStartKeepsPredecessorBesideNewWill)
+{
+  mqtt::WillScheduler scheduler;
+  const auto later = std::chrono::steady_clock::now() + std::chrono::hours(1);
+  scheduler.schedule(entry_for("swap", "old-transport", later));
+  scheduler.observe_connect("swap", true);
+  const auto inflight =
+      scheduler.take_due(std::this_thread::get_id(), std::chrono::steady_clock::now(), false);
+  ASSERT_EQ(inflight.size(), 1u);
+  const uint64_t predecessor = inflight[0]->generation;
+
+  scheduler.schedule(entry_for("swap", "new-transport", later));
+  EXPECT_TRUE(scheduler.generation_matches("swap", predecessor));
+  const auto waiting =
+      scheduler.take_due(std::this_thread::get_id(), std::chrono::steady_clock::now(), false);
+  EXPECT_TRUE(waiting.empty());
+  scheduler.complete("swap", predecessor);
+  EXPECT_FALSE(scheduler.generation_matches("swap", predecessor));
+  EXPECT_TRUE(scheduler.generation_matches("swap", 2));
+}
+
+TEST(WillScheduler, ReclaimsClientIdWithoutAWill)
+{
+  mqtt::WillScheduler scheduler;
+  scheduler.observe_connect("fresh", false);
+  scheduler.schedule(entry_for("fresh", "fresh", std::chrono::steady_clock::now()));
+  EXPECT_TRUE(scheduler.generation_matches("fresh", 1));
+  const auto taken =
+      scheduler.take_due(std::this_thread::get_id(), std::chrono::steady_clock::now(), false);
+  ASSERT_EQ(taken.size(), 1u);
+  scheduler.complete("fresh", taken[0]->generation);
+  EXPECT_FALSE(scheduler.generation_matches("fresh", 1));
+  scheduler.schedule(entry_for("fresh", "fresh", std::chrono::steady_clock::now()));
+  EXPECT_TRUE(scheduler.generation_matches("fresh", 1));
+}
+
 TEST(WillScheduler, OtherThreadAndFlush)
 {
   mqtt::WillScheduler scheduler;

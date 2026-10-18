@@ -1285,24 +1285,11 @@ void WebSocketMQTTBridge::dispose_will(const std::string& transport_id) {
         persistent, will.body.delay_seconds, will.session_expiry_seconds);
     const mqtt::WillBody body = will.body;
     const std::string mqtt_client_id = will.mqtt_client_id;
-    if (delay == 0) {
-        const auto auth_found = auth_contexts_.find(transport_id);
-        const mqtt::auth::ClientAuthContext* auth =
-            auth_found == auth_contexts_.end() ? nullptr : auth_found->second.get();
-        const mqtt::WillPublishOutcome outcome = mqtt::publish_will(
-            session_manager_, auth_manager_, auth, transport_id, body, std::function<bool()>());
-        if (outcome == mqtt::WillPublishOutcome::Published) {
-            session_manager_->note_will_published();
-        } else if (outcome == mqtt::WillPublishOutcome::Rejected) {
-            session_manager_->note_will_rejected();
-        }
-        return;
-    }
-
     std::unique_ptr<mqtt::WillScheduler::Entry> entry(new mqtt::WillScheduler::Entry());
     entry->client_id = mqtt_client_id;
     entry->forward_id = transport_id;
-    entry->due = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+    entry->due = delay == 0 ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
     entry->owner = std::this_thread::get_id();
     entry->body = body;
     const auto auth_found = auth_contexts_.find(transport_id);

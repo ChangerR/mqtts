@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "mqtt_allocator.h"
@@ -89,11 +90,14 @@ class WillScheduler {
   };
 
   void schedule(std::unique_ptr<Entry> entry);
-  // 同一 Client ID 恢复会话：只增加世代号，到期时不再发布。
+  // 同一会话在遗嘱延迟结束前重连：丢掉还没到期的遗嘱。已经到期的保留并发布。
   void cancel(const std::string& client_id);
-  // Clean Start 结束旧会话：不改变世代号，让所属线程马上发布。
+  // 旧会话结束：不改变世代号，让所属线程马上发布。
   void expire_now(const std::string& client_id);
-  void observe_connect(const std::string& client_id, bool clean_start);
+  // session_present 为假表示会话已经结束，到期或被结束的遗嘱都要发布。
+  void observe_connect(const std::string& client_id, bool clean_start, bool session_present = true);
+  // 发布协程结束时调用，释放不再被队列或在途遗嘱引用的 Client ID。
+  void complete(const std::string& client_id, uint64_t generation);
 
   std::vector<std::unique_ptr<Entry>> take_due(std::thread::id owner,
                                                std::chrono::steady_clock::time_point now,
@@ -101,8 +105,17 @@ class WillScheduler {
   bool generation_matches(const std::string& client_id, uint64_t generation) const;
 
  private:
+  struct ClientGenerations {
+    uint64_t next = 0;
+    std::unordered_set<uint64_t> live;
+    std::unordered_set<uint64_t> inflight;
+  };
+
+  void suppress_pending(const std::string& client_id, std::chrono::steady_clock::time_point now);
+  void drop_client_if_idle(const std::string& client_id);
+
   mutable std::mutex mutex_;
-  std::unordered_map<std::string, uint64_t> generation_;
+  std::unordered_map<std::string, ClientGenerations> generations_;
   std::vector<std::unique_ptr<Entry>> entries_;
 };
 

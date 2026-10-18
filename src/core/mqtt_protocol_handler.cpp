@@ -1032,7 +1032,8 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     } else if (session_manager_) {
       // 旧连接的清理已经结束。在下一次让出之前取消或立刻到期它的延迟遗嘱。
       session_manager_->will_scheduler().observe_connect(from_mqtt_string(client_id_),
-                                                        packet->flags.clean_start != 0);
+                                                        packet->flags.clean_start != 0,
+                                                        session_present);
     }
   }
 
@@ -1086,14 +1087,17 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   if (MQ_SUCC(ret)) {
     ret = remember_will(packet);
     if (MQ_FAIL(ret)) {
-      connected_ = false;
       if (session_manager_ && !client_id_.empty()) {
+        session_manager_->unsubscribe_all_topics(client_id_);
+        MQTTString disconnect_reason("will storage failed", MQTTStrAllocator(allocator_));
+        session_manager_->notify_router_client_disconnect(client_id_, disconnect_reason);
         session_manager_->unregister_session(client_id_);
       }
       if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
         session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
         durable_epoch_ = 0;
       }
+      connected_ = false;
       reject_reason = ReasonCode::QuotaExceeded;
       need_reject = true;
     }
@@ -2179,22 +2183,12 @@ void MQTTProtocolHandler::dispose_will()
   const bool persistent = session_manager_->durable_store() != nullptr;
   const uint32_t delay =
       effective_will_delay_seconds(persistent, body.delay_seconds, session_expiry_interval_);
-  if (delay == 0) {
-    const WillPublishOutcome outcome =
-        publish_will(session_manager_, auth_manager_, current_auth_context_, client_id, body,
-                     std::function<bool()>());
-    if (outcome == WillPublishOutcome::Published) {
-      session_manager_->note_will_published();
-    } else if (outcome == WillPublishOutcome::Rejected) {
-      session_manager_->note_will_rejected();
-    }
-    return;
-  }
-
+  // 立即遗嘱也只入队。授权在所属线程的发布协程里做，接管不用等那次远程授权。
   std::unique_ptr<WillScheduler::Entry> entry(new WillScheduler::Entry());
   entry->client_id = client_id;
   entry->forward_id = client_id;
-  entry->due = std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+  entry->due = delay == 0 ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
   entry->owner = std::this_thread::get_id();
   entry->body = body;
   if (current_auth_context_ && !copy_auth_context(*current_auth_context_, entry->auth)) {
@@ -2215,7 +2209,7 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
   while (durable_task_.is_valid() && !durable_task_.is_finished())
     runtime::current_runtime().wait(-1, 0, 5);
   durable_task_.release();
-  // 认证上下文和订阅都还在。立即遗嘱在注销前发布，延迟遗嘱只入队。
+  // 认证上下文和订阅都还在。遗嘱只入队，授权留给所属线程，接管不必等待。
   dispose_will();
   if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
     session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);

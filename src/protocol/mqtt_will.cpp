@@ -41,6 +41,7 @@ void* run_will_fire(void* arg)
       [sessions, client_id, generation]() {
         return sessions->will_scheduler().generation_matches(client_id, generation);
       });
+  sessions->will_scheduler().complete(client_id, generation);
   if (outcome == WillPublishOutcome::Published) {
     sessions->note_will_published();
   } else if (outcome == WillPublishOutcome::Rejected) {
@@ -269,19 +270,54 @@ void WillScheduler::schedule(std::unique_ptr<Entry> entry)
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  uint64_t& generation = generation_[entry->client_id];
-  ++generation;
+  // 新连接的遗嘱单独编号。已经到期、等待发布的上一代不能被这次插入清掉。
+  ClientGenerations& state = generations_[entry->client_id];
+  uint64_t generation = ++state.next;
   if (generation == 0) {
-    ++generation;
+    generation = ++state.next;
   }
   entry->generation = generation;
-  const std::string client_id = entry->client_id;
-  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                [&client_id](const std::unique_ptr<Entry>& current) {
-                                  return current && current->client_id == client_id;
-                                }),
-                 entries_.end());
+  state.live.insert(generation);
   entries_.push_back(std::move(entry));
+}
+
+void WillScheduler::suppress_pending(const std::string& client_id,
+                                    std::chrono::steady_clock::time_point now)
+{
+  std::vector<std::unique_ptr<Entry>> keep;
+  keep.reserve(entries_.size());
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    Entry* entry = entries_[i].get();
+    if (entry && entry->client_id == client_id && entry->due > now) {
+      const std::unordered_map<std::string, ClientGenerations>::iterator state =
+          generations_.find(client_id);
+      if (state != generations_.end()) {
+        state->second.live.erase(entry->generation);
+      }
+      continue;
+    }
+    keep.push_back(std::move(entries_[i]));
+  }
+  entries_.swap(keep);
+  drop_client_if_idle(client_id);
+}
+
+void WillScheduler::drop_client_if_idle(const std::string& client_id)
+{
+  bool queued = false;
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    if (entries_[i] && entries_[i]->client_id == client_id) {
+      queued = true;
+      break;
+    }
+  }
+  const std::unordered_map<std::string, ClientGenerations>::iterator state = generations_.find(client_id);
+  if (state == generations_.end()) {
+    return;
+  }
+  if (!queued && state->second.live.empty() && state->second.inflight.empty()) {
+    generations_.erase(state);
+  }
 }
 
 void WillScheduler::cancel(const std::string& client_id)
@@ -290,12 +326,7 @@ void WillScheduler::cancel(const std::string& client_id)
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  ++generation_[client_id];
-  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                [&client_id](const std::unique_ptr<Entry>& current) {
-                                  return current && current->client_id == client_id;
-                                }),
-                 entries_.end());
+  suppress_pending(client_id, std::chrono::steady_clock::now());
 }
 
 void WillScheduler::expire_now(const std::string& client_id)
@@ -304,25 +335,46 @@ void WillScheduler::expire_now(const std::string& client_id)
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  const std::unordered_map<std::string, uint64_t>::const_iterator found = generation_.find(client_id);
-  if (found == generation_.end()) {
-    return;
-  }
   for (size_t i = 0; i < entries_.size(); ++i) {
     Entry* entry = entries_[i].get();
-    if (entry && entry->client_id == client_id && entry->generation == found->second) {
+    if (entry && entry->client_id == client_id) {
       entry->due = std::chrono::steady_clock::time_point::min();
     }
   }
 }
 
-void WillScheduler::observe_connect(const std::string& client_id, bool clean_start)
+void WillScheduler::observe_connect(const std::string& client_id, bool clean_start,
+                                   bool session_present)
 {
-  if (clean_start) {
+  if (clean_start || !session_present) {
     expire_now(client_id);
   } else {
     cancel(client_id);
   }
+}
+
+void WillScheduler::complete(const std::string& client_id, uint64_t generation)
+{
+  if (client_id.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::unordered_map<std::string, ClientGenerations>::iterator state = generations_.find(client_id);
+  if (state == generations_.end()) {
+    return;
+  }
+  state->second.inflight.erase(generation);
+  bool queued = false;
+  for (size_t i = 0; i < entries_.size(); ++i) {
+    if (entries_[i] && entries_[i]->client_id == client_id && entries_[i]->generation == generation) {
+      queued = true;
+      break;
+    }
+  }
+  if (!queued) {
+    state->second.live.erase(generation);
+  }
+  drop_client_if_idle(client_id);
 }
 
 std::vector<std::unique_ptr<WillScheduler::Entry>> WillScheduler::take_due(
@@ -335,13 +387,15 @@ std::vector<std::unique_ptr<WillScheduler::Entry>> WillScheduler::take_due(
     if (!entries_[i]) {
       continue;
     }
-    const std::unordered_map<std::string, uint64_t>::const_iterator found =
-        generation_.find(entries_[i]->client_id);
-    const bool live = found != generation_.end() && found->second == entries_[i]->generation;
+    const std::unordered_map<std::string, ClientGenerations>::iterator state =
+        generations_.find(entries_[i]->client_id);
+    const bool live = state != generations_.end() &&
+                      state->second.live.find(entries_[i]->generation) != state->second.live.end();
     if (!live) {
       continue;
     }
     if (entries_[i]->owner == owner && (flush_all || entries_[i]->due <= now)) {
+      state->second.inflight.insert(entries_[i]->generation);
       due.push_back(std::move(entries_[i]));
     } else {
       keep.push_back(std::move(entries_[i]));
@@ -354,8 +408,10 @@ std::vector<std::unique_ptr<WillScheduler::Entry>> WillScheduler::take_due(
 bool WillScheduler::generation_matches(const std::string& client_id, uint64_t generation) const
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  const std::unordered_map<std::string, uint64_t>::const_iterator found = generation_.find(client_id);
-  return found != generation_.end() && found->second == generation;
+  const std::unordered_map<std::string, ClientGenerations>::const_iterator found =
+      generations_.find(client_id);
+  return found != generations_.end() &&
+         found->second.live.find(generation) != found->second.live.end();
 }
 
 void launch_due_wills(GlobalSessionManager* sessions, auth::AuthManager* auth, std::thread::id owner,
@@ -374,7 +430,10 @@ void launch_due_wills(GlobalSessionManager* sessions, auth::AuthManager* auth, s
     runtime::TaskHandle handle =
         runtime::current_runtime().spawn(run_will_fire, fire, 128 * 1024);
     if (!handle.is_valid()) {
+      const std::string client_id = fire->entry->client_id;
+      const uint64_t generation = fire->entry->generation;
       delete fire;
+      sessions->will_scheduler().complete(client_id, generation);
       sessions->note_will_rejected();
       continue;
     }
