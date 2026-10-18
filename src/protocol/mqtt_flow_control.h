@@ -48,6 +48,8 @@ class ConnectionFlow {
  public:
   enum class Qos2Admit { Forward, Duplicate, Exceeded };
   enum class AllocateStatus { Ready, WindowFull, Busy, Quota, Exhausted };
+  enum class AckKind { PubAck, PubRec, PubComp };
+  enum class AckDisposition { Absent, Unexpected, Complete, Continue };
 
   struct Allocation {
     AllocateStatus status;
@@ -102,7 +104,8 @@ class ConnectionFlow {
   }
 
   // claim 返回 0 表示调用方已独占该标识符，1 表示已被占用，2 表示锁忙，3 表示内存不足。
-  Allocation allocate_outbound(int (*claim)(uint16_t, void*), void* arg)
+  // qos >= 2 记为等待 PUBREC；否则等待 PUBACK。
+  Allocation allocate_outbound(int (*claim)(uint16_t, void*), void* arg, uint8_t qos = 0)
   {
     Allocation result{AllocateStatus::WindowFull, 0};
     if (outbound_window_full()) {
@@ -127,6 +130,9 @@ class ConnectionFlow {
         continue;
       }
       outbound_.add(id);
+      if (qos >= 2) {
+        outbound_qos2_.add(id);
+      }
       result.status = AllocateStatus::Ready;
       result.id = id;
       return result;
@@ -135,7 +141,38 @@ class ConnectionFlow {
     return result;
   }
 
-  void release_outbound(uint16_t id) { outbound_.erase(id); }
+  void release_outbound(uint16_t id)
+  {
+    outbound_.erase(id);
+    outbound_qos2_.erase(id);
+    outbound_awaiting_pubcomp_.erase(id);
+  }
+
+  AckDisposition classify_outbound_ack(uint16_t id, AckKind kind) const
+  {
+    if (!outbound_.test(id)) {
+      return AckDisposition::Absent;
+    }
+    const bool qos2 = outbound_qos2_.test(id);
+    const bool awaiting_pubcomp = outbound_awaiting_pubcomp_.test(id);
+    if (kind == AckKind::PubAck) {
+      return qos2 ? AckDisposition::Unexpected : AckDisposition::Complete;
+    }
+    if (kind == AckKind::PubRec) {
+      return qos2 ? AckDisposition::Continue : AckDisposition::Unexpected;
+    }
+    if (!qos2 || !awaiting_pubcomp) {
+      return AckDisposition::Unexpected;
+    }
+    return AckDisposition::Complete;
+  }
+
+  void mark_awaiting_pubcomp(uint16_t id)
+  {
+    if (outbound_qos2_.test(id)) {
+      outbound_awaiting_pubcomp_.add(id);
+    }
+  }
 
   Qos2Admit admit_qos2(uint16_t packet_id)
   {
@@ -160,6 +197,8 @@ class ConnectionFlow {
   uint16_t next_packet_id_;
   PacketIdSet inbound_qos2_;
   PacketIdSet outbound_;
+  PacketIdSet outbound_qos2_;
+  PacketIdSet outbound_awaiting_pubcomp_;
 };
 
 }  // namespace mqtt

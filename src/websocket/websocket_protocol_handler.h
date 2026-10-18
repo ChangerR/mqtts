@@ -181,6 +181,7 @@ private:
 
     void arm_connection_watch();
     int64_t read_deadline_ms() const;
+    int reject_oversized_mqtt_fragment(size_t incoming);
     void finish_session_takeover();
     void signal_takeover_done();
 };

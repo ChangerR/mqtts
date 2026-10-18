@@ -127,7 +127,7 @@ private:
     int handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet);
     int handle_mqtt_pingreq(const std::string& client_id);
     int handle_mqtt_disconnect(const std::string& client_id);
-    int send_serialized_mqtt_packet(const std::string& client_id, const mqtt::Packet& packet);
+    int send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet);
     void destroy_packet(mqtt::Packet* packet);
     bool topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission);
     void fill_connack(mqtt::ConnAckPacket& connack, const mqtt::ConnectPacket* packet);

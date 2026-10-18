@@ -576,6 +576,26 @@ int WebSocketProtocolHandler::read_frame(WebSocketFrame& frame) {
     }
 }
 
+int WebSocketProtocolHandler::reject_oversized_mqtt_fragment(size_t incoming)
+{
+    if (!bridge_) {
+        return MQ_SUCCESS;
+    }
+    const size_t limit = bridge_->effective_limits().max_packet_size;
+    if (limit == 0) {
+        return MQ_SUCCESS;
+    }
+    const size_t have = is_fragmenting_ ? fragmented_payload_.size() : 0;
+    if (incoming > limit || have > limit - incoming) {
+        is_fragmenting_ = false;
+        fragmented_payload_.clear();
+        LOG_WARN("WebSocket client {} accumulated {} bytes, above MQTT max packet size {}",
+                 client_id_, have + incoming, limit);
+        return MQ_ERR_PACKET_TOO_LARGE;
+    }
+    return MQ_SUCCESS;
+}
+
 int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame) {
     LOG_TRACE("Handling frame: opcode={}, fin={}, length={}",
               static_cast<int>(frame.opcode), frame.fin, frame.payload_length);
@@ -601,11 +621,15 @@ int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame) {
             return handle_text_frame(frame);
         case WebSocketOpcode::BINARY:
             return handle_binary_frame(frame);
-        case WebSocketOpcode::CONTINUATION:
+        case WebSocketOpcode::CONTINUATION: {
             // Handle continuation frame for fragmented messages
             if (!is_fragmenting_) {
                 LOG_ERROR("Received continuation frame without initial frame");
                 return MQ_ERR_WS_FRAGMENTATION;
+            }
+            const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
+            if (capped != MQ_SUCCESS) {
+                return capped;
             }
             // Append to fragmented payload
             fragmented_payload_.insert(fragmented_payload_.end(),
@@ -629,6 +653,7 @@ int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame) {
                 }
             }
             return MQ_SUCCESS;
+        }
         default:
             LOG_ERROR("Unknown data frame opcode: {}", static_cast<int>(frame.opcode));
             return MQ_ERR_WS_INVALID_OPCODE;
@@ -643,6 +668,10 @@ int WebSocketProtocolHandler::handle_text_frame(const WebSocketFrame& frame) {
         if (is_fragmenting_) {
             LOG_ERROR("Already fragmenting a message");
             return MQ_ERR_WS_FRAGMENTATION;
+        }
+        const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
+        if (capped != MQ_SUCCESS) {
+            return capped;
         }
         is_fragmenting_ = true;
         fragmented_opcode_ = frame.opcode;
@@ -670,6 +699,10 @@ int WebSocketProtocolHandler::handle_binary_frame(const WebSocketFrame& frame) {
         if (is_fragmenting_) {
             LOG_ERROR("Already fragmenting a message");
             return MQ_ERR_WS_FRAGMENTATION;
+        }
+        const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
+        if (capped != MQ_SUCCESS) {
+            return capped;
         }
         is_fragmenting_ = true;
         fragmented_opcode_ = frame.opcode;

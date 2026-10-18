@@ -660,6 +660,37 @@ TEST(Phase0Flow, InboundQos2DedupAndReceiveMaximum)
   EXPECT_EQ(flow.max_qos(), 2);
 }
 
+TEST(Phase0Flow, AckMustMatchOutboundPhase)
+{
+  mqtt::ConnectionFlow flow;
+  const auto qos1 = flow.allocate_outbound(nullptr, nullptr, 1);
+  const auto qos2 = flow.allocate_outbound(nullptr, nullptr, 2);
+  ASSERT_EQ(qos1.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+  ASSERT_EQ(qos2.status, mqtt::ConnectionFlow::AllocateStatus::Ready);
+
+  EXPECT_EQ(flow.classify_outbound_ack(qos2.id, mqtt::ConnectionFlow::AckKind::PubAck),
+            mqtt::ConnectionFlow::AckDisposition::Unexpected);
+  EXPECT_TRUE(flow.outbound_holds(qos2.id));
+  EXPECT_EQ(flow.classify_outbound_ack(qos1.id, mqtt::ConnectionFlow::AckKind::PubComp),
+            mqtt::ConnectionFlow::AckDisposition::Unexpected);
+  EXPECT_TRUE(flow.outbound_holds(qos1.id));
+
+  EXPECT_EQ(flow.classify_outbound_ack(qos2.id, mqtt::ConnectionFlow::AckKind::PubComp),
+            mqtt::ConnectionFlow::AckDisposition::Unexpected);
+  EXPECT_EQ(flow.classify_outbound_ack(qos2.id, mqtt::ConnectionFlow::AckKind::PubRec),
+            mqtt::ConnectionFlow::AckDisposition::Continue);
+  flow.mark_awaiting_pubcomp(qos2.id);
+  EXPECT_EQ(flow.classify_outbound_ack(qos2.id, mqtt::ConnectionFlow::AckKind::PubComp),
+            mqtt::ConnectionFlow::AckDisposition::Complete);
+  flow.release_outbound(qos2.id);
+  EXPECT_FALSE(flow.outbound_holds(qos2.id));
+
+  EXPECT_EQ(flow.classify_outbound_ack(qos1.id, mqtt::ConnectionFlow::AckKind::PubAck),
+            mqtt::ConnectionFlow::AckDisposition::Complete);
+  flow.release_outbound(qos1.id);
+  EXPECT_FALSE(flow.outbound_holds(qos1.id));
+}
+
 int main(int argc, char** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

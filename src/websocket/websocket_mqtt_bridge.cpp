@@ -544,6 +544,16 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
                               client_id, puback->packet_id, static_cast<uint8_t>(puback->reason_code));
                     auto session = session_handlers_.find(client_id);
                     if (session != session_handlers_.end() && session->second) {
+                        if (session->second->classify_outbound_ack(
+                                puback->packet_id, mqtt::ConnectionFlow::AckKind::PubAck) ==
+                            mqtt::ConnectionFlow::AckDisposition::Unexpected) {
+                            (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
+                            if (auto* socket_handler = get_handler(client_id)) {
+                                socket_handler->close_connection();
+                            }
+                            ret = MQ_ERR_PACKET_TYPE;
+                            break;
+                        }
                         session->second->release_outbound_packet_id(puback->packet_id);
                     }
                     ret = MQ_SUCCESS;
@@ -555,13 +565,24 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
                     LOG_DEBUG("Received MQTT PUBREC from WebSocket client {} (packet_id={}, reason=0x{:02x})",
                               client_id, pubrec->packet_id, static_cast<uint8_t>(pubrec->reason_code));
                     auto session = session_handlers_.find(client_id);
-                    if (static_cast<uint8_t>(pubrec->reason_code) >= 0x80) {
-                        if (session != session_handlers_.end() && session->second) {
-                            session->second->release_outbound_packet_id(pubrec->packet_id);
+                    mqtt::MQTTProtocolHandler* flow =
+                        session == session_handlers_.end() ? nullptr : session->second;
+                    if (flow && flow->classify_outbound_ack(pubrec->packet_id,
+                                                           mqtt::ConnectionFlow::AckKind::PubRec) ==
+                                   mqtt::ConnectionFlow::AckDisposition::Unexpected) {
+                        (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
+                        if (auto* socket_handler = get_handler(client_id)) {
+                            socket_handler->close_connection();
                         }
+                        ret = MQ_ERR_PACKET_TYPE;
+                        break;
+                    }
+                    if (static_cast<uint8_t>(pubrec->reason_code) >= 0x80) {
+                        if (flow) flow->release_outbound_packet_id(pubrec->packet_id);
                         ret = MQ_SUCCESS;
                         break;
                     }
+                    if (flow) flow->mark_outbound_awaiting_pubcomp(pubrec->packet_id);
                     mqtt::PubRelPacket pubrel(allocator_);
                     pubrel.type = mqtt::PacketType::PUBREL;
                     pubrel.packet_id = pubrec->packet_id;
@@ -592,6 +613,16 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
                               client_id, pubcomp->packet_id, static_cast<uint8_t>(pubcomp->reason_code));
                     auto session = session_handlers_.find(client_id);
                     if (session != session_handlers_.end() && session->second) {
+                        if (session->second->classify_outbound_ack(
+                                pubcomp->packet_id, mqtt::ConnectionFlow::AckKind::PubComp) ==
+                            mqtt::ConnectionFlow::AckDisposition::Unexpected) {
+                            (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
+                            if (auto* socket_handler = get_handler(client_id)) {
+                                socket_handler->close_connection();
+                            }
+                            ret = MQ_ERR_PACKET_TYPE;
+                            break;
+                        }
                         session->second->release_outbound_packet_id(pubcomp->packet_id);
                     }
                     ret = MQ_SUCCESS;
@@ -1145,7 +1176,7 @@ int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id) {
     return MQ_SUCCESS;
 }
 
-int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_id, const mqtt::Packet& packet) {
+int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet) {
     WebSocketProtocolHandler* handler = get_handler(client_id);
     if (!handler || !handler->is_connected()) {
         LOG_WARN("No active WebSocket handler for client {}", client_id);
@@ -1203,6 +1234,54 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
         LOG_ERROR("Failed to serialize MQTT packet type 0x{:02x}: {}",
                   static_cast<uint8_t>(packet.type), ret);
         return ret;
+    }
+
+    auto session = session_handlers_.find(client_id);
+    mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
+    if (flow && flow->outbound_exceeds_client_maximum(serialized.size())) {
+        mqtt::MQTTProtocolHandler::omit_optional_outbound_properties(packet.properties);
+        serialized.clear();
+        switch (packet.type) {
+            case mqtt::PacketType::CONNACK:
+                ret = parser.serialize_connack(reinterpret_cast<const mqtt::ConnAckPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::SUBACK:
+                ret = parser.serialize_suback(reinterpret_cast<const mqtt::SubAckPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::UNSUBACK:
+                ret = parser.serialize_unsuback(reinterpret_cast<const mqtt::UnsubAckPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PINGRESP:
+                ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::DISCONNECT:
+                ret = parser.serialize_disconnect(reinterpret_cast<const mqtt::DisconnectPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PUBACK:
+                ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PUBREC:
+                ret = parser.serialize_pubrec(reinterpret_cast<const mqtt::PubRecPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PUBREL:
+                ret = parser.serialize_pubrel(reinterpret_cast<const mqtt::PubRelPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PUBCOMP:
+                ret = parser.serialize_pubcomp(reinterpret_cast<const mqtt::PubCompPacket*>(&packet), serialized);
+                break;
+            case mqtt::PacketType::PUBLISH:
+                ret = parser.serialize_publish(reinterpret_cast<const mqtt::PublishPacket*>(&packet), serialized);
+                break;
+            default:
+                return MQ_ERR_PACKET_TYPE;
+        }
+        if (ret != MQ_SUCCESS) return ret;
+        if (flow->outbound_exceeds_client_maximum(serialized.size())) {
+            LOG_WARN("Not sending {}-byte WebSocket MQTT packet to {}, client maximum is smaller",
+                     serialized.size(), client_id);
+            if (auto* socket_handler = get_handler(client_id)) socket_handler->close_connection();
+            return MQ_ERR_PACKET_TOO_LARGE;
+        }
     }
 
     std::vector<uint8_t> payload(serialized.data(), serialized.data() + serialized.size());

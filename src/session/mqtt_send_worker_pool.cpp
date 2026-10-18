@@ -227,6 +227,10 @@ void SendWorkerPool::worker_main(size_t worker_id)
                 1, std::memory_order_relaxed);
           }
         }
+        // 接收窗口堵住时不要沿用最初入队时间，否则慢确认会把还没发出的 QoS 报文判成过期。
+        if (result == MQ_ERR_INFLIGHT_WINDOW) {
+          task.enqueue_time = end_time;
+        }
         {
           CoroLockGuard lock(&worker->queue_mutex);
           worker->task_queue.push(std::move(task));

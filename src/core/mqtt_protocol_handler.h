@@ -121,10 +121,21 @@ class MQTTProtocolHandler
   // 客户端在 CONNECT 里声明的接收窗口和最大报文。所有会话都记录，不只是持久化会话。
   void observe_client_flow(uint8_t protocol_version, uint16_t receive_maximum,
                           uint32_t maximum_packet_size);
+  bool outbound_exceeds_client_maximum(size_t bytes) const;
+  static void omit_optional_outbound_properties(Properties& properties);
   uint8_t granted_qos_limit() const;
   ConnectionFlow::Qos2Admit admit_inbound_qos2(uint16_t packet_id);
   void release_inbound_qos2(uint16_t packet_id);
   void release_outbound_packet_id(uint16_t packet_id);
+  ConnectionFlow::AckDisposition classify_outbound_ack(uint16_t packet_id,
+                                                      ConnectionFlow::AckKind kind) const
+  {
+    return flow_.classify_outbound_ack(packet_id, kind);
+  }
+  void mark_outbound_awaiting_pubcomp(uint16_t packet_id)
+  {
+    flow_.mark_awaiting_pubcomp(packet_id);
+  }
   bool outbound_packet_id_inflight(uint16_t packet_id) const
   {
     return flow_.outbound_holds(packet_id);
@@ -193,6 +204,7 @@ class MQTTProtocolHandler
   bool request_response_information_;
   bool request_problem_information_;
   uint8_t negotiated_protocol_version_;
+  bool version_negotiated_;
   bool allow_mqtt3x_;
 
   MQTTBuffer* serialize_buffer_;  // 复用的序列化缓冲区
@@ -236,11 +248,13 @@ class MQTTProtocolHandler
   void arm_connection_watch();
   int fail_protocol(ReasonCode reason, int err);
   int close_for_flow(ReasonCode reason, int err);
+  template <typename Serialize>
+  int send_within_client_limit(Packet* packet, Serialize serialize);
   void signal_takeover_done();
   void sync_server_flow_limits();
   uint32_t inbound_packet_limit() const;
   static int claim_outbound_packet_id(uint16_t id, void* arg);
-  ConnectionFlow::Allocation allocate_outbound_packet_id();
+  ConnectionFlow::Allocation allocate_outbound_packet_id(uint8_t qos = 0);
 
  protected:
   virtual int transmit_serialized(const uint8_t* data, size_t size);
