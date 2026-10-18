@@ -358,8 +358,9 @@ struct AuthPacket : public Packet
 // MQTT v5 ConnAck Packet
 struct ConnAckPacket : public Packet
 {
-  bool session_present;
-  ReasonCode reason_code;
+  // 未写入的标志在 -O1 下会把栈上的非 0/1 字节原样发出，CONNACK 标志位因此非法。
+  bool session_present = false;
+  ReasonCode reason_code = ReasonCode::Success;
 
   ConnAckPacket(MQTTAllocator* allocator = nullptr) : Packet(allocator) {}
 };
