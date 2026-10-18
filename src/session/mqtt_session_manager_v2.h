@@ -614,6 +614,8 @@ class GlobalSessionManager
   mutable RWMutex client_index_mutex_;  // 读写锁
   std::unordered_map<std::string, ThreadLocalSessionManager*>
       client_to_manager_;  // 直接存储管理器指针
+  // 从查找到安装完成之前占住 Client ID，避免并发接管看到旧主人或空位后再注册一份。
+  std::unordered_map<std::string, std::shared_ptr<SessionTakeoverGate>> client_reservations_;
 
   // 消息内容缓存管理器
   std::unique_ptr<MessageContentCache> message_cache_;

@@ -188,6 +188,10 @@ void WebSocketProtocolHandler::signal_takeover_done() {
 
 void WebSocketProtocolHandler::request_session_takeover(
     const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) {
+    if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
+        gate->done.store(true, std::memory_order_release);
+        return;
+    }
     takeover_gate_ = gate;
     takeover_pending_.store(true, std::memory_order_release);
     if (takeover_finished_) {

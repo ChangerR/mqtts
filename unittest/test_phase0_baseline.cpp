@@ -432,6 +432,154 @@ TEST(Phase0Takeover, ControlMessageRunsOnTheOwningThread)
   delete original;
 }
 
+TEST(Phase0Takeover, TimedOutRequestDoesNotDisconnectLater)
+{
+  MQTTAllocator allocator("phase0_takeover_timeout", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+  const mqtt::MQTTString client_id = mqtt::to_mqtt_string("timeout-client", &allocator);
+  mqtt::GlobalSessionManager manager;
+  ASSERT_EQ(manager.pre_register_threads(2, 8), 0);
+
+  std::atomic<bool> registered{false};
+  std::atomic<bool> stop{false};
+  std::thread::id owner_id;
+  TakeoverProbe* original = nullptr;
+  std::thread owner([&] {
+    auto* local = manager.register_thread_manager(std::this_thread::get_id());
+    ASSERT_NE(local, nullptr);
+    local->set_session_removal_timeout_ms(40);
+    owner_id = std::this_thread::get_id();
+    original = new TakeoverProbe(&allocator);
+    ASSERT_EQ(manager.register_session(client_id, original), 0);
+    registered.store(true);
+    while (!stop.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (auto* current = manager.get_thread_manager()) {
+      current->process_control_messages();
+    }
+  });
+  while (!registered.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_NE(manager.register_thread_manager(std::this_thread::get_id()), nullptr);
+  ASSERT_EQ(manager.finalize_thread_registration(), 0);
+
+  TakeoverProbe replacement(&allocator);
+  EXPECT_EQ(manager.register_session(client_id, &replacement), MQ_ERR_TIMEOUT_V2);
+  EXPECT_FALSE(original->called.load());
+
+  stop.store(true);
+  owner.join();
+  EXPECT_FALSE(original->called.load());
+  auto* owner_manager = manager.find_client_manager(client_id);
+  ASSERT_NE(owner_manager, nullptr);
+  EXPECT_EQ(owner_manager->get_thread_id(), owner_id);
+  delete original;
+}
+
+namespace {
+
+class HoldingProbe : public mqtt::MQTTProtocolHandler
+{
+ public:
+  explicit HoldingProbe(MQTTAllocator* allocator) : mqtt::MQTTProtocolHandler(allocator) {}
+
+  void request_session_takeover(const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) override
+  {
+    calls.fetch_add(1);
+    while (!release.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (gate) {
+      gate->done.store(true, std::memory_order_release);
+    }
+  }
+
+  std::atomic<int> calls{0};
+  std::atomic<bool> release{false};
+};
+
+}  // namespace
+
+TEST(Phase0Takeover, ReservationBlocksASecondClaim)
+{
+  MQTTAllocator allocator("phase0_takeover_reserve", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+  const mqtt::MQTTString client_id = mqtt::to_mqtt_string("reserved-client", &allocator);
+  mqtt::GlobalSessionManager manager;
+  ASSERT_EQ(manager.pre_register_threads(3, 8), 0);
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> stop{false};
+  HoldingProbe* original = nullptr;
+  std::thread owner([&] {
+    ASSERT_NE(manager.register_thread_manager(std::this_thread::get_id()), nullptr);
+    original = new HoldingProbe(&allocator);
+    ASSERT_EQ(manager.register_session(client_id, original), 0);
+    ready.fetch_add(1);
+    while (!stop.load()) {
+      if (auto* local = manager.get_thread_manager()) {
+        local->process_control_messages();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+
+  std::atomic<int> first_result{-1};
+  std::atomic<int> second_result{-1};
+  TakeoverProbe first_replacement(&allocator);
+  TakeoverProbe second_replacement(&allocator);
+  std::thread first([&] {
+    ASSERT_NE(manager.register_thread_manager(std::this_thread::get_id()), nullptr);
+    ready.fetch_add(1);
+    while (ready.load() < 4) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    first_result.store(manager.register_session(client_id, &first_replacement));
+    while (!stop.load()) {
+      if (auto* local = manager.get_thread_manager()) {
+        local->process_control_messages();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  std::thread second([&] {
+    ASSERT_NE(manager.register_thread_manager(std::this_thread::get_id()), nullptr);
+    ready.fetch_add(1);
+    while (ready.load() < 4) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    second_result.store(manager.register_session(client_id, &second_replacement));
+  });
+  while (ready.load() < 3) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(manager.finalize_thread_registration(), 0);
+  ready.fetch_add(1);
+
+  const auto pause_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  while (original->calls.load() < 1 && std::chrono::steady_clock::now() < pause_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(original->calls.load(), 1);
+  EXPECT_EQ(manager.find_client_manager(client_id)->get_thread_id(), owner.get_id());
+
+  original->release.store(true);
+  const auto done_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while ((first_result.load() != 0 || second_result.load() != 0) &&
+         std::chrono::steady_clock::now() < done_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(first_result.load(), 0);
+  EXPECT_EQ(second_result.load(), 0);
+  EXPECT_EQ(original->calls.load(), 1);
+
+  stop.store(true);
+  first.join();
+  second.join();
+  owner.join();
+  delete original;
+}
+
 int main(int argc, char** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);

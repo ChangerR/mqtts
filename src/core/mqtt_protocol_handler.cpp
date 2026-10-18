@@ -162,6 +162,10 @@ void MQTTProtocolHandler::signal_takeover_done()
 
 void MQTTProtocolHandler::request_session_takeover(const std::shared_ptr<SessionTakeoverGate>& gate)
 {
+  if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
+    gate->done.store(true, std::memory_order_release);
+    return;
+  }
   takeover_gate_ = gate;
   takeover_pending_.store(true, std::memory_order_release);
   if (cleanup_finished_) {
