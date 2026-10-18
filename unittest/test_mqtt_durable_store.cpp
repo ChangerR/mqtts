@@ -178,7 +178,7 @@ static void test_native_upgrade(const std::string& path, uint32_t version)
   {
     auto marker = read_file(path + "/FORMAT", 4096).substr(4);
     Decoder d(marker);
-    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 5);
+    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 6);
     DurableStore store(cfg);
     auto c = store.connect("legacy", "owner", false, 60);
     auto batch = store.fetch("legacy", c.epoch, 0, 32);
@@ -215,7 +215,13 @@ static void test_retain_journal(const std::string& path)
   {
     DurableStore store(cfg);
     assert(store.retained_messages().empty());
-    assert(store.put_retained("keep/t", 1, "saved", "pub", 0, true).ok);
+    DurableStore::RetainedProperties properties;
+    properties.payload_format_indicator = 1;
+    properties.content_type = "text/plain";
+    properties.response_topic = "reply/to";
+    properties.correlation_data = std::string("\0corr", 5);
+    properties.user_properties.push_back(std::make_pair("k", "v"));
+    assert(store.put_retained("keep/t", 1, "saved", "pub", 0, true, properties).ok);
     assert(store.put_retained("keep/async", 0, "later", "pub", 0, false).ok);
     assert(store.put_retained("keep/disk", 1, "qos1", "writer", soon, true).ok);
     assert(store.put_retained("keep/gone", 1, "temp", "pub", 0, true).ok);
@@ -246,7 +252,13 @@ static void test_retain_journal(const std::string& path)
     for (const auto& item : kept) {
       if (item.topic == "keep/t") {
         saw_saved = item.payload == "saved" && item.qos == 1 && item.sender == "pub" &&
-                    item.expires_ms == 0;
+                    item.expires_ms == 0 && item.properties.payload_format_indicator == 1 &&
+                    item.properties.content_type == "text/plain" &&
+                    item.properties.response_topic == "reply/to" &&
+                    item.properties.correlation_data == std::string("\0corr", 5) &&
+                    item.properties.user_properties.size() == 1 &&
+                    item.properties.user_properties[0].first == "k" &&
+                    item.properties.user_properties[0].second == "v";
       } else if (item.topic == "keep/async")
         saw_async = item.payload == "later" && item.qos == 0;
       else if (item.topic == "keep/disk")

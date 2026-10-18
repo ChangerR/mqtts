@@ -218,6 +218,8 @@ class GlobalSessionManager
   void set_implicit_no_local(bool enabled) { implicit_no_local_ = enabled; }
   bool implicit_no_local() const { return implicit_no_local_; }
   void set_retain_config(const RetainConfig& config);
+  // false 时不把磁盘上的保留消息装进内存，也不在 SUBSCRIBE 时下发。
+  void set_retain_available(bool enabled) { retain_available_ = enabled; }
   DurableStore* durable_store() const { return durable_store_.get(); }
   WillScheduler& will_scheduler() { return will_scheduler_; }
   const WillScheduler& will_scheduler() const { return will_scheduler_; }
@@ -628,6 +630,9 @@ class GlobalSessionManager
   std::unique_ptr<DurableStore> durable_store_;
   bool implicit_no_local_ = false;
   RetainConfig retain_config_;
+  bool retain_available_ = true;
+  std::atomic<int64_t> retained_gauge_messages_{0};
+  std::atomic<int64_t> retained_gauge_bytes_{0};
   std::unique_ptr<RetainStore> retain_store_;
   // 递归锁：订阅侧持有它再调用 deliver_retained，投递内部会再锁一次。
   std::recursive_mutex retain_replay_mu_;

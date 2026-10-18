@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mqtt {
 namespace journal {
@@ -131,7 +133,7 @@ inline void read_legacy_subscription_options(Decoder& d, StoredSubscription& sub
 
 // Retain log version 1. A missing retain log is an empty set (journals written
 // before retain persistence). Subscription records are unchanged.
-constexpr uint8_t kStoredRetainVersion = 1;
+constexpr uint8_t kStoredRetainVersion = 2;
 constexpr uint8_t kRetainSet = 1;
 constexpr uint8_t kRetainClear = 2;
 struct StoredRetain
@@ -141,7 +143,66 @@ struct StoredRetain
   int64_t expires_ms = 0;
   std::string payload;
   std::string sender;
+  bool has_payload_format = false;
+  uint8_t payload_format = 0;
+  std::string content_type;
+  std::string response_topic;
+  std::string correlation_data;
+  std::vector<std::pair<std::string, std::string>> user_properties;
 };
+inline void write_retain_properties(Encoder& e, const StoredRetain& item)
+{
+  uint8_t flags = 0;
+  if (item.has_payload_format)
+    flags = static_cast<uint8_t>(flags | 1u);
+  if (!item.content_type.empty())
+    flags = static_cast<uint8_t>(flags | 2u);
+  if (!item.response_topic.empty())
+    flags = static_cast<uint8_t>(flags | 4u);
+  if (!item.correlation_data.empty())
+    flags = static_cast<uint8_t>(flags | 8u);
+  if (!item.user_properties.empty())
+    flags = static_cast<uint8_t>(flags | 16u);
+  e.u8(flags);
+  if (flags & 1u)
+    e.u8(item.payload_format);
+  if (flags & 2u)
+    e.text(item.content_type);
+  if (flags & 4u)
+    e.text(item.response_topic);
+  if (flags & 8u)
+    e.text(item.correlation_data);
+  if (flags & 16u) {
+    e.u32(static_cast<uint32_t>(item.user_properties.size()));
+    for (size_t i = 0; i < item.user_properties.size(); ++i) {
+      e.text(item.user_properties[i].first);
+      e.text(item.user_properties[i].second);
+    }
+  }
+}
+inline void read_retain_properties(Decoder& d, StoredRetain& item)
+{
+  const uint8_t flags = d.u8();
+  if (flags & 1u) {
+    item.has_payload_format = true;
+    item.payload_format = d.u8();
+  }
+  if (flags & 2u)
+    item.content_type = d.text();
+  if (flags & 4u)
+    item.response_topic = d.text();
+  if (flags & 8u)
+    item.correlation_data = d.text();
+  if (flags & 16u) {
+    const uint32_t count = d.u32();
+    item.user_properties.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      std::string key = d.text();
+      std::string value = d.text();
+      item.user_properties.emplace_back(std::move(key), std::move(value));
+    }
+  }
+}
 inline void write_retain_set(Encoder& e, const StoredRetain& item)
 {
   e.u8(kRetainSet);
@@ -151,6 +212,7 @@ inline void write_retain_set(Encoder& e, const StoredRetain& item)
   e.u64(static_cast<uint64_t>(item.expires_ms));
   e.text(item.payload);
   e.text(item.sender);
+  write_retain_properties(e, item);
 }
 inline void write_retain_clear(Encoder& e, const std::string& topic)
 {
@@ -163,7 +225,7 @@ inline StoredRetain read_retain_record(Decoder& d, bool& cleared)
 {
   const uint8_t kind = d.u8();
   const uint8_t version = d.u8();
-  if (version != kStoredRetainVersion)
+  if (version != 1 && version != kStoredRetainVersion)
     throw std::runtime_error("unsupported retain record version");
   StoredRetain item;
   item.topic = d.text();
@@ -188,6 +250,8 @@ inline StoredRetain read_retain_record(Decoder& d, bool& cleared)
   if (item.payload.empty())
     throw std::runtime_error("empty retained payload");
   item.sender = d.text();
+  if (version >= 2)
+    read_retain_properties(d, item);
   d.end();
   return item;
 }

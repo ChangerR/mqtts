@@ -184,7 +184,7 @@ struct DurableStore::Impl
   std::atomic<bool> frozen{false};
   int lock_fd = -1;
   uint64_t next_id = 0;
-  static constexpr uint32_t kFormatVersion = 5;
+  static constexpr uint32_t kFormatVersion = 6;
   uint32_t format_version = kFormatVersion;
   std::atomic<size_t> checkpoint_bytes{0};
   size_t pending = 0, bytes = 0, unique_bytes = 0, requests = 0, request_bytes = 0,
@@ -208,6 +208,7 @@ struct DurableStore::Impl
     std::string sender;
     uint64_t generation = 0;
     bool committed = false;
+    RetainedProperties properties;
   };
   std::map<std::string, RetainedItem> retained;
   // Latest mutation per topic, including clears that removed the map entry.
@@ -633,6 +634,9 @@ struct DurableStore::Impl
                                           const Location& location, bool attach);
   void apply_retain_record(const std::string& data);
   void restore_retained();
+  void erase_expired_retained_locked(int64_t now);
+  size_t encoded_retain_snapshot_locked(const std::string& replacing,
+                                       const journal::StoredRetain& incoming) const;
   void restore();
   void checkpoint();
   void maintain();
@@ -804,9 +808,75 @@ bool retain_topic_ok(const std::string& topic)
 }
 }  // namespace
 
+namespace {
+size_t journal_text_width(const std::string& value)
+{
+  return 4 + value.size();
+}
+
+void fill_retain_record(journal::StoredRetain& record, const DurableStore::RetainedProperties& properties)
+{
+  if (properties.payload_format_indicator != 0) {
+    record.has_payload_format = true;
+    record.payload_format = properties.payload_format_indicator;
+  }
+  record.content_type = properties.content_type;
+  record.response_topic = properties.response_topic;
+  record.correlation_data = properties.correlation_data;
+  record.user_properties = properties.user_properties;
+}
+
+DurableStore::RetainedProperties properties_from_record(const journal::StoredRetain& record)
+{
+  DurableStore::RetainedProperties properties;
+  if (record.has_payload_format)
+    properties.payload_format_indicator = record.payload_format;
+  properties.content_type = record.content_type;
+  properties.response_topic = record.response_topic;
+  properties.correlation_data = record.correlation_data;
+  properties.user_properties = record.user_properties;
+  return properties;
+}
+
+size_t retain_property_width(const journal::StoredRetain& item)
+{
+  size_t bytes = 1;
+  if (item.has_payload_format)
+    bytes += 1;
+  if (!item.content_type.empty())
+    bytes += journal_text_width(item.content_type);
+  if (!item.response_topic.empty())
+    bytes += journal_text_width(item.response_topic);
+  if (!item.correlation_data.empty())
+    bytes += journal_text_width(item.correlation_data);
+  if (!item.user_properties.empty()) {
+    bytes += 4;
+    for (size_t i = 0; i < item.user_properties.size(); ++i) {
+      bytes += journal_text_width(item.user_properties[i].first);
+      bytes += journal_text_width(item.user_properties[i].second);
+    }
+  }
+  return bytes;
+}
+
+size_t retain_record_width(const journal::StoredRetain& item)
+{
+  return journal_text_width(item.topic) + 1 + 8 + journal_text_width(item.payload) +
+         journal_text_width(item.sender) + retain_property_width(item);
+}
+}  // namespace
+
 DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_t qos,
                                                 const std::string& payload, const std::string& sender,
                                                 int64_t expires_ms, bool wait)
+{
+  return put_retained(topic, qos, payload, sender, expires_ms, wait, RetainedProperties());
+}
+
+DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_t qos,
+                                                const std::string& payload, const std::string& sender,
+                                                int64_t expires_ms, bool wait,
+                                                const RetainedProperties& properties)
 {
   auto& v = *impl_;
   if (!retain_topic_ok(topic) || payload.empty() || qos > 2 || expires_ms < 0) {
@@ -817,6 +887,19 @@ DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_
   return v.call(
       [&](const std::shared_ptr<Result>& r) -> Ticket {
         *r = success();
+        v.erase_expired_retained_locked(now_ms());
+        journal::StoredRetain record;
+        record.topic = topic;
+        record.qos = qos;
+        record.expires_ms = expires_ms;
+        record.payload = payload;
+        record.sender = sender;
+        fill_retain_record(record, properties);
+        if (expires_ms == 0 || expires_ms > now_ms()) {
+          const size_t snapshot_bytes = v.encoded_retain_snapshot_locked(topic, record);
+          if (snapshot_bytes + 4 > v.config.max_disk_bytes / 16)
+            throw journal::AdmissionFull("retain snapshot exceeds reserved disk budget");
+        }
         const uint64_t generation = ++v.next_retain_generation;
         v.retain_epoch[topic] = generation;
         if (expires_ms > 0 && expires_ms <= now_ms()) {
@@ -837,15 +920,10 @@ DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_
         item.expires_ms = expires_ms;
         item.payload = payload;
         item.sender = sender;
+        item.properties = properties;
         item.generation = generation;
         v.retained[topic] = std::move(item);
         Encoder e;
-        journal::StoredRetain record;
-        record.topic = topic;
-        record.qos = qos;
-        record.expires_ms = expires_ms;
-        record.payload = payload;
-        record.sender = sender;
         journal::write_retain_set(e, record);
         try {
           return v.enqueue(
@@ -922,6 +1000,7 @@ std::vector<DurableStore::RetainedMessage> DurableStore::retained_messages() con
     message.payload = item.second.payload;
     message.sender = item.second.sender;
     message.expires_ms = item.second.expires_ms;
+    message.properties = item.second.properties;
     out.push_back(std::move(message));
   }
   return out;
@@ -1764,6 +1843,45 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
   d.end();
   return m;
 }
+void DurableStore::Impl::erase_expired_retained_locked(int64_t now)
+{
+  std::vector<std::string> expired_topics;
+  for (const auto& item : retained) {
+    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
+      expired_topics.push_back(item.first);
+  }
+  for (size_t i = 0; i < expired_topics.size(); ++i)
+    retained.erase(expired_topics[i]);
+}
+
+size_t DurableStore::Impl::encoded_retain_snapshot_locked(const std::string& replacing,
+                                                        const journal::StoredRetain& incoming) const
+{
+  const int64_t now = DurableStore::now_ms();
+  size_t bytes = journal_text_width("MQTTS-RETAIN-2") + 8 + 4;
+  bool replaced = false;
+  for (const auto& item : retained) {
+    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
+      continue;
+    if (item.first == replacing) {
+      bytes += retain_record_width(incoming);
+      replaced = true;
+      continue;
+    }
+    journal::StoredRetain record;
+    record.topic = item.first;
+    record.qos = item.second.qos;
+    record.expires_ms = item.second.expires_ms;
+    record.payload = item.second.payload;
+    record.sender = item.second.sender;
+    fill_retain_record(record, item.second.properties);
+    bytes += retain_record_width(record);
+  }
+  if (!replaced && (incoming.expires_ms == 0 || incoming.expires_ms > now))
+    bytes += retain_record_width(incoming);
+  return bytes;
+}
+
 void DurableStore::Impl::apply_retain_record(const std::string& data)
 {
   Decoder d(data);
@@ -1778,6 +1896,7 @@ void DurableStore::Impl::apply_retain_record(const std::string& data)
   item.expires_ms = record.expires_ms;
   item.payload = std::move(record.payload);
   item.sender = std::move(record.sender);
+  item.properties = properties_from_record(record);
   item.committed = true;
   retained[record.topic] = std::move(item);
 }
@@ -1790,7 +1909,9 @@ void DurableStore::Impl::restore_retained()
   if (!file.empty()) {
     auto body = unchecked(file);
     Decoder d(body);
-    if (d.text() != "MQTTS-RETAIN-1")
+    const std::string magic = d.text();
+    const bool with_properties = magic == "MQTTS-RETAIN-2";
+    if (magic != "MQTTS-RETAIN-1" && !with_properties)
       throw std::runtime_error("retain snapshot format mismatch");
     retain_cut = d.u64();
     uint32_t count = d.u32();
@@ -1801,6 +1922,11 @@ void DurableStore::Impl::restore_retained()
       item.expires_ms = static_cast<int64_t>(d.u64());
       item.payload = d.text();
       item.sender = d.text();
+      if (with_properties) {
+        journal::StoredRetain record;
+        journal::read_retain_properties(d, record);
+        item.properties = properties_from_record(record);
+      }
       item.committed = true;
       if (!retain_topic_ok(topic) || item.qos > 2 || item.expires_ms < 0 || item.payload.empty())
         throw std::runtime_error("invalid retain snapshot");
@@ -2017,10 +2143,13 @@ void DurableStore::Impl::checkpoint()
       if (retain_log)
         retain_fence = retain_log->serial();
       const int64_t now = DurableStore::now_ms();
+      std::vector<std::string> expired_topics;
       for (const auto& item : retained) {
-        if (!item.second.committed)
+        if (item.second.expires_ms > 0 && item.second.expires_ms <= now) {
+          expired_topics.push_back(item.first);
           continue;
-        if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
+        }
+        if (!item.second.committed)
           continue;
         journal::StoredRetain copy;
         copy.topic = item.first;
@@ -2028,8 +2157,11 @@ void DurableStore::Impl::checkpoint()
         copy.expires_ms = item.second.expires_ms;
         copy.payload = item.second.payload;
         copy.sender = item.second.sender;
+        fill_retain_record(copy, item.second.properties);
         retain_snapshot.push_back(std::move(copy));
       }
+      for (size_t i = 0; i < expired_topics.size(); ++i)
+        retained.erase(expired_topics[i]);
       for (size_t p = 0; p < config.partitions; ++p) {
         message_fences[p] = messages[p]->serial();
         state_fences[p] = states[p]->serial();
@@ -2117,7 +2249,7 @@ void DurableStore::Impl::checkpoint()
     }
     if (retain_log) {
       Encoder retain_body;
-      retain_body.text("MQTTS-RETAIN-1");
+      retain_body.text("MQTTS-RETAIN-2");
       retain_body.u64(retain_fence);
       retain_body.u32(uint32_t(retain_snapshot.size()));
       for (const auto& item : retain_snapshot) {
@@ -2126,6 +2258,7 @@ void DurableStore::Impl::checkpoint()
         retain_body.u64(static_cast<uint64_t>(item.expires_ms));
         retain_body.text(item.payload);
         retain_body.text(item.sender);
+        journal::write_retain_properties(retain_body, item);
       }
       if (retain_body.data.size() + 4 > config.max_disk_bytes / 16)
         throw std::runtime_error("retain snapshot exceeds reserved disk budget");

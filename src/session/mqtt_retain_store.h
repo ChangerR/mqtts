@@ -81,6 +81,9 @@ class RetainStore
   RetainWriteResult store(const PublishPacket& packet, const MQTTString& sender,
                           const RetainConfig& limits, std::chrono::steady_clock::time_point now);
   RetainWriteResult remove(const std::string& topic);
+  // 日志提交失败时把内存改回调用 store 之前的值。过期项视为不存在。
+  bool peek(const std::string& topic, RetainedCopy& out, std::chrono::steady_clock::time_point now) const;
+  RetainWriteResult install(const RetainedCopy& copy);
   // 匹配非过期消息。遍历时只保留字典序最小的 limit 条。过期项在读锁外用写锁清掉。
   RetainMatchResult match(const std::string& filter, size_t limit,
                           std::chrono::steady_clock::time_point now);

@@ -107,6 +107,14 @@ class DurableStore
   Statistics statistics() const;
   // Versioned retain log under the store directory. Empty payload is not a put;
   // deletion is clear_retained. wait is false for QoS 0 (the worker commits later).
+  struct RetainedProperties
+  {
+    uint8_t payload_format_indicator = 0;
+    std::string content_type;
+    std::string response_topic;
+    std::string correlation_data;
+    std::vector<std::pair<std::string, std::string>> user_properties;
+  };
   struct RetainedMessage
   {
     std::string topic;
@@ -114,9 +122,13 @@ class DurableStore
     std::string payload;
     std::string sender;
     int64_t expires_ms = 0;
+    RetainedProperties properties;
   };
   Result put_retained(const std::string& topic, uint8_t qos, const std::string& payload,
                       const std::string& sender, int64_t expires_ms, bool wait);
+  Result put_retained(const std::string& topic, uint8_t qos, const std::string& payload,
+                      const std::string& sender, int64_t expires_ms, bool wait,
+                      const RetainedProperties& properties);
   Result clear_retained(const std::string& topic, bool wait);
   // Committed, unexpired messages. Absent on journals that predate the retain log.
   std::vector<RetainedMessage> retained_messages() const;
