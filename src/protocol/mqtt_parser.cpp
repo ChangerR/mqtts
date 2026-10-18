@@ -1487,6 +1487,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::MaximumQoS:
         properties.maximum_qos = buffer[bytes_read++];
+        properties.has_maximum_qos = true;
         break;
       case PropertyType::RetainAvailable:
         properties.retain_available = buffer[bytes_read++] != 0;

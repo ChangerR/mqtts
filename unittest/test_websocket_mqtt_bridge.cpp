@@ -1,9 +1,11 @@
 #include <cassert>
 #include <iostream>
+#include <thread>
 #include <vector>
 #include "mqtt_allocator.h"
 #include "mqtt_parser.h"
 #include "mqtt_buffer.h"
+#include "mqtt_session_manager_v2.h"
 #include "websocket_mqtt_bridge.h"
 
 namespace {
@@ -135,6 +137,30 @@ void test_first_packet_must_be_connect() {
     std::cout << "First-packet CONNECT guard test passed" << std::endl;
 }
 
+void test_text_publish_counted_when_forward_fails() {
+    std::cout << "\nTesting WebSocket publish receipt is counted before forwarding..." << std::endl;
+
+    mqtt::GlobalSessionManager manager;
+    assert(manager.pre_register_threads(1, 4) == 0);
+    assert(manager.register_thread_manager(std::this_thread::get_id()) != nullptr);
+    assert(manager.finalize_thread_registration() == 0);
+
+    MQTTAllocator allocator("test_ws_bridge_publish_count", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    websocket::WebSocketMQTTBridge bridge(&allocator);
+    assert(bridge.init(&manager) == MQ_SUCCESS);
+    bridge.set_message_format(websocket::MessageFormat::TEXT_PROTOCOL);
+
+    int ret = bridge.handle_websocket_text("ws_text_pub", "PUBLISH:+/bad:hi");
+    assert(ret != MQ_SUCCESS);
+
+    mqtt::ProtocolCounterSnapshot snapshot;
+    manager.collect_protocol_counters(snapshot);
+    assert(snapshot.publish_received == 1);
+    assert(snapshot.publish_received_bytes == 2);
+
+    std::cout << "WebSocket publish receipt counting test passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -144,6 +170,7 @@ int main() {
     test_reject_fragmented_pingresp_before_connect();
     test_reject_multiple_packets_before_connect();
     test_first_packet_must_be_connect();
+    test_text_publish_counted_when_forward_fails();
 
     std::cout << "\nAll WebSocket MQTT bridge tests passed!" << std::endl;
     return 0;

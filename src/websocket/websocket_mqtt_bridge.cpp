@@ -351,6 +351,8 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                         return ret;
                     }
 
+                    // Count at ingestion, including later authorization or quota failure.
+                    if (session_manager_) session_manager_->note_publish_received(payload.size());
                     ret = publish_message(client_id, topic, payload, qos, retain);
                 }
             }
@@ -368,6 +370,7 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                     return ret;
                 }
 
+                if (session_manager_) session_manager_->note_publish_received(payload.size());
                 ret = publish_message(client_id, topic, payload, 0, false);
             }
             break;
@@ -768,7 +771,6 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
 
   if (ret >= 0) {
     stats_.mqtt_messages_sent++;
-    if (session_manager_) session_manager_->note_publish_received(payload.size());
     return MQ_SUCCESS;  // Session manager returns the recipient count.
   }
 
@@ -916,6 +918,8 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, c
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
+    // Receipt is independent of authorization, quota, and durable QoS 2 rejection.
+    if (session_manager_) session_manager_->note_publish_received(packet->payload.size());
     if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
       const auto protocol = client_protocol_versions_.find(client_id);
       if (protocol != client_protocol_versions_.end() && protocol->second >= 5) {

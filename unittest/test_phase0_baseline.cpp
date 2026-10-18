@@ -122,6 +122,35 @@ TEST(Phase0ConnAck, MaximumQosZeroIsWritten)
   EXPECT_TRUE(contains_bytes(connack.bytes, 0x24, 0x00));
 }
 
+TEST(Phase0ConnAck, ParsedMaximumQosZeroSurvivesReserialize)
+{
+  MQTTAllocator allocator("phase0_qos0_parse", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+  mqtt::ConnAckPacket packet(&allocator);
+  packet.type = mqtt::PacketType::CONNACK;
+  packet.reason_code = mqtt::ReasonCode::Success;
+  packet.properties.has_maximum_qos = true;
+  packet.properties.maximum_qos = 0;
+
+  mqtt::MQTTParser parser(&allocator);
+  parser.set_protocol_version_hint(5);
+  mqtt::MQTTBuffer buffer(&allocator);
+  ASSERT_EQ(parser.serialize_connack(&packet, buffer), 0);
+
+  mqtt::Packet* raw = nullptr;
+  ASSERT_EQ(parser.parse_packet(buffer.data(), buffer.size(), &raw), 0);
+  auto* parsed = static_cast<mqtt::ConnAckPacket*>(raw);
+  EXPECT_TRUE(parsed->properties.has_maximum_qos);
+  EXPECT_EQ(parsed->properties.maximum_qos, 0u);
+
+  mqtt::MQTTBuffer again(&allocator);
+  ASSERT_EQ(parser.serialize_connack(parsed, again), 0);
+  std::vector<uint8_t> bytes(again.data(), again.data() + again.size());
+  EXPECT_TRUE(contains_bytes(bytes, 0x24, 0x00));
+
+  parsed->~ConnAckPacket();
+  allocator.deallocate(parsed, sizeof(mqtt::ConnAckPacket));
+}
+
 TEST(Phase0ConnAck, PersistenceCapsMaximumQosAtOne)
 {
   MQTTAllocator allocator("phase0_qos1", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
@@ -235,6 +264,12 @@ TEST(Phase0Config, LimitValidation)
 
 TEST(Phase0Config, SampleConfigs)
 {
+  mqtt::ConfigManager auth;
+  EXPECT_EQ(auth.load_from_file(std::string(MQTTS_SOURCE_DIR) + "/mqtts_with_auth.yaml"), 0);
+  EXPECT_EQ(auth.get_config().mqtt.max_packet_size, 268435455u);
+  EXPECT_GE(auth.get_config().memory.client_max_size,
+            static_cast<size_t>(auth.get_config().mqtt.max_packet_size) + 64 * 1024);
+
   mqtt::ConfigManager stock;
   EXPECT_EQ(stock.load_from_file(std::string(MQTTS_SOURCE_DIR) + "/mqtts.yaml"), 0);
   EXPECT_TRUE(warnings_contain(stock, "websocket.enabled"));
