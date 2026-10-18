@@ -94,6 +94,9 @@ TEST(InboundTopicAlias, ParserRecordsAliasZero)
 
   mqtt::PublishPacket named(&allocator);
   named.type = mqtt::PacketType::PUBLISH;
+  named.dup = false;
+  named.qos = 0;
+  named.retain = false;
   named.topic_name = topic_of("sensors/temp", &allocator);
   named.properties.topic_alias = 4;
   named.payload = mqtt::to_mqtt_bytes(std::vector<uint8_t>{'z'}, &allocator);
@@ -107,6 +110,12 @@ TEST(InboundTopicAlias, ParserRecordsAliasZero)
   EXPECT_EQ(mqtt::from_mqtt_string(round->topic_name), "sensors/temp");
   round->~PublishPacket();
   allocator.deallocate(parsed, sizeof(mqtt::PublishPacket));
+
+  const uint8_t duplicate[] = {0x30, 0x0B, 0x00, 0x00, 0x06, 0x23, 0x00, 0x01,
+                               0x23, 0x00, 0x02, 'h', 'i'};
+  mqtt::Packet* rejected = nullptr;
+  EXPECT_EQ(parser.parse_packet(duplicate, sizeof(duplicate), &rejected), MQ_ERR_PROTOCOL);
+  EXPECT_EQ(rejected, nullptr);
 }
 
 int main(int argc, char** argv)

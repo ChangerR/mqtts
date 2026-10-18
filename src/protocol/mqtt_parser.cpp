@@ -410,7 +410,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
       LOG_ERROR("Failed to parse properties");
       publish->~PublishPacket();
       allocator_->deallocate(publish, sizeof(PublishPacket));
-      return MQ_ERR_PACKET_INVALID;
+      return ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
     }
     pos += properties_bytes_read;
   }
@@ -1507,6 +1507,10 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         bytes_read += 2;
         break;
       case PropertyType::TopicAlias:
+        if (properties.has_topic_alias) {
+          LOG_ERROR("Duplicate Topic Alias property");
+          return MQ_ERR_PROTOCOL;
+        }
         properties.has_topic_alias = true;
         properties.topic_alias = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
         bytes_read += 2;
