@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -218,6 +219,9 @@ def wildcard_trial(port, expect, payload):
             if first is None:
                 first = now
             topics.append(topic)
+        expected = ['store/%06d' % index for index in range(expect)]
+        if topics != expected:
+            raise AssertionError('wildcard topics are not the ordered range store/000000 through store/%06d' % (expect - 1))
         finished = time.perf_counter()
         # Drain nothing else for a short quiet period; the cap must hold.
         sock.settimeout(0.05)
@@ -263,16 +267,27 @@ def start_broker(binary, root, retained):
     log = (root / 'broker.log').open('w')
     proc = subprocess.Popen([binary, '-c', str(config_path)], stdout=log, stderr=log)
     deadline = time.monotonic() + 8
-    while True:
-        if proc.poll() is not None:
-            raise RuntimeError((root / 'broker.log').read_text()[-4000:])
-        try:
-            with socket.create_connection(('127.0.0.1', port), timeout=0.1):
-                break
-        except OSError:
-            if time.monotonic() > deadline:
-                raise TimeoutError((root / 'broker.log').read_text()[-4000:])
-            time.sleep(0.02)
+    try:
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError((root / 'broker.log').read_text()[-4000:])
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=0.1):
+                    break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError((root / 'broker.log').read_text()[-4000:])
+                time.sleep(0.02)
+    except Exception:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        log.close()
+        raise
     return proc, port, stats_path, log
 
 
@@ -312,6 +327,10 @@ def main():
                 if after.get('retained_delivery_truncated', 0) >= args.trials and after.get('retained_messages') == args.retained:
                     break
                 time.sleep(0.2)
+            if after.get('retained_delivery_truncated', 0) < args.trials or after.get('retained_messages') != args.retained:
+                raise AssertionError(
+                    'monitor counters did not converge: retained_delivery_truncated=%s retained_messages=%s, want truncated>=%s retained=%s'
+                    % (after.get('retained_delivery_truncated'), after.get('retained_messages'), args.trials, args.retained))
             for sock in (pub, sub, filler):
                 sock.close()
         finally:
@@ -322,8 +341,8 @@ def main():
                 proc.kill()
                 proc.wait()
             log.close()
-            if proc.returncode not in (0, -15, None) and proc.returncode is not None and proc.returncode < 0:
-                pass
+        if proc.returncode not in (0, -signal.SIGTERM):
+            raise RuntimeError('broker exited with status %s' % proc.returncode)
     base_p99 = distribution(baseline)['p99']
     loaded_p99 = distribution(loaded)['p99']
     ratio = round(loaded_p99 / base_p99, 4) if base_p99 else None
