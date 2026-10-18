@@ -1410,8 +1410,9 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         const uint8_t key = static_cast<uint8_t>((delivery.qos << 1) | (delivery.retain ? 1 : 0));
         auto found = shaped.find(key);
         if (found == shaped.end()) {
+          // 降级或改写后的投递是一条新报文，不能沿用入站重传的 DUP。
           outbound = SharedMessageContentPtr(new SharedMessageContent(
-              packet.topic_name, packet.payload, delivery.qos, delivery.retain, packet.dup,
+              packet.topic_name, packet.payload, delivery.qos, delivery.retain, false,
               packet.properties, sender_client_id, global_allocator_));
           shaped.emplace(key, outbound);
         } else {
@@ -1469,7 +1470,7 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
         } else {
           shaped.emplace(key, SharedMessageContentPtr(new SharedMessageContent(
                                   content->topic_name, content->payload, delivery.qos,
-                                  delivery.retain, content->dup, content->properties,
+                                  delivery.retain, false, content->properties,
                                   content->sender_client_id, global_allocator_)));
         }
       }

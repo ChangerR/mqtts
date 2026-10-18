@@ -909,6 +909,27 @@ def subscription_options(binary, websocket):
             low.close()
             high.close()
 
+        qos0 = Client(broker.port, websocket)
+        retransmit = Client(broker.port, websocket)
+        try:
+            connect(qos0, 'opt-dup', 5, 30)
+            subscribe(qos0, 'opt/dup', 5, qos=0)
+            connect(retransmit, 'opt-dup-pub', 5, 30)
+            body = utf('opt/dup') + struct.pack('!H', 9) + b'\x00' + b'dup'
+            retransmit.send(packet(0x3A, body))
+            header, _ = retransmit.read(2)
+            if header != 0x40:
+                raise AssertionError('DUP publish PUBACK 0x%02x' % header)
+            header, body = qos0.read(2)
+            if header & 0x08 or (header >> 1) & 3 != 0:
+                raise AssertionError('downgraded DUP header 0x%02x' % header)
+            topic, payload = publish_of(header, body, 5)
+            if topic != 'opt/dup' or payload != b'dup':
+                raise AssertionError((topic, payload))
+        finally:
+            qos0.close()
+            retransmit.close()
+
         overlap = Client(broker.port, websocket)
         try:
             connect(overlap, 'opt-over', 5, 30)
