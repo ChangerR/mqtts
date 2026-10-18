@@ -981,23 +981,18 @@ void GlobalSessionManager::set_retain_config(const RetainConfig& config)
 
 void GlobalSessionManager::account_retained_result(const RetainWriteResult& result)
 {
-  ProtocolCounters* counters = current_thread_counters();
-  if (counters) {
-    note_retained_delta(result.message_delta, result.byte_delta);
-    if (result.kind == RetainWriteResult::Rejected) {
-      note_retained_not_stored();
-    }
+  // 恢复发生在事件线程注册之前。条数和字节只记在有符号总量上；
+  // 监控汇总会用总量覆盖线程计数，种子里的条数重启后看不见。
+  note_retained_delta(result.message_delta, result.byte_delta);
+  if (result.kind != RetainWriteResult::Rejected) {
     return;
   }
-  if (result.message_delta != 0) {
-    retained_seed_messages_.fetch_add(result.message_delta, std::memory_order_relaxed);
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->retained_not_stored.fetch_add(1, std::memory_order_relaxed);
+    return;
   }
-  if (result.byte_delta != 0) {
-    retained_seed_bytes_.fetch_add(result.byte_delta, std::memory_order_relaxed);
-  }
-  if (result.kind == RetainWriteResult::Rejected) {
-    retained_seed_not_stored_.fetch_add(1, std::memory_order_relaxed);
-  }
+  retained_seed_not_stored_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::claim_retained_seed(ProtocolCounters& counters)
