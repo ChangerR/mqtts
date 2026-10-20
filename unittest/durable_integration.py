@@ -171,6 +171,20 @@ def run(binary, fault_library):
         assert [replay[1]]+[r.delivery()[1] for _ in range(197)]==[data for i,data in enumerate(expected) if i not in [3,5]]
         r.quiet()
         print('PASS checkpoints, cross-partition ordering, segment reclamation and ACK gaps across SIGKILL',flush=True)
+    with Fixture(binary,persistence={}) as f:
+        reader,present=client(f,'reader');assert not present
+        # QoS 1, No Local, Retain As Published, Retain Handling 2.
+        assert reader.sub('fixture/opts',options=0x2D)==1
+        reader.disconnect();time.sleep(.05)
+        restart(f)
+        reader,present=client(f,'reader');assert present
+        reader.pub('fixture/opts',f.payload(reader));reader.quiet()
+        writer,_=client(f,'writer',clean=True,expiry=0)
+        other=f.payload(writer)
+        writer.pub('fixture/opts',other)
+        assert reader.delivery()[1]==other
+        reader.quiet()
+        print('PASS restored subscription keeps No Local across restart',flush=True)
 
 def journal_faults(binary, library):
     with tempfile.TemporaryDirectory(prefix='mqtts-fault-control-') as control:

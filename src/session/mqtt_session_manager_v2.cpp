@@ -1330,15 +1330,6 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
     planned = plan_subscription_deliveries(subscribers, sender_id, packet.qos, packet.retain,
                                            implicit_no_local_);
   }
-  bool sender_uses_durable_queue = false;
-  if (lookup == MQ_SUCCESS) {
-    for (const PlannedDelivery& delivery : planned) {
-      if (delivery.qos > 0 && from_mqtt_string(delivery.client_id) == sender_id) {
-        sender_uses_durable_queue = true;
-        break;
-      }
-    }
-  }
   if (durable_store_) {
     if (packet.qos > 1)
       return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
@@ -1354,8 +1345,9 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         copy.payload = packet.payload;
         copy.qos = 1;
         copy.packet_id = 1;
-        // One shared wire cannot carry a different retain flag per subscriber.
-        // Per-subscription RAP on this path waits for the subscription-record format.
+        // One stored wire is shared by every durable recipient, so it cannot
+        // carry a different retain flag per subscription. Restored Retain As
+        // Published still applies on the live path. This copy keeps retain clear.
         copy.retain = false;
         copy.dup = false;
         copy.properties = Properties(packet.properties, &wire_allocator);
@@ -1370,7 +1362,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         auto result = durable_store_->publish(
             from_mqtt_string(topic),
             std::string(reinterpret_cast<const char*>(wire.data()), wire.size()),
-            from_mqtt_string(sender_client_id), expires, !sender_uses_durable_queue);
+            from_mqtt_string(sender_client_id), expires, implicit_no_local_);
         if (!result.ok) {
           LOG_WARN("Persistent publish refused: {}", result.error);
           return result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;

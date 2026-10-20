@@ -77,11 +77,15 @@ Thus disk workers run concurrently while client replay preserves the accepted or
 A stalled earlier message can intentionally hold later messages to the same consumer;
 a consumer for an independent partition continues to receive.
 Live fanout delivers a publish to its sender unless that subscription sets No Local,
-or `mqtt.implicit_no_local` is true. A durable QoS 1 queue follows the same decision
-from the in-memory subscription. The on-disk subscription record still stores only QoS,
-so a restarted session comes back with every option clear (No Local off) until the
-subscription-record format change. The shared durable wire also still clears the retain
-flag; per-subscriber Retain As Published on that path waits for the same format change.
+or `mqtt.implicit_no_local` is true. A durable QoS 1 queue makes the same decision from
+the stored subscription: the publisher is skipped only when every matching record has
+No Local, or when `implicit_no_local` is on. Legacy records have no option tail and
+decode as all options clear, so an upgraded session receives its own publishes until
+that flag or a new No Local subscription says otherwise. Retain Handling is stored and
+restored with the subscription; applying it to retained-message delivery is separate.
+The shared durable wire still clears the retain flag, because one stored payload cannot
+carry a different Retain As Published bit per subscriber. Restored Retain As Published
+applies on the live path.
 
 Clean Start discards the previous owner's session/queue. Another authenticated owner
 cannot take over a retained Client ID. Connection epochs fence late socket operations,
@@ -238,15 +242,19 @@ sessions first. Clean Start has its standard explicit backlog-discard semantics.
 
 ## Upgrade from the SQLite version
 
-The wire contract remains QoS 1, but `durable_sessions_contract` is now **4** because
-the on-disk format changed. Existing configured basenames are deliberately preserved.
+The wire contract remains QoS 1, but `durable_sessions_contract` is now **5** because
+subscription records gained a version and option byte. Existing configured basenames are deliberately preserved.
 An old SQLite file at that path refuses startup instead of starting an empty store at
 a different implicit path. Do not delete or rename the old volume to make startup pass.
 
-Native format 2/3 directories upgrade in place after successful recovery. The new
-reader accepts checkpoint formats 2, 3 and 4. The FORMAT marker is atomically advanced
-to 4 before admitting writes that can contain gap records, so an old binary refuses
-the upgraded directory instead of misreading it. Back up the stopped
+Native format 2/3/4 directories upgrade in place after successful recovery. The new
+reader accepts checkpoint formats 2, 3, 4 and 5. Checkpoints 2–4 store each
+subscription as filter plus QoS; those options decode as clear. Checkpoint 5 and new
+session-journal SUBSCRIBE records append version `1` and the MQTT option byte (No
+Local, Retain As Published, Retain Handling). A journal SUBSCRIBE that ends after QoS
+is the legacy body. The FORMAT marker is atomically advanced to 5 before admitting
+writes, so an older binary refuses the upgraded directory instead of misreading the
+new tail. Back up the stopped
 store before upgrading; rollback requires restoring that backup. Compacted formats reserve
 checkpoint space for all unique live payloads as well as metadata. If a custom
 format 2 backlog exceeds that budget, startup refuses without deleting records;

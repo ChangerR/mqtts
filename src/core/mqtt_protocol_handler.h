@@ -200,8 +200,7 @@ class MQTTProtocolHandler
     }
     bool operator==(const MQTTString& topic) const { return filter == topic; }
   };
-  // Topic subscriptions. Options live here and in the topic tree. Disk records
-  // still store QoS only until the subscription-format change.
+  // Topic subscriptions. Options are mirrored into the durable subscription record.
   MQTTVector<LocalSubscription> subscriptions_;
 
   // Memory management

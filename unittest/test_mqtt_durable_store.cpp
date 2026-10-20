@@ -159,6 +159,8 @@ static void test_native_upgrade(const std::string& path, uint32_t version)
   checkpoint.u64(DurableStore::now_ms() + 60000);
   checkpoint.u8(0);
   checkpoint.u32(8);
+  if (version >= 4)
+    checkpoint.u64(0);
   checkpoint.u32(1);
   checkpoint.text("topic");
   checkpoint.u8(1);
@@ -175,13 +177,180 @@ static void test_native_upgrade(const std::string& path, uint32_t version)
   {
     auto marker = read_file(path + "/FORMAT", 4096).substr(4);
     Decoder d(marker);
-    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 4);
+    assert(d.text() == "MQTTS-PARTITION-LOG" && d.u32() == 5);
     DurableStore store(cfg);
     auto c = store.connect("legacy", "owner", false, 60);
     auto batch = store.fetch("legacy", c.epoch, 0, 32);
-    assert(c.present && batch.deliveries.size() == 1);
+    assert(c.present && c.subscriptions.size() == 1);
+    assert(c.subscriptions[0].first == "topic");
+    assert(c.subscriptions[0].second.qos == 1);
+    assert(!c.subscriptions[0].second.no_local);
+    assert(!c.subscriptions[0].second.retain_as_published);
+    assert(c.subscriptions[0].second.retain_handling == 0);
+    assert(batch.deliveries.size() == 1);
     assert(batch.deliveries[0].wire == "v2-payload" && batch.deliveries[0].packet_id == 7);
   }
+}
+
+static void test_subscription_options(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.checkpoint_interval_ms = 600000;
+  mqtt::journal::StoredSubscription rich;
+  rich.qos = 1;
+  rich.no_local = true;
+  rich.retain_as_published = true;
+  rich.retain_handling = 2;
+  {
+    DurableStore store(cfg);
+    auto session = store.connect("reader", "owner", false, 60);
+    assert(session.ok);
+    assert(store.subscribe("reader", session.epoch, "room/#", rich).ok);
+    assert(store.publish("room/one", "self", "reader", 0).targets.empty());
+    assert(store.publish("room/one", "other", "writer", 0).targets.size() == 1);
+    mqtt::journal::StoredSubscription plain;
+    plain.qos = 1;
+    assert(store.subscribe("reader", session.epoch, "room/+", plain).ok);
+    assert(store.publish("room/one", "overlap", "reader", 0).targets.size() == 1);
+    assert(store.unsubscribe("reader", session.epoch, "room/+").ok);
+    assert(store.publish("room/one", "again", "reader", 0).targets.empty());
+    mqtt::journal::StoredSubscription echo;
+    echo.qos = 1;
+    auto echo_session = store.connect("echo", "owner", false, 60);
+    assert(store.subscribe("echo", echo_session.epoch, "echo", echo).ok);
+    assert(store.publish("echo", "mine", "echo", 0).targets.size() == 1);
+    assert(store.publish("echo", "mine", "echo", 0, true).targets.empty());
+    mqtt::journal::StoredSubscription qos0 = rich;
+    qos0.qos = 0;
+    assert(store.subscribe("reader", session.epoch, "room/qos0", qos0).ok);
+    store.checkpoint();
+  }
+  {
+    DurableStore store(cfg);
+    auto session = store.connect("reader", "owner", false, 60);
+    assert(session.present);
+    const mqtt::journal::StoredSubscription* kept = nullptr;
+    const mqtt::journal::StoredSubscription* zero = nullptr;
+    for (const auto& sub : session.subscriptions) {
+      if (sub.first == "room/#")
+        kept = &sub.second;
+      if (sub.first == "room/qos0")
+        zero = &sub.second;
+    }
+    assert(kept && kept->qos == 1 && kept->no_local && kept->retain_as_published &&
+           kept->retain_handling == 2);
+    assert(zero && zero->qos == 0 && zero->no_local && zero->retain_as_published &&
+           zero->retain_handling == 2);
+    assert(store.publish("room/one", "after", "reader", 0).targets.empty());
+    assert(store.publish("room/one", "after", "writer", 0).targets.size() == 1);
+    auto echo = store.connect("echo", "owner", false, 60);
+    assert(echo.present && echo.subscriptions.size() == 1 && !echo.subscriptions[0].second.no_local &&
+           echo.subscriptions[0].second.retain_handling == 0);
+    assert(store.publish("echo", "after", "echo", 0).targets.size() == 1);
+  }
+}
+
+static void append_record(mqtt::journal::AppendLog& log, const std::string& body)
+{
+  auto appended = log.append(body, [](bool ok, const mqtt::journal::Location&) { assert(ok); });
+  assert(appended->wait());
+}
+
+static void test_legacy_subscription_journal(const std::string& path)
+{
+  using namespace mqtt::journal;
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.segment_bytes = 8192;
+  cfg.max_disk_bytes = 1024 * 1024;
+  cfg.checkpoint_interval_ms = 600000;
+  ensure_directory(path);
+  Encoder format;
+  format.text("MQTTS-PARTITION-LOG");
+  format.u32(4);
+  format.u32(1);
+  atomic_file(path + "/FORMAT", checked(format.data));
+  {
+    AppendLog log(path + "/sessions-0", cfg.segment_bytes, cfg.max_disk_bytes / 4);
+    Encoder connect;
+    connect.u8(1);
+    connect.text("legacy");
+    connect.text("owner");
+    connect.u64(1);
+    connect.u64(1);
+    connect.u32(60);
+    connect.u64(DurableStore::now_ms() + 60000);
+    connect.u8(0);
+    append_record(log, connect.data);
+    Encoder sub;
+    sub.u8(3);
+    sub.text("legacy");
+    sub.u64(1);
+    sub.text("old/filter");
+    sub.u8(1);
+    append_record(log, sub.data);
+    assert(log.seal()->wait());
+  }
+  {
+    DurableStore store(cfg);
+    auto session = store.connect("legacy", "owner", false, 60);
+    assert(session.ok && session.present && session.subscriptions.size() == 1);
+    assert(session.subscriptions[0].first == "old/filter");
+    assert(session.subscriptions[0].second.qos == 1);
+    assert(!session.subscriptions[0].second.no_local);
+    assert(!session.subscriptions[0].second.retain_as_published);
+    assert(session.subscriptions[0].second.retain_handling == 0);
+    assert(store.publish("old/filter", "self", "legacy", 0).targets.size() == 1);
+  }
+
+  const std::string bad = path + "-bad";
+  cfg.path = bad;
+  ensure_directory(bad);
+  Encoder bad_format;
+  bad_format.text("MQTTS-PARTITION-LOG");
+  bad_format.u32(5);
+  bad_format.u32(1);
+  atomic_file(bad + "/FORMAT", checked(bad_format.data));
+  {
+    AppendLog log(bad + "/sessions-0", cfg.segment_bytes, cfg.max_disk_bytes / 4);
+    Encoder connect;
+    connect.u8(1);
+    connect.text("legacy");
+    connect.text("owner");
+    connect.u64(1);
+    connect.u64(1);
+    connect.u32(60);
+    connect.u64(DurableStore::now_ms() + 60000);
+    connect.u8(0);
+    append_record(log, connect.data);
+    Encoder sub;
+    sub.u8(3);
+    sub.text("legacy");
+    sub.u64(1);
+    sub.text("old/filter");
+    sub.u8(1);
+    sub.u8(99);
+    sub.u8(0);
+    append_record(log, sub.data);
+    assert(log.seal()->wait());
+  }
+  std::vector<std::filesystem::path> logs;
+  for (const auto& entry : std::filesystem::directory_iterator(bad + "/sessions-0"))
+    if (entry.path().extension() == ".log")
+      logs.push_back(entry.path());
+  assert(logs.size() == 1);
+  const auto preserved = std::filesystem::file_size(logs[0]);
+  bool rejected = false;
+  try {
+    DurableStore store(cfg);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(std::filesystem::file_size(logs[0]) == preserved);
 }
 
 static void test_overflow_isolation(const std::string& path)
@@ -437,6 +606,9 @@ int main()
   test_compaction(std::string(dir) + "/compact");
   test_native_upgrade(std::string(dir) + "/upgrade-2", 2);
   test_native_upgrade(std::string(dir) + "/upgrade-3", 3);
+  test_native_upgrade(std::string(dir) + "/upgrade-4", 4);
+  test_subscription_options(std::string(dir) + "/options");
+  test_legacy_subscription_journal(std::string(dir) + "/legacy-options");
   test_overflow_isolation(std::string(dir) + "/overflow");
   test_incremental_routing_and_expiry(std::string(dir) + "/indexes");
   std::filesystem::remove_all(dir);

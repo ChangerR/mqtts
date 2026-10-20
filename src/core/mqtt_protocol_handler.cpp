@@ -854,7 +854,7 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   int ret = MQ_SUCCESS;
   bool need_reject = false;
   bool session_present = false;
-  std::vector<std::pair<std::string, uint8_t>> restored_subscriptions;
+  std::vector<std::pair<std::string, journal::StoredSubscription>> restored_subscriptions;
   ReasonCode reject_reason = ReasonCode::Success;
   auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
   MQTTString username{MQTTStrAllocator(allocator_)};
@@ -1022,9 +1022,11 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     try {
       for (const auto& sub : restored_subscriptions) {
         auto filter = to_mqtt_string(sub.first, allocator_);
-        // Old records have no option byte. Treat them as all zeros until the format change.
         SubscriptionOptions restored;
-        restored.qos = sub.second;
+        restored.qos = sub.second.qos;
+        restored.no_local = sub.second.no_local;
+        restored.retain_as_published = sub.second.retain_as_published;
+        restored.retain_handling = sub.second.retain_handling;
         if (add_subscription(filter, restored) != MQ_SUCCESS ||
             session_manager_->subscribe_topic_with_router(filter, client_id_, restored) != MQ_SUCCESS)
           throw std::runtime_error("persistent subscription restore failed");
@@ -1576,8 +1578,13 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
       }
 
       if (local_added && durable_epoch_) {
+        journal::StoredSubscription record;
+        record.qos = granted.qos;
+        record.no_local = granted.no_local;
+        record.retain_as_published = granted.retain_as_published;
+        record.retain_handling = granted.retain_handling;
         auto stored = session_manager_->durable_store()->subscribe(
-            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), granted.qos);
+            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), record);
         if (!stored.ok) {
           if (existed)
             (void)add_subscription(topic, previous_options, nullptr);
