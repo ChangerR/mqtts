@@ -38,6 +38,7 @@ class MQTTProtocolHandler;
 struct SessionInfo;
 class SafeHandlerRef;
 class RetainStore;
+struct RetainWriteResult;
 
 /**
  * @brief 线程本地会话管理器，管理单个线程下的所有Handler
@@ -685,6 +686,13 @@ class GlobalSessionManager
    */
   ThreadLocalSessionManager* fast_find_client_manager(const std::string& client_id_str) const;
   ProtocolCounters* current_thread_counters();
+  // 启动恢复发生在事件线程注册之前。差值先记在这里，由第一个注册的事件线程领走。
+  void account_retained_result(const RetainWriteResult& result);
+  void claim_retained_seed(ProtocolCounters& counters);
+
+  std::atomic<int64_t> retained_seed_messages_{0};
+  std::atomic<int64_t> retained_seed_bytes_{0};
+  std::atomic<uint64_t> retained_seed_not_stored_{0};
 
   /**
    * @brief 内部辅助函数：检查通配符匹配

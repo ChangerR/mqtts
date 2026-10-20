@@ -2509,10 +2509,10 @@ void MQTTProtocolHandler::pump_durable()
           fetch_again = true;
           if (removed.ok)
             cursor = delivery.sequence;
-          return removed.ok;
+          return removed;
         };
         if (!packet) {
-          if (!discard(DurableStore::DiscardReason::Malformed))
+          if (!discard(DurableStore::DiscardReason::Malformed).ok)
             break;
           continue;
         }
@@ -2530,7 +2530,7 @@ void MQTTProtocolHandler::pump_durable()
               allowed == auth::AuthResult::TOPIC_ACCESS_DENIED ||
               allowed == auth::AuthResult::INVALID_CREDENTIALS ||
               allowed == auth::AuthResult::USER_NOT_FOUND) {
-            if (!discard(DurableStore::DiscardReason::NotAuthorized))
+            if (!discard(DurableStore::DiscardReason::NotAuthorized).ok)
               break;
             continue;
           }
@@ -2564,12 +2564,15 @@ void MQTTProtocolHandler::pump_durable()
         int ret = encoder.serialize_publish(packet, output);
         packets[i].reset();
         if (ret != MQ_SUCCESS) {
-          if (!discard(DurableStore::DiscardReason::Malformed))
+          if (!discard(DurableStore::DiscardReason::Malformed).ok)
             break;
           continue;
         }
         if (output.size() > maximum_packet_size_) {
-          if (!discard(DurableStore::DiscardReason::PacketTooLarge))
+          const auto removed = discard(DurableStore::DiscardReason::PacketTooLarge);
+          if (removed.ok && removed.present && session_manager_)
+            session_manager_->note_outbound_packet_size_drop();
+          if (!removed.ok)
             break;
           continue;
         }

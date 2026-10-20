@@ -8,7 +8,6 @@ namespace mqtt {
 
 // 每条事件线程一份。字段名在本阶段定稿，阶段 1 的管理 API 直接沿用。
 // 只有所在事件线程写入，监控线程只做 relaxed 读。结构按缓存行对齐，避免线程之间伪共享。
-// 别名、遗嘱、保留消息和各类断开计数先留在这里，对应条目落地时再递增。
 struct alignas(64) ProtocolCounters {
   std::atomic<uint64_t> publish_received;
   std::atomic<uint64_t> publish_received_bytes;

@@ -301,6 +301,18 @@ TEST(Phase0Counters, ThreadCountersAggregateIntoJson)
   manager.note_publish_sent(4);
   manager.note_bytes_received(100);
   manager.note_bytes_sent(40);
+  manager.note_keepalive_timeout();
+  manager.note_connect_timeout();
+  manager.note_session_takeover();
+  manager.note_malformed_disconnect();
+  manager.note_outbound_packet_size_drop();
+  manager.note_inflight_window_delay();
+  manager.note_will_published();
+  manager.note_will_rejected();
+  manager.note_retained_delta(2, 9);
+  manager.note_retained_delta(-1, -4);
+  manager.note_retained_not_stored();
+  manager.note_retained_delivery_truncated();
 
   mqtt::ProtocolCounterSnapshot snapshot;
   manager.collect_protocol_counters(snapshot);
@@ -310,10 +322,18 @@ TEST(Phase0Counters, ThreadCountersAggregateIntoJson)
   EXPECT_EQ(snapshot.publish_sent_bytes, 4u);
   EXPECT_EQ(snapshot.bytes_received, 100u);
   EXPECT_EQ(snapshot.bytes_sent, 40u);
-  EXPECT_EQ(snapshot.keepalive_timeouts, 0u);
-  EXPECT_EQ(snapshot.wills_published, 0u);
-  EXPECT_EQ(snapshot.retained_messages, 0u);
-  EXPECT_EQ(snapshot.malformed_packet_disconnects, 0u);
+  EXPECT_EQ(snapshot.keepalive_timeouts, 1u);
+  EXPECT_EQ(snapshot.connect_timeouts, 1u);
+  EXPECT_EQ(snapshot.session_takeovers, 1u);
+  EXPECT_EQ(snapshot.malformed_packet_disconnects, 1u);
+  EXPECT_EQ(snapshot.outbound_packet_size_drops, 1u);
+  EXPECT_EQ(snapshot.inflight_window_delays, 1u);
+  EXPECT_EQ(snapshot.wills_published, 1u);
+  EXPECT_EQ(snapshot.wills_rejected, 1u);
+  EXPECT_EQ(snapshot.retained_messages, 1u);
+  EXPECT_EQ(snapshot.retained_bytes, 5u);
+  EXPECT_EQ(snapshot.retained_not_stored, 1u);
+  EXPECT_EQ(snapshot.retained_delivery_truncated, 1u);
 
   const std::string json_path = "/tmp/mqtts-phase0-counters.json";
   mqtt::ProcessMonitor monitor(&manager, 5);
@@ -332,6 +352,18 @@ TEST(Phase0Counters, ThreadCountersAggregateIntoJson)
     EXPECT_NE(json.find(field), std::string::npos) << field;
   }
   EXPECT_NE(json.find("\"publish_received\": 2"), std::string::npos);
+  EXPECT_NE(json.find("\"keepalive_timeouts\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"connect_timeouts\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"session_takeovers\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"malformed_packet_disconnects\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"outbound_packet_size_drops\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"inflight_window_delays\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"wills_published\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"wills_rejected\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"retained_messages\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"retained_bytes\": 5"), std::string::npos);
+  EXPECT_NE(json.find("\"retained_not_stored\": 1"), std::string::npos);
+  EXPECT_NE(json.find("\"retained_delivery_truncated\": 1"), std::string::npos);
   ::unlink(json_path.c_str());
 }
 

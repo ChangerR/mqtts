@@ -109,11 +109,20 @@ class Broker:
         return text[-4000:]
 
     def counter(self, name):
+        snapshot = self.snapshot()
+        if snapshot is None:
+            return None
+        try:
+            return snapshot['protocol'][name]
+        except (KeyError, TypeError):
+            return None
+
+    def snapshot(self):
         if not self.monitor_path.exists():
             return None
         try:
-            return json.loads(self.monitor_path.read_text())['protocol'][name]
-        except (OSError, json.JSONDecodeError, KeyError):
+            return json.loads(self.monitor_path.read_text())
+        except (OSError, json.JSONDecodeError):
             return None
 
     def wait_counter(self, name, minimum, timeout=4):
@@ -125,6 +134,20 @@ class Broker:
                 return last
             time.sleep(0.1)
         raise AssertionError('%s=%s, want >= %s\n%s' % (name, last, minimum, self.tail()))
+
+    def wait_exact(self, expected, timeout=5, after_timestamp=None):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = self.snapshot()
+            protocol = None if last is None else last.get('protocol')
+            fresh = after_timestamp is None or (
+                last is not None and last.get('timestamp', 0) > after_timestamp)
+            if fresh and protocol is not None and all(
+                    protocol.get(key) == value for key, value in expected.items()):
+                return protocol
+            time.sleep(0.1)
+        raise AssertionError('protocol %s, want %s\n%s' % (last, expected, self.tail()))
 
     def thread_of(self, client_id):
         text = (self.root / 'broker.log').read_text(errors='replace')
@@ -168,6 +191,8 @@ class Client:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.wire = b''
         self.mqtt = b''
+        self.sent_mqtt = 0
+        self.recv_mqtt = 0
         self.opened = time.monotonic()
         if websocket:
             key = base64.b64encode(os.urandom(16)).decode()
@@ -202,6 +227,7 @@ class Client:
         return data
 
     def send(self, payload):
+        self.sent_mqtt += len(payload)
         if self.websocket:
             mask = os.urandom(4)
             size = len(payload)
@@ -293,6 +319,7 @@ class Client:
                 index, length = complete
                 header = self.mqtt[0]
                 body = self.mqtt[index:index + length]
+                self.recv_mqtt += index + length
                 self.mqtt = self.mqtt[index + length:]
                 return header, body
             if time.monotonic() >= deadline:
@@ -718,7 +745,7 @@ def outbound_packet_limit(binary, websocket):
 
 
 def outbound_receive_window(binary, websocket):
-    broker = Broker(binary, 1, 30, 10)
+    broker = Broker(binary, 1, 30, 10, monitor=True)
     try:
         subscriber = Client(broker.port, websocket)
         publisher = Client(broker.port, websocket)
@@ -739,6 +766,9 @@ def outbound_receive_window(binary, websocket):
                     raise AssertionError((header, topic))
                 received.append((packet_id, payload))
             quiet(subscriber, 0.4)
+            delays = broker.wait_counter('inflight_window_delays', 1)
+            if delays < 1:
+                raise AssertionError('inflight delays %s' % delays)
             if [item[1] for item in received] != [bytes([0]), bytes([1])]:
                 raise AssertionError(received)
             if received[0][0] == received[1][0]:
@@ -2049,6 +2079,116 @@ def retain_durable(binary):
     print('PASS P0-7 retain journal restart and directed QoS 1', flush=True)
 
 
+def protocol_counters(binary, websocket):
+    payloads = [bytes([index]) * (8 + index) for index in range(4)]
+    broker = Broker(binary, 2, 60, 2, monitor=True)
+    try:
+        subscriber = Client(broker.port, websocket)
+        publisher = Client(broker.port, websocket)
+        try:
+            connect(subscriber, 'meter-sub', 5, 30)
+            subscribe(subscriber, 'meter/topic', 5)
+            connect(publisher, 'meter-pub', 5, 30)
+            for payload in payloads:
+                publish(publisher, 'meter/topic', payload, 5)
+            received = []
+            for _ in payloads:
+                header, body = subscriber.read(3)
+                topic, payload = publish_of(header, body, 5)
+                if topic != 'meter/topic' or (header & 0x06) != 0:
+                    raise AssertionError((header, topic))
+                received.append(payload)
+            if received != payloads:
+                raise AssertionError(received)
+            quiet(subscriber, 0.2)
+            quiet(publisher, 0.2)
+            payload_bytes = sum(len(item) for item in payloads)
+            before = broker.wait_exact({
+                'publish_received': len(payloads),
+                'publish_received_bytes': payload_bytes,
+                'publish_sent': len(payloads),
+                'publish_sent_bytes': payload_bytes,
+                'bytes_received': publisher.sent_mqtt + subscriber.sent_mqtt,
+                'bytes_sent': publisher.recv_mqtt + subscriber.recv_mqtt,
+            })
+        finally:
+            subscriber.close()
+            publisher.close()
+        silent = Client(broker.port, websocket)
+        try:
+            silent.expect_closed(4)
+        finally:
+            silent.close()
+        broker.wait_exact({'connect_timeouts': before['connect_timeouts'] + 1})
+
+        keeper = Client(broker.port, websocket)
+        try:
+            connect(keeper, 'meter-ka', 5, 2)
+            expect_disconnect_after(keeper, 0x8D, 2.0, 4.5)
+        finally:
+            keeper.close()
+        broker.wait_exact({'keepalive_timeouts': before['keepalive_timeouts'] + 1})
+
+        broken = Client(broker.port, websocket)
+        try:
+            connect(broken, 'meter-bad', 5, 30)
+            broken.send(b'\x30\x80\x80\x80\x80')
+            header, body = broken.read(2)
+            if disconnect_reason(header, body) != 0x81:
+                raise AssertionError(body.hex())
+            broken.expect_closed(1)
+        finally:
+            broken.close()
+        broker.wait_exact({'malformed_packet_disconnects': before['malformed_packet_disconnects'] + 1})
+
+        old = Client(broker.port, websocket)
+        new = None
+        try:
+            connect(old, 'meter-takeover', 5, 30)
+            new = Client(broker.port, websocket)
+            connect(new, 'meter-takeover', 5, 30)
+            header, body = old.read(2)
+            if disconnect_reason(header, body) != 0x8E:
+                raise AssertionError(body.hex())
+        finally:
+            old.close()
+            if new:
+                new.close()
+        broker.wait_exact({'session_takeovers': before['session_takeovers'] + 1})
+    finally:
+        broker.close()
+    print('PASS P0-8 counters websocket=%s' % websocket, flush=True)
+
+
+def retained_counter_restart(binary):
+    payload = b'kept-12'
+    broker = Broker(binary, 1, 30, 10, monitor=True, persistence=True)
+    try:
+        publisher = Client(broker.port, False)
+        try:
+            connect(publisher, 'meter-retain', 5, 30)
+            publish_retain(publisher, 'meter/keep', payload, 5, qos=1, packet_id=1)
+            expect_puback(publisher, 0x00)
+        finally:
+            publisher.close()
+        broker.wait_exact({'retained_messages': 1, 'retained_bytes': len(payload)})
+        previous = broker.snapshot()['timestamp']
+        broker.restart()
+        broker.wait_exact(
+            {'retained_messages': 1, 'retained_bytes': len(payload)},
+            timeout=6, after_timestamp=previous)
+        reader = Client(broker.port, False)
+        try:
+            connect(reader, 'meter-retain-sub', 5, 30)
+            subscribe(reader, 'meter/keep', 5)
+            expect_retained(reader, 'meter/keep', payload, 5)
+        finally:
+            reader.close()
+    finally:
+        broker.close()
+    print('PASS P0-8 retained counters survive restart', flush=True)
+
+
 def run(binary):
     for websocket in (False, True):
         will_rejections(binary, websocket)
@@ -2070,9 +2210,11 @@ def run(binary):
         inbound_qos2(binary, websocket)
         max_qos_cap(binary, websocket)
         packet_id_wrap(binary, websocket)
+        protocol_counters(binary, websocket)
         print('PASS P0-3 websocket=%s' % websocket, flush=True)
     will_delay_and_no_local(binary)
     retain_durable(binary)
+    retained_counter_restart(binary)
 
 
 def main():
