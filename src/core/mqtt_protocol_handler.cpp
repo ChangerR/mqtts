@@ -47,7 +47,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       client_port_(0),
       client_id_(MQTTStrAllocator(allocator)),
       connected_(false),
-      subscriptions_(MQTTStrAllocator(allocator)),
+      subscriptions_(MQTTSTLAllocator<LocalSubscription>(allocator)),
       allocator_(allocator),
       parser_(nullptr),
       session_expiry_interval_(0),
@@ -1022,8 +1022,11 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     try {
       for (const auto& sub : restored_subscriptions) {
         auto filter = to_mqtt_string(sub.first, allocator_);
-        if (add_subscription(filter) != MQ_SUCCESS ||
-            session_manager_->subscribe_topic_with_router(filter, client_id_, sub.second) != MQ_SUCCESS)
+        // Old records have no option byte. Treat them as all zeros until the format change.
+        SubscriptionOptions restored;
+        restored.qos = sub.second;
+        if (add_subscription(filter, restored) != MQ_SUCCESS ||
+            session_manager_->subscribe_topic_with_router(filter, client_id_, restored) != MQ_SUCCESS)
           throw std::runtime_error("persistent subscription restore failed");
       }
     } catch (const std::exception&) {
@@ -1490,28 +1493,54 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
               client_port_, packet->packet_id);
   }
 
+  if (MQ_SUCC(ret) && packet->properties.subscription_identifier != 0) {
+    LOG_WARN("Client {}:{} sent a Subscription Identifier, which is not supported",
+             client_ip_.c_str(), client_port_);
+    return close_for_flow(ReasonCode::SubscriptionIdentifiersNotSupported, MQ_ERR_FLOW_CLOSED);
+  }
+
+  const auto suback_failure = [this](ReasonCode code) {
+    return negotiated_protocol_version_ >= 5 ? code : ReasonCode::UnspecifiedError;
+  };
+
   if (MQ_SUCC(ret)) {
-    for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
-      const MQTTString& topic = subscription.first;
-      uint8_t qos = subscription.second;
+    for (const TopicSubscription& subscription : packet->subscriptions) {
+      const MQTTString& topic = subscription.topic_filter;
+      SubscriptionOptions granted = subscription.options;
+      const uint8_t requested_qos = granted.qos;
       // 授予值不超过服务器上限。持久化会话的上限同时不超过 1。
       const uint8_t qos_cap = granted_qos_limit();
-      if (qos <= 2 && qos > qos_cap) {
-        qos = qos_cap;
+      if (granted.qos <= 2 && granted.qos > qos_cap) {
+        granted.qos = qos_cap;
       }
       int add_ret = MQ_SUCCESS;
       int subscribe_ret = MQ_SUCCESS;
       int rollback_ret = MQ_SUCCESS;
       bool local_added = false;
-      const bool existed = std::find(subscriptions_.begin(), subscriptions_.end(), topic) != subscriptions_.end();
+      bool existed = false;
+      SubscriptionOptions previous_options;
+      for (const LocalSubscription& current : subscriptions_) {
+        if (current.filter == topic) {
+          existed = true;
+          previous_options = current.options;
+          break;
+        }
+      }
       DurableStore::Result previous;
       ReasonCode reason_code = ReasonCode::UnspecifiedError;
       auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
+      const bool shared = is_shared_subscription_filter(topic);
+      const bool wildcard_rejected =
+          !effective_limits().wildcard_subscription_available && topic_filter_has_wildcard(topic);
 
       LOG_DEBUG("Client {}:{} subscribing to topic: {} with QoS: {}", client_ip_.c_str(),
-                client_port_, from_mqtt_string(topic), qos);
+                client_port_, from_mqtt_string(topic), granted.qos);
 
-      if (auth_manager_ && current_auth_context_) {
+      if (shared) {
+        reason_code = suback_failure(ReasonCode::SharedSubscriptionsNotSupported);
+      } else if (wildcard_rejected) {
+        reason_code = suback_failure(ReasonCode::WildcardSubscriptionsNotSupported);
+      } else if (auth_manager_ && current_auth_context_) {
         (void)auth_manager_->check_topic_access(*current_auth_context_, topic,
                                                 auth::Permission::READ, auth_result);
         if (auth::AuthResult::SUCCESS != auth_result) {
@@ -1526,16 +1555,18 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         auth_result = auth::AuthResult::SUCCESS;
       }
 
-      if (auth::AuthResult::SUCCESS == auth_result) {
-        if (qos > 2) {
-          LOG_WARN("Unsupported QoS level {} for topic {} from client {}:{}", qos,
+      if (!shared && !wildcard_rejected && auth::AuthResult::SUCCESS == auth_result) {
+        if (requested_qos > 2) {
+          LOG_WARN("Unsupported QoS level {} for topic {} from client {}:{}", requested_qos,
                    from_mqtt_string(topic), client_ip_.c_str(), client_port_);
           reason_code = ReasonCode::QoSNotSupported;
         } else {
-          add_ret = add_subscription(topic);
+          bool recorded_present = false;
+          add_ret = add_subscription(topic, granted, &recorded_present);
           if (MQ_SUCC(add_ret)) {
             local_added = true;
-            reason_code = static_cast<ReasonCode>(qos);
+            existed = recorded_present;
+            reason_code = static_cast<ReasonCode>(granted.qos);
           } else {
             LOG_WARN("Failed to add local subscription for client {}:{}, topic: {}, error: {}",
                      client_ip_.c_str(), client_port_, from_mqtt_string(topic), add_ret);
@@ -1546,16 +1577,19 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
       if (local_added && durable_epoch_) {
         auto stored = session_manager_->durable_store()->subscribe(
-            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), qos);
+            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), granted.qos);
         if (!stored.ok) {
-          if (!existed) remove_subscription(topic);
+          if (existed)
+            (void)add_subscription(topic, previous_options, nullptr);
+          else
+            remove_subscription(topic);
           local_added = false;
           reason_code = stored.quota_exceeded ? ReasonCode::QuotaExceeded : ReasonCode::UnspecifiedError;
         }
         previous = std::move(stored);
       }
       if (local_added && session_manager_) {
-        subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, qos);
+        subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, granted);
         if (MQ_SUCC(subscribe_ret)) {
           LOG_DEBUG(
               "Successfully registered subscription with session manager for client {}:{}, topic: {}",
@@ -1575,7 +1609,8 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
               return MQ_ERR_INTERNAL;
             }
           }
-          rollback_ret = existed ? MQ_SUCCESS : remove_subscription(topic);
+          rollback_ret = existed ? add_subscription(topic, previous_options, nullptr)
+                                 : remove_subscription(topic);
           if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
             LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
                      client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);
@@ -1584,9 +1619,9 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
       }
 
       reason_codes.push_back(reason_code);
-      if (static_cast<ReasonCode>(qos) == reason_code) {
+      if (static_cast<ReasonCode>(granted.qos) == reason_code) {
         LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}",
-                  client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos);
+                  client_ip_.c_str(), client_port_, from_mqtt_string(topic), granted.qos);
       }
     }
   }
@@ -1826,7 +1861,9 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
   });
 }
 
-int MQTTProtocolHandler::add_subscription(const MQTTString& topic)
+int MQTTProtocolHandler::add_subscription(const MQTTString& topic,
+                                           const SubscriptionOptions& options,
+                                           bool* already_present)
 {
   int ret = MQ_SUCCESS;
 
@@ -1835,8 +1872,20 @@ int MQTTProtocolHandler::add_subscription(const MQTTString& topic)
     ret = MQ_ERR_SUBSCRIBE_TOPIC;
   } else {
     try {
-      if (std::find(subscriptions_.begin(), subscriptions_.end(), topic) == subscriptions_.end())
-        subscriptions_.push_back(topic);
+      bool present = false;
+      for (LocalSubscription& current : subscriptions_) {
+        if (current.filter == topic) {
+          if (already_present && !present)
+            *already_present = true;
+          current.options = options;
+          present = true;
+        }
+      }
+      if (!present) {
+        if (already_present)
+          *already_present = false;
+        subscriptions_.push_back(LocalSubscription(topic, options));
+      }
       LOG_DEBUG("Added subscription for topic: {}", from_mqtt_string(topic));
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to add subscription for topic {}: {}", from_mqtt_string(topic), e.what());
@@ -1883,7 +1932,9 @@ int MQTTProtocolHandler::get_subscriptions(MQTTVector<MQTTString>& subscriptions
   int ret = MQ_SUCCESS;
 
   try {
-    subscriptions = subscriptions_;
+    subscriptions.clear();
+    for (const LocalSubscription& current : subscriptions_)
+      subscriptions.push_back(current.filter);
   } catch (const std::exception& e) {
     LOG_ERROR("Failed to copy subscriptions: {}", e.what());
     ret = MQ_ERR_MEMORY_ALLOC;

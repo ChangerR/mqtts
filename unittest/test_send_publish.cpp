@@ -517,7 +517,7 @@ void test_persistent_connection_has_one_packet_id_owner()
             context.manager->set_router_client(std::unique_ptr<MQTTRouterRpcClient>(
                 new RejectSubscriptionRouter(context.manager->get_allocator())));
             subscribe.packet_id = 2;
-            subscribe.subscriptions.front().second = 0;
+            subscribe.subscriptions.front().options.qos = 0;
             assert(handler.handle_subscribe(&subscribe) == MQ_SUCCESS);
             uint8_t reply[128];
             int count = recv(fds[1], reply, sizeof(reply), MSG_DONTWAIT);

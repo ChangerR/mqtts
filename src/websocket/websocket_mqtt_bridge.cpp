@@ -810,22 +810,29 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
 }
 
 int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos) {
+    mqtt::SubscriptionOptions options;
+    options.qos = qos;
+    return subscribe_topic(client_id, topic_filter, options);
+}
+
+int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std::string& topic_filter,
+                                         const mqtt::SubscriptionOptions& options) {
     if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
     if (!session_manager_) {
         LOG_ERROR("Session manager not initialized");
         return MQ_ERR_SESSION_MANAGER_NOT_READY;
     }
 
-    LOG_INFO("Subscribing WebSocket client {} to topic {}, qos={}", client_id, topic_filter, qos);
+    LOG_INFO("Subscribing WebSocket client {} to topic {}, qos={}", client_id, topic_filter, options.qos);
 
     // Add to subscription tracking
-    subscriptions_[client_id].push_back(SubscriptionInfo(topic_filter, qos));
+    subscriptions_[client_id].push_back(SubscriptionInfo(topic_filter, options.qos));
     stats_.active_subscriptions++;
 
     // Subscribe via session manager
     mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
     mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-    return session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, qos);
+    return session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, options);
 }
 
 int WebSocketMQTTBridge::unsubscribe_topic(const std::string& client_id, const std::string& topic_filter) {
@@ -1026,6 +1033,19 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
 int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet) {
     LOG_INFO("Received MQTT SUBSCRIBE from WebSocket client {}", client_id);
 
+    if (packet->properties.subscription_identifier != 0) {
+        (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::SubscriptionIdentifiersNotSupported);
+        auto handler = handlers_.find(client_id);
+        if (handler != handlers_.end())
+            handler->second->close_connection();
+        return MQ_ERR_FLOW_CLOSED;
+    }
+
+    const uint8_t protocol = mqtt_protocol_version(client_id);
+    const auto suback_failure = [protocol](mqtt::ReasonCode code) {
+        return protocol >= 5 ? code : mqtt::ReasonCode::UnspecifiedError;
+    };
+
     mqtt::SubAckPacket suback(allocator_);
     suback.type = mqtt::PacketType::SUBACK;
     suback.packet_id = packet->packet_id;
@@ -1034,18 +1054,30 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
     mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
     const uint8_t qos_cap = flow ? flow->granted_qos_limit() : effective_limits().max_qos;
     for (const auto& sub : packet->subscriptions) {
-        std::string topic_filter = mqtt::from_mqtt_string(sub.first);
-        uint8_t qos = sub.second;
-        if (qos > 2) {
+        mqtt::MQTTString topic = sub.topic_filter;
+        mqtt::SubscriptionOptions granted = sub.options;
+        const uint8_t requested_qos = granted.qos;
+        if (mqtt::is_shared_subscription_filter(topic)) {
+            suback.reason_codes.push_back(
+                suback_failure(mqtt::ReasonCode::SharedSubscriptionsNotSupported));
+            continue;
+        }
+        if (!effective_limits().wildcard_subscription_available &&
+            mqtt::topic_filter_has_wildcard(topic)) {
+            suback.reason_codes.push_back(
+                suback_failure(mqtt::ReasonCode::WildcardSubscriptionsNotSupported));
+            continue;
+        }
+        if (requested_qos > 2) {
             suback.reason_codes.push_back(mqtt::ReasonCode::QoSNotSupported);
             continue;
         }
-        if (qos > qos_cap) {
-            qos = qos_cap;
+        if (granted.qos > qos_cap) {
+            granted.qos = qos_cap;
         }
-        int sub_ret = subscribe_topic(client_id, topic_filter, qos);
+        int sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted);
         if (sub_ret == MQ_SUCCESS) {
-          switch (qos) {
+          switch (granted.qos) {
             case 0:
               suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
               break;

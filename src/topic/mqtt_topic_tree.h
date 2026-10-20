@@ -101,9 +101,13 @@ struct SubscriberInfo
 {
   MQTTString client_id;
   uint8_t qos;
+  bool no_local;
+  bool retain_as_published;
+  uint8_t retain_handling;
 
   explicit SubscriberInfo(MQTTAllocator* allocator = nullptr);
   SubscriberInfo(const MQTTString& id, uint8_t q, MQTTAllocator* allocator);
+  SubscriberInfo(const MQTTString& id, const SubscriptionOptions& options, MQTTAllocator* allocator);
 
   bool operator==(const SubscriberInfo& other) const;
 };
@@ -201,6 +205,8 @@ class ConcurrentTopicTree
   ConcurrentTopicTree& operator=(const ConcurrentTopicTree&) = delete;
 
   int subscribe(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
+  int subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
+                const SubscriptionOptions& options);
   int unsubscribe(const MQTTString& topic_filter, const MQTTString& client_id);
   int unsubscribe_all(const MQTTString& client_id);
   int find_subscribers(const MQTTString& topic, TopicMatchResult& result) const;

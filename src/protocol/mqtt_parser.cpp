@@ -425,6 +425,24 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   return MQ_SUCCESS;
 }
 
+namespace {
+int decode_subscription_options(uint8_t raw, bool legacy, SubscriptionOptions& out)
+{
+  if (legacy) {
+    if ((raw & 0xFC) != 0)
+      return MQ_ERR_PACKET_INVALID;
+  } else if ((raw & 0xC0) != 0 || ((raw >> 4) & 0x03) == 3) {
+    return MQ_ERR_PACKET_INVALID;
+  }
+  out = SubscriptionOptions();
+  out.qos = raw & 0x03;
+  out.no_local = !legacy && (raw & 0x04) != 0;
+  out.retain_as_published = !legacy && (raw & 0x08) != 0;
+  out.retain_handling = legacy ? 0 : static_cast<uint8_t>((raw >> 4) & 0x03);
+  return MQ_SUCCESS;
+}
+}  // namespace
+
 int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribePacket** packet)
 {
   if (length < 5) {  // Minimum SUBSCRIBE packet size
@@ -504,10 +522,17 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
       allocator_->deallocate(subscribe, sizeof(SubscribePacket));
       return MQ_ERR_PACKET_INCOMPLETE;
     }
-    uint8_t qos = buffer[pos++] & 0x03;
+    SubscriptionOptions options;
+    const int decoded =
+        decode_subscription_options(buffer[pos++], is_legacy_protocol_hint(), options);
+    if (decoded != MQ_SUCCESS) {
+      LOG_ERROR("Invalid subscription options");
+      subscribe->~SubscribePacket();
+      allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+      return decoded;
+    }
 
-    // 直接添加到subscriptions，不需要转换
-    subscribe->subscriptions.push_back(std::make_pair(std::move(topic_filter), qos));
+    subscribe->subscriptions.push_back(TopicSubscription(std::move(topic_filter), options));
   }
 
   *packet = subscribe;
@@ -2306,8 +2331,8 @@ int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTBuffer& b
 
   // Subscriptions
   for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
-    total_length += 2 + packet->subscriptions[i].first.length();  // Topic filter
-    total_length += 1;                                            // QoS
+    total_length += 2 + packet->subscriptions[i].topic_filter.length();  // Topic filter
+    total_length += 1;                                                    // Options
   }
 
   // Remaining length
@@ -2332,10 +2357,10 @@ int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTBuffer& b
 
   // Subscriptions
   for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
-    ret = serialize_mqtt_string(packet->subscriptions[i].first, buffer);
+    ret = serialize_mqtt_string(packet->subscriptions[i].topic_filter, buffer);
     if (ret != 0)
       return ret;
-    ret = buffer.push_back(packet->subscriptions[i].second);
+    ret = buffer.push_back(packet->subscriptions[i].options.encode());
     if (ret != 0)
       return ret;
   }

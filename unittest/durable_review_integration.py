@@ -94,13 +94,28 @@ def sender_loop_avoidance(binary):
             with Fixture(binary, persistence={} if persistent else None) as f:
                 writer, _ = client(f, 'writer', version=version, clean=not persistent, expiry=60 if persistent else 0)
                 reader, _ = client(f, 'reader', version=version, clean=not persistent, expiry=60 if persistent else 0)
-                assert writer.sub('fixture/echo') == 1
+                # v5 must set No Local itself. v3 has no option bit and receives its own publish.
+                assert writer.sub('fixture/echo', options=(0x05 if version == 5 else None)) == 1
                 assert reader.sub('fixture/echo') == 1
                 data = f.payload(writer, 1)
-                writer.pub('fixture/echo', data)
-                assert reader.delivery()[1] == data
-                writer.quiet()
-    print('PASS MQTT 3/5 sender loop avoidance in durable and live fanout', flush=True)
+                if version == 5:
+                    writer.pub('fixture/echo', data)
+                    assert reader.delivery()[1] == data
+                    writer.quiet()
+                else:
+                    writer.send(packet(0x32, utf('fixture/echo') + b'\0\1' + data))
+                    saw_ack = saw_echo = False
+                    for _ in range(2):
+                        head, body = writer.read()
+                        if head == 0x40:
+                            saw_ack = True
+                        elif head >> 4 == 3:
+                            saw_echo = body.endswith(data)
+                        else:
+                            raise AssertionError((head, body))
+                    assert saw_ack and saw_echo
+                    assert reader.delivery()[1] == data
+    print('PASS MQTT 5 No Local and MQTT 3 self-delivery in durable and live fanout', flush=True)
 
 
 def publish_negative_ack(binary):

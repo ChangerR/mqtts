@@ -155,6 +155,55 @@ TEST_F(TopicTreeTest, TopicNoMatch)
   EXPECT_EQ(result.subscribers.size(), 0);
 }
 
+TEST_F(TopicTreeTest, RootWildcardDoesNotMatchDollarTopic)
+{
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("#"), create_mqtt_string("hash"), 0), MQ_SUCCESS);
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("+"), create_mqtt_string("plus"), 0), MQ_SUCCESS);
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("+/x"), create_mqtt_string("plusx"), 0), MQ_SUCCESS);
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("$test/#"), create_mqtt_string("exact"), 1), MQ_SUCCESS);
+
+  TopicMatchResult dollar(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string("$test/x"), dollar), MQ_SUCCESS);
+  ASSERT_EQ(dollar.subscribers.size(), 1u);
+  EXPECT_EQ(from_mqtt_string(dollar.subscribers[0].client_id), "exact");
+  EXPECT_EQ(dollar.subscribers[0].qos, 1);
+
+  TopicMatchResult normal(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string("sensor/x"), normal), MQ_SUCCESS);
+  EXPECT_EQ(normal.total_count, 2u);
+}
+
+TEST_F(TopicTreeTest, SubscriptionOptionsReplaceInPlace)
+{
+  SubscriptionOptions options;
+  options.qos = 1;
+  options.no_local = true;
+  options.retain_as_published = true;
+  options.retain_handling = 2;
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("a/b"), create_mqtt_string("c1"), options), MQ_SUCCESS);
+
+  TopicMatchResult result(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string("a/b"), result), MQ_SUCCESS);
+  ASSERT_EQ(result.subscribers.size(), 1u);
+  EXPECT_TRUE(result.subscribers[0].no_local);
+  EXPECT_TRUE(result.subscribers[0].retain_as_published);
+  EXPECT_EQ(result.subscribers[0].retain_handling, 2);
+
+  options.no_local = false;
+  options.qos = 0;
+  options.retain_handling = 1;
+  EXPECT_EQ(tree->subscribe(create_mqtt_string("a/b"), create_mqtt_string("c1"), options), MQ_SUCCESS);
+  TopicMatchResult again(tree_allocator);
+  EXPECT_EQ(tree->find_subscribers(create_mqtt_string("a/b"), again), MQ_SUCCESS);
+  ASSERT_EQ(again.subscribers.size(), 1u);
+  EXPECT_FALSE(again.subscribers[0].no_local);
+  EXPECT_EQ(again.subscribers[0].qos, 0);
+  EXPECT_EQ(again.subscribers[0].retain_handling, 1);
+  size_t count = 0;
+  EXPECT_EQ(tree->get_total_subscribers(count), MQ_SUCCESS);
+  EXPECT_EQ(count, 1u);
+}
+
 // Wildcard tests
 TEST_F(TopicTreeTest, SingleLevelWildcard)
 {

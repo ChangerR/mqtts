@@ -94,8 +94,8 @@ void test_parse_subscribe()
   mqtt::SubscribePacket* subscribe = static_cast<mqtt::SubscribePacket*>(packet);
   assert(subscribe->packet_id == 1);
   assert(subscribe->subscriptions.size() == 1);
-  assert(subscribe->subscriptions[0].first == "test/topic");
-  assert(subscribe->subscriptions[0].second == 1);
+  assert(subscribe->subscriptions[0].topic_filter == "test/topic");
+  assert(subscribe->subscriptions[0].options.qos == 1);
 
   std::cout << "SUBSCRIBE包解析测试通过" << std::endl;
 }

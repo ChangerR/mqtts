@@ -126,14 +126,44 @@ MQTTString clone_to_tree_string(const MQTTString& input, MQTTAllocator* tree_all
 }
 
 SubscriberInfo::SubscriberInfo(MQTTAllocator* allocator)
-    : client_id(MQTTStrAllocator(allocator)), qos(0)
+    : client_id(MQTTStrAllocator(allocator)),
+      qos(0),
+      no_local(false),
+      retain_as_published(false),
+      retain_handling(0)
 {
 }
 
 SubscriberInfo::SubscriberInfo(const MQTTString& id, uint8_t q, MQTTAllocator* allocator)
-    : client_id(clone_to_tree_string(id, allocator)), qos(q)
+    : client_id(clone_to_tree_string(id, allocator)),
+      qos(q),
+      no_local(false),
+      retain_as_published(false),
+      retain_handling(0)
 {
 }
+
+SubscriberInfo::SubscriberInfo(const MQTTString& id, const SubscriptionOptions& options,
+                               MQTTAllocator* allocator)
+    : client_id(clone_to_tree_string(id, allocator)),
+      qos(options.qos),
+      no_local(options.no_local),
+      retain_as_published(options.retain_as_published),
+      retain_handling(options.retain_handling)
+{
+}
+
+namespace {
+SubscriberInfo copy_subscriber(const SubscriberInfo& source, MQTTAllocator* allocator)
+{
+  SubscriptionOptions options;
+  options.qos = source.qos;
+  options.no_local = source.no_local;
+  options.retain_as_published = source.retain_as_published;
+  options.retain_handling = source.retain_handling;
+  return SubscriberInfo(source.client_id, options, allocator);
+}
+}  // namespace
 
 bool SubscriberInfo::operator==(const SubscriberInfo& other) const
 {
@@ -234,7 +264,7 @@ int IntermediateNode::add_subscriber(const SubscriberInfo& subscriber)
     return MQ_ERR_TOPIC_TREE_INVALID_CLIENT;
   }
 
-  SubscriberInfo owned_subscriber(subscriber.client_id, subscriber.qos, allocator_);
+  SubscriberInfo owned_subscriber = copy_subscriber(subscriber, allocator_);
   auto existing = subscribers_.find(owned_subscriber);
   if (existing != subscribers_.end()) {
     subscribers_.erase(existing);
@@ -398,7 +428,7 @@ int TopicTreeNode::get_subscribers(SubscriberSet& subscribers) const
     MQTTAllocator* allocator = container_allocator(subscribers);
     subscribers.clear();
     for (const auto& subscriber : *subscribers_ptr) {
-      subscribers.insert(SubscriberInfo(subscriber.client_id, subscriber.qos, allocator));
+      subscribers.insert(copy_subscriber(subscriber, allocator));
     }
   }
 
@@ -699,6 +729,14 @@ int ConcurrentTopicTree::remove_subscriber_from_node(const TopicTreeNodePtr& nod
 int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
                                    uint8_t qos)
 {
+  SubscriptionOptions options;
+  options.qos = qos;
+  return subscribe(topic_filter, client_id, options);
+}
+
+int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
+                                   const SubscriptionOptions& options)
+{
   if (!is_initialized()) {
     return MQ_ERR_TOPIC_TREE;
   }
@@ -724,7 +762,7 @@ int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTStr
     return ret;
   }
 
-  SubscriberInfo subscriber(client_id, qos, allocator_);
+  SubscriberInfo subscriber(client_id, options, allocator_);
   return add_subscriber_to_node(target_node, subscriber);
 }
 
@@ -768,7 +806,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
     if (MQ_SUCC(ret)) {
       MQTTAllocator* result_allocator = container_allocator(result.subscribers);
       for (const auto& subscriber : subscribers) {
-        result.subscribers.emplace_back(subscriber.client_id, subscriber.qos, result_allocator);
+        result.subscribers.push_back(copy_subscriber(subscriber, result_allocator));
         ++result.total_count;
       }
     }
@@ -781,7 +819,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
       if (MQ_SUCC(ret)) {
         MQTTAllocator* result_allocator = container_allocator(result.subscribers);
         for (const auto& subscriber : wildcard_subscribers) {
-          result.subscribers.emplace_back(subscriber.client_id, subscriber.qos, result_allocator);
+          result.subscribers.push_back(copy_subscriber(subscriber, result_allocator));
           ++result.total_count;
         }
       }
@@ -792,6 +830,9 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
 
   int ret = MQ_SUCCESS;
   const MQTTString& current_level = topic_levels[level_index];
+  // A leading '+' or '#' does not match a topic that begins with '$'.
+  const bool root_system_topic =
+      level_index == 0 && !current_level.empty() && current_level[0] == '$';
 
   TopicTreeNodePtr exact_child;
   ret = node->get_child(current_level, exact_child);
@@ -800,6 +841,10 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
     if (MQ_FAIL(ret)) {
       return ret;
     }
+  }
+
+  if (root_system_topic) {
+    return MQ_SUCCESS;
   }
 
   TopicTreeNodePtr single_wildcard_child;
@@ -819,7 +864,7 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
     if (MQ_SUCC(ret)) {
       MQTTAllocator* result_allocator = container_allocator(result.subscribers);
       for (const auto& subscriber : multi_wildcard_subscribers) {
-        result.subscribers.emplace_back(subscriber.client_id, subscriber.qos, result_allocator);
+        result.subscribers.push_back(copy_subscriber(subscriber, result_allocator));
         ++result.total_count;
       }
     }

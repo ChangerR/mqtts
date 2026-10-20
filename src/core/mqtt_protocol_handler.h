@@ -141,8 +141,10 @@ class MQTTProtocolHandler
     return flow_.outbound_holds(packet_id);
   }
 
-  // Topic subscription management
-  int add_subscription(const MQTTString& topic);
+  // Topic subscription management. already_present is set when the filter was
+  // already on this connection; P0-7 Retain Handling needs that fact.
+  int add_subscription(const MQTTString& topic, const SubscriptionOptions& options = SubscriptionOptions(),
+                       bool* already_present = nullptr);
   int remove_subscription(const MQTTString& topic);
   int get_subscriptions(MQTTVector<MQTTString>& subscriptions) const;
 
@@ -188,8 +190,19 @@ class MQTTProtocolHandler
   void pump_durable();
   ConnectionFlow flow_;
 
-  // Topic subscriptions
-  MQTTVector<MQTTString> subscriptions_;
+  struct LocalSubscription
+  {
+    MQTTString filter;
+    SubscriptionOptions options;
+    LocalSubscription(const MQTTString& topic, const SubscriptionOptions& requested)
+        : filter(topic), options(requested)
+    {
+    }
+    bool operator==(const MQTTString& topic) const { return filter == topic; }
+  };
+  // Topic subscriptions. Options live here and in the topic tree. Disk records
+  // still store QoS only until the subscription-format change.
+  MQTTVector<LocalSubscription> subscriptions_;
 
   // Memory management
   MQTTAllocator* allocator_;
