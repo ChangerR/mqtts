@@ -249,18 +249,19 @@ def poison_messages(binary):
         f.mode = 'normal'
         assert reader.delivery()[1] == good
         assert 'reason not_authorized' not in (f.root/'broker.log').read_text()
-    # Empty topics and aliases must be rejected equally on TCP and WebSocket.
+    # Topic plus alias is a normal publish: acknowledge it and deliver the resolved topic.
     for websocket in (False, True):
         with Fixture(binary, persistence={}) as f:
             reader, _ = client(f, 'reader'); assert reader.sub('fixture/invalid') == 1
             writer, _ = client(f, 'writer', clean=True, expiry=0, websocket=websocket)
             props = b'\x23\x00\x01'
-            writer.send(packet(0x32, utf('fixture/invalid') + b'\0\1' + bytes([len(props)]) + props + f.payload(writer, 0)))
-            try: result = writer.read()
-            except (EOFError, ConnectionError): pass
-            else: assert result[0] == 0xe0, result
+            payload = f.payload(writer, 0)
+            writer.send(packet(0x32, utf('fixture/invalid') + b'\0\1' + bytes([len(props)]) + props + payload))
+            head, body = writer.read()
+            assert head == 0x40 and body[:3] == b'\x00\x01\x00', (head, body)
+            assert reader.delivery()[:2] == ('fixture/invalid', payload)
             reader.quiet()
-    print('PASS permanent deny and oversize discard, transient outage retry, and alias rejection', flush=True)
+    print('PASS permanent deny and oversize discard, transient outage retry, and inbound alias acknowledgement', flush=True)
 
 
 def replace_first_stored_wire(f, replacement):

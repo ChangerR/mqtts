@@ -126,7 +126,7 @@ private:
     int handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet);
     int handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet);
     int handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet);
-    int handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet);
+    int handle_mqtt_publish_packet(const std::string& client_id, mqtt::PublishPacket* packet);
     int handle_mqtt_pingreq(const std::string& client_id);
     int handle_mqtt_disconnect(const std::string& client_id);
     int send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet);

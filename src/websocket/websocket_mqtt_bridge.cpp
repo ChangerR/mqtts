@@ -524,7 +524,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
                 ret = handle_mqtt_unsubscribe(client_id, static_cast<const mqtt::UnsubscribePacket*>(packet));
                 break;
             case mqtt::PacketType::PUBLISH:
-                ret = handle_mqtt_publish_packet(client_id, static_cast<const mqtt::PublishPacket*>(packet));
+                ret = handle_mqtt_publish_packet(client_id, static_cast<mqtt::PublishPacket*>(packet));
                 break;
             case mqtt::PacketType::PINGREQ:
                 ret = handle_mqtt_pingreq(client_id);
@@ -1117,7 +1117,7 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, c
     return send_serialized_mqtt_packet(client_id, unsuback);
 }
 
-int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
+int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, mqtt::PublishPacket* packet) {
     // Receipt is independent of authorization, quota, and durable QoS 2 rejection.
     if (session_manager_) session_manager_->note_publish_received(packet->payload.size());
     auto session = session_handlers_.find(client_id);
@@ -1128,6 +1128,16 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
         if (handler != handlers_.end()) handler->second->close_connection();
         return err;
     };
+    if (!flow || !packet) {
+        return close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+    }
+    const mqtt::InboundTopicAliases::Result alias = flow->apply_inbound_topic_alias(packet);
+    const mqtt::ReasonCode alias_reason = mqtt::inbound_alias_disconnect_reason(alias);
+    if (alias_reason != mqtt::ReasonCode::Success) {
+        LOG_WARN("Inbound topic alias rejected for WebSocket client {} reason 0x{:02x}", client_id,
+                 static_cast<uint8_t>(alias_reason));
+        return close_flow(alias_reason, MQ_ERR_FLOW_CLOSED);
+    }
     if (packet->qos > 2 || ((packet->qos == 1 || packet->qos == 2) && packet->packet_id == 0)) {
         return close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
     }

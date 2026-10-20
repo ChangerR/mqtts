@@ -56,7 +56,7 @@ public:
     }
     
     // Make handle_publish public for testing
-    int test_handle_publish(const mqtt::PublishPacket* packet)
+    int test_handle_publish(mqtt::PublishPacket* packet)
     {
         return handle_publish(packet);
     }

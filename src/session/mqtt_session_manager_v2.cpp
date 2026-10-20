@@ -1310,9 +1310,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                                                    const PublishPacket& packet,
                                                    const MQTTString& sender_client_id)
 {
-  // Inbound topic aliases are not supported (CONNACK advertises a maximum of
-  // zero). Reject unresolved/invalid topics before they can enter the journal,
-  // including the WebSocket bridge's publishing path.
+  // 入站别名必须在调用前解析，主题已替换，topic_alias 已清零。
+  // 这里继续拒绝未解析的别名，避免空主题或别名进入日志和转发。
   if (topic.empty() || topic.find('+') != MQTTString::npos ||
       topic.find('#') != MQTTString::npos || topic.find('\0') != MQTTString::npos ||
       packet.properties.topic_alias != 0)

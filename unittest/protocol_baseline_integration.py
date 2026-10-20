@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""P0-2 连接生命周期、P0-3 流控，以及 P0-4 订阅选项。TCP 与 WebSocket 二进制都覆盖。"""
+"""P0-2 连接生命周期、P0-3 流控、P0-4 订阅选项，以及 P0-5 入站主题别名。TCP 与 WebSocket 二进制都覆盖。"""
 import argparse
 import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 
 
@@ -46,7 +48,8 @@ def remaining(data, index):
 class Broker:
     def __init__(self, binary, threads, keep_alive_max, connect_timeout,
                  max_packet_size=1048576, receive_maximum=65535, max_qos=2, monitor=False,
-                 implicit_no_local=False, wildcard_subscription_available=True):
+                 implicit_no_local=False, wildcard_subscription_available=True,
+                 topic_alias_maximum=None, auth=None):
         self.root = Path(tempfile.mkdtemp(prefix='mqtts-p02-'))
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
@@ -72,6 +75,10 @@ class Broker:
                 'json_output_file': str(self.monitor_path),
             },
         }
+        if topic_alias_maximum is not None:
+            config['mqtt']['topic_alias_maximum'] = topic_alias_maximum
+        if auth is not None:
+            config['auth'] = auth
         (self.root / 'config.json').write_text(json.dumps(config))
         self.log = (self.root / 'broker.log').open('a+')
         self.proc = subprocess.Popen(
@@ -299,16 +306,16 @@ def property_length(body):
     return body[index:index + length]
 
 
-def server_keep_alive(body):
+def u16_property(body, wanted):
     blob = property_length(body)
-    index, found = 0, None
+    index = 0
     while index < len(blob):
         ident = blob[index]
         index += 1
         if ident in (0x13, 0x21, 0x22):
             value = int.from_bytes(blob[index:index + 2], 'big')
-            if ident == 0x13:
-                found = value
+            if ident == wanted:
+                return value
             index += 2
         elif ident in (0x11, 0x02, 0x18, 0x27):
             index += 4
@@ -323,7 +330,11 @@ def server_keep_alive(body):
                 index += 2 + size
         else:
             raise AssertionError('unknown property 0x%02x in %s' % (ident, blob.hex()))
-    return found
+    return None
+
+
+def server_keep_alive(body):
+    return u16_property(body, 0x13)
 
 
 def connect(client, client_id, version, keep_alive, properties=b''):
@@ -356,6 +367,21 @@ def publish_qos(client, topic, payload, version, qos, packet_id):
         body += b'\x00'
     body += payload
     client.send(packet(0x30 | (qos << 1), body))
+
+
+def publish_alias(client, topic, payload, alias, qos=0, packet_id=1):
+    props = b'\x23' + struct.pack('!H', alias)
+    body = utf(topic)
+    if qos:
+        body += struct.pack('!H', packet_id)
+    body += bytes([len(props)]) + props + payload
+    client.send(packet(0x30 | (qos << 1), body))
+
+
+def expect_puback(client, reason):
+    header, body = client.read(2)
+    if header != 0x40 or len(body) < 3 or body[2] != reason:
+        raise AssertionError('PUBACK 0x%02x %s, want reason 0x%02x' % (header, body.hex(), reason))
 
 
 def puback(client, packet_id):
@@ -1085,8 +1111,196 @@ def subscription_options(binary, websocket):
     print('PASS P0-4 websocket=%s' % websocket, flush=True)
 
 
+def expect_disconnect(client, reason):
+    header, body = client.read(2)
+    got = disconnect_reason(header, body)
+    if got != reason:
+        raise AssertionError('reason 0x%02x, want 0x%02x' % (got, reason))
+    client.expect_closed(1)
+
+
+def connect_user(client, client_id, username, password):
+    body = utf('MQTT') + bytes([5, 0xC2]) + struct.pack('!H', 30) + b'\x00'
+    body += utf(client_id) + utf(username) + utf(password)
+    client.send(packet(0x10, body))
+    header, result = client.read(3)
+    if header != 0x20:
+        raise AssertionError('CONNACK 0x%02x %s' % (header, result.hex()))
+    return result[1]
+
+
+class AliasPolicy(BaseHTTPRequestHandler):
+    seen = []
+    password = 'pw'
+
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/authentication':
+            allowed = req.get('password') == self.password and req.get('username') == req.get('clientid')
+        elif self.path == '/authorization':
+            if req.get('action') == 'publish':
+                AliasPolicy.seen.append(req.get('topic'))
+                allowed = not str(req.get('topic', '')).startswith('closed/')
+            else:
+                allowed = True
+        else:
+            allowed = False
+        body = json.dumps({'result': 'allow' if allowed else 'deny', 'is_superuser': False}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def topic_alias(binary, websocket):
+    broker = Broker(binary, 1, 30, 10, topic_alias_maximum=2)
+    try:
+        subscriber = Client(broker.port, websocket)
+        publisher = Client(broker.port, websocket)
+        try:
+            body = connect(subscriber, 'alias-sub', 5, 30)
+            if u16_property(body, 0x22) != 2:
+                raise AssertionError('CONNACK topic alias maximum %s' % u16_property(body, 0x22))
+            subscribe(subscriber, 'alias/one', 5)
+            subscribe(subscriber, 'alias/two', 5)
+            connect(publisher, 'alias-pub', 5, 30)
+            publish_alias(publisher, 'alias/one', b'first', 1)
+            topic, payload = publish_of(*subscriber.read(2), 5)
+            if topic != 'alias/one' or payload != b'first':
+                raise AssertionError((topic, payload))
+            publish_alias(publisher, '', b'second', 1)
+            topic, payload = publish_of(*subscriber.read(2), 5)
+            if topic != 'alias/one' or payload != b'second':
+                raise AssertionError((topic, payload))
+            publish_alias(publisher, 'alias/two', b'third', 1)
+            topic, payload = publish_of(*subscriber.read(2), 5)
+            if topic != 'alias/two' or payload != b'third':
+                raise AssertionError((topic, payload))
+            publish_alias(publisher, '', b'fourth', 1)
+            topic, payload = publish_of(*subscriber.read(2), 5)
+            if topic != 'alias/two' or payload != b'fourth':
+                raise AssertionError((topic, payload))
+            publish_alias(publisher, 'alias/one', b'bound', 2)
+            topic, payload = publish_of(*subscriber.read(2), 5)
+            if topic != 'alias/one' or payload != b'bound':
+                raise AssertionError((topic, payload))
+        finally:
+            subscriber.close()
+            publisher.close()
+
+        invalid = Client(broker.port, websocket)
+        try:
+            connect(invalid, 'alias-zero', 5, 30)
+            publish_alias(invalid, 'alias/one', b'nope', 0)
+            expect_disconnect(invalid, 0x94)
+        finally:
+            invalid.close()
+
+        over = Client(broker.port, websocket)
+        try:
+            connect(over, 'alias-over', 5, 30)
+            publish_alias(over, 'alias/one', b'nope', 3)
+            expect_disconnect(over, 0x94)
+        finally:
+            over.close()
+
+        unknown = Client(broker.port, websocket)
+        try:
+            connect(unknown, 'alias-unknown', 5, 30)
+            publish_alias(unknown, '', b'nope', 1)
+            expect_disconnect(unknown, 0x82)
+        finally:
+            unknown.close()
+
+        first = Client(broker.port, websocket)
+        try:
+            connect(first, 'alias-again', 5, 30)
+            publish_alias(first, 'alias/one', b'stored', 1)
+            first.send(packet(0xE0, b''))
+        finally:
+            first.close()
+        time.sleep(0.2)
+        second = Client(broker.port, websocket)
+        try:
+            connect(second, 'alias-again', 5, 30)
+            publish_alias(second, '', b'gone', 1)
+            expect_disconnect(second, 0x82)
+        finally:
+            second.close()
+    finally:
+        broker.close()
+
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), AliasPolicy)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        token_root = Path(tempfile.mkdtemp(prefix='mqtts-alias-auth-'))
+        (token_root / 'token').write_text('alias-token-0123456789abcdef0123456789')
+        auth = {
+            'enabled': True,
+            'allow_anonymous': False,
+            'cache_enabled': False,
+            'providers': [{
+                'type': 'http',
+                'settings': {
+                    'authentication_url': 'http://127.0.0.1:%d/authentication' % httpd.server_port,
+                    'authorization_url': 'http://127.0.0.1:%d/authorization' % httpd.server_port,
+                    'token_file': str(token_root / 'token'),
+                    'timeout_ms': '500',
+                    'max_payload_bytes': '1024',
+                },
+            }],
+        }
+        secured = Broker(binary, 1, 30, 10, topic_alias_maximum=2, auth=auth)
+        try:
+            reader = Client(secured.port, websocket)
+            writer = Client(secured.port, websocket)
+            try:
+                tag = 'ws' if websocket else 'tcp'
+                if connect_user(reader, 'reader-' + tag, 'reader-' + tag, 'pw') != 0:
+                    raise AssertionError('reader auth')
+                subscribe(reader, '#', 5)
+                if connect_user(writer, 'writer-' + tag, 'writer-' + tag, 'pw') != 0:
+                    raise AssertionError('writer auth')
+                AliasPolicy.seen = []
+                publish_alias(writer, 'alias/open', b'yes', 1, qos=1, packet_id=1)
+                expect_puback(writer, 0x00)
+                topic, payload = publish_of(*reader.read(2), 5)
+                if topic != 'alias/open' or payload != b'yes':
+                    raise AssertionError((topic, payload))
+                AliasPolicy.seen = []
+                publish_alias(writer, '', b'yes2', 1, qos=1, packet_id=2)
+                expect_puback(writer, 0x00)
+                topic, payload = publish_of(*reader.read(2), 5)
+                if topic != 'alias/open' or payload != b'yes2' or AliasPolicy.seen != ['alias/open']:
+                    raise AssertionError((topic, payload, AliasPolicy.seen))
+                AliasPolicy.seen = []
+                publish_alias(writer, 'closed/secret', b'no', 2, qos=1, packet_id=3)
+                expect_puback(writer, 0x87)
+                quiet(reader, 0.3)
+                if AliasPolicy.seen != ['closed/secret']:
+                    raise AssertionError(AliasPolicy.seen)
+                AliasPolicy.seen = []
+                publish_alias(writer, '', b'no2', 2, qos=1, packet_id=4)
+                expect_puback(writer, 0x87)
+                quiet(reader, 0.3)
+                if AliasPolicy.seen != ['closed/secret']:
+                    raise AssertionError(AliasPolicy.seen)
+            finally:
+                reader.close()
+                writer.close()
+        finally:
+            secured.close()
+    finally:
+        httpd.shutdown()
+    print('PASS P0-5 websocket=%s' % websocket, flush=True)
+
+
 def run(binary):
     for websocket in (False, True):
+        topic_alias(binary, websocket)
         subscription_options(binary, websocket)
         silent_close(binary, websocket)
         keepalive_idle(binary, websocket, 5)
