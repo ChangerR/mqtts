@@ -25,7 +25,7 @@ async def load(port, authz, metrics_url, count, messages, size):
             reader = await AsyncClient.connect(port, 'reader-'+str(index)); clients.append(reader)
             writer = await AsyncClient.connect(port, 'writer-'+str(index)); clients.append(writer)
             pair = Pair(reader, writer, index, size)
-            assert await reader.subscribe(pair.topic) == 1
+            assert await reader.subscribe(pair.topic, no_local=True) == 1
             await pair.transfer()
             return pair
     def stats():
@@ -51,6 +51,7 @@ async def load(port, authz, metrics_url, count, messages, size):
             assert before['items'] == after['items'], 'fresh cache hit reached RPC authorization'
             report = metrics('gRPC authz paused' if offline else 'gRPC healthy', count, samples, elapsed,
                              after['batches']-before['batches'], 2, 4, size)
+            report['subscriber_no_local'] = 1
             reports.append(report)
             print(json.dumps(report), flush=True)
         print(json.dumps(dict(cold_rpc_batches=initial['batches'], cold_decisions=initial['items'], largest_batch=initial['max_batch'])), flush=True)

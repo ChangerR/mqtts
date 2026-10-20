@@ -25,7 +25,7 @@ async def load(f,count,messages,size,fan_in=False):
     shared=None;routes={}
     if fan_in:
         shared=await PersistentClient.connect(f.port,'collector');clients.append(shared)
-        assert await shared.subscribe('fixture/#')==1
+        assert await shared.subscribe('fixture/#', no_local=True)==1
     async def prepare(i):
         async with admission:
             r=shared or await PersistentClient.connect(f.port,'reader-'+str(i))
@@ -35,7 +35,7 @@ async def load(f,count,messages,size,fan_in=False):
             if shared:
                 routes[pair.topic]=pair
                 shared.on_message=lambda topic,data:routes[topic].receive(topic,data)
-            else:assert await r.subscribe(pair.topic)==1
+            else:assert await r.subscribe(pair.topic, no_local=True)==1
             await pair.transfer();return pair
     try:
         pairs=await asyncio.gather(*(prepare(i) for i in range(count)))
@@ -49,7 +49,7 @@ async def load(f,count,messages,size,fan_in=False):
             assert all(c.failure is None for c in clients)
             callbacks=f.counts['/authorization']-before;assert callbacks==0
             row=metrics(label,count,samples,elapsed,callbacks,2,4,size)
-            row.update(filesystem=subprocess.check_output(['stat','-f','-c','%T',str(f.root)],text=True).strip(),connections=len(clients),persistent_consumers=1 if fan_in else count,durability='partitioned append log, fdatasync before ACK',message_partitions=4,state_partitions=4,disk_threads=8,io_queue_limit=1024,io_queue_bytes=16777216)
+            row.update(filesystem=subprocess.check_output(['stat','-f','-c','%T',str(f.root)],text=True).strip(),connections=len(clients),persistent_consumers=1 if fan_in else count,durability='partitioned append log, fdatasync before ACK',message_partitions=4,state_partitions=4,disk_threads=8,io_queue_limit=1024,io_queue_bytes=16777216,subscriber_no_local=1,no_local_note='MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.')
             reports.append(row);print(json.dumps(row),flush=True)
         return reports
     except BaseException as error:

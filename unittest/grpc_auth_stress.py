@@ -197,7 +197,7 @@ async def run(port, authz, broker, url, args, emit):
                   for i in range(args.pairs)]
         async def warm(pair):
             async with admission:
-                assert await pair.reader.subscribe(pair.topic) == 1
+                assert await pair.reader.subscribe(pair.topic, no_local=True) == 1
                 assert (await pair.transfer())[0] == 'delivered'
         await asyncio.gather(*(warm(pair) for pair in probes))
         before = rpc_stats(url)
@@ -269,7 +269,7 @@ async def run(port, authz, broker, url, args, emit):
         # compare every payload, duplicate, and per-recipient sequence.
         readers = probes[:-1]
         for pair in readers:
-            assert await pair.reader.subscribe('fixture/fanout') == 1
+            assert await pair.reader.subscribe('fixture/fanout', no_local=True) == 1
         seq, received, waiting = 0, Counter(), {}
         def receive(name, topic, payload):
             value = json.loads(payload)
@@ -321,6 +321,8 @@ def main():
     assert 1 <= args.queue_capacity <= 4096
     report = dict(settings=vars(args), transport='loopback TCP MQTT + plaintext gRPC',
                   mqtt_threads=2, rpc_workers=4, rpc_queue_capacity=args.queue_capacity, cache_ttl_ms=10000,
+                  subscriber_no_local=1,
+                  no_local_note='MQTT v5 benchmark subscribers set No Local = 1 so a publisher on the same filter is excluded, matching historical fan-out after phase 0 made self-delivery the default.',
                   cpu_max=optional_limit('/sys/fs/cgroup/cpu.max'),
                   memory_max=optional_limit('/sys/fs/cgroup/memory.max'), phases=[])
     def emit(row):
