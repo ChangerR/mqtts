@@ -36,11 +36,12 @@ struct ProcessStats {
     std::chrono::steady_clock::time_point timestamp;
     std::chrono::seconds uptime;
     
-    // 吞吐量统计
+    // 吞吐量统计，数值来自各事件线程的 ProtocolCounters。
     size_t messages_sent = 0;
     size_t messages_received = 0;
     size_t bytes_sent = 0;
     size_t bytes_received = 0;
+    ProtocolCounterSnapshot protocol;
     
     // 事件转发统计
     size_t events_forwarded = 0;
@@ -110,20 +111,6 @@ public:
      * @param json_file_path JSON文件路径
      */
     void set_json_output_file(const std::string& json_file_path);
-    
-    /**
-     * @brief 增加消息发送统计
-     * @param message_count 消息数量
-     * @param bytes 字节数
-     */
-    void add_sent_stats(size_t message_count, size_t bytes);
-    
-    /**
-     * @brief 增加消息接收统计
-     * @param message_count 消息数量
-     * @param bytes 字节数
-     */
-    void add_received_stats(size_t message_count, size_t bytes);
 
 private:
     GlobalSessionManager* session_manager_;
@@ -134,12 +121,6 @@ private:
     std::atomic<bool> running_;
     std::unique_ptr<std::thread> monitor_thread_;
     std::chrono::steady_clock::time_point start_time_;
-    
-    // 统计计数器
-    std::atomic<size_t> messages_sent_;
-    std::atomic<size_t> messages_received_;
-    std::atomic<size_t> bytes_sent_;
-    std::atomic<size_t> bytes_received_;
     
     /**
      * @brief 监控线程主函数

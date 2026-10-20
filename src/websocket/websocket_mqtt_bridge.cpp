@@ -1,4 +1,5 @@
 #include "websocket_mqtt_bridge.h"
+#include "mqtt_connack_limits.h"
 #include <algorithm>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -205,6 +206,24 @@ WebSocketMQTTBridge::WebSocketMQTTBridge(MQTTAllocator* allocator, MessageFormat
       allow_mqtt3x_(true) {
 }
 
+const mqtt::ProtocolLimits& WebSocketMQTTBridge::effective_limits() const {
+    if (protocol_limits_) return *protocol_limits_;
+    static const mqtt::ProtocolLimits defaults = mqtt::ProtocolLimits::defaults();
+    return defaults;
+}
+
+void WebSocketMQTTBridge::fill_connack(mqtt::ConnAckPacket& connack, const mqtt::ConnectPacket* packet) {
+    const bool persistence = session_manager_ && session_manager_->durable_store();
+    uint8_t version = 5;
+    if (packet && (packet->protocol_version == 3 || packet->protocol_version == 4)) {
+        version = packet->protocol_version;
+    }
+    const uint16_t keep_alive = packet ? packet->keep_alive : 0;
+    const bool requested_expiry = packet && packet->properties.has_session_expiry_interval;
+    mqtt::apply_connack_capabilities(connack, effective_limits(), version, keep_alive, requested_expiry,
+                                     persistence);
+}
+
 WebSocketMQTTBridge::~WebSocketMQTTBridge() {
     // Unregister all handlers
     for (auto& pair : handlers_) {
@@ -280,6 +299,7 @@ WebSocketProtocolHandler* WebSocketMQTTBridge::get_handler(const std::string& cl
 }
 
 int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, const std::string& message) {
+    if (session_manager_) session_manager_->note_bytes_received(message.size());
     stats_.ws_messages_received++;
     if (auth_manager_) return MQ_ERR_CONNECT_NOT_AUTHORIZED; // Authenticated mode uses MQTT CONNECT, never legacy text commands.
 
@@ -331,6 +351,8 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                         return ret;
                     }
 
+                    // Count at ingestion, including later authorization or quota failure.
+                    if (session_manager_) session_manager_->note_publish_received(payload.size());
                     ret = publish_message(client_id, topic, payload, qos, retain);
                 }
             }
@@ -348,6 +370,7 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                     return ret;
                 }
 
+                if (session_manager_) session_manager_->note_publish_received(payload.size());
                 ret = publish_message(client_id, topic, payload, 0, false);
             }
             break;
@@ -392,6 +415,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             return ret;
         }
 
+        if (session_manager_) session_manager_->note_bytes_received(packet_len);
         std::vector<uint8_t> packet_bytes(pending.begin(), pending.begin() + packet_len);
         uint8_t protocol_version_hint = 5;
         auto version_it = client_protocol_versions_.find(client_id);
@@ -609,6 +633,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
     }
 
     int ret = MQ_SUCCESS;
+    uint64_t text_bytes = 0;
 
     switch (format_) {
         case MessageFormat::JSON:
@@ -617,6 +642,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
                 std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
                 std::string json = format_json_message(topic_str, payload_vec,
                                                        packet.qos, packet.retain);
+                text_bytes = json.size();
                 ret = handler->send_text(json);
             }
             break;
@@ -626,6 +652,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
                 std::string topic_str = mqtt::from_mqtt_string(packet.topic_name);
                 std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
                 std::string text = format_text_protocol(topic_str, payload_vec);
+                text_bytes = text.size();
                 ret = handler->send_text(text);
             }
             break;
@@ -648,6 +675,10 @@ int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const
 
     if (ret == MQ_SUCCESS) {
         stats_.mqtt_messages_sent++;
+        if (session_manager_) {
+            session_manager_->note_publish_sent(packet.payload.size());
+            if (text_bytes > 0) session_manager_->note_bytes_sent(text_bytes);
+        }
     }
 
     return ret;
@@ -775,6 +806,7 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         connack.type = mqtt::PacketType::CONNACK;
         connack.session_present = false;
         connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
+        fill_connack(connack, packet);
         int ret = send_serialized_mqtt_packet(client_id, connack);
         client_protocol_versions_.erase(client_id);
         return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
@@ -787,6 +819,7 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
         connack.type = mqtt::PacketType::CONNACK;
         connack.session_present = false;
         connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
+        fill_connack(connack, packet);
         int ret = send_serialized_mqtt_packet(client_id, connack);
         client_protocol_versions_.erase(client_id);
         return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
@@ -799,7 +832,6 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::Success;
     if (session_manager_ && session_manager_->durable_store()) {
-      connack.properties.maximum_qos = 1;
       // Persistent consumers use TCP; reject unsupported WS session semantics.
       if ((packet->protocol_version < 5 && !packet->flags.clean_start) ||
           packet->properties.session_expiry_interval)
@@ -817,6 +849,7 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
             auth_contexts_[client_id] = std::move(context);
         }
     }
+    fill_connack(connack, packet);
     if (connack.reason_code != mqtt::ReasonCode::Success) {
         send_serialized_mqtt_packet(client_id, connack);
         client_protocol_versions_.erase(client_id);
@@ -885,6 +918,8 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, c
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id, const mqtt::PublishPacket* packet) {
+    // Receipt is independent of authorization, quota, and durable QoS 2 rejection.
+    if (session_manager_) session_manager_->note_publish_received(packet->payload.size());
     if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
       const auto protocol = client_protocol_versions_.find(client_id);
       if (protocol != client_protocol_versions_.end() && protocol->second >= 5) {
@@ -1011,6 +1046,7 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
     ret = handler->send_binary(payload);
     if (ret == MQ_SUCCESS) {
         stats_.ws_messages_sent++;
+        if (session_manager_) session_manager_->note_bytes_sent(payload.size());
     }
     return ret;
 }

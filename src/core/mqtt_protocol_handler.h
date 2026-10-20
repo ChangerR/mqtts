@@ -17,6 +17,7 @@
 #include "mqtt_packet.h"
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
+#include "mqtt_config.h"
 #include "mqtt_socket.h"
 #include "mqtt_stl_allocator.h"
 
@@ -51,7 +52,15 @@ class MQTTProtocolHandler
   }
   auth::AuthManager* get_auth_manager() const { return auth_manager_; }
 
-  void set_allow_mqtt3x(bool allow_mqtt3x) { allow_mqtt3x_ = allow_mqtt3x; }
+  // 启动时冻结的只读限额。空指针表示使用 ProtocolLimits 默认值。
+  void set_protocol_limits(const ProtocolLimits* limits)
+  {
+    protocol_limits_ = limits;
+    if (limits) {
+      allow_mqtt3x_ = limits->allow_mqtt3x;
+    }
+  }
+  const ProtocolLimits& effective_limits() const;
   bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
 
   // Packet handlers
@@ -192,6 +201,10 @@ class MQTTProtocolHandler
   // Helper methods for CONNECT auth/reject flow
   int ensure_auth_state();
   int reject_connect_request(uint8_t protocol_version, ReasonCode reason_code, int err_code);
+
+  const ProtocolLimits* protocol_limits_;
+  uint16_t client_keep_alive_;
+  bool client_requested_session_expiry_;
 };
 
 }  // namespace mqtt

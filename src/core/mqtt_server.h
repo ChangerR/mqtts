@@ -31,7 +31,7 @@ class MQTTServer
  public:
   MQTTServer(const std::string& host, int port);
   MQTTServer(const mqtt::ServerConfig& config, const mqtt::MemoryConfig& memory_config,
-             const mqtt::MQTTProtocolConfig& mqtt_protocol_config);
+             const mqtt::ProtocolLimits& protocol_limits);
   virtual ~MQTTServer();
 
   int start();
@@ -63,7 +63,7 @@ class MQTTServer
   // 服务器配置
   mqtt::ServerConfig server_config_;
   mqtt::MemoryConfig memory_config_;
-  mqtt::MQTTProtocolConfig mqtt_protocol_config_;
+  mqtt::ProtocolLimits protocol_limits_;
 
   // 连接管理
   std::atomic<int> current_connections_;

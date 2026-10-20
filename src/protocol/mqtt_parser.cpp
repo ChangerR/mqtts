@@ -1487,6 +1487,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       case PropertyType::MaximumQoS:
         properties.maximum_qos = buffer[bytes_read++];
+        properties.has_maximum_qos = true;
         break;
       case PropertyType::RetainAvailable:
         properties.retain_available = buffer[bytes_read++] != 0;
@@ -2499,7 +2500,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
     properties_total_length += 1 + 2;  // PropertyType + 2 bytes
   }
 
-  if (properties.maximum_qos != 0) {
+  if (properties.maximum_qos != 0 || properties.has_maximum_qos) {
     properties_total_length += 1 + 1;  // PropertyType + 1 byte
   }
 
@@ -2763,7 +2764,7 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
       return ret;
   }
 
-  if (properties.maximum_qos != 0) {
+  if (properties.maximum_qos != 0 || properties.has_maximum_qos) {
     ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumQoS));
     if (ret != 0)
       return ret;

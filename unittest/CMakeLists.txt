@@ -204,6 +204,14 @@ add_test(NAME test_mqtt_session_manager_router COMMAND test_mqtt_session_manager
 add_test(NAME test_websocket_frame COMMAND test_websocket_frame)
 add_test(NAME test_websocket_mqtt_bridge COMMAND test_websocket_mqtt_bridge)
 add_test(NAME test_http_parser COMMAND test_http_parser)
+
+add_executable(test_phase0_baseline test_phase0_baseline.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_protocol_handler.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)
+target_include_directories(test_phase0_baseline PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+target_compile_definitions(test_phase0_baseline PRIVATE MQTTS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(test_phase0_baseline PRIVATE mqtt_runtime mqtt_parser mqtt_router mqtt_auth tcmalloc_minimal gtest pthread dl -Wl,-Bstatic ${YAML_CPP_STATIC_LIBRARIES} -Wl,-Bdynamic)
+add_test(NAME test_phase0_baseline COMMAND test_phase0_baseline)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(test_mqtt_auth_grpc test_mqtt_auth_grpc.cpp)
 target_link_libraries(test_mqtt_auth_grpc PRIVATE mqtt_auth mqtt_runtime tcmalloc_minimal pthread dl)

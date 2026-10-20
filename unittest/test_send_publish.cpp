@@ -459,7 +459,9 @@ public:
 void test_persistent_connection_has_one_packet_id_owner()
 {
     char root[] = "/tmp/mqtts-live-guard-XXXXXX";
-    assert(mkdtemp(root));
+    if (!mkdtemp(root)) {
+        throw std::runtime_error("mkdtemp failed");
+    }
     {
         mqtt::GlobalSessionManager manager;
         assert(manager.pre_register_threads(1) == MQ_SUCCESS);
@@ -473,7 +475,9 @@ void test_persistent_connection_has_one_packet_id_owner()
         auto task = mqtt::runtime::current_runtime().spawn([](void* arg) -> void* {
             auto& context = *static_cast<Context*>(arg);
             int fds[2];
-            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+                throw std::runtime_error("socketpair failed");
+            }
             MQTTAllocator allocator("persistent_live_guard", MQTTMemoryTag::MEM_TAG_CLIENT);
             MQTTSocket socket(fds[0]);
             socket.set_nonblocking();

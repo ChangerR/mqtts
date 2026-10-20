@@ -13,6 +13,7 @@
 #include "mqtt_allocator.h"
 #include "mqtt_coroutine_utils.h"
 #include "mqtt_message_queue.h"
+#include "mqtt_protocol_counters.h"
 #include "mqtt_parser.h"
 #include "mqtt_send_worker_pool.h"
 #include "mqtt_session_info.h"
@@ -166,6 +167,10 @@ class ThreadLocalSessionManager
    */
   MQTTAllocator* get_allocator() const { return allocator_; }
 
+  // 只允许本事件线程写入。
+  ProtocolCounters& protocol_counters() { return protocol_counters_; }
+  const ProtocolCounters& protocol_counters() const { return protocol_counters_; }
+
  private:
   std::thread::id thread_id_;
   MQTTAllocator* allocator_;
@@ -183,6 +188,7 @@ class ThreadLocalSessionManager
 
   // 发送Worker池
   std::unique_ptr<SendWorkerPool> worker_pool_;
+  ProtocolCounters protocol_counters_;
 
   bool is_handler_valid(MQTTProtocolHandler* handler) const;
   int safe_remove_session(const std::string& client_id, SessionInfo* info);
@@ -385,6 +391,13 @@ class GlobalSessionManager
    * @return 线程数量
    */
   size_t get_thread_count() const;
+
+  // 下列计数只在连接所在的事件线程调用。监控线程用 collect_protocol_counters 汇总。
+  void note_publish_received(uint64_t payload_bytes);
+  void note_publish_sent(uint64_t payload_bytes);
+  void note_bytes_received(uint64_t bytes);
+  void note_bytes_sent(uint64_t bytes);
+  void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
   /**
    * @brief 获取总的Handler数量
@@ -616,6 +629,7 @@ class GlobalSessionManager
    * @brief 内部快速查找客户端管理器（无锁版本）
    */
   ThreadLocalSessionManager* fast_find_client_manager(const std::string& client_id_str) const;
+  ProtocolCounters* current_thread_counters();
 
   /**
    * @brief 内部辅助函数：检查通配符匹配

@@ -54,16 +54,27 @@ struct ServerConfig
 struct MQTTProtocolConfig
 {
   uint32_t max_packet_size = 1024 * 1024;         // 最大包大小 (1MB)
-  uint16_t keep_alive_default = 60;               // 默认保活时间(秒)
+  uint16_t keep_alive_default = 60;               // 已废弃，配置里出现时忽略并 WARN
   uint16_t keep_alive_max = 3600;                 // 最大保活时间(秒)
+  uint32_t connect_timeout_seconds = 10;          // 等待 CONNECT 的秒数，超时断开在后续条目实现
+  bool implicit_no_local = false;                 // 兼容开关。投递行为在后续条目实现，默认不排除发布者
   uint8_t max_qos = 2;                            // 最大QoS级别
   bool retain_available = true;                   // 是否支持retain消息
   bool wildcard_subscription_available = true;    // 是否支持通配符订阅
-  bool subscription_identifier_available = true;  // 是否支持订阅标识符
-  bool shared_subscription_available = false;     // 是否支持共享订阅
+  bool subscription_identifier_available = false; // 本版本不实现，配成 true 时启动失败
+  bool shared_subscription_available = false;     // 本版本不实现，配成 true 时启动失败
   uint16_t topic_alias_maximum = 65535;           // 主题别名最大值
   uint16_t receive_maximum = 65535;               // 接收最大值
   bool allow_mqtt3x = true;                       // 是否允许 MQTT 3.1 / 3.1.1
+};
+
+// 保留消息限额。存储本身在后续条目实现，这里只冻结配置。
+struct RetainConfig
+{
+  size_t max_messages = 100000;
+  size_t max_payload_bytes = 0;  // 0 表示采用 mqtt.max_packet_size
+  size_t max_total_bytes = 256 * 1024 * 1024;
+  size_t max_deliver_per_subscribe = 1000;
 };
 
 /**
@@ -71,7 +82,8 @@ struct MQTTProtocolConfig
  */
 struct MemoryConfig
 {
-  size_t client_max_size = 1048576;
+  // 1MiB 报文加上 64KiB 每连接状态空间，满足 max_packet_size 不得超过 client_max_size - 64KiB。
+  size_t client_max_size = 1048576 + 64 * 1024;
 };
 
 /**
@@ -208,10 +220,52 @@ struct Config
   ServerConfig server;
   MQTTProtocolConfig mqtt;
   MemoryConfig memory;
+  RetainConfig retain;
   LogConfig log;
   EventForwardingConfig event_forwarding;
   MonitoringConfig monitoring;
   AuthConfig auth;
+};
+
+// 启动时从 Config 冻结，各线程只读共享。不要在连接路径上修改。
+struct ProtocolLimits
+{
+  uint32_t max_packet_size = 1024 * 1024;
+  uint16_t keep_alive_max = 3600;
+  uint32_t connect_timeout_seconds = 10;
+  bool implicit_no_local = false;
+  uint8_t max_qos = 2;
+  bool retain_available = true;
+  bool wildcard_subscription_available = true;
+  bool subscription_identifier_available = false;
+  bool shared_subscription_available = false;
+  uint16_t topic_alias_maximum = 65535;
+  uint16_t receive_maximum = 65535;
+  bool allow_mqtt3x = true;
+  bool persistence_enabled = false;
+  RetainConfig retain;
+
+  static ProtocolLimits defaults() { return ProtocolLimits(); }
+
+  static ProtocolLimits from_config(const Config& config)
+  {
+    ProtocolLimits limits;
+    limits.max_packet_size = config.mqtt.max_packet_size;
+    limits.keep_alive_max = config.mqtt.keep_alive_max;
+    limits.connect_timeout_seconds = config.mqtt.connect_timeout_seconds;
+    limits.implicit_no_local = config.mqtt.implicit_no_local;
+    limits.max_qos = config.mqtt.max_qos;
+    limits.retain_available = config.mqtt.retain_available;
+    limits.wildcard_subscription_available = config.mqtt.wildcard_subscription_available;
+    limits.subscription_identifier_available = config.mqtt.subscription_identifier_available;
+    limits.shared_subscription_available = config.mqtt.shared_subscription_available;
+    limits.topic_alias_maximum = config.mqtt.topic_alias_maximum;
+    limits.receive_maximum = config.mqtt.receive_maximum;
+    limits.allow_mqtt3x = config.mqtt.allow_mqtt3x;
+    limits.persistence_enabled = config.persistence.enabled;
+    limits.retain = config.retain;
+    return limits;
+  }
 };
 
 /**
@@ -238,13 +292,17 @@ class ConfigManager
    * @brief 验证配置有效性
    * @return 0有效，非0无效
    */
-  int validate() const;
+  int validate();
 
   /**
    * @brief 获取配置
    * @return 配置引用
    */
   const Config& get_config() const { return config_; }
+
+  // 未知键、废弃键、本版本不生效的键。加载失败时也会保留已发现的警告。
+  const std::vector<std::string>& warnings() const { return warnings_; }
+  const std::string& last_error() const { return last_error_; }
 
   /**
    * @brief 获取可修改的配置
@@ -254,11 +312,23 @@ class ConfigManager
 
  private:
   Config config_;
+  std::vector<std::string> warnings_;
+  std::string last_error_;
+
+  void note_warning(const std::string& message);
+  void note_error(const std::string& message);
+  void audit_config(const YAML::Node& root);
+  void audit_map(const YAML::Node& node, const std::string& path,
+                 const std::vector<const char*>& effective,
+                 const std::vector<const char*>& deprecated);
+  void audit_auth(const YAML::Node& node);
+  void warn_leaves(const YAML::Node& node, const std::string& path, const char* reason);
 
   // 解析辅助方法
   void parse_server_config(const YAML::Node& node);
   void parse_mqtt_config(const YAML::Node& node);
   void parse_memory_config(const YAML::Node& node);
+  void parse_retain_config(const YAML::Node& node);
   void parse_log_config(const YAML::Node& node);
   void parse_event_forwarding_config(const YAML::Node& node);
   void parse_monitoring_config(const YAML::Node& node);
