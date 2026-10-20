@@ -10,8 +10,10 @@
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
 #include "mqtt_connack_limits.h"
+#include "mqtt_connection_watch.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_socket.h"
+#include <sys/socket.h>
 namespace mqtt {
 
 static const size_t INITIAL_BUFFER_SIZE = 1024;
@@ -141,11 +143,65 @@ int MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, 
   return ret;
 }
 
+void MQTTProtocolHandler::arm_connection_watch()
+{
+  if (watch_.started()) {
+    return;
+  }
+  const auto established = established_set_ ? established_ : ConnectionWatch::now();
+  watch_.start(established, effective_limits().connect_timeout_seconds);
+}
+
+void MQTTProtocolHandler::signal_takeover_done()
+{
+  if (takeover_gate_) {
+    takeover_gate_->done.store(true, std::memory_order_release);
+    takeover_gate_.reset();
+  }
+}
+
+void MQTTProtocolHandler::request_session_takeover(const std::shared_ptr<SessionTakeoverGate>& gate)
+{
+  if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
+    gate->done.store(true, std::memory_order_release);
+    return;
+  }
+  takeover_gate_ = gate;
+  takeover_pending_.store(true, std::memory_order_release);
+  if (cleanup_finished_) {
+    signal_takeover_done();
+    return;
+  }
+  if (socket_ && socket_->get_fd() >= 0) {
+    ::shutdown(socket_->get_fd(), SHUT_RD);
+  }
+}
+
+int MQTTProtocolHandler::fail_protocol(ReasonCode reason, int err)
+{
+  if (negotiated_protocol_version_ >= 5 && socket_ && socket_->is_connected()) {
+    (void)send_disconnect(reason);
+  }
+  if (session_manager_ && !protocol_fault_noted_) {
+    session_manager_->note_malformed_disconnect();
+    protocol_fault_noted_ = true;
+  }
+  LOG_WARN("Closing client {}:{} for protocol fault 0x{:02x}", client_ip_.c_str(), client_port_,
+           static_cast<uint8_t>(reason));
+  return err;
+}
+
 int MQTTProtocolHandler::process()
 {
   int ret = MQ_SUCCESS;
+  arm_connection_watch();
 
   while (MQ_SUCC(ret)) {
+    if (takeover_pending_.load(std::memory_order_acquire)) {
+      ret = MQ_ERR_SESSION;
+      break;
+    }
+
     // Ensure buffer has enough space
     ret = ensure_buffer_size(bytes_needed_);
     if (ret != 0) {
@@ -154,6 +210,36 @@ int MQTTProtocolHandler::process()
 
     // Read packet data
     ret = read_packet();
+    if (takeover_pending_.load(std::memory_order_acquire)) {
+      ret = MQ_ERR_SESSION;
+      break;
+    }
+    if (ret == MQ_ERR_SOCKET_TIMEOUT) {
+      if (!watch_.connect_complete()) {
+        if (session_manager_) {
+          session_manager_->note_connect_timeout();
+        }
+        LOG_INFO("CONNECT timeout, closing client {}:{} without a response", client_ip_.c_str(),
+                 client_port_);
+      } else {
+        if (session_manager_) {
+          session_manager_->note_keepalive_timeout();
+        }
+        LOG_INFO("Keep alive timeout for client {}:{}", client_ip_.c_str(), client_port_);
+        if (negotiated_protocol_version_ >= 5 && socket_ && socket_->is_connected()) {
+          (void)send_disconnect(ReasonCode::KeepAliveTimeout);
+        }
+      }
+      break;
+    }
+    if (ret == MQ_ERR_PACKET_INVALID) {
+      ret = fail_protocol(ReasonCode::MalformedPacket, ret);
+      break;
+    }
+    if (ret == MQ_ERR_PACKET_TYPE || ret == MQ_ERR_PROTOCOL) {
+      ret = fail_protocol(ReasonCode::ProtocolError, ret);
+      break;
+    }
     if (ret != 0) {
       LOG_ERROR("Failed to read packet from client {}:{}, error: {}", client_ip_.c_str(),
                 client_port_, mqtt_error_string(ret));
@@ -163,13 +249,24 @@ int MQTTProtocolHandler::process()
     // Parse packet if complete
     if (state_ == ReadState::READ_PAYLOAD && bytes_read_ >= header_size_ + remaining_length_) {
       ret = parse_packet();
+      if (ret == MQ_ERR_PACKET_INVALID) {
+        ret = fail_protocol(ReasonCode::MalformedPacket, ret);
+        break;
+      }
+      if (ret == MQ_ERR_PACKET_TYPE || ret == MQ_ERR_PROTOCOL ||
+          ret == MQ_ERR_SESSION_NOT_CONNECTED) {
+        ret = fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PROTOCOL);
+        break;
+      }
+      if (ret == MQ_ERR_TIMEOUT_V2) {
+        break;
+      }
       if (ret != 0) {
-        // Reset state machine on parse error
         state_ = ReadState::READ_HEADER;
         bytes_needed_ = 1;
         bytes_read_ = 0;
         remaining_length_ = 0;
-        header_size_ = 0;  // 重置header_size_
+        header_size_ = 0;
         continue;
       }
 
@@ -188,6 +285,17 @@ int MQTTProtocolHandler::process()
       remaining_length_ = 0;  // 重置remaining length
       header_size_ = 0;       // 重置header_size_
     }
+  }
+
+  if (ret == MQ_ERR_SESSION && takeover_pending_.load(std::memory_order_acquire)) {
+    if (negotiated_protocol_version_ >= 5 && socket_ && socket_->is_connected()) {
+      (void)send_disconnect(ReasonCode::SessionTakenOver);
+    }
+    if (session_manager_) {
+      session_manager_->note_session_takeover();
+    }
+    LOG_INFO("Session {} taken over, closing client {}:{}", from_mqtt_string(client_id_),
+             client_ip_.c_str(), client_port_);
   }
 
   // Cleanup session registration when process() exits (for any reason: socket disconnect, error,
@@ -240,11 +348,9 @@ int MQTTProtocolHandler::read_packet()
     return MQ_ERR_SOCKET;
   }
 
-  mqtt::runtime::current_runtime().wait_readable(socket_->get_fd(), 100);
-
-  // Try to receive data
+  // Try to receive data. 截止时间到了就返回，不再忽略等待结果。
   int len = bytes_needed_;
-  int ret = socket_->recv(buffer_ + bytes_read_, len);
+  int ret = socket_->recv(buffer_ + bytes_read_, len, watch_.recv_deadline_ms());
   if (MQ_FAIL(ret)) {
     if (ret == MQ_ERR_SOCKET_RECV) {
       LOG_WARN("Client {}:{} recv error, closing connection", client_ip_.c_str(), client_port_);
@@ -357,8 +463,14 @@ int MQTTProtocolHandler::parse_packet()
   if (ret != 0) {
     LOG_ERROR("Failed to parse MQTT packet from client {}:{}, {}, error: {}", client_ip_.c_str(),
               client_port_, bytes_read_, mqtt_error_string(ret));
+    if (ret == MQ_ERR_PACKET_TYPE || ret == MQ_ERR_PROTOCOL) {
+      return ret;
+    }
     return MQ_ERR_PACKET_INVALID;
   }
+
+  const auto packet_now = ConnectionWatch::now();
+  watch_.observe_packet(packet_now);
 
   LOG_DEBUG("Successfully parsed packet type: 0x{:02x} from client {}:{}",
             static_cast<uint8_t>(packet->type), client_ip_.c_str(), client_port_);
@@ -571,6 +683,11 @@ int MQTTProtocolHandler::reject_connect_request(uint8_t protocol_version, Reason
 
 int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 {
+  if (connected_) {
+    LOG_WARN("Client {}:{} sent CONNECT while already connected", client_ip_.c_str(), client_port_);
+    return MQ_ERR_PROTOCOL;
+  }
+
   int ret = MQ_SUCCESS;
   bool need_reject = false;
   bool session_present = false;
@@ -615,6 +732,9 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     parser_->set_protocol_version_hint(negotiated_protocol_version_);
     client_keep_alive_ = packet->keep_alive;
     client_requested_session_expiry_ = packet->properties.has_session_expiry_interval;
+    const uint16_t negotiated = negotiated_keep_alive_seconds(
+        packet->keep_alive, effective_limits().keep_alive_max, packet->protocol_version);
+    watch_.observe_connect(negotiated, ConnectionWatch::now());
   }
 
   if (MQ_SUCC(ret) && packet->client_id.empty()) {
@@ -723,6 +843,14 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     ret = register_session_with_manager();
     if (MQ_FAIL(ret)) {
       connected_ = false;
+      if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+        session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
+        durable_epoch_ = 0;
+      }
+      if (ret == MQ_ERR_TIMEOUT_V2) {
+        reject_reason = ReasonCode::ServerUnavailable;
+        need_reject = true;
+      }
     }
   }
 
@@ -1742,6 +1870,8 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
     }
     connected_ = false;
   }
+  cleanup_finished_ = true;
+  signal_takeover_done();
 }
 
 int MQTTProtocolHandler::register_session_with_manager()
@@ -1757,6 +1887,10 @@ int MQTTProtocolHandler::register_session_with_manager()
   }
 
   int ret = session_manager_->register_session(client_id_, this);
+  if (ret == MQ_ERR_TIMEOUT_V2) {
+    LOG_WARN("Session takeover of {} timed out", from_mqtt_string(client_id_));
+    return ret;
+  }
   if (ret != 0) {
     LOG_ERROR("Failed to register session for client {}, error: {}", from_mqtt_string(client_id_),
               ret);

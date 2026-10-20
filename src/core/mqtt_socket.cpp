@@ -215,6 +215,11 @@ int MQTTSocket::send(const mqtt::MQTTBuffer& buffer)
 
 int MQTTSocket::recv(char* buf, int& len)
 {
+  return recv(buf, len, -1);
+}
+
+int MQTTSocket::recv(char* buf, int& len, int64_t deadline_ms)
+{
   int ret = MQ_SUCCESS;
 
   if (!connected_) {
@@ -227,10 +232,32 @@ int MQTTSocket::recv(char* buf, int& len)
         if (errno == EINTR) {
           continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          if (mqtt::runtime::current_runtime().wait_readable(fd_, 1000) < 0) {
+          const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+          if (deadline_ms >= 0 && now_ms >= deadline_ms) {
+            ret = MQ_ERR_SOCKET_TIMEOUT;
+            break;
+          }
+          int wait_ms = 1000;
+          if (deadline_ms >= 0) {
+            const int64_t remaining = deadline_ms - now_ms;
+            if (remaining < wait_ms) {
+              wait_ms = remaining > 0 ? static_cast<int>(remaining) : 0;
+            }
+          }
+          const int waited = mqtt::runtime::current_runtime().wait_readable(fd_, wait_ms);
+          if (waited < 0) {
             LOG_ERROR("Failed to wait for socket to become readable - {}", strerror(errno));
             connected_ = false;
             ret = MQ_ERR_SOCKET_RECV;
+          } else if (waited == 0 && deadline_ms >= 0) {
+            const int64_t after_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count();
+            if (after_ms >= deadline_ms) {
+              ret = MQ_ERR_SOCKET_TIMEOUT;
+            }
           }
           continue;
         } else {
@@ -239,8 +266,8 @@ int MQTTSocket::recv(char* buf, int& len)
           ret = MQ_ERR_SOCKET_RECV;
         }
       } else if (received == 0) {
+        // 读侧结束。先不要清 connected_：会话接管要在这之后还能写出 DISCONNECT。
         LOG_INFO("Connection closed by peer");
-        connected_ = false;
         ret = MQ_ERR_SOCKET;
       } else {
         len = received;

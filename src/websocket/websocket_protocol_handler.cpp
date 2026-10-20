@@ -9,7 +9,9 @@
 #include <sstream>
 #include "http_parser.h"
 #include "logger.h"
+#include "mqtt_connection_watch.h"
 #include "websocket_mqtt_bridge.h"
+#include <sys/socket.h>
 
 namespace websocket {
 
@@ -153,15 +155,89 @@ int WebSocketProtocolHandler::init(MQTTSocket* socket, const std::string& client
     return MQ_SUCCESS;
 }
 
+void WebSocketProtocolHandler::arm_connection_watch() {
+    if (watch_.started()) {
+        return;
+    }
+    const auto established = established_set_ ? established_ : mqtt::ConnectionWatch::now();
+    uint32_t timeout = 10;
+    if (bridge_) {
+        timeout = bridge_->effective_limits().connect_timeout_seconds;
+    }
+    watch_.start(established, timeout);
+}
+
+int64_t WebSocketProtocolHandler::read_deadline_ms() const {
+    return watch_.recv_deadline_ms();
+}
+
+void WebSocketProtocolHandler::observe_mqtt_connect(uint16_t negotiated_keep_alive) {
+    watch_.observe_connect(negotiated_keep_alive, mqtt::ConnectionWatch::now());
+}
+
+void WebSocketProtocolHandler::observe_mqtt_packet() {
+    watch_.observe_packet(mqtt::ConnectionWatch::now());
+}
+
+void WebSocketProtocolHandler::signal_takeover_done() {
+    if (takeover_gate_) {
+        takeover_gate_->done.store(true, std::memory_order_release);
+        takeover_gate_.reset();
+    }
+}
+
+void WebSocketProtocolHandler::request_session_takeover(
+    const std::shared_ptr<mqtt::SessionTakeoverGate>& gate) {
+    if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
+        gate->done.store(true, std::memory_order_release);
+        return;
+    }
+    takeover_gate_ = gate;
+    takeover_pending_.store(true, std::memory_order_release);
+    if (takeover_finished_) {
+        signal_takeover_done();
+        return;
+    }
+    if (socket_ && socket_->get_fd() >= 0) {
+        ::shutdown(socket_->get_fd(), SHUT_RD);
+    }
+}
+
+void WebSocketProtocolHandler::finish_session_takeover() {
+    if (takeover_finished_) {
+        signal_takeover_done();
+        return;
+    }
+    takeover_finished_ = true;
+    if (bridge_ && bridge_->get_message_format() == MessageFormat::MQTT_PACKET &&
+        bridge_->mqtt_protocol_version(client_id_) >= 5) {
+        (void)bridge_->send_mqtt_disconnect(client_id_, mqtt::ReasonCode::SessionTakenOver);
+    }
+    if (bridge_ && bridge_->get_session_manager()) {
+        bridge_->get_session_manager()->note_session_takeover();
+    }
+    if (bridge_) {
+        bridge_->unregister_handler(client_id_);
+    }
+    state_ = WebSocketState::CLOSED;
+    signal_takeover_done();
+    LOG_INFO("WebSocket session {} taken over", client_id_);
+}
+
 int WebSocketProtocolHandler::process() {
     if (!socket_) {
         return MQ_ERR_INVALID_STATE;
     }
 
+    arm_connection_watch();
+
     // Handle handshake first
     if (state_ == WebSocketState::CONNECTING) {
         int ret = handle_handshake();
         if (ret != MQ_SUCCESS) {
+            if (ret == MQ_ERR_SOCKET_TIMEOUT && bridge_ && bridge_->get_session_manager()) {
+                bridge_->get_session_manager()->note_connect_timeout();
+            }
             LOG_ERROR("Handshake failed: {}", ret);
             state_ = WebSocketState::CLOSED;
             return ret;
@@ -170,8 +246,16 @@ int WebSocketProtocolHandler::process() {
         LOG_INFO("WebSocket connection established for client {}", client_id_);
     }
 
+    if (!bridge_ || bridge_->get_message_format() != MessageFormat::MQTT_PACKET) {
+        watch_.suppress();
+    }
+
     // Main processing loop
     while (state_ == WebSocketState::OPEN) {
+        if (takeover_pending_.load(std::memory_order_acquire)) {
+            finish_session_takeover();
+            break;
+        }
         // Check for ping timeout
         if (is_pong_timeout()) {
             LOG_WARN("Pong timeout for client {}", client_id_);
@@ -188,8 +272,36 @@ int WebSocketProtocolHandler::process() {
         // Read and process frames
         WebSocketFrame frame(allocator_);
         int ret = read_frame(frame);
+        if (takeover_pending_.load(std::memory_order_acquire)) {
+            finish_session_takeover();
+            break;
+        }
 
-        if (ret == MQ_ERR_SOCKET_RECV || ret == MQ_ERR_SOCKET) {
+        if (ret == MQ_ERR_SOCKET_TIMEOUT) {
+            if (!watch_.connect_complete()) {
+                if (bridge_ && bridge_->get_session_manager()) {
+                    bridge_->get_session_manager()->note_connect_timeout();
+                }
+                LOG_INFO("CONNECT timeout, closing WebSocket client {} without a response", client_id_);
+                state_ = WebSocketState::CLOSED;
+                if (socket_) {
+                    socket_->close();
+                }
+            } else {
+                if (bridge_ && bridge_->get_session_manager()) {
+                    bridge_->get_session_manager()->note_keepalive_timeout();
+                }
+                LOG_INFO("Keep alive timeout for WebSocket client {}", client_id_);
+                if (bridge_ && bridge_->mqtt_protocol_version(client_id_) >= 5) {
+                    (void)bridge_->send_mqtt_disconnect(client_id_, mqtt::ReasonCode::KeepAliveTimeout);
+                }
+                state_ = WebSocketState::CLOSED;
+                if (socket_) {
+                    socket_->close();
+                }
+            }
+            break;
+        } else if (ret == MQ_ERR_SOCKET_RECV || ret == MQ_ERR_SOCKET) {
             // Treat both recv errors and generic socket disconnect as peer close.
             LOG_INFO("Connection closed by peer for client {} (ret={})", client_id_, ret);
             state_ = WebSocketState::CLOSED;
@@ -281,7 +393,7 @@ int WebSocketProtocolHandler::read_handshake_request(std::string& request) {
     // Read until we find "\r\n\r\n" (end of HTTP headers)
     while (true) {
         int len = sizeof(buffer) - 1;
-        int ret = socket_->recv(buffer, len);
+        int ret = socket_->recv(buffer, len, read_deadline_ms());
 
         if (ret < 0) {
             LOG_ERROR("Failed to read handshake: {}", ret);
@@ -449,7 +561,7 @@ int WebSocketProtocolHandler::read_frame(WebSocketFrame& frame) {
         // Need more bytes to finish a frame.
         char temp_buffer[4096];
         int len = sizeof(temp_buffer);
-        int ret = socket_->recv(temp_buffer, len);
+        int ret = socket_->recv(temp_buffer, len, read_deadline_ms());
 
         if (ret < 0) {
             return ret;

@@ -65,6 +65,9 @@ public:
     int register_handler(const std::string& client_id, WebSocketProtocolHandler* handler);
     int unregister_handler(const std::string& client_id);
     WebSocketProtocolHandler* get_handler(const std::string& client_id) const;
+    void bind_session_handler(const std::string& client_id, mqtt::MQTTProtocolHandler* handler);
+    int send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason);
+    uint8_t mqtt_protocol_version(const std::string& client_id) const;
 
     // Handle incoming WebSocket messages
     int handle_websocket_text(const std::string& client_id, const std::string& message);
@@ -163,6 +166,8 @@ private:
                                                   std::equal_to<std::string>,
                                                   mqtt::mqtt_stl_allocator<std::pair<const std::string, uint8_t>>>;
     ProtocolVersionMap client_protocol_versions_;
+    std::unordered_map<std::string, mqtt::MQTTProtocolHandler*> session_handlers_;
+    std::unordered_map<std::string, std::string> mqtt_client_ids_;
 
     // Statistics
     BridgeStatistics stats_;

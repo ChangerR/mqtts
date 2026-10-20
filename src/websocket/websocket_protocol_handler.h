@@ -5,8 +5,11 @@
 #include <string>
 #include <vector>
 #include "mqtt_allocator.h"
+#include "mqtt_connection_watch.h"
 #include "mqtt_define.h"
+#include "mqtt_packet.h"
 #include "mqtt_socket.h"
+#include "mqtt_takeover.h"
 #include "mqtt_stl_allocator.h"
 #include "websocket_frame.h"
 
@@ -96,6 +99,16 @@ public:
     void set_bridge(WebSocketMQTTBridge* bridge) { bridge_ = bridge; }
     WebSocketMQTTBridge* get_bridge() const { return bridge_; }
 
+    void set_connection_established(std::chrono::steady_clock::time_point when)
+    {
+        established_ = when;
+        established_set_ = true;
+    }
+    void observe_mqtt_connect(uint16_t negotiated_keep_alive);
+    void observe_mqtt_packet();
+    mqtt::ConnectionWatch& connection_watch() { return watch_; }
+    void request_session_takeover(const std::shared_ptr<mqtt::SessionTakeoverGate>& gate);
+
     // Server integration
     void set_server(WebSocketServer* server) { server_ = server; }
     WebSocketServer* get_server() const { return server_; }
@@ -158,6 +171,18 @@ private:
     WebSocketOpcode fragmented_opcode_;
     Buffer fragmented_payload_;
     bool is_fragmenting_;
+
+    mqtt::ConnectionWatch watch_;
+    std::chrono::steady_clock::time_point established_{};
+    bool established_set_ = false;
+    std::shared_ptr<mqtt::SessionTakeoverGate> takeover_gate_;
+    std::atomic<bool> takeover_pending_{false};
+    bool takeover_finished_ = false;
+
+    void arm_connection_watch();
+    int64_t read_deadline_ms() const;
+    void finish_session_takeover();
+    void signal_takeover_done();
 };
 
 }  // namespace websocket

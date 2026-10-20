@@ -327,6 +327,64 @@ int ThreadLocalSessionManager::enqueue_shared_messages(
   return ret;
 }
 
+int ThreadLocalSessionManager::enqueue_takeover(const std::string& client_id,
+                                                MQTTProtocolHandler* newcomer,
+                                                const std::shared_ptr<SessionTakeoverGate>& gate)
+{
+  if (!initialized_) {
+    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+  }
+  if (!gate) {
+    return MQ_ERR_PARAM_V2;
+  }
+
+  SessionTakeoverRequest request;
+  request.client_id = client_id;
+  request.newcomer = newcomer;
+  request.gate = gate;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    takeover_requests_.push(std::move(request));
+  }
+  return MQ_SUCCESS;
+}
+
+int ThreadLocalSessionManager::process_control_messages()
+{
+  if (!initialized_) {
+    return 0;
+  }
+
+  int processed = 0;
+  while (true) {
+    SessionTakeoverRequest request;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (takeover_requests_.empty()) {
+        break;
+      }
+      request = std::move(takeover_requests_.front());
+      takeover_requests_.pop();
+    }
+
+    if (!request.gate || !request.gate->arm()) {
+      if (request.gate) {
+        request.gate->done.store(true, std::memory_order_release);
+      }
+      processed++;
+      continue;
+    }
+    SafeHandlerRef current = get_safe_handler(to_mqtt_string(request.client_id, allocator_));
+    if (!current.is_valid() || current.get() == request.newcomer) {
+      request.gate->done.store(true, std::memory_order_release);
+    } else {
+      current->request_session_takeover(request.gate);
+    }
+    processed++;
+  }
+  return processed;
+}
+
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
 {
   // 如果队列为空，等待新消息
@@ -829,6 +887,38 @@ void GlobalSessionManager::note_bytes_sent(uint64_t bytes)
   counters->bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void GlobalSessionManager::note_connect_timeout()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->connect_timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_keepalive_timeout()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->keepalive_timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_session_takeover()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->session_takeovers.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_malformed_disconnect()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->malformed_packet_disconnects.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void GlobalSessionManager::collect_protocol_counters(ProtocolCounterSnapshot& out) const
 {
   out = ProtocolCounterSnapshot();
@@ -897,16 +987,120 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
     return MQ_ERR_SESSION_THREAD_MISMATCH;
   }
 
+  // 先占住 Client ID，再投递接管。等待期间不能持有任何 OS 锁。
+  auto gate = std::make_shared<SessionTakeoverGate>();
+  ThreadLocalSessionManager* existing = nullptr;
+  const int timeout_ms = thread_manager->get_session_removal_timeout_ms();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+  while (true) {
+    std::shared_ptr<SessionTakeoverGate> blocker;
+    {
+      WriteLockGuard lock(client_index_mutex_);
+      auto reserved = client_reservations_.find(client_id_str);
+      // 占位要保留到索引安装完成。只等 done 会让下一个连接在发布前抢走 Client ID。
+      if (reserved != client_reservations_.end() && reserved->second && reserved->second != gate) {
+        blocker = reserved->second;
+      } else {
+        client_reservations_[client_id_str] = gate;
+        auto found = client_to_manager_.find(client_id_str);
+        existing = found == client_to_manager_.end() ? nullptr : found->second;
+      }
+    }
+    if (!blocker) {
+      break;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      LOG_WARN("Timed out waiting for in-flight session takeover of {}", client_id_str);
+      return MQ_ERR_TIMEOUT_V2;
+    }
+    int slice_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    if (slice_ms > 10) {
+      slice_ms = 10;
+    }
+    if (slice_ms < 1) {
+      slice_ms = 1;
+    }
+    runtime::current_runtime().wait(-1, 0, slice_ms);
+  }
+
+  bool held = true;
+  auto release_reservation = [&]() {
+    if (!held) {
+      return;
+    }
+    held = false;
+    WriteLockGuard lock(client_index_mutex_);
+    auto reserved = client_reservations_.find(client_id_str);
+    if (reserved != client_reservations_.end() && reserved->second == gate) {
+      client_reservations_.erase(reserved);
+    }
+  };
+
+  if (existing) {
+    const int posted = existing->enqueue_takeover(client_id_str, handler, gate);
+    if (posted != MQ_SUCCESS) {
+      release_reservation();
+      return posted;
+    }
+    const auto takeover_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(existing->get_session_removal_timeout_ms());
+    bool finished = false;
+    while (!gate->done.load(std::memory_order_acquire)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= takeover_deadline) {
+        break;
+      }
+      int slice_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(takeover_deadline - now).count());
+      if (slice_ms > 10) {
+        slice_ms = 10;
+      }
+      if (slice_ms < 1) {
+        slice_ms = 1;
+      }
+      runtime::current_runtime().wait(-1, 0, slice_ms);
+    }
+    finished = gate->done.load(std::memory_order_acquire);
+    if (!finished) {
+      if (gate->cancel()) {
+        LOG_WARN("Timed out waiting for session takeover of {}", client_id_str);
+        release_reservation();
+        return MQ_ERR_TIMEOUT_V2;
+      }
+      while (!gate->done.load(std::memory_order_acquire)) {
+        runtime::current_runtime().wait(-1, 0, 10);
+      }
+    }
+  }
+
   // 在线程管理器中注册handler
   int result = thread_manager->register_handler(client_id, handler);
   if (result != MQ_SUCCESS) {
+    release_reservation();
     return result;
   }
 
-  // 更新客户端索引（使用写锁，但这个操作相对较少）
-  update_client_index(client_id_str, thread_manager);
+  // 占位还在自己手里时才发布索引，避免后写的连接覆盖先完成的主人。
+  {
+    WriteLockGuard lock(client_index_mutex_);
+    auto reserved = client_reservations_.find(client_id_str);
+    if (reserved != client_reservations_.end() && reserved->second == gate) {
+      client_to_manager_[client_id_str] = thread_manager;
+      client_reservations_.erase(reserved);
+      held = false;
+    }
+  }
+  if (held) {
+    thread_manager->unregister_handler(client_id);
+    release_reservation();
+    return MQ_ERR_TIMEOUT_V2;
+  }
 
-  LOG_INFO("Session registered globally: {}", client_id_str);
+  LOG_INFO("Session registered globally: {} thread {}", client_id_str,
+           std::hash<std::thread::id>{}(thread_manager->get_thread_id()));
   return MQ_SUCCESS;
 }
 

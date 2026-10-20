@@ -379,8 +379,20 @@ void MQTTServer::handle_client(ClientContext* ctx)
 {
   int ret = MQ_SUCCESS;
 
-  // Detect if this is a WebSocket connection
-  bool is_websocket = ctx->client->is_websocket_upgrade_request();
+  const auto established = std::chrono::steady_clock::now();
+  const uint32_t connect_budget = ctx->server->protocol_limits_.connect_timeout_seconds;
+  int peek_ms = 1000;
+  if (connect_budget == 0) {
+    peek_ms = 0;
+  } else {
+    const uint64_t budget_ms = static_cast<uint64_t>(connect_budget) * 1000;
+    if (budget_ms < static_cast<uint64_t>(peek_ms)) {
+      peek_ms = static_cast<int>(budget_ms);
+    }
+  }
+
+  // Detect if this is a WebSocket connection. 探测时间算进 CONNECT 超时。
+  bool is_websocket = ctx->client->is_websocket_upgrade_request(peek_ms);
 
   if (is_websocket) {
     LOG_INFO("Detected WebSocket upgrade request from {}:{}", ctx->client_ip, ctx->client_port);
@@ -412,6 +424,8 @@ void MQTTServer::handle_client(ClientContext* ctx)
 
         // Register handler with bridge
         bridge->register_handler(ctx->client_id, ws_handler);
+        bridge->bind_session_handler(ctx->client_id, adapter);
+        ws_handler->set_connection_established(established);
 
         // Set bridge reference in handler
         ws_handler->set_bridge(bridge);
@@ -468,6 +482,7 @@ void MQTTServer::handle_client(ClientContext* ctx)
       // Set session manager reference
       mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
       handler->set_session_manager(&session_manager);
+      handler->set_connection_established(established);
 
       // Process packets until client disconnects
       ret = handler->process();
@@ -503,6 +518,7 @@ int MQTTServer::eventloop_callback(void* arg)
     if (processed > 0) {
       LOG_DEBUG("Processed {} pending messages in eventloop callback", processed);
     }
+    local_manager->process_control_messages();
   }
 
   return 0;  // Continue eventloop
