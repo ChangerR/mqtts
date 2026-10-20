@@ -549,6 +549,13 @@ TEST(Phase0Takeover, ReservationBlocksASecondClaim)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     second_result.store(manager.register_session(client_id, &second_replacement));
+    // 抢到会话的线程就是下一次接管的主人，必须继续处理控制消息。
+    while (!stop.load()) {
+      if (auto* local = manager.get_thread_manager()) {
+        local->process_control_messages();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   });
   while (ready.load() < 3) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
