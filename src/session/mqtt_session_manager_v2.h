@@ -213,13 +213,13 @@ class GlobalSessionManager
 {
  public:
   GlobalSessionManager();
-  void configure_persistence(const PersistenceConfig& config) {
-    if (config.enabled) durable_store_.reset(new DurableStore(config));
-  }
+  void configure_persistence(const PersistenceConfig& config);
   // 启动时冻结。true 时恢复“总是不把消息投回发布者”的旧行为。
   void set_implicit_no_local(bool enabled) { implicit_no_local_ = enabled; }
   bool implicit_no_local() const { return implicit_no_local_; }
   void set_retain_config(const RetainConfig& config);
+  // false 时不把磁盘上的保留消息装进内存，也不在 SUBSCRIBE 时下发。
+  void set_retain_available(bool enabled) { retain_available_ = enabled; }
   DurableStore* durable_store() const { return durable_store_.get(); }
   WillScheduler& will_scheduler() { return will_scheduler_; }
   const WillScheduler& will_scheduler() const { return will_scheduler_; }
@@ -435,7 +435,7 @@ class GlobalSessionManager
   std::unique_lock<std::recursive_mutex> lock_retain_replay();
 
   // SUBACK 之后调用。retain 恒为 1，QoS 取订阅和消息的较小值。
-  // 持久化会话的 QoS>0 仍走在线发送，会被在线路径拒绝；定向入队留到保留日志那份 PR。
+  // 持久化会话的 QoS>0 进入 DurableStore 定向队列；在线路径会拒绝这种发送。
   int deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
                        const SubscriptionOptions& options, bool subscription_existed);
 
@@ -630,6 +630,9 @@ class GlobalSessionManager
   std::unique_ptr<DurableStore> durable_store_;
   bool implicit_no_local_ = false;
   RetainConfig retain_config_;
+  bool retain_available_ = true;
+  std::atomic<int64_t> retained_gauge_messages_{0};
+  std::atomic<int64_t> retained_gauge_bytes_{0};
   std::unique_ptr<RetainStore> retain_store_;
   // 递归锁：订阅侧持有它再调用 deliver_retained，投递内部会再锁一次。
   std::recursive_mutex retain_replay_mu_;
@@ -704,7 +707,9 @@ class GlobalSessionManager
   int batch_forward_publish(const std::vector<MQTTString>& target_client_ids,
                             const SharedMessageContentPtr& content);
   // retain = 0 的发布不得调用这里，避免热路径碰到保留库的锁。
-  void remember_retained(const PublishPacket& packet, const MQTTString& sender);
+  // QoS>0 时会等保留日志提交；失败时返回错误，调用方不得回成功 PUBACK。
+  int remember_retained(const PublishPacket& packet, const MQTTString& sender);
+  void restore_retained_messages();
 };
 
 // 单例访问

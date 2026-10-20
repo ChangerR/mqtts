@@ -102,8 +102,39 @@ class DurableStore
     size_t isolated_sessions = 0, overflow_skipped = 0;
     std::vector<size_t> message_partition_bytes, session_partition_bytes;
     size_t discarded_denied = 0, discarded_oversize = 0, discarded_malformed = 0;
+    size_t retained = 0, retain_log_bytes = 0;
   };
   Statistics statistics() const;
+  // Versioned retain log under the store directory. Empty payload is not a put;
+  // deletion is clear_retained. wait is false for QoS 0 (the worker commits later).
+  struct RetainedProperties
+  {
+    uint8_t payload_format_indicator = 0;
+    std::string content_type;
+    std::string response_topic;
+    std::string correlation_data;
+    std::vector<std::pair<std::string, std::string>> user_properties;
+  };
+  struct RetainedMessage
+  {
+    std::string topic;
+    uint8_t qos = 0;
+    std::string payload;
+    std::string sender;
+    int64_t expires_ms = 0;
+    RetainedProperties properties;
+  };
+  Result put_retained(const std::string& topic, uint8_t qos, const std::string& payload,
+                      const std::string& sender, int64_t expires_ms, bool wait);
+  Result put_retained(const std::string& topic, uint8_t qos, const std::string& payload,
+                      const std::string& sender, int64_t expires_ms, bool wait,
+                      const RetainedProperties& properties);
+  Result clear_retained(const std::string& topic, bool wait);
+  // Committed, unexpired messages. Absent on journals that predate the retain log.
+  std::vector<RetainedMessage> retained_messages() const;
+  // Queue one QoS 1 publish into an online persistent session.
+  // present is false when that client has no online durable session.
+  Result enqueue_directed(const std::string& client, const std::string& wire, int64_t expires);
   // Maintenance/administration API; performs blocking disk work outside MQTT threads.
   void checkpoint();
   void import_legacy(const std::string& exported);

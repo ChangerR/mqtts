@@ -118,6 +118,65 @@ const char* RetainStore::warn_locked(const char* reason)
   return reason;
 }
 
+bool RetainStore::peek(const std::string& topic, RetainedCopy& out,
+                       std::chrono::steady_clock::time_point now) const
+{
+  if (topic.empty()) {
+    return false;
+  }
+  ReadLockGuard lock(mutex_);
+  const Node* node = &root_;
+  const std::vector<std::string> segments = split(topic);
+  for (size_t i = 0; i < segments.size(); ++i) {
+    std::unordered_map<std::string, Node*>::const_iterator found = node->children.find(segments[i]);
+    if (found == node->children.end()) {
+      return false;
+    }
+    node = found->second;
+  }
+  if (!node->has_message || (node->has_expiry && now >= node->expires_at)) {
+    return false;
+  }
+  out.topic = topic;
+  out.content = node->content;
+  out.has_expiry = node->has_expiry;
+  out.expires_at = node->expires_at;
+  return true;
+}
+
+RetainWriteResult RetainStore::install(const RetainedCopy& copy)
+{
+  RetainWriteResult result;
+  if (copy.topic.empty() || !copy.content.is_valid()) {
+    return result;
+  }
+  const size_t payload_bytes = copy.content->payload.size();
+  const std::vector<std::string> segments = split(copy.topic);
+  WriteLockGuard lock(mutex_);
+  Node* existing = descend(&root_, segments, false);
+  const bool replacing = existing && existing->has_message;
+  const size_t old_bytes = replacing ? existing->payload_bytes : 0;
+  Node* node = existing;
+  if (!node) {
+    node = descend(&root_, segments, true);
+  }
+  node->content = copy.content;
+  node->has_message = true;
+  node->has_expiry = copy.has_expiry;
+  node->expires_at = copy.expires_at;
+  node->payload_bytes = payload_bytes;
+  message_count_ = message_count_ - (replacing ? 1 : 0) + 1;
+  if (total_bytes_ >= old_bytes) {
+    total_bytes_ = total_bytes_ - old_bytes + payload_bytes;
+  } else {
+    total_bytes_ = payload_bytes;
+  }
+  result.kind = replacing ? RetainWriteResult::Replaced : RetainWriteResult::Stored;
+  result.message_delta = replacing ? 0 : 1;
+  result.byte_delta = static_cast<int64_t>(payload_bytes) - static_cast<int64_t>(old_bytes);
+  return result;
+}
+
 RetainWriteResult RetainStore::remove(const std::string& topic)
 {
   RetainWriteResult result;

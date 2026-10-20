@@ -23,6 +23,7 @@ int run_mqtt_server(const mqtt::Config& config)
   // 初始化全局会话管理器
   mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
   session_manager.set_implicit_no_local(config.mqtt.implicit_no_local);
+  session_manager.set_retain_available(config.mqtt.retain_available);
   session_manager.set_retain_config(config.retain);
 
   try { session_manager.configure_persistence(config.persistence); }
