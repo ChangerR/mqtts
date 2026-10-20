@@ -114,9 +114,19 @@ def packet_growth(binary):
             assert reader.message() == ('fixture/allowed', data)
         oversized = fixture.client('oversized')
         # Advertise a one-MiB body: with the fixed header this exceeds the
-        # broker cap. It must close before allocating or waiting for the body.
+        # broker cap. MQTT 5 answers DISCONNECT 0x95 and closes before the body.
         oversized.send(packet(0x30, b'\0'*(1024*1024))[:4])
-        assert oversized.sock.recv(1) == b'', 'oversized packet header was accepted'
+        oversized.sock.settimeout(2)
+        data = b''
+        while True:
+            try:
+                more = oversized.sock.recv(16)
+            except TimeoutError:
+                break
+            if not more:
+                break
+            data += more
+        assert data[:1] == b'\xe0' and b'\x95' in data, data
         fixture.transfer(reader, writer)
     print('PASS receive-buffer growth and oversized packet rejection', flush=True)
     return dict(scenario='4/64 KiB packet growth and oversized header rejection', passed=True)

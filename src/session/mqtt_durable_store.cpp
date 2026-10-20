@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <unordered_set>
 #include "logger.h"
 #include "mqtt_append_log.h"
 #include "mqtt_log_codec.h"
@@ -160,6 +161,7 @@ struct DurableStore::Impl
     std::map<std::string, uint8_t> subscriptions;
     std::map<int64_t, DeliveryState> pending;
     std::unordered_map<uint16_t, int64_t> packets;
+    std::unordered_set<uint16_t> live_packet_ids;
     std::vector<int64_t> recovery_acks;
     std::unordered_map<int64_t, uint16_t> recovery_claims;
     std::shared_ptr<Signal> signal;
@@ -535,15 +537,58 @@ struct DurableStore::Impl
   uint16_t available_packet(const std::shared_ptr<Session>& s,
                             const std::set<uint16_t>& reserved = {})
   {
-    if (s->packets.size() + reserved.size() >= 65535)
+    if (s->packets.size() + s->live_packet_ids.size() + reserved.size() >= 65535)
       return 0;
     uint16_t candidate = s->next_packet;
     for (size_t i = 0; i < 65535; ++i) {
-      if (!s->packets.count(candidate) && !reserved.count(candidate))
+      if (!s->packets.count(candidate) && !s->live_packet_ids.count(candidate) &&
+          !reserved.count(candidate))
         return candidate;
       candidate = uint16_t(candidate % 65535 + 1);
     }
     return 0;
+  }
+  DurableStore::PacketIdClaim claim_live(const std::string& client, uint64_t epoch, uint16_t id)
+  {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
+      if (!guard.owns_lock()) {
+        runtime::current_runtime().wait(-1, 0, 1);
+        continue;
+      }
+      try {
+        auto s = current(client, epoch);
+        if (!s)
+          return DurableStore::PacketIdClaim::Absent;
+        if (!id || s->packets.count(id) || s->live_packet_ids.count(id))
+          return DurableStore::PacketIdClaim::InUse;
+        s->live_packet_ids.insert(id);
+        return DurableStore::PacketIdClaim::Reserved;
+      } catch (const Deferred&) {
+        return DurableStore::PacketIdClaim::Busy;
+      } catch (const std::bad_alloc&) {
+        return DurableStore::PacketIdClaim::Quota;
+      }
+    }
+    return DurableStore::PacketIdClaim::Busy;
+  }
+  void release_live(const std::string& client, uint64_t epoch, uint16_t id)
+  {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
+      if (!guard.owns_lock()) {
+        runtime::current_runtime().wait(-1, 0, 1);
+        continue;
+      }
+      try {
+        auto s = current(client, epoch);
+        if (s)
+          s->live_packet_ids.erase(id);
+        return;
+      } catch (const Deferred&) {
+        continue;
+      }
+    }
   }
   std::vector<std::shared_ptr<Session>> match(const std::string& topic);
   void mark_overflow(const std::shared_ptr<Session>& s, int64_t sequence)
@@ -658,6 +703,17 @@ DurableStore::Impl::~Impl()
 }
 DurableStore::DurableStore(const PersistenceConfig& config) : impl_(new Impl(config)) {}
 DurableStore::~DurableStore() = default;
+DurableStore::PacketIdClaim DurableStore::claim_live_packet_id(const std::string& client,
+                                                                 uint64_t epoch, uint16_t id)
+{
+  return impl_->claim_live(client, epoch, id);
+}
+
+void DurableStore::release_live_packet_id(const std::string& client, uint64_t epoch, uint16_t id)
+{
+  impl_->release_live(client, epoch, id);
+}
+
 bool DurableStore::has_subscriptions() const
 {
   return impl_->subscriptions.load() != 0;
@@ -763,6 +819,7 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
               s->expiry = expiry;
               s->deadline = deadline;
               s->online = true;
+              s->live_packet_ids.clear();
               v.schedule_session(s);
               s->busy = false;
               s->signal = signal;
@@ -819,6 +876,7 @@ DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_
           if (!ok)
             return;
           s->online = false;
+          s->live_packet_ids.clear();
           s->expiry = expiry;
           s->deadline = deadline;
           if (!expiry)

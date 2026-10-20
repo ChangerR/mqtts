@@ -17,6 +17,42 @@ static std::string checked(const std::string& data)
   return e.data + data;
 }
 
+static void test_live_packet_id_is_shared(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.segment_bytes = 8192;
+  cfg.max_disk_bytes = 1024 * 1024;
+  cfg.checkpoint_interval_ms = 600000;
+  DurableStore store(cfg);
+  auto session = store.connect("reader", "owner", false, 60);
+  assert(session.ok);
+  assert(store.subscribe("reader", session.epoch, "topic", 1).ok);
+  assert(store.claim_live_packet_id("reader", session.epoch, 1) ==
+         DurableStore::PacketIdClaim::Reserved);
+  assert(store.claim_live_packet_id("reader", session.epoch, 1) ==
+         DurableStore::PacketIdClaim::InUse);
+  assert(store.publish("topic", "payload", "writer", 0).ok);
+  auto batch = store.fetch("reader", session.epoch, 0, 32);
+  assert(batch.ok && batch.deliveries.size() == 1);
+  assert(batch.deliveries[0].packet_id == 2);
+  assert(store.claim_live_packet_id("reader", session.epoch, 2) ==
+         DurableStore::PacketIdClaim::InUse);
+  store.release_live_packet_id("reader", session.epoch, 1);
+  assert(store.claim_live_packet_id("reader", session.epoch, 1) ==
+         DurableStore::PacketIdClaim::Reserved);
+  store.release_live_packet_id("reader", session.epoch, 1);
+  assert(store.claim_live_packet_id("reader", session.epoch, 3) ==
+         DurableStore::PacketIdClaim::Reserved);
+  assert(store.disconnect("reader", session.epoch).ok);
+  auto again = store.connect("reader", "owner", false, 60);
+  assert(again.ok);
+  assert(store.claim_live_packet_id("reader", again.epoch, 3) ==
+         DurableStore::PacketIdClaim::Reserved);
+  store.release_live_packet_id("reader", again.epoch, 3);
+}
+
 static void test_compaction(const std::string& path)
 {
   mqtt::PersistenceConfig cfg;
@@ -397,6 +433,7 @@ int main()
     assert((fanout.targets == std::vector<std::string>{"alpha", "bravo", "tango", "zulu"}));
     assert(store.statistics().bytes == store.statistics().unique_bytes * 4);
   }
+  test_live_packet_id_is_shared(std::string(dir) + "/live-packet-id");
   test_compaction(std::string(dir) + "/compact");
   test_native_upgrade(std::string(dir) + "/upgrade-2", 2);
   test_native_upgrade(std::string(dir) + "/upgrade-3", 3);

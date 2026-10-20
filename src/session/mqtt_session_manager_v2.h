@@ -408,6 +408,8 @@ class GlobalSessionManager
   void note_keepalive_timeout();
   void note_session_takeover();
   void note_malformed_disconnect();
+  void note_outbound_packet_size_drop();
+  void note_inflight_window_delay();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
   /**

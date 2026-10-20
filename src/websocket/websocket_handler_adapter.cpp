@@ -30,6 +30,22 @@ void WebSocketHandlerAdapter::request_session_takeover(
     }
 }
 
+int WebSocketHandlerAdapter::transmit_serialized(const uint8_t* data, size_t size) {
+    if (!ws_handler_ || !ws_handler_->is_connected()) {
+        return MQ_ERR_SESSION_INVALID_HANDLER;
+    }
+    std::vector<uint8_t> payload(data, data + size);
+    const int ret = ws_handler_->send_binary(payload);
+    if (ret == MQ_SUCCESS && bridge_) {
+        bridge_->get_statistics().ws_messages_sent.fetch_add(1, std::memory_order_relaxed);
+        bridge_->get_statistics().mqtt_messages_sent.fetch_add(1, std::memory_order_relaxed);
+        if (bridge_->get_session_manager()) {
+            bridge_->get_session_manager()->note_bytes_sent(payload.size());
+        }
+    }
+    return ret;
+}
+
 int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
                                           const mqtt::MQTTByteVector& payload,
                                           uint8_t qos,
@@ -37,11 +53,21 @@ int WebSocketHandlerAdapter::send_publish(const mqtt::MQTTString& topic,
                                           bool dup,
                                           const mqtt::Properties& properties,
                                           std::shared_ptr<mqtt::auth::AuthorizationRequest>* pending) {
-    (void)pending;
     if (!bridge_) {
         LOG_ERROR("Bridge is null in WebSocketHandlerAdapter");
         return MQ_ERR_PARAM_V2;
     }
+
+    // mqtt 子协议和 TCP 共用报文上限、接收窗口和报文标识符。
+    // 授权仍走桥上原来的读权限复查，撤销后的订阅不能继续收到消息。
+    if (bridge_->get_message_format() == MessageFormat::MQTT_PACKET) {
+        if (!bridge_->outbound_read_allowed(client_id_, mqtt::from_mqtt_string(topic))) {
+            return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+        }
+        return mqtt::MQTTProtocolHandler::send_publish(topic, payload, qos, retain, dup, properties,
+                                                       pending);
+    }
+    (void)pending;
 
     // Create a PublishPacket to forward to the bridge
     mqtt::PublishPacket packet(adapter_allocator_);

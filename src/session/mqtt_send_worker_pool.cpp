@@ -217,11 +217,20 @@ void SendWorkerPool::worker_main(size_t worker_id)
       const int result = behind_head || too_early ? MQ_ERR_AUTH_PENDING : process_send_task(task, worker_id);
       auto end_time = std::chrono::steady_clock::now();
 
-      if (result == MQ_ERR_AUTH_PENDING) {
-        // The HTTP future stays with this task. Rotate it behind unrelated
-        // clients without spending a send coroutine on an HTTP wait. The head
-        // gate preserves order even when later topics already have cached ACLs.
-        if (!behind_head && !too_early) task.retry_after = end_time + std::chrono::milliseconds(5);
+      if (result == MQ_ERR_AUTH_PENDING || result == MQ_ERR_INFLIGHT_WINDOW) {
+        // 授权未完成和出站窗口满都把任务按 ticket 顺序放回队尾，短暂后再试。
+        // 窗口满时记一次延迟。队头还没轮到、或还没到 retry_after 的不算新的延迟。
+        if (!behind_head && !too_early) {
+          task.retry_after = end_time + std::chrono::milliseconds(5);
+          if (result == MQ_ERR_INFLIGHT_WINDOW && session_manager_) {
+            session_manager_->protocol_counters().inflight_window_delays.fetch_add(
+                1, std::memory_order_relaxed);
+          }
+        }
+        // 接收窗口堵住时不要沿用最初入队时间，否则慢确认会把还没发出的 QoS 报文判成过期。
+        if (result == MQ_ERR_INFLIGHT_WINDOW) {
+          task.enqueue_time = end_time;
+        }
         {
           CoroLockGuard lock(&worker->queue_mutex);
           worker->task_queue.push(std::move(task));
@@ -244,7 +253,8 @@ void SendWorkerPool::worker_main(size_t worker_id)
       }
 
       // 更新统计信息
-      if (result == MQ_SUCCESS) {
+      const int completed = result == MQ_ERR_PACKET_DROPPED ? MQ_SUCCESS : result;
+      if (completed == MQ_SUCCESS) {
         worker->processed_count.fetch_add(1);
       } else {
         worker->failed_count.fetch_add(1);
@@ -306,7 +316,10 @@ int SendWorkerPool::process_send_task(WorkerSendTask& task, size_t worker_id)
     int result = handler->send_publish(task.get_topic(), task.get_payload(), task.get_qos(),
                                        task.is_retain(), task.is_dup(), task.get_properties(), &task.authorization);
 
-    if (result == MQ_ERR_AUTH_PENDING) return result;
+    if (result == MQ_ERR_AUTH_PENDING || result == MQ_ERR_INFLIGHT_WINDOW ||
+        result == MQ_ERR_PACKET_DROPPED) {
+      return result;
+    }
 
     if (result == MQ_SUCCESS) {
       LOG_DEBUG(

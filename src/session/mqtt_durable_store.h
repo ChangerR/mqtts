@@ -75,6 +75,12 @@ class DurableStore
   enum class DiscardReason { NotAuthorized, PacketTooLarge, Malformed };
   Result discard(const std::string& client, uint64_t epoch, uint16_t packet_id,
                  DiscardReason reason);
+  // 在线路径占住的报文标识符。和 sessions.packets 一起构成“在途 ID 已占用”。
+  // 不进入确认日志，PUBACK 不会把它当成持久化队列里的消息。
+  enum class PacketIdClaim { Reserved, InUse, Busy, Quota, Absent };
+  PacketIdClaim claim_live_packet_id(const std::string& client, uint64_t epoch, uint16_t id);
+  void release_live_packet_id(const std::string& client, uint64_t epoch, uint16_t id);
+
   bool has_subscriptions() const;
   uint32_t max_session_expiry() const;
   static int64_t now_ms();

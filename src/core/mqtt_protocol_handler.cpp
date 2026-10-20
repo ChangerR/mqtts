@@ -17,7 +17,6 @@
 namespace mqtt {
 
 static const size_t INITIAL_BUFFER_SIZE = 1024;
-static const size_t MAX_BUFFER_SIZE = 1024 * 1024;  // 1MB max size
 
 namespace {
 static bool is_supported_protocol_name_version(const MQTTString& protocol_name,
@@ -48,7 +47,6 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       client_port_(0),
       client_id_(MQTTStrAllocator(allocator)),
       connected_(false),
-      next_packet_id_(1),
       subscriptions_(MQTTStrAllocator(allocator)),
       allocator_(allocator),
       parser_(nullptr),
@@ -59,6 +57,7 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       request_response_information_(false),
       request_problem_information_(true),
       negotiated_protocol_version_(5),
+      version_negotiated_(false),
       allow_mqtt3x_(true),
       serialize_buffer_(nullptr),
       write_lock_acquired_(false),
@@ -232,6 +231,10 @@ int MQTTProtocolHandler::process()
       }
       break;
     }
+    if (ret == MQ_ERR_PACKET_TOO_LARGE) {
+      ret = close_for_flow(ReasonCode::PacketTooLarge, ret);
+      break;
+    }
     if (ret == MQ_ERR_PACKET_INVALID) {
       ret = fail_protocol(ReasonCode::MalformedPacket, ret);
       break;
@@ -258,7 +261,7 @@ int MQTTProtocolHandler::process()
         ret = fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PROTOCOL);
         break;
       }
-      if (ret == MQ_ERR_TIMEOUT_V2) {
+      if (ret == MQ_ERR_TIMEOUT_V2 || ret == MQ_ERR_FLOW_CLOSED || ret == MQ_ERR_PACKET_TOO_LARGE) {
         break;
       }
       if (ret != 0) {
@@ -307,16 +310,18 @@ int MQTTProtocolHandler::process()
 
 int MQTTProtocolHandler::ensure_buffer_size(size_t needed_size)
 {
-  if (needed_size > MAX_BUFFER_SIZE || bytes_read_ > MAX_BUFFER_SIZE - needed_size) {
-    LOG_ERROR("Packet exceeds {} byte limit from client {}:{}", MAX_BUFFER_SIZE,
-              client_ip_.c_str(), client_port_);
+  const size_t limit = inbound_packet_limit();
+  if (needed_size > limit || bytes_read_ > limit || bytes_read_ > limit - needed_size) {
+    LOG_ERROR("Packet exceeds {} byte limit from client {}:{}", limit, client_ip_.c_str(),
+              client_port_);
     return MQ_ERR_PACKET_TOO_LARGE;
   }
   if (bytes_read_ + needed_size > current_buffer_size_) {
     // Remaining Length reveals the complete body size at once. It may need
     // more than a single doubling even when it is well below the packet cap.
+    const size_t capped = std::max(limit, current_buffer_size_);
     const size_t new_size = std::max(bytes_read_ + needed_size,
-                                    std::min(current_buffer_size_ * 2, MAX_BUFFER_SIZE));
+                                    std::min(current_buffer_size_ * 2, capped));
 
     // Allocate new buffer
     char* new_buffer = (char*)allocator_->allocate(new_size);
@@ -399,9 +404,11 @@ int MQTTProtocolHandler::read_packet()
 
         if ((byte & 0x80) == 0) {
           // Check if remaining length is too large
-          if (remaining_length_ > MAX_BUFFER_SIZE - bytes_read_) {
+          const size_t limit = inbound_packet_limit();
+          if (remaining_length_ > limit || bytes_read_ > limit ||
+              bytes_read_ > limit - remaining_length_) {
             LOG_ERROR("Packet too large from client {}:{} (size: {}, max: {})", client_ip_.c_str(),
-                      client_port_, remaining_length_ + bytes_read_, MAX_BUFFER_SIZE);
+                      client_port_, static_cast<size_t>(remaining_length_) + bytes_read_, limit);
             return MQ_ERR_PACKET_TOO_LARGE;
           }
           // Remaining length complete
@@ -446,6 +453,162 @@ const ProtocolLimits& MQTTProtocolHandler::effective_limits() const
   }
   static const ProtocolLimits defaults = ProtocolLimits::defaults();
   return defaults;
+}
+
+void MQTTProtocolHandler::sync_server_flow_limits()
+{
+  const ProtocolLimits& limits = effective_limits();
+  flow_.set_server_limits(limits.max_packet_size, limits.receive_maximum, limits.max_qos);
+}
+
+uint32_t MQTTProtocolHandler::inbound_packet_limit() const
+{
+  return flow_.inbound_limit();
+}
+
+void MQTTProtocolHandler::observe_client_flow(uint8_t protocol_version, uint16_t receive_maximum,
+                                              uint32_t maximum_packet_size)
+{
+  if (protocol_version >= 3 && protocol_version <= 5) {
+    negotiated_protocol_version_ = protocol_version;
+    version_negotiated_ = true;
+    if (parser_) {
+      parser_->set_protocol_version_hint(protocol_version);
+    }
+  }
+  receive_maximum_ = receive_maximum ? receive_maximum : 65535;
+  maximum_packet_size_ = maximum_packet_size ? maximum_packet_size : 268435455;
+  flow_.observe_client(receive_maximum_, maximum_packet_size_);
+}
+
+uint8_t MQTTProtocolHandler::granted_qos_limit() const
+{
+  uint8_t cap = flow_.max_qos();
+  if (session_manager_ && session_manager_->durable_store() && cap > 1) {
+    cap = 1;
+  }
+  return cap;
+}
+
+ConnectionFlow::Qos2Admit MQTTProtocolHandler::admit_inbound_qos2(uint16_t packet_id)
+{
+  sync_server_flow_limits();
+  return flow_.admit_qos2(packet_id);
+}
+
+void MQTTProtocolHandler::release_inbound_qos2(uint16_t packet_id)
+{
+  flow_.release_qos2(packet_id);
+}
+
+int MQTTProtocolHandler::claim_outbound_packet_id(uint16_t id, void* arg)
+{
+  auto* self = static_cast<MQTTProtocolHandler*>(arg);
+  if (!self->durable_epoch_ || !self->session_manager_ || !self->session_manager_->durable_store()) {
+    return 0;
+  }
+  const auto claim = self->session_manager_->durable_store()->claim_live_packet_id(
+      from_mqtt_string(self->client_id_), self->durable_epoch_, id);
+  switch (claim) {
+    case DurableStore::PacketIdClaim::Reserved:
+    case DurableStore::PacketIdClaim::Absent:
+      return 0;
+    case DurableStore::PacketIdClaim::InUse:
+      return 1;
+    case DurableStore::PacketIdClaim::Quota:
+      return 3;
+    case DurableStore::PacketIdClaim::Busy:
+      return 2;
+  }
+  return 2;
+}
+
+ConnectionFlow::Allocation MQTTProtocolHandler::allocate_outbound_packet_id(uint8_t qos)
+{
+  return flow_.allocate_outbound(&MQTTProtocolHandler::claim_outbound_packet_id, this, qos);
+}
+
+void MQTTProtocolHandler::release_outbound_packet_id(uint16_t packet_id)
+{
+  if (!flow_.outbound_holds(packet_id)) {
+    return;
+  }
+  flow_.release_outbound(packet_id);
+  if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+    session_manager_->durable_store()->release_live_packet_id(from_mqtt_string(client_id_),
+                                                              durable_epoch_, packet_id);
+  }
+}
+
+uint16_t MQTTProtocolHandler::get_next_packet_id()
+{
+  const ConnectionFlow::Allocation allocated = allocate_outbound_packet_id();
+  return allocated.status == ConnectionFlow::AllocateStatus::Ready ? allocated.id : 0;
+}
+
+int MQTTProtocolHandler::close_for_flow(ReasonCode reason, int err)
+{
+  // 协议级别要在 CONNECT 解析成功之后才算谈妥。超大 CONNECT 只能直接关掉。
+  if (version_negotiated_ && negotiated_protocol_version_ >= 5 && socket_ &&
+      socket_->is_connected()) {
+    (void)send_disconnect(reason);
+  }
+  if (socket_) {
+    socket_->close();
+  }
+  LOG_WARN("Closing client {}:{} for flow control 0x{:02x}", client_ip_.c_str(), client_port_,
+           static_cast<uint8_t>(reason));
+  return err;
+}
+
+int MQTTProtocolHandler::transmit_serialized(const uint8_t* data, size_t size)
+{
+  return send_data_with_lock(reinterpret_cast<const char*>(data), size);
+}
+
+bool MQTTProtocolHandler::outbound_exceeds_client_maximum(size_t bytes) const
+{
+  if (!version_negotiated_ || negotiated_protocol_version_ < 5) {
+    return false;
+  }
+  return flow_.outbound_too_large(bytes);
+}
+
+void MQTTProtocolHandler::omit_optional_outbound_properties(Properties& properties)
+{
+  properties.reason_string.clear();
+  properties.user_properties.clear();
+  properties.response_information.clear();
+  properties.server_reference.clear();
+  properties.authentication_method.clear();
+  properties.authentication_data.clear();
+  properties.assigned_client_identifier.clear();
+  properties.content_type.clear();
+  properties.response_topic.clear();
+  properties.correlation_data.clear();
+}
+
+template <typename Serialize>
+int MQTTProtocolHandler::send_within_client_limit(Packet* packet, Serialize serialize)
+{
+  int ret = serialize(packet, serialize_buffer_);
+  if (ret != 0) {
+    return ret;
+  }
+  if (outbound_exceeds_client_maximum(serialize_buffer_->size())) {
+    omit_optional_outbound_properties(packet->properties);
+    ret = serialize(packet, serialize_buffer_);
+    if (ret != 0) {
+      return ret;
+    }
+    if (outbound_exceeds_client_maximum(serialize_buffer_->size())) {
+      LOG_WARN("Not sending {}-byte packet to client {}:{}, client maximum is {}",
+               serialize_buffer_->size(), client_ip_.c_str(), client_port_, maximum_packet_size_);
+      return MQ_ERR_PACKET_TOO_LARGE;
+    }
+  }
+  return send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
+                            serialize_buffer_->size());
 }
 
 int MQTTProtocolHandler::parse_packet()
@@ -730,6 +893,9 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
   if (MQ_SUCC(ret)) {
     negotiated_protocol_version_ = packet->protocol_version;
     parser_->set_protocol_version_hint(negotiated_protocol_version_);
+    sync_server_flow_limits();
+    observe_client_flow(packet->protocol_version, packet->properties.receive_maximum,
+                        packet->properties.maximum_packet_size);
     client_keep_alive_ = packet->keep_alive;
     client_requested_session_expiry_ = packet->properties.has_session_expiry_interval;
     const uint16_t negotiated = negotiated_keep_alive_seconds(
@@ -823,11 +989,6 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
       durable_revision_ = opened.revision;
       session_present = opened.present;
       session_expiry_interval_ = std::min(expiry, store->max_session_expiry());
-      receive_maximum_ =
-          packet->properties.receive_maximum ? packet->properties.receive_maximum : 65535;
-      maximum_packet_size_ = packet->properties.maximum_packet_size
-                                 ? packet->properties.maximum_packet_size
-                                 : 268435455;
       restored_subscriptions = std::move(opened.subscriptions);
     }
   }
@@ -972,6 +1133,40 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
     ret = MQ_ERR_PUBLISH_TOPIC;
   }
 
+  if (MQ_SUCC(ret) && packet->qos > 2) {
+    LOG_ERROR("Invalid QoS level: {} from client {}:{}", packet->qos, client_ip_.c_str(),
+              client_port_);
+    return close_for_flow(ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+  }
+
+  if (MQ_SUCC(ret) && (packet->qos == 1 || packet->qos == 2) && packet->packet_id == 0) {
+    return close_for_flow(ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+  }
+
+  sync_server_flow_limits();
+  if (MQ_SUCC(ret) && packet->qos > granted_qos_limit()) {
+    LOG_WARN("PUBLISH QoS {} exceeds maximum {} from client {}:{}", packet->qos, granted_qos_limit(),
+             client_ip_.c_str(), client_port_);
+    return close_for_flow(ReasonCode::QoSNotSupported, MQ_ERR_FLOW_CLOSED);
+  }
+
+  bool qos2_tracked = false;
+  if (MQ_SUCC(ret) && packet->qos == 2) {
+    switch (flow_.admit_qos2(packet->packet_id)) {
+      case ConnectionFlow::Qos2Admit::Duplicate:
+        LOG_DEBUG("Duplicate QoS 2 PUBLISH {} from client {}:{}, resending PUBREC",
+                  packet->packet_id, client_ip_.c_str(), client_port_);
+        return send_pubrec(packet->packet_id, ReasonCode::Success);
+      case ConnectionFlow::Qos2Admit::Exceeded:
+        LOG_WARN("Inbound receive maximum {} exceeded by client {}:{}", flow_.server_receive_maximum(),
+                 client_ip_.c_str(), client_port_);
+        return close_for_flow(ReasonCode::ReceiveMaximumExceeded, MQ_ERR_FLOW_CLOSED);
+      case ConnectionFlow::Qos2Admit::Forward:
+        qos2_tracked = true;
+        break;
+    }
+  }
+
   if (MQ_SUCC(ret) && auth_manager_ && current_auth_context_) {
     (void)auth_manager_->check_publish(*current_auth_context_, packet->topic_name, packet->payload, auth_result);
 
@@ -988,6 +1183,10 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
       } else if (1 == packet->qos) {
         ret = send_puback(packet->packet_id, reason);
       } else if (2 == packet->qos) {
+        if (qos2_tracked) {
+          release_inbound_qos2(packet->packet_id);
+          qos2_tracked = false;
+        }
         ret = send_pubrec(packet->packet_id, reason);
       } else {
         ret = MQ_SUCCESS;
@@ -998,18 +1197,7 @@ int MQTTProtocolHandler::handle_publish(const PublishPacket* packet)
     }
   }
 
-  if (MQ_SUCC(ret) && !auth_denied && packet->qos > 2) {
-    LOG_ERROR("Invalid QoS level: {} from client {}:{}", packet->qos, client_ip_.c_str(),
-              client_port_);
-    ret = MQ_ERR_PACKET_QOS;
-  }
-
   if (MQ_SUCC(ret) && !auth_denied) {
-    if (packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
-      if (negotiated_protocol_version_ >= 5)
-        (void)send_disconnect(ReasonCode::QoSNotSupported);
-      return MQ_ERR_PUBLISH_QOS;
-    }
     LOG_DEBUG("Successfully processed PUBLISH from client {}:{} (payload size: {})",
               client_ip_.c_str(), client_port_, packet->payload.size());
 
@@ -1051,6 +1239,10 @@ int MQTTProtocolHandler::handle_puback(const PubAckPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
+  if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubAck) ==
+      ConnectionFlow::AckDisposition::Unexpected) {
+    return fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
+  }
   if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
     auto result = session_manager_->durable_store()->acknowledge(
         from_mqtt_string(client_id_), durable_epoch_, packet->packet_id, false);
@@ -1060,7 +1252,7 @@ int MQTTProtocolHandler::handle_puback(const PubAckPacket* packet)
       return MQ_ERR_INTERNAL;
     }
   }
-  // 处理PUBACK响应
+  release_outbound_packet_id(packet->packet_id);
   if (packet->reason_code != ReasonCode::Success) {
     LOG_WARN("PUBACK with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
   }
@@ -1075,12 +1267,17 @@ int MQTTProtocolHandler::handle_pubrec(const PubRecPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
-  // 处理PUBREC响应
-  if (packet->reason_code != ReasonCode::Success) {
+  if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubRec) ==
+      ConnectionFlow::AckDisposition::Unexpected) {
+    return fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
+  }
+  if (static_cast<uint8_t>(packet->reason_code) >= 0x80) {
     LOG_WARN("PUBREC with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
+    release_outbound_packet_id(packet->packet_id);
+    return MQ_SUCCESS;
   }
 
-  // 发送PUBREL
+  flow_.mark_awaiting_pubcomp(packet->packet_id);
   return send_pubrel(packet->packet_id, ReasonCode::Success);
 }
 
@@ -1091,12 +1288,11 @@ int MQTTProtocolHandler::handle_pubrel(const PubRelPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
-  // 处理PUBREL响应
   if (packet->reason_code != ReasonCode::Success) {
     LOG_WARN("PUBREL with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
   }
 
-  // 发送PUBCOMP
+  release_inbound_qos2(packet->packet_id);
   return send_pubcomp(packet->packet_id, ReasonCode::Success);
 }
 
@@ -1107,7 +1303,11 @@ int MQTTProtocolHandler::handle_pubcomp(const PubCompPacket* packet)
     return MQ_ERR_SESSION_NOT_CONNECTED;
   }
 
-  // 处理PUBCOMP响应
+  if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubComp) ==
+      ConnectionFlow::AckDisposition::Unexpected) {
+    return fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
+  }
+  release_outbound_packet_id(packet->packet_id);
   if (packet->reason_code != ReasonCode::Success) {
     LOG_WARN("PUBCOMP with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
   }
@@ -1294,9 +1494,11 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     for (const std::pair<MQTTString, uint8_t>& subscription : packet->subscriptions) {
       const MQTTString& topic = subscription.first;
       uint8_t qos = subscription.second;
-      // Persistent delivery is QoS 1; MQTT permits granting a lower QoS.
-      if (session_manager_ && session_manager_->durable_store() && qos == 2)
-        qos = 1;
+      // 授予值不超过服务器上限。持久化会话的上限同时不超过 1。
+      const uint8_t qos_cap = granted_qos_limit();
+      if (qos <= 2 && qos > qos_cap) {
+        qos = qos_cap;
+      }
       int add_ret = MQ_SUCCESS;
       int subscribe_ret = MQ_SUCCESS;
       int rollback_ret = MQ_SUCCESS;
@@ -1489,17 +1691,9 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
     }
   }
 
-  // 序列化包
-  int ret = parser_->serialize_connack(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to serialize CONNACK packet for client {}:{}, error: {}", client_ip_.c_str(),
-              client_port_, ret);
-    return ret;
-  }
-
-  // 使用统一的带锁写入函数
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
+  int ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_connack(static_cast<ConnAckPacket*>(raw), *buffer);
+  });
   if (ret != 0) {
     LOG_ERROR("Failed to send CONNACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -1526,14 +1720,9 @@ int MQTTProtocolHandler::send_pubrec(uint16_t packet_id, ReasonCode reason_code)
   packet->packet_id = packet_id;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_pubrec(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_pubrec(static_cast<PubRecPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_pubrel(uint16_t packet_id, ReasonCode reason_code)
@@ -1551,14 +1740,9 @@ int MQTTProtocolHandler::send_pubrel(uint16_t packet_id, ReasonCode reason_code)
   packet->packet_id = packet_id;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_pubrel(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_pubrel(static_cast<PubRelPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_pubcomp(uint16_t packet_id, ReasonCode reason_code)
@@ -1576,14 +1760,9 @@ int MQTTProtocolHandler::send_pubcomp(uint16_t packet_id, ReasonCode reason_code
   packet->packet_id = packet_id;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_pubcomp(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_pubcomp(static_cast<PubCompPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
@@ -1604,14 +1783,9 @@ int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
     packet->reason_codes.push_back(code);
   }
 
-  int ret = parser_->serialize_unsuback(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_unsuback(static_cast<UnsubAckPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_disconnect(ReasonCode reason_code)
@@ -1628,14 +1802,9 @@ int MQTTProtocolHandler::send_disconnect(ReasonCode reason_code)
   packet->type = PacketType::DISCONNECT;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_disconnect(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_disconnect(static_cast<DisconnectPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
@@ -1652,14 +1821,9 @@ int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
   packet->type = PacketType::AUTH;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_auth(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_auth(static_cast<AuthPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::add_subscription(const MQTTString& topic)
@@ -1746,14 +1910,9 @@ int MQTTProtocolHandler::send_suback(uint16_t packet_id,
     packet->reason_codes.push_back(code);
   }
 
-  int ret = parser_->serialize_suback(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_suback(static_cast<SubAckPacket*>(raw), *buffer);
+  });
 }
 
 int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
@@ -1778,15 +1937,9 @@ int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
   packet->packet_id = packet_id;
   packet->reason_code = reason_code;
 
-  int ret = parser_->serialize_puback(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    LOG_ERROR("Failed to serialize PUBACK packet for client {}:{}, error: {}", client_ip_.c_str(),
-              client_port_, ret);
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
+  int ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_puback(static_cast<PubAckPacket*>(raw), *buffer);
+  });
   if (ret != 0) {
     LOG_ERROR("Failed to send PUBACK packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
@@ -1811,14 +1964,9 @@ int MQTTProtocolHandler::send_pingresp()
 
   packet->type = PacketType::PINGRESP;
 
-  int ret = parser_->serialize_pingresp(packet.get(), *serialize_buffer_);
-  if (ret != 0) {
-    return ret;
-  }
-
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
-  return ret;
+  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+    return parser_->serialize_pingresp(static_cast<PingRespPacket*>(raw), *buffer);
+  });
 }
 
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)
@@ -1909,12 +2057,6 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
   LOG_DEBUG("Sending PUBLISH to client {}:{} (topic: {}, qos: {}, retain: {}, dup: {})",
             client_ip_.c_str(), client_port_, from_mqtt_string(topic), qos, retain, dup);
 
-  if (!socket_) {
-    LOG_ERROR("Cannot send PUBLISH: socket is null for client {}:{}", client_ip_.c_str(),
-              client_port_);
-    return MQ_ERR_SOCKET;
-  }
-
   // A persistent connection has exactly one Packet ID owner. Alternate live
   // paths (including cluster forwarding) must never allocate an ID that a
   // PUBACK could incorrectly apply to its durable queue.
@@ -1948,11 +2090,8 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
   packet->dup = dup;
   packet->properties = properties;
 
-  if (qos > 0) {
-    packet->packet_id = get_next_packet_id();
-  } else {
-    packet->packet_id = 0;
-  }
+  // 报文标识符的具体取值不改变包长，先用占位符量出线上大小。
+  packet->packet_id = qos > 0 ? 1 : 0;
 
   int ret = parser_->serialize_publish(packet.get(), *serialize_buffer_);
   if (ret != 0) {
@@ -1960,10 +2099,53 @@ int MQTTProtocolHandler::send_publish(const MQTTString& topic, const MQTTByteVec
               client_port_, ret);
     return ret;
   }
+  if (outbound_exceeds_client_maximum(serialize_buffer_->size())) {
+    omit_optional_outbound_properties(packet->properties);
+    ret = parser_->serialize_publish(packet.get(), *serialize_buffer_);
+    if (ret != 0) {
+      return ret;
+    }
+  }
 
-  ret = send_data_with_lock(reinterpret_cast<const char*>(serialize_buffer_->data()),
-                            serialize_buffer_->size());
+  if (outbound_exceeds_client_maximum(serialize_buffer_->size()) ||
+      serialize_buffer_->size() > maximum_packet_size_) {
+    if (session_manager_) {
+      session_manager_->note_outbound_packet_size_drop();
+    }
+    LOG_DEBUG("Dropping outbound PUBLISH of {} bytes for client {}:{}, client maximum is {}",
+              serialize_buffer_->size(), client_ip_.c_str(), client_port_, maximum_packet_size_);
+    return MQ_ERR_PACKET_DROPPED;
+  }
+
+  uint16_t allocated_id = 0;
+  if (qos > 0) {
+    sync_server_flow_limits();
+    if (flow_.outbound_window_full()) {
+      return MQ_ERR_INFLIGHT_WINDOW;
+    }
+    const ConnectionFlow::Allocation allocated = allocate_outbound_packet_id(qos);
+    if (allocated.status == ConnectionFlow::AllocateStatus::Quota) {
+      return close_for_flow(ReasonCode::QuotaExceeded, MQ_ERR_FLOW_CLOSED);
+    }
+    if (allocated.status != ConnectionFlow::AllocateStatus::Ready) {
+      return MQ_ERR_INFLIGHT_WINDOW;
+    }
+    allocated_id = allocated.id;
+    packet->packet_id = allocated_id;
+    ret = parser_->serialize_publish(packet.get(), *serialize_buffer_);
+    if (ret != 0) {
+      release_outbound_packet_id(allocated_id);
+      LOG_ERROR("Failed to serialize PUBLISH packet for client {}:{}, error: {}", client_ip_.c_str(),
+                client_port_, ret);
+      return ret;
+    }
+  }
+
+  ret = transmit_serialized(serialize_buffer_->data(), serialize_buffer_->size());
   if (ret != 0) {
+    if (allocated_id) {
+      release_outbound_packet_id(allocated_id);
+    }
     LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
               client_port_, ret);
   } else {

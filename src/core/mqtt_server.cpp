@@ -413,9 +413,11 @@ void MQTTServer::handle_client(ClientContext* ctx)
     websocket::WebSocketHandlerAdapter* adapter =
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketHandlerAdapter)))
         websocket::WebSocketHandlerAdapter(ctx->allocator, bridge, ws_handler, ctx->client_id);
+    adapter->set_protocol_limits(&ctx->server->protocol_limits_);
 
     // Initialize bridge with session manager
     mqtt::GlobalSessionManager& session_manager = mqtt::GlobalSessionManagerInstance::instance();
+    adapter->set_session_manager(&session_manager);
     if (MQ_SUCC(bridge->init(&session_manager))) {
       // Initialize WebSocket handler
       if (MQ_SUCC(ws_handler->init(ctx->client, ctx->client_ip, ctx->client_port))) {

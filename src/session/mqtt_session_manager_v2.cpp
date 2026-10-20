@@ -919,6 +919,22 @@ void GlobalSessionManager::note_malformed_disconnect()
   }
 }
 
+void GlobalSessionManager::note_outbound_packet_size_drop()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->outbound_packet_size_drops.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_inflight_window_delay()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->inflight_window_delays.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void GlobalSessionManager::collect_protocol_counters(ProtocolCounterSnapshot& out) const
 {
   out = ProtocolCounterSnapshot();
