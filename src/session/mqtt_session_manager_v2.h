@@ -21,6 +21,7 @@
 #include "mqtt_durable_store.h"
 #include "mqtt_stl_allocator.h"
 #include "mqtt_topic_tree.h"
+#include "mqtt_config.h"
 #include "mqtt_will.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
@@ -36,6 +37,7 @@ namespace mqtt {
 class MQTTProtocolHandler;
 struct SessionInfo;
 class SafeHandlerRef;
+class RetainStore;
 
 /**
  * @brief 线程本地会话管理器，管理单个线程下的所有Handler
@@ -217,6 +219,7 @@ class GlobalSessionManager
   // 启动时冻结。true 时恢复“总是不把消息投回发布者”的旧行为。
   void set_implicit_no_local(bool enabled) { implicit_no_local_ = enabled; }
   bool implicit_no_local() const { return implicit_no_local_; }
+  void set_retain_config(const RetainConfig& config);
   DurableStore* durable_store() const { return durable_store_.get(); }
   WillScheduler& will_scheduler() { return will_scheduler_; }
   const WillScheduler& will_scheduler() const { return will_scheduler_; }
@@ -422,7 +425,19 @@ class GlobalSessionManager
   void note_inflight_window_delay();
   void note_will_published();
   void note_will_rejected();
+  void note_retained_delta(int64_t messages, int64_t bytes);
+  void note_retained_not_stored();
+  void note_retained_delivery_truncated();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
+
+  // 订阅变为可见之前加锁，直到 deliver_retained 入队结束再放开。
+  // 和保留发布的“写入 + 扇出”互斥，避免新订阅先看到新值再补上旧快照。
+  std::unique_lock<std::recursive_mutex> lock_retain_replay();
+
+  // SUBACK 之后调用。retain 恒为 1，QoS 取订阅和消息的较小值。
+  // 持久化会话的 QoS>0 仍走在线发送，会被在线路径拒绝；定向入队留到保留日志那份 PR。
+  int deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
+                       const SubscriptionOptions& options, bool subscription_existed);
 
   /**
    * @brief 获取总的Handler数量
@@ -614,6 +629,10 @@ class GlobalSessionManager
  private:
   std::unique_ptr<DurableStore> durable_store_;
   bool implicit_no_local_ = false;
+  RetainConfig retain_config_;
+  std::unique_ptr<RetainStore> retain_store_;
+  // 递归锁：订阅侧持有它再调用 deliver_retained，投递内部会再锁一次。
+  std::recursive_mutex retain_replay_mu_;
   WillScheduler will_scheduler_;
   // 运行状态
   enum class ManagerState {
@@ -684,6 +703,8 @@ class GlobalSessionManager
    */
   int batch_forward_publish(const std::vector<MQTTString>& target_client_ids,
                             const SharedMessageContentPtr& content);
+  // retain = 0 的发布不得调用这里，避免热路径碰到保留库的锁。
+  void remember_retained(const PublishPacket& packet, const MQTTString& sender);
 };
 
 // 单例访问

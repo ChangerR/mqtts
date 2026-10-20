@@ -1,4 +1,5 @@
 #include "mqtt_session_manager_v2.h"
+#include "mqtt_retain_store.h"
 #include <algorithm>
 #include <chrono>
 #include <sstream>
@@ -717,6 +718,19 @@ GlobalSessionManager::GlobalSessionManager() : state_(ManagerState::INITIALIZING
   // 初始化高性能主题匹配树
   topic_tree_.reset(new ConcurrentTopicTree(topic_tree_allocator));
 
+  MQTTAllocator* retain_allocator = global_allocator_->get_child("retain_store");
+  if (!retain_allocator) {
+    retain_allocator = global_allocator_->create_child("retain_store", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+  }
+  if (!retain_allocator) {
+    retain_allocator = global_allocator_;
+    LOG_WARN("Failed to create/find retain_store allocator, using global allocator");
+  }
+  retain_store_.reset(new RetainStore(retain_allocator));
+  if (retain_config_.max_payload_bytes == 0) {
+    retain_config_.max_payload_bytes = 1024 * 1024;
+  }
+
   // 初始化服务器ID为空，由外部设置
   server_id_ = MQTTString(MQTTStrAllocator(global_allocator_));
 
@@ -734,6 +748,9 @@ GlobalSessionManager::~GlobalSessionManager()
   thread_managers_.clear();
   thread_manager_array_.clear();
   client_to_manager_.clear();
+
+  // 保留消息持有保留分配器上的内容，必须先于分配器释放。
+  retain_store_.reset();
 
   // 清理消息缓存
   message_cache_.reset();
@@ -950,6 +967,126 @@ void GlobalSessionManager::note_will_rejected()
   if (counters) {
     counters->wills_rejected.fetch_add(1, std::memory_order_relaxed);
   }
+}
+
+void GlobalSessionManager::set_retain_config(const RetainConfig& config)
+{
+  retain_config_ = config;
+  if (retain_config_.max_payload_bytes == 0) {
+    retain_config_.max_payload_bytes = 1024 * 1024;
+  }
+}
+
+void GlobalSessionManager::note_retained_delta(int64_t messages, int64_t bytes)
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (!counters) {
+    return;
+  }
+  if (messages != 0) {
+    counters->retained_messages.fetch_add(static_cast<uint64_t>(messages), std::memory_order_relaxed);
+  }
+  if (bytes != 0) {
+    counters->retained_bytes.fetch_add(static_cast<uint64_t>(bytes), std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_retained_not_stored()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->retained_not_stored.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_retained_delivery_truncated()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->retained_delivery_truncated.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+std::unique_lock<std::recursive_mutex> GlobalSessionManager::lock_retain_replay()
+{
+  return std::unique_lock<std::recursive_mutex>(retain_replay_mu_);
+}
+
+void GlobalSessionManager::remember_retained(const PublishPacket& packet, const MQTTString& sender)
+{
+  if (!packet.retain || !retain_store_) {
+    return;
+  }
+  const std::string topic = from_mqtt_string(packet.topic_name);
+  const RetainWriteResult result =
+      retain_store_->store(packet, sender, retain_config_, std::chrono::steady_clock::now());
+  note_retained_delta(result.message_delta, result.byte_delta);
+  if (result.kind == RetainWriteResult::Rejected) {
+    note_retained_not_stored();
+    if (result.warn) {
+      LOG_WARN("Retained message on topic {} was not stored: {}", topic, result.warn);
+    }
+  }
+}
+
+int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
+                                           const SubscriptionOptions& options, bool subscription_existed)
+{
+  if (!retain_store_ || !retain_handling_delivers(options.retain_handling, subscription_existed)) {
+    return 0;
+  }
+  // 调用方应已持有同一把锁，这里再锁一次，保证快照和入队相对保留发布是原子的。
+  std::unique_lock<std::recursive_mutex> retained_replay = lock_retain_replay();
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  RetainMatchResult matched =
+      retain_store_->match(from_mqtt_string(topic_filter), retain_config_.max_deliver_per_subscribe, now);
+  note_retained_delta(matched.message_delta, matched.byte_delta);
+  if (matched.truncated) {
+    note_retained_delivery_truncated();
+  }
+  const std::string subscriber_id = from_mqtt_string(client_id);
+  int delivered = 0;
+  try {
+    for (size_t i = 0; i < matched.messages.size(); ++i) {
+      const RetainedCopy& item = matched.messages[i];
+      if (!item.content.is_valid()) {
+        continue;
+      }
+      const std::string sender_id = from_mqtt_string(item.content->sender_client_id);
+      if (subscriber_id == sender_id && (implicit_no_local_ || options.no_local)) {
+        continue;
+      }
+      const uint8_t qos = std::min(options.qos, item.content->qos);
+      Properties properties(item.content->properties, global_allocator_);
+      properties.topic_alias = 0;
+      properties.has_topic_alias = false;
+      if (item.has_expiry) {
+        const int64_t remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      item.expires_at - std::chrono::steady_clock::now())
+                                      .count();
+        if (remain_ms <= 0) {
+          continue;
+        }
+        const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
+        properties.has_message_expiry_interval = true;
+        properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
+      }
+      SharedMessageContentPtr outbound(new SharedMessageContent(
+          item.content->topic_name, item.content->payload, qos, true, false, properties,
+          item.content->sender_client_id, global_allocator_));
+      if (item.has_expiry) {
+        outbound->has_absolute_expiry = true;
+        outbound->absolute_expiry = item.expires_at;
+      }
+      if (forward_publish_shared(client_id, outbound) == MQ_SUCCESS) {
+        ++delivered;
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    LOG_WARN("Insufficient memory while queueing retained messages for {}", from_mqtt_string(client_id));
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+  return delivered;
 }
 
 void GlobalSessionManager::process_due_wills(auth::AuthManager* auth, bool flush_all)
@@ -1337,11 +1474,14 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       topic.find('#') != MQTTString::npos || topic.find('\0') != MQTTString::npos ||
       packet.properties.topic_alias != 0)
     return MQ_ERR_PUBLISH_TOPIC;
+  // 保留发布的写入和扇出占同一把锁，避免插在“订阅已可见、快照还没入队”之间。
+  std::unique_lock<std::recursive_mutex> retained_replay;
+  if (packet.retain)
+    retained_replay = lock_retain_replay();
+  const bool expired_now = packet.properties.has_message_expiry_interval &&
+                           packet.properties.message_expiry_interval == 0;
   std::vector<std::string> persisted_targets;
   size_t persisted_count = 0;
-  if (packet.properties.has_message_expiry_interval &&
-      packet.properties.message_expiry_interval == 0)
-    return 0;
   const std::string sender_id = from_mqtt_string(sender_client_id);
   std::vector<SubscriberInfo> subscribers;
   const int lookup = find_topic_subscribers(topic, subscribers);
@@ -1353,7 +1493,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   if (durable_store_) {
     if (packet.qos > 1)
       return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
-    if (packet.qos == 1 && durable_store_->has_subscriptions()) {
+    // 过期间隔为 0 的报文不入库，但保留位仍要删掉旧值。失败路径必须先于保留变更返回。
+    if (!expired_now && packet.qos == 1 && durable_store_->has_subscriptions()) {
       try {
         MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
                                      4 * 1024 * 1024);
@@ -1395,6 +1536,11 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       }
     }
   }
+  // 持久化拒绝已经返回。这里才改保留库，空载荷和过期间隔 0 都会删掉旧值。
+  if (packet.retain)
+    remember_retained(packet, sender_client_id);
+  if (expired_now)
+    return 0;
   int ret = lookup;
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to find subscribers for topic: {}", from_mqtt_string(topic));
@@ -2343,6 +2489,18 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
             ret = MQ_ERR_FORWARD_TARGET_INVALID;
           }
         } else {
+          bool has_message_expiry = false;
+          int64_t expiry_deadline_unix_ms = 0;
+          if (packet.properties.has_message_expiry_interval) {
+            has_message_expiry = true;
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+            expiry_deadline_unix_ms =
+                packet.properties.message_expiry_interval == 0
+                    ? now_ms - 1
+                    : now_ms + static_cast<int64_t>(packet.properties.message_expiry_interval) * 1000;
+          }
           ret = forwarding_client_->forward_publish(from_mqtt_string(targets[i].host),
                                                     targets[i].forwarding_port,
                                                     server_id_,
@@ -2353,7 +2511,9 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
                                                     packet.retain,
                                                     request.message_id,
                                                     request.trace_id,
-                                                    remote_delivered_count);
+                                                    remote_delivered_count,
+                                                    has_message_expiry,
+                                                    expiry_deadline_unix_ms);
           if (MQ_SUCCESS == ret) {
             delivered_count += remote_delivered_count;
           }

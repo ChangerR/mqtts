@@ -4,6 +4,7 @@
 #include "mqtt_protocol_handler.h"
 #include "mqtt_will.h"
 #include <chrono>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <algorithm>
@@ -376,7 +377,19 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                         }
                         int qos = 0;
                         json_get_int(message, "qos", qos);
-                        ret = subscribe_topic(client_id, topic, static_cast<uint8_t>(qos));
+                        mqtt::SubscriptionOptions options;
+                        options.qos = static_cast<uint8_t>(qos);
+                        bool existed = false;
+                        std::unique_lock<std::recursive_mutex> retained_replay;
+                        if (session_manager_) {
+                            retained_replay = session_manager_->lock_retain_replay();
+                        }
+                        ret = subscribe_topic(client_id, topic, options, &existed);
+                        if (ret == MQ_SUCCESS && session_manager_) {
+                            session_manager_->deliver_retained(
+                                mqtt::to_mqtt_string(client_id, allocator_),
+                                mqtt::to_mqtt_string(topic, allocator_), options, existed);
+                        }
                     } else if (type == "unsubscribe") {
                         std::string topic;
                         if (!json_get_string(message, "topic", topic)) {
@@ -831,7 +844,7 @@ int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std
 }
 
 int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std::string& topic_filter,
-                                         const mqtt::SubscriptionOptions& options) {
+                                         const mqtt::SubscriptionOptions& options, bool* already_present) {
     if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ)) return MQ_ERR_CONNECT_NOT_AUTHORIZED;
     if (!session_manager_) {
         LOG_ERROR("Session manager not initialized");
@@ -840,14 +853,35 @@ int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id, const std
 
     LOG_INFO("Subscribing WebSocket client {} to topic {}, qos={}", client_id, topic_filter, options.qos);
 
-    // Add to subscription tracking
-    subscriptions_[client_id].push_back(SubscriptionInfo(topic_filter, options.qos));
-    stats_.active_subscriptions++;
+    bool existed = false;
+    std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>& subs = subscriptions_[client_id];
+    for (size_t i = 0; i < subs.size(); ++i) {
+        if (subs[i].topic_filter == topic_filter) {
+            existed = true;
+            break;
+        }
+    }
+    if (already_present) {
+        *already_present = existed;
+    }
 
-    // Subscribe via session manager
     mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
     mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-    return session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, options);
+    const int subscribed = session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, options);
+    if (subscribed != MQ_SUCCESS) {
+        return subscribed;
+    }
+    if (existed) {
+        for (size_t i = 0; i < subs.size(); ++i) {
+            if (subs[i].topic_filter == topic_filter) {
+                subs[i].qos = options.qos;
+            }
+        }
+    } else {
+        subs.push_back(SubscriptionInfo(topic_filter, options.qos));
+        stats_.active_subscriptions++;
+    }
+    return MQ_SUCCESS;
 }
 
 int WebSocketMQTTBridge::unsubscribe_topic(const std::string& client_id, const std::string& topic_filter) {
@@ -879,6 +913,13 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
                                          const std::vector<uint8_t>& payload, uint8_t qos,
                                          bool retain, const mqtt::Properties& properties)
 {
+  if (retain && !effective_limits().retain_available) {
+    auto handler = handlers_.find(client_id);
+    if (handler != handlers_.end() && handler->second) {
+      handler->second->close_connection();
+    }
+    return MQ_ERR_FLOW_CLOSED;
+  }
   if (auth_manager_) {
     const auto found = auth_contexts_.find(client_id);
     if (found == auth_contexts_.end())
@@ -1091,6 +1132,13 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
     mqtt::SubAckPacket suback(allocator_);
     suback.type = mqtt::PacketType::SUBACK;
     suback.packet_id = packet->packet_id;
+    struct GrantedRetain {
+        std::string topic;
+        mqtt::SubscriptionOptions options;
+        bool existed;
+    };
+    std::vector<GrantedRetain> retained_grants;
+    std::unique_lock<std::recursive_mutex> retained_replay;
 
     auto session = session_handlers_.find(client_id);
     mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
@@ -1117,8 +1165,13 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
         if (granted.qos > qos_cap) {
             granted.qos = qos_cap;
         }
-        int sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted);
+        bool existed = false;
+        if (!retained_replay.owns_lock() && session_manager_) {
+            retained_replay = session_manager_->lock_retain_replay();
+        }
+        int sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
         if (sub_ret == MQ_SUCCESS) {
+          retained_grants.push_back(GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed});
           switch (granted.qos) {
             case 0:
               suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
@@ -1138,7 +1191,16 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
         }
     }
 
-    return send_serialized_mqtt_packet(client_id, suback);
+    const int sent = send_serialized_mqtt_packet(client_id, suback);
+    if (sent == MQ_SUCCESS && session_manager_) {
+        mqtt::MQTTString subscriber = mqtt::to_mqtt_string(client_id, allocator_);
+        for (size_t i = 0; i < retained_grants.size(); ++i) {
+            const GrantedRetain& grant = retained_grants[i];
+            (void)session_manager_->deliver_retained(
+                subscriber, mqtt::to_mqtt_string(grant.topic, allocator_), grant.options, grant.existed);
+        }
+    }
+    return sent;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet) {
@@ -1182,6 +1244,9 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     }
     if (packet->qos > 2 || ((packet->qos == 1 || packet->qos == 2) && packet->packet_id == 0)) {
         return close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+    }
+    if (packet->retain && !effective_limits().retain_available) {
+        return close_flow(mqtt::ReasonCode::RetainNotSupported, MQ_ERR_FLOW_CLOSED);
     }
     if (flow && packet->qos > flow->granted_qos_limit()) {
         return close_flow(mqtt::ReasonCode::QoSNotSupported, MQ_ERR_FLOW_CLOSED);

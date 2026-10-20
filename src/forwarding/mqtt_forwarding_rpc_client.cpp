@@ -91,7 +91,9 @@ int MQTTForwardingRpcClient::forward_publish(const std::string& host,
                                              bool retain,
                                              uint64_t message_id,
                                              const MQTTString& trace_id,
-                                             int& delivered_count)
+                                             int& delivered_count,
+                                             bool has_message_expiry,
+                                             int64_t message_expiry_deadline_unix_ms)
 {
   int ret = MQ_SUCCESS;
   MQTTSocket* socket = NULL;
@@ -125,6 +127,10 @@ int MQTTForwardingRpcClient::forward_publish(const std::string& host,
     request->set_message_id(message_id);
     request->set_trace_id(from_mqtt_string(trace_id));
     request->set_hop_count(1);
+    if (has_message_expiry) {
+      request->set_message_expiry_present(true);
+      request->set_message_expiry_deadline_unix_ms(message_expiry_deadline_unix_ms);
+    }
     if (!payload.empty()) {
       request->set_payload(payload.data(), payload.size());
     }

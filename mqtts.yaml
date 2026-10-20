@@ -15,7 +15,7 @@ mqtt:
   connect_timeout_seconds: 10  # 连接建立后等待完整 CONNECT 的秒数，超时直接关闭，不回报文
   implicit_no_local: false  # 默认 false，发布者会收到自己的消息。true 恢复“总是排除发布者”的旧行为
   max_qos: 2  # 最大 QoS。开启持久化时 CONNACK Maximum QoS 不超过 1
-  retain_available: true  # CONNACK Retain Available。保留消息库在后续条目实现
+  retain_available: true  # CONNACK Retain Available。false 时带 retain 的 PUBLISH 断开（v5 为 0x9A）
   wildcard_subscription_available: true  # CONNACK Wildcard Subscription Available
   subscription_identifier_available: false  # 本版本不实现。设为 true 时启动失败
   shared_subscription_available: false  # 本版本不实现。设为 true 时启动失败
@@ -27,7 +27,7 @@ mqtt:
 memory:
   client_max_size: 1114112  # 1MiB + 64KiB，给最大报文留出每连接状态空间
 
-# 保留消息限额。存储在后续条目实现，这里的值会被读入并冻结。
+# 保留消息限额。超限不入库但仍转发给在线订阅者。重启后保留消息不恢复，落盘留给后续格式变更。
 retain:
   max_messages: 100000
   max_payload_bytes: 1048576  # 默认等于 max_packet_size

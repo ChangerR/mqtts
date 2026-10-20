@@ -1,5 +1,7 @@
 #include "mqtt_forwarding_service.h"
 #include <arpa/inet.h>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <poll.h>
 #include "logger.h"
@@ -310,6 +312,22 @@ int MQTTForwardingService::handle_client(MQTTSocket* client)
       if (!request_envelope.forward_publish_request().payload().empty()) {
         const std::string& payload = request_envelope.forward_publish_request().payload();
         packet.payload.assign(payload.begin(), payload.end());
+      }
+      const ::mqtt::forwarding::ForwardPublishRequest& forwarded =
+          request_envelope.forward_publish_request();
+      if (forwarded.message_expiry_present()) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+        const int64_t remain_ms = forwarded.message_expiry_deadline_unix_ms() - now_ms;
+        packet.properties.has_message_expiry_interval = true;
+        if (remain_ms <= 0) {
+          packet.properties.message_expiry_interval = 0;
+        } else {
+          const uint64_t seconds = (static_cast<uint64_t>(remain_ms) + 999) / 1000;
+          packet.properties.message_expiry_interval =
+              seconds > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(seconds);
+        }
       }
       delivered_count = session_manager_->forward_publish_by_topic(
           packet.topic_name, packet,

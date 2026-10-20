@@ -32,7 +32,9 @@ class MQTTForwardingRpcClient
                       bool retain,
                       uint64_t message_id,
                       const MQTTString& trace_id,
-                      int& delivered_count);
+                      int& delivered_count,
+                      bool has_message_expiry = false,
+                      int64_t message_expiry_deadline_unix_ms = 0);
 
  private:
   void destroy_socket(MQTTSocket*& socket);

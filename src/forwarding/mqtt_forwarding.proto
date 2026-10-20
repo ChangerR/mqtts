@@ -12,6 +12,9 @@ message ForwardPublishRequest {
   uint64 message_id = 7;
   string trace_id = 8;
   uint32 hop_count = 9;
+  // 为真时 message_expiry_deadline_unix_ms 是墙上时钟截止时刻，接收方扣除传输耗时。
+  bool message_expiry_present = 10;
+  int64 message_expiry_deadline_unix_ms = 11;
 }
 
 message ForwardPublishResponse {

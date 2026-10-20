@@ -83,7 +83,7 @@ public:
     // Topic subscription management
     int subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos = 0);
     int subscribe_topic(const std::string& client_id, const std::string& topic_filter,
-                        const mqtt::SubscriptionOptions& options);
+                        const mqtt::SubscriptionOptions& options, bool* already_present = nullptr);
     int unsubscribe_topic(const std::string& client_id, const std::string& topic_filter);
 
     // Publish MQTT message

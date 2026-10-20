@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0-2 到 P0-6。TCP 与 WebSocket 二进制都覆盖。遗嘱延迟只在 TCP 持久化会话上跑。"""
+"""P0-2 到 P0-7 的内存行为。TCP 与 WebSocket 二进制都覆盖。遗嘱延迟只在 TCP 持久化会话上跑。保留消息落盘不在这里。"""
 import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,7 +49,8 @@ class Broker:
     def __init__(self, binary, threads, keep_alive_max, connect_timeout,
                  max_packet_size=1048576, receive_maximum=65535, max_qos=2, monitor=False,
                  implicit_no_local=False, wildcard_subscription_available=True,
-                 topic_alias_maximum=None, auth=None, retain_available=True, persistence=False):
+                 topic_alias_maximum=None, auth=None, retain_available=True, persistence=False,
+                 retain=None):
         self.root = Path(tempfile.mkdtemp(prefix='mqtts-p02-'))
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
@@ -84,6 +85,8 @@ class Broker:
             journal = self.root / 'journal'
             journal.mkdir()
             config['persistence'] = {'enabled': True, 'path': str(journal)}
+        if retain is not None:
+            config['retain'] = retain
         (self.root / 'config.json').write_text(json.dumps(config))
         self.log = (self.root / 'broker.log').open('a+')
         self.proc = subprocess.Popen(
@@ -1539,6 +1542,335 @@ def will_authorization(binary, websocket):
     print('PASS P0-6 auth websocket=%s' % websocket, flush=True)
 
 
+def publish_retain(client, topic, payload, version, qos=0, packet_id=1, expiry=None):
+    body = utf(topic)
+    if qos:
+        body += struct.pack('!H', packet_id)
+    if version >= 5:
+        props = b''
+        if expiry is not None:
+            props += bytes([0x02]) + struct.pack('!I', expiry)
+        body += bytes([len(props)]) + props
+    body += payload
+    client.send(packet(0x31 | (qos << 1), body))
+
+
+def expect_retained(client, topic, payload, version, qos=0, timeout=2):
+    header, body = client.read(timeout)
+    if header & 1 != 1 or ((header >> 1) & 3) != qos:
+        raise AssertionError('header 0x%02x, want retain qos %s' % (header, qos))
+    got_topic, got_payload = publish_of(header, body, version)
+    if got_topic != topic or got_payload != payload:
+        raise AssertionError((got_topic, got_payload, topic, payload))
+    if qos:
+        puback(client, int.from_bytes(body[2 + int.from_bytes(body[:2], 'big'):4 + int.from_bytes(body[:2], 'big')], 'big'))
+    return header, body
+
+
+class RetainAuth(BaseHTTPRequestHandler):
+    password = 'pw'
+
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/authentication':
+            allowed = req.get('password') == self.password and req.get('username') == req.get('clientid')
+        elif self.path == '/authorization':
+            topic = str(req.get('topic', ''))
+            if req.get('action') == 'publish':
+                allowed = True
+            else:
+                allowed = not topic.startswith('secret/')
+        else:
+            allowed = False
+        body = json.dumps({'result': 'allow' if allowed else 'deny', 'is_superuser': False}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def retain_messages(binary, websocket):
+    broker = Broker(binary, 1, 30, 10, monitor=True)
+    try:
+        publisher = Client(broker.port, websocket)
+        watcher = Client(broker.port, websocket)
+        try:
+            connect(publisher, 'ret-pub', 5, 30)
+            connect(watcher, 'ret-watch', 5, 30)
+            subscribe(watcher, 'gone/t', 5)
+            subscribe(watcher, 'stay/t', 5)
+            publish_retain(publisher, 'keep/t', b'kept', 5)
+            publish_retain(publisher, 'a/b', b'ab', 5)
+            publish_retain(publisher, 'a/c', b'ac', 5)
+            publish_retain(publisher, 'a/b/c', b'deep', 5)
+            publish_retain(publisher, 'sport', b'root', 5)
+            publish_retain(publisher, 'sport/tennis', b'ball', 5)
+            publish_retain(publisher, '$hidden/a', b'secret', 5)
+            publish_retain(publisher, 'visible/a', b'ok', 5)
+            publish_retain(publisher, 'gone/t', b'x', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if topic != 'gone/t' or payload != b'x':
+                raise AssertionError((topic, payload))
+            publish_retain(publisher, 'gone/t', b'', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if topic != 'gone/t' or payload != b'':
+                raise AssertionError((topic, payload))
+            publish_retain(publisher, 'stay/t', b'first', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if payload != b'first':
+                raise AssertionError(payload)
+            publish(publisher, 'stay/t', b'second', 5)
+            topic, payload = publish_of(*watcher.read(2), 5)
+            if payload != b'second':
+                raise AssertionError(payload)
+            publish_retain(publisher, 'qos/t', b'ab', 5, qos=2, packet_id=7)
+            header, body = publisher.read(2)
+            if header != 0x50:
+                raise AssertionError('PUBREC 0x%02x' % header)
+            publish_retain(publisher, 'exp/soon', b'gone', 5, expiry=1)
+            publish_retain(publisher, 'exp/keep', b'stay', 5)
+            publish_retain(publisher, 'rh/t', b'live', 5)
+
+            reader = Client(broker.port, websocket)
+            try:
+                connect(reader, 'ret-read', 5, 30)
+                subscribe(reader, 'keep/t', 5)
+                expect_retained(reader, 'keep/t', b'kept', 5)
+                subscribe(reader, 'gone/t', 5)
+                quiet(reader, 0.3)
+                if sub_code(reader, 'a/+', 5, 0, packet_id=2) != 0:
+                    raise AssertionError('plus grant')
+                expect_retained(reader, 'a/b', b'ab', 5)
+                expect_retained(reader, 'a/c', b'ac', 5)
+                quiet(reader, 0.2)
+                if sub_code(reader, 'a/#', 5, 0, packet_id=3) != 0:
+                    raise AssertionError('hash grant')
+                expect_retained(reader, 'a/b', b'ab', 5)
+                expect_retained(reader, 'a/b/c', b'deep', 5)
+                expect_retained(reader, 'a/c', b'ac', 5)
+                if sub_code(reader, 'sport/#', 5, 0, packet_id=4) != 0:
+                    raise AssertionError('sport hash')
+                expect_retained(reader, 'sport', b'root', 5)
+                expect_retained(reader, 'sport/tennis', b'ball', 5)
+                if sub_code(reader, '#', 5, 0, packet_id=5) != 0:
+                    raise AssertionError('root hash')
+                saw_secret = False
+                saw_visible = False
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not saw_visible:
+                    header, body = reader.read(max(0.1, deadline - time.monotonic()))
+                    topic, payload = publish_of(header, body, 5)
+                    if topic == '$hidden/a':
+                        saw_secret = True
+                    if topic == 'visible/a' and payload == b'ok' and header & 1:
+                        saw_visible = True
+                if saw_secret or not saw_visible:
+                    raise AssertionError('root hash secret=%s visible=%s' % (saw_secret, saw_visible))
+                if sub_code(reader, '$hidden/#', 5, 0, packet_id=6) != 0:
+                    raise AssertionError('dollar filter')
+                expect_retained(reader, '$hidden/a', b'secret', 5)
+                subscribe(reader, 'stay/t', 5)
+                expect_retained(reader, 'stay/t', b'first', 5)
+                if sub_code(reader, 'qos/t', 5, 1, packet_id=8) != 1:
+                    raise AssertionError('qos grant')
+                expect_retained(reader, 'qos/t', b'ab', 5, qos=1)
+            finally:
+                reader.close()
+
+            handling = Client(broker.port, websocket)
+            try:
+                connect(handling, 'ret-rh', 5, 30)
+                if sub_code(handling, 'rh/t', 5, 0x10) != 0:
+                    raise AssertionError('retain handling 1')
+                expect_retained(handling, 'rh/t', b'live', 5)
+                if sub_code(handling, 'rh/t', 5, 0x10, packet_id=2) != 0:
+                    raise AssertionError('retain handling 1 repeat')
+                quiet(handling, 0.3)
+            finally:
+                handling.close()
+            blocked = Client(broker.port, websocket)
+            try:
+                connect(blocked, 'ret-rh2', 5, 30)
+                if sub_code(blocked, 'rh/t', 5, 0x20) != 0:
+                    raise AssertionError('retain handling 2')
+                quiet(blocked, 0.3)
+            finally:
+                blocked.close()
+
+            time.sleep(1.6)
+            expired = Client(broker.port, websocket)
+            try:
+                connect(expired, 'ret-exp', 5, 30)
+                subscribe(expired, 'exp/#', 5)
+                expect_retained(expired, 'exp/keep', b'stay', 5)
+                quiet(expired, 0.3)
+            finally:
+                expired.close()
+
+            legacy = Client(broker.port, websocket)
+            try:
+                connect(legacy, 'ret-v3', 4, 30)
+                publish_retain(legacy, 'v3/t', b'old', 4)
+            finally:
+                legacy.close()
+            legacy_sub = Client(broker.port, websocket)
+            try:
+                connect(legacy_sub, 'ret-v3-sub', 4, 30)
+                subscribe(legacy_sub, 'v3/t', 4)
+                expect_retained(legacy_sub, 'v3/t', b'old', 4)
+            finally:
+                legacy_sub.close()
+
+            will_watch = Client(broker.port, websocket)
+            try:
+                connect(will_watch, 'ret-will-watch', 5, 30)
+                subscribe(will_watch, 'will/kept', 5)
+                dying = Client(broker.port, websocket)
+                try:
+                    open_session(dying, will_packet('ret-will', 'will/kept', b'kept', retain=True))
+                finally:
+                    dying.close()
+                expect_will(will_watch, 'will/kept', b'kept', retain=False)
+            finally:
+                will_watch.close()
+            will_new = Client(broker.port, websocket)
+            try:
+                connect(will_new, 'ret-will-new', 5, 30)
+                subscribe(will_new, 'will/kept', 5)
+                expect_retained(will_new, 'will/kept', b'kept', 5)
+            finally:
+                will_new.close()
+            broker.wait_counter('retained_messages', 1)
+        finally:
+            publisher.close()
+            watcher.close()
+    finally:
+        broker.close()
+
+    limited = Broker(binary, 1, 30, 10, monitor=True, retain={
+        'max_messages': 2,
+        'max_payload_bytes': 4,
+        'max_total_bytes': 4,
+        'max_deliver_per_subscribe': 1,
+    })
+    try:
+        publisher = Client(limited.port, websocket)
+        online = Client(limited.port, websocket)
+        try:
+            connect(publisher, 'lim-pub', 5, 30)
+            connect(online, 'lim-on', 5, 30)
+            subscribe(online, 'lim/#', 5)
+            publish_retain(publisher, 'lim/a', b'aa', 5)
+            publish_retain(publisher, 'lim/b', b'bb', 5)
+            publish_retain(publisher, 'lim/c', b'cc', 5, qos=1, packet_id=1)
+            expect_puback(publisher, 0x00)
+            publish_retain(publisher, 'lim/big', b'12345', 5)
+            for payload in (b'aa', b'bb', b'cc', b'12345'):
+                topic, got = publish_of(*online.read(2), 5)
+                if not topic.startswith('lim/') or got != payload:
+                    raise AssertionError((topic, got, payload))
+        finally:
+            publisher.close()
+            online.close()
+        late = Client(limited.port, websocket)
+        try:
+            connect(late, 'lim-late', 5, 30)
+            subscribe(late, 'lim/#', 5)
+            header, body = late.read(2)
+            if header & 1 != 1:
+                raise AssertionError('truncated retain header 0x%02x' % header)
+            topic, payload = publish_of(header, body, 5)
+            if topic != 'lim/a' or payload != b'aa':
+                raise AssertionError((topic, payload))
+            quiet(late, 0.3)
+            subscribe(late, 'lim/big', 5)
+            quiet(late, 0.3)
+        finally:
+            late.close()
+        limited.wait_counter('retained_not_stored', 1)
+        limited.wait_counter('retained_delivery_truncated', 1)
+        if limited.counter('retained_messages') != 2:
+            raise AssertionError('retained_messages %s' % limited.counter('retained_messages'))
+    finally:
+        limited.close()
+
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), RetainAuth)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        token_root = Path(tempfile.mkdtemp(prefix='mqtts-retain-auth-'))
+        (token_root / 'token').write_text('retain-token-0123456789abcdef0123456789')
+        auth = {
+            'enabled': True,
+            'allow_anonymous': False,
+            'cache_enabled': False,
+            'providers': [{
+                'type': 'http',
+                'settings': {
+                    'authentication_url': 'http://127.0.0.1:%d/authentication' % httpd.server_port,
+                    'authorization_url': 'http://127.0.0.1:%d/authorization' % httpd.server_port,
+                    'token_file': str(token_root / 'token'),
+                    'timeout_ms': '500',
+                    'max_payload_bytes': '1024',
+                },
+            }],
+        }
+        secured = Broker(binary, 1, 30, 10, auth=auth)
+        try:
+            tag = 'ws' if websocket else 'tcp'
+            writer = Client(secured.port, websocket)
+            reader = Client(secured.port, websocket)
+            try:
+                if connect_user(writer, 'writer-' + tag, 'writer-' + tag, RetainAuth.password) != 0:
+                    raise AssertionError('writer auth')
+                publish_retain(writer, 'secret/hidden', b'no', 5)
+                publish_retain(writer, 'public/ok', b'yes', 5)
+                if connect_user(reader, 'reader-' + tag, 'reader-' + tag, RetainAuth.password) != 0:
+                    raise AssertionError('reader auth')
+                subscribe(reader, '#', 5)
+                expect_retained(reader, 'public/ok', b'yes', 5)
+                quiet(reader, 0.4)
+            finally:
+                writer.close()
+                reader.close()
+        finally:
+            secured.close()
+    finally:
+        httpd.shutdown()
+
+    disabled = Broker(binary, 1, 30, 10, retain_available=False)
+    try:
+        client = Client(disabled.port, websocket)
+        try:
+            connect(client, 'ret-off', 5, 30)
+            publish_retain(client, 'off/t', b'x', 5)
+            expect_disconnect(client, 0x9A)
+        finally:
+            client.close()
+        legacy = Client(disabled.port, websocket)
+        try:
+            connect(legacy, 'ret-off-v3', 4, 30)
+            publish_retain(legacy, 'off/t', b'x', 4)
+            legacy.expect_closed(2)
+        finally:
+            legacy.close()
+        plain = Client(disabled.port, websocket)
+        try:
+            connect(plain, 'ret-off-ok', 5, 30)
+            subscribe(plain, 'off/plain', 5)
+            publish(plain, 'off/plain', b'ok', 5)
+            topic, payload = publish_of(*plain.read(2), 5)
+            if topic != 'off/plain' or payload != b'ok':
+                raise AssertionError((topic, payload))
+        finally:
+            plain.close()
+    finally:
+        disabled.close()
+    print('PASS P0-7 websocket=%s' % websocket, flush=True)
+
+
 def will_delay_and_no_local(binary):
     broker = Broker(binary, 1, 30, 10, persistence=True)
     try:
@@ -1642,6 +1974,7 @@ def run(binary):
     for websocket in (False, True):
         will_rejections(binary, websocket)
         will_delivery(binary, websocket)
+        retain_messages(binary, websocket)
         will_authorization(binary, websocket)
         topic_alias(binary, websocket)
         subscription_options(binary, websocket)

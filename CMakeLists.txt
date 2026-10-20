@@ -166,6 +166,7 @@ add_library(mqtt_parser STATIC
     src/session/mqtt_durable_store.cpp
     src/session/mqtt_append_log.cpp
     src/session/mqtt_session_manager_v2.cpp
+    src/session/mqtt_retain_store.cpp
 	src/session/mqtt_session_info.cpp
     src/topic/mqtt_topic_tree.cpp
 	src/session/mqtt_send_worker_pool.cpp
