@@ -50,6 +50,8 @@ MQTTProtocolHandler::MQTTProtocolHandler(MQTTAllocator* allocator)
       subscriptions_(MQTTSTLAllocator<LocalSubscription>(allocator)),
       allocator_(allocator),
       inbound_aliases_(allocator),
+      will_topic_(MQTTStrAllocator(allocator)),
+      will_payload_(MQTTSTLAllocator<uint8_t>(allocator)),
       parser_(nullptr),
       session_expiry_interval_(0),
       receive_maximum_(65535),
@@ -114,6 +116,7 @@ MQTTProtocolHandler::~MQTTProtocolHandler()
     current_auth_context_->~ClientAuthContext();
     allocator_->deallocate(current_auth_context_, sizeof(auth::ClientAuthContext));
   }
+  release_will_properties();
 }
 
 int MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, int client_port)
@@ -911,6 +914,19 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     need_reject = true;
   }
 
+  if (MQ_SUCC(ret) && packet->flags.will_flag) {
+    const WillConnectDecision will_decision = validate_will_connect(
+        packet->flags.will_qos, packet->flags.will_retain != 0, from_mqtt_string(packet->will_topic),
+        granted_qos_limit(), effective_limits().retain_available);
+    if (!will_decision.accept) {
+      LOG_WARN("CONNECT will rejected for client {}:{} reason 0x{:02x}", client_ip_.c_str(),
+               client_port_, static_cast<uint8_t>(will_decision.reason));
+      reject_reason = will_decision.reason;
+      ret = MQ_ERR_PACKET_INVALID;
+      need_reject = true;
+    }
+  }
+
   if (MQ_SUCC(ret) && auth_manager_) {
     ret = ensure_auth_state();
     if (MQ_FAIL(ret)) {
@@ -1013,6 +1029,11 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
         reject_reason = ReasonCode::ServerUnavailable;
         need_reject = true;
       }
+    } else if (session_manager_) {
+      // 旧连接的清理已经结束。在下一次让出之前取消或立刻到期它的延迟遗嘱。
+      session_manager_->will_scheduler().observe_connect(from_mqtt_string(client_id_),
+                                                        packet->flags.clean_start != 0,
+                                                        session_present);
     }
   }
 
@@ -1060,6 +1081,25 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
     } else {
       LOG_DEBUG("Failed to notify router about client connect: {}, error: {}",
                 from_mqtt_string(client_id_), router_ret);
+    }
+  }
+
+  if (MQ_SUCC(ret)) {
+    ret = remember_will(packet);
+    if (MQ_FAIL(ret)) {
+      if (session_manager_ && !client_id_.empty()) {
+        session_manager_->unsubscribe_all_topics(client_id_);
+        MQTTString disconnect_reason("will storage failed", MQTTStrAllocator(allocator_));
+        session_manager_->notify_router_client_disconnect(client_id_, disconnect_reason);
+        session_manager_->unregister_session(client_id_);
+      }
+      if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+        session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
+        durable_epoch_ = 0;
+      }
+      connected_ = false;
+      reject_reason = ReasonCode::QuotaExceeded;
+      need_reject = true;
     }
   }
 
@@ -1466,9 +1506,14 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
         socket_->close();
       return MQ_ERR_PACKET_INVALID;
     }
+    session_expiry_interval_ = packet->properties.session_expiry_interval;
     session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_,
                                                   packet->properties.session_expiry_interval);
+  } else if (packet->properties.has_session_expiry_interval) {
+    session_expiry_interval_ = packet->properties.session_expiry_interval;
   }
+  // 0x00 丢弃遗嘱。0x04 以及其他原因码都要发布。
+  will_discard_ = packet->reason_code == ReasonCode::NormalDisconnection;
   // Unregister from session manager before marking as disconnected
   cleanup_session_registration("on DISCONNECT packet");
   LOG_INFO("Client {}:{} disconnected with reason code: 0x{:02x}", client_ip_.c_str(), client_port_,
@@ -2054,6 +2099,107 @@ int MQTTProtocolHandler::send_pingresp()
   });
 }
 
+void MQTTProtocolHandler::release_will_properties()
+{
+  if (!will_properties_) {
+    return;
+  }
+  will_properties_->~Properties();
+  allocator_->deallocate(will_properties_, sizeof(Properties));
+  will_properties_ = nullptr;
+}
+
+int MQTTProtocolHandler::remember_will(const ConnectPacket* packet)
+{
+  release_will_properties();
+  will_present_ = false;
+  will_settled_ = false;
+  will_discard_ = false;
+  will_qos_ = 0;
+  will_retain_ = false;
+  will_delay_seconds_ = 0;
+  will_topic_.clear();
+  will_payload_.clear();
+  if (!packet || !packet->flags.will_flag) {
+    return MQ_SUCCESS;
+  }
+  try {
+    will_topic_.assign(packet->will_topic.begin(), packet->will_topic.end());
+    will_payload_.assign(packet->will_payload.begin(), packet->will_payload.end());
+    void* memory = allocator_->allocate(sizeof(Properties));
+    if (!memory) {
+      return MQ_ERR_MEMORY_ALLOC;
+    }
+    will_properties_ = new (memory) Properties(packet->will_properties, allocator_);
+    will_properties_->will_delay_interval = 0;
+    will_qos_ = packet->flags.will_qos;
+    will_retain_ = packet->flags.will_retain != 0;
+    will_delay_seconds_ = packet->will_properties.will_delay_interval;
+    will_present_ = true;
+  } catch (const std::exception&) {
+    release_will_properties();
+    will_present_ = false;
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+  return MQ_SUCCESS;
+}
+
+WillBody MQTTProtocolHandler::snapshot_will() const
+{
+  WillBody body;
+  body.topic = from_mqtt_string(will_topic_);
+  body.payload.assign(will_payload_.begin(), will_payload_.end());
+  body.qos = will_qos_;
+  body.retain = will_retain_;
+  body.delay_seconds = will_delay_seconds_;
+  if (will_properties_) {
+    body.payload_format = will_properties_->payload_format_indicator;
+    body.has_message_expiry = will_properties_->has_message_expiry_interval;
+    body.message_expiry = will_properties_->message_expiry_interval;
+    body.content_type = from_mqtt_string(will_properties_->content_type);
+    body.response_topic = from_mqtt_string(will_properties_->response_topic);
+    body.correlation_data.assign(will_properties_->correlation_data.begin(),
+                                 will_properties_->correlation_data.end());
+    for (size_t i = 0; i < will_properties_->user_properties.size(); ++i) {
+      body.user_properties.push_back(
+          std::make_pair(from_mqtt_string(will_properties_->user_properties[i].first),
+                         from_mqtt_string(will_properties_->user_properties[i].second)));
+    }
+  }
+  return body;
+}
+
+void MQTTProtocolHandler::dispose_will()
+{
+  if (!will_present_ || will_settled_) {
+    return;
+  }
+  will_settled_ = true;
+  if (will_discard_ || !session_manager_ || client_id_.empty()) {
+    return;
+  }
+  const WillBody body = snapshot_will();
+  const std::string client_id = from_mqtt_string(client_id_);
+  const bool persistent = session_manager_->durable_store() != nullptr;
+  const uint32_t delay =
+      effective_will_delay_seconds(persistent, body.delay_seconds, session_expiry_interval_);
+  // 立即遗嘱也只入队。授权在所属线程的发布协程里做，接管不用等那次远程授权。
+  std::unique_ptr<WillScheduler::Entry> entry(new WillScheduler::Entry());
+  entry->client_id = client_id;
+  entry->forward_id = client_id;
+  entry->due = delay == 0 ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+  entry->owner = std::this_thread::get_id();
+  entry->body = body;
+  if (current_auth_context_ && !copy_auth_context(*current_auth_context_, entry->auth)) {
+    LOG_WARN("Failed to copy auth context for delayed will of {}", client_id);
+    session_manager_->note_will_rejected();
+    return;
+  }
+  session_manager_->will_scheduler().schedule(std::move(entry));
+  LOG_INFO("Scheduled will for {} in {} seconds", client_id, delay);
+}
+
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)
 {
   durable_running_ = false;
@@ -2063,6 +2209,8 @@ void MQTTProtocolHandler::cleanup_session_registration(const char* context)
   while (durable_task_.is_valid() && !durable_task_.is_finished())
     runtime::current_runtime().wait(-1, 0, 5);
   durable_task_.release();
+  // 认证上下文和订阅都还在。遗嘱只入队，授权留给所属线程，接管不必等待。
+  dispose_will();
   if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
     session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
     durable_epoch_ = 0;

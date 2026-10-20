@@ -936,6 +936,27 @@ void GlobalSessionManager::note_inflight_window_delay()
   }
 }
 
+void GlobalSessionManager::note_will_published()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->wills_published.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::note_will_rejected()
+{
+  ProtocolCounters* counters = current_thread_counters();
+  if (counters) {
+    counters->wills_rejected.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void GlobalSessionManager::process_due_wills(auth::AuthManager* auth, bool flush_all)
+{
+  launch_due_wills(this, auth, std::this_thread::get_id(), flush_all);
+}
+
 void GlobalSessionManager::collect_protocol_counters(ProtocolCounterSnapshot& out) const
 {
   out = ProtocolCounterSnapshot();

@@ -189,6 +189,13 @@ public:
     (void)payload;
     return check_topic_access(user_info, topic, Permission::WRITE);
   }
+  // 默认实现当场返回。需要 PENDING 的提供者覆盖它，并交出可轮询的请求。
+  virtual AuthResult begin_publish_check(const UserInfo& user_info, const MQTTString& topic,
+                                         const MQTTByteVector& payload,
+                                         std::shared_ptr<AuthorizationRequest>& pending) {
+    pending.reset();
+    return check_publish(user_info, topic, payload);
+  }
   virtual AuthResult check_delivery_access(const UserInfo& user, const MQTTString& topic,
                                            std::shared_ptr<AuthorizationRequest>& pending) {
     pending.reset();
@@ -313,6 +320,8 @@ public:
                          Permission permission,
                          AuthResult& auth_result);
   int check_publish(const ClientAuthContext&, const MQTTString&, const MQTTByteVector&, AuthResult&);
+  int check_publish(const ClientAuthContext&, const MQTTString&, const MQTTByteVector&,
+                    std::shared_ptr<AuthorizationRequest>&, AuthResult&);
   int check_delivery(const ClientAuthContext&, const MQTTString&,
                      std::shared_ptr<AuthorizationRequest>&, AuthResult&);
 

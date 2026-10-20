@@ -157,6 +157,22 @@ struct Job {
   }
 };
 
+struct PendingPublish : AuthorizationRequest {
+  std::shared_ptr<Job> job;
+  uint64_t session;
+  std::string username, client_id, topic;
+  PendingPublish(std::shared_ptr<Job> value, const UserInfo& user, const MQTTString& destination)
+      : job(std::move(value)), session(user.authorization_session),
+        username(from_mqtt_string(user.username)), client_id(from_mqtt_string(user.client_id)),
+        topic(from_mqtt_string(destination)) {}
+  AuthResult poll(const UserInfo& user, const MQTTString& destination) override {
+    if (session != user.authorization_session || username != from_mqtt_string(user.username)
+        || client_id != from_mqtt_string(user.client_id) || topic != from_mqtt_string(destination)
+        || (user.expires_at_ms && user.expires_at_ms <= wall_ms())) return AuthResult::ACCESS_DENIED;
+    return job->poll().result;
+  }
+};
+
 struct PendingDelivery : AuthorizationRequest {
   std::shared_ptr<Job> job;
   uint64_t session;
@@ -755,6 +771,27 @@ AuthResult RemoteAuthProvider::check_publish(const UserInfo& user, const MQTTStr
   try { result = p.authorize(user, from_mqtt_string(topic), "publish", p.include_payload ? &payload : nullptr); } catch (...) {}
   if (result.result == AuthResult::SUCCESS) ++p.stats.allowed;
   return result.result;
+}
+AuthResult RemoteAuthProvider::begin_publish_check(const UserInfo& user, const MQTTString& topic,
+                                                   const MQTTByteVector& payload,
+                                                   std::shared_ptr<AuthorizationRequest>& pending) {
+  auto& p = *impl_;
+  if (!p.initialized) { pending.reset(); return AuthResult::INTERNAL_ERROR; }
+  AuthResult result = AuthResult::INTERNAL_ERROR;
+  try {
+    if (pending) result = pending->poll(user, topic);
+    else {
+      ++p.stats.checks;
+      std::shared_ptr<Job> job;
+      result = p.authorize(user, from_mqtt_string(topic), "publish", p.include_payload ? &payload : nullptr, &job).result;
+      if (result == AuthResult::PENDING) pending = std::make_shared<PendingPublish>(job, user, topic);
+    }
+  } catch (...) { result = AuthResult::INTERNAL_ERROR; }
+  if (result != AuthResult::PENDING) {
+    pending.reset();
+    if (result == AuthResult::SUCCESS) ++p.stats.allowed;
+  }
+  return result;
 }
 AuthResult RemoteAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
                                                    std::shared_ptr<AuthorizationRequest>& pending) {

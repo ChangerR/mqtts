@@ -157,6 +157,7 @@ target_include_directories(mqtt_proto PUBLIC
 # 添加mqtt_parser库
 add_library(mqtt_parser STATIC
     src/protocol/mqtt_parser.cpp
+    src/protocol/mqtt_will.cpp
     src/memory/mqtt_allocator.cpp
     src/common/mqtt_string_utils.cpp
     src/common/logger.cpp

@@ -21,6 +21,7 @@
 #include "mqtt_connection_watch.h"
 #include "mqtt_flow_control.h"
 #include "mqtt_topic_alias.h"
+#include "mqtt_will.h"
 #include "mqtt_socket.h"
 #include "mqtt_takeover.h"
 #include "mqtt_stl_allocator.h"
@@ -210,6 +211,15 @@ class MQTTProtocolHandler
   // Memory management
   MQTTAllocator* allocator_;
   InboundTopicAliases inbound_aliases_;
+  bool will_present_ = false;
+  bool will_settled_ = false;
+  bool will_discard_ = false;
+  uint8_t will_qos_ = 0;
+  bool will_retain_ = false;
+  uint32_t will_delay_seconds_ = 0;
+  MQTTString will_topic_;
+  MQTTByteVector will_payload_;
+  Properties* will_properties_ = nullptr;
   MQTTParser* parser_;
 
   // MQTT 5.0 session state
@@ -269,6 +279,10 @@ class MQTTProtocolHandler
   int send_within_client_limit(Packet* packet, Serialize serialize);
   void signal_takeover_done();
   void sync_server_flow_limits();
+  int remember_will(const ConnectPacket* packet);
+  void release_will_properties();
+  WillBody snapshot_will() const;
+  void dispose_will();
   uint32_t inbound_packet_limit() const;
   static int claim_outbound_packet_id(uint16_t id, void* arg);
   ConnectionFlow::Allocation allocate_outbound_packet_id(uint8_t qos = 0);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0-2 连接生命周期、P0-3 流控、P0-4 订阅选项，以及 P0-5 入站主题别名。TCP 与 WebSocket 二进制都覆盖。"""
+"""P0-2 到 P0-6。TCP 与 WebSocket 二进制都覆盖。遗嘱延迟只在 TCP 持久化会话上跑。"""
 import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,7 +49,7 @@ class Broker:
     def __init__(self, binary, threads, keep_alive_max, connect_timeout,
                  max_packet_size=1048576, receive_maximum=65535, max_qos=2, monitor=False,
                  implicit_no_local=False, wildcard_subscription_available=True,
-                 topic_alias_maximum=None, auth=None):
+                 topic_alias_maximum=None, auth=None, retain_available=True, persistence=False):
         self.root = Path(tempfile.mkdtemp(prefix='mqtts-p02-'))
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
@@ -66,6 +66,7 @@ class Broker:
                 'allow_mqtt3x': True,
                 'implicit_no_local': implicit_no_local,
                 'wildcard_subscription_available': wildcard_subscription_available,
+                'retain_available': retain_available,
             },
             'memory': {'client_max_size': max(1114112, max_packet_size + 65536)},
             'log': {'level': 'info', 'file_path': str(self.root / 'broker.log'), 'flush_immediately': True},
@@ -79,6 +80,10 @@ class Broker:
             config['mqtt']['topic_alias_maximum'] = topic_alias_maximum
         if auth is not None:
             config['auth'] = auth
+        if persistence:
+            journal = self.root / 'journal'
+            journal.mkdir()
+            config['persistence'] = {'enabled': True, 'path': str(journal)}
         (self.root / 'config.json').write_text(json.dumps(config))
         self.log = (self.root / 'broker.log').open('a+')
         self.proc = subprocess.Popen(
@@ -1298,8 +1303,346 @@ def topic_alias(binary, websocket):
     print('PASS P0-5 websocket=%s' % websocket, flush=True)
 
 
+def will_packet(client_id, topic, payload, qos=0, retain=False, delay=0, session_expiry=None,
+                clean_start=True, keep_alive=30, version=5, username=None, password=None):
+    flags = 0x04
+    if clean_start:
+        flags |= 0x02
+    flags |= (qos & 3) << 3
+    if retain:
+        flags |= 0x20
+    if username is not None:
+        flags |= 0x80
+    if password is not None:
+        flags |= 0x40
+    name = 'MQTT' if version >= 4 else 'MQIsdp'
+    body = utf(name) + bytes([version, flags]) + struct.pack('!H', keep_alive)
+    if version >= 5:
+        props = b''
+        if session_expiry is not None:
+            props += bytes([0x11]) + struct.pack('!I', session_expiry)
+        body += bytes([len(props)]) + props
+    body += utf(client_id)
+    if version >= 5:
+        will_props = b''
+        if delay:
+            will_props += bytes([0x18]) + struct.pack('!I', delay)
+        body += bytes([len(will_props)]) + will_props
+    body += utf(topic) + struct.pack('!H', len(payload)) + payload
+    if username is not None:
+        body += utf(username)
+    if password is not None:
+        body += utf(password)
+    return packet(0x10, body)
+
+
+def session_packet(client_id, clean_start, session_expiry, keep_alive=30):
+    flags = 0x02 if clean_start else 0
+    props = bytes([0x11]) + struct.pack('!I', session_expiry)
+    body = utf('MQTT') + bytes([5, flags]) + struct.pack('!H', keep_alive)
+    body += bytes([len(props)]) + props + utf(client_id)
+    return packet(0x10, body)
+
+
+def expect_connack(client, encoded, reason):
+    client.send(encoded)
+    header, body = client.read(3)
+    if header != 0x20 or len(body) < 2 or body[1] != reason:
+        raise AssertionError('CONNACK 0x%02x %s, want reason 0x%02x' % (header, body.hex(), reason))
+    return body
+
+
+def open_session(client, encoded):
+    client.send(encoded)
+    header, body = client.read(3)
+    if header != 0x20 or len(body) < 2 or body[1] != 0:
+        raise AssertionError('CONNACK 0x%02x %s' % (header, body.hex()))
+    return body
+
+
+def disconnect_packet(client, reason):
+    client.send(packet(0xE0, b'' if reason == 0 else bytes([reason])))
+
+
+def expect_will(client, topic, payload, retain=None, timeout=3):
+    started = time.monotonic()
+    header, body = client.read(timeout)
+    elapsed = time.monotonic() - started
+    got_topic, got_payload = publish_of(header, body, 5)
+    if got_topic != topic or got_payload != payload:
+        raise AssertionError((got_topic, got_payload, topic, payload))
+    if retain is not None and bool(header & 1) != retain:
+        raise AssertionError('retain %s, want %s, header 0x%02x' % (bool(header & 1), retain, header))
+    return elapsed
+
+
+def will_rejections(binary, websocket):
+    broker = Broker(binary, 1, 30, 10, max_qos=1, retain_available=False)
+    try:
+        for client_id, topic, qos, retain, reason in (
+            ('will-qos', 'will/qos', 2, False, 0x9B),
+            ('will-retain', 'will/retain', 0, True, 0x9A),
+            ('will-plus', 'bad/+/x', 0, False, 0x82),
+            ('will-hash', 'bad/#', 0, False, 0x82),
+            ('will-empty', '', 0, False, 0x82),
+        ):
+            client = Client(broker.port, websocket)
+            try:
+                expect_connack(client, will_packet(client_id, topic, b'x', qos=qos, retain=retain), reason)
+            finally:
+                client.close()
+    finally:
+        broker.close()
+
+
+def will_delivery(binary, websocket):
+    broker = Broker(binary, 1, 30, 10, monitor=True)
+    try:
+        watcher = Client(broker.port, websocket)
+        try:
+            connect(watcher, 'will-watch', 5, 30)
+            subscribe(watcher, 'will/live', 5)
+            killed = Client(broker.port, websocket)
+            try:
+                open_session(killed, will_packet('will-kill', 'will/live', b'killed'))
+            finally:
+                killed.close()
+            expect_will(watcher, 'will/live', b'killed')
+
+            normal = Client(broker.port, websocket)
+            try:
+                open_session(normal, will_packet('will-normal', 'will/live', b'normal'))
+                disconnect_packet(normal, 0)
+                quiet(watcher, 0.4)
+            finally:
+                normal.close()
+
+            explicit = Client(broker.port, websocket)
+            try:
+                open_session(explicit, will_packet('will-zero', 'will/live', b'zero'))
+                explicit.send(packet(0xE0, bytes([0x00])))
+                quiet(watcher, 0.4)
+            finally:
+                explicit.close()
+
+            gone = Client(broker.port, websocket)
+            try:
+                open_session(gone, will_packet('will-with-will', 'will/live', b'disconnect-will'))
+                disconnect_packet(gone, 0x04)
+                expect_will(watcher, 'will/live', b'disconnect-will')
+            finally:
+                gone.close()
+
+            legacy = Client(broker.port, websocket)
+            try:
+                open_session(legacy, will_packet('will-v3', 'will/live', b'legacy', version=4))
+                legacy.send(packet(0xE0, b''))
+                quiet(watcher, 0.4)
+            finally:
+                legacy.close()
+            legacy_kill = Client(broker.port, websocket)
+            try:
+                open_session(legacy_kill, will_packet('will-v3-kill', 'will/live', b'legacy-kill', version=4))
+            finally:
+                legacy_kill.close()
+            expect_will(watcher, 'will/live', b'legacy-kill')
+
+            sleepy = Client(broker.port, websocket)
+            try:
+                open_session(sleepy, will_packet('will-ka', 'will/live', b'keepalive', keep_alive=2))
+                started = time.monotonic()
+                expect_will(watcher, 'will/live', b'keepalive', timeout=8)
+                elapsed = time.monotonic() - started
+                if not 2.2 <= elapsed <= 6.5:
+                    raise AssertionError('keepalive will after %.2fs' % elapsed)
+            finally:
+                sleepy.close()
+
+            old = Client(broker.port, websocket)
+            try:
+                open_session(old, will_packet('will-take', 'will/live', b'taken'))
+                new = Client(broker.port, websocket)
+                try:
+                    connect(new, 'will-take', 5, 30)
+                    expect_will(watcher, 'will/live', b'taken')
+                finally:
+                    new.close()
+            finally:
+                old.close()
+
+            # 默认订阅会清掉 retain。Retain As Published 才能在在线转发里看见遗嘱的 retain 位。
+            # 新订阅者事后收到保留遗嘱要等 P0-7 的保留库。
+            published = Client(broker.port, websocket)
+            try:
+                connect(published, 'will-rap', 5, 30)
+                if sub_code(published, 'will/live', 5, 0x08, packet_id=7) != 0:
+                    raise AssertionError('Retain As Published was not granted')
+                retained = Client(broker.port, websocket)
+                try:
+                    open_session(retained, will_packet('will-ret', 'will/live', b'kept', retain=True))
+                finally:
+                    retained.close()
+                expect_will(watcher, 'will/live', b'kept', retain=False)
+                expect_will(published, 'will/live', b'kept', retain=True)
+            finally:
+                published.close()
+            broker.wait_counter('wills_published', 1)
+        finally:
+            watcher.close()
+    finally:
+        broker.close()
+    print('PASS P0-6 immediate websocket=%s' % websocket, flush=True)
+
+
+def will_authorization(binary, websocket):
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), AliasPolicy)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    token_root = Path(tempfile.mkdtemp(prefix='mqtts-will-auth-'))
+    try:
+        (token_root / 'token').write_text('will-token-0123456789abcdef0123456789ab')
+        auth = {
+            'enabled': True,
+            'allow_anonymous': False,
+            'cache_enabled': False,
+            'providers': [{
+                'type': 'http',
+                'settings': {
+                    'authentication_url': 'http://127.0.0.1:%d/authentication' % httpd.server_port,
+                    'authorization_url': 'http://127.0.0.1:%d/authorization' % httpd.server_port,
+                    'token_file': str(token_root / 'token'),
+                    'timeout_ms': '500',
+                    'max_payload_bytes': '1024',
+                },
+            }],
+        }
+        broker = Broker(binary, 1, 30, 10, monitor=True, auth=auth)
+        try:
+            watcher = Client(broker.port, websocket)
+            denied = Client(broker.port, websocket)
+            try:
+                if connect_user(watcher, 'will-reader', 'will-reader', AliasPolicy.password) != 0:
+                    raise AssertionError('watcher auth')
+                subscribe(watcher, 'closed/will', 5)
+                encoded = will_packet(
+                    'will-denied', 'closed/will', b'secret', username='will-denied', password=AliasPolicy.password)
+                if open_session(denied, encoded)[1] != 0:
+                    raise AssertionError('publisher auth')
+            finally:
+                denied.close()
+            quiet(watcher, 0.6)
+            broker.wait_counter('wills_rejected', 1)
+            watcher.close()
+        finally:
+            broker.close()
+    finally:
+        httpd.shutdown()
+    print('PASS P0-6 auth websocket=%s' % websocket, flush=True)
+
+
+def will_delay_and_no_local(binary):
+    broker = Broker(binary, 1, 30, 10, persistence=True)
+    try:
+        watcher = Client(broker.port, False)
+        try:
+            open_session(watcher, session_packet('will-delay-watch', True, 60))
+            subscribe(watcher, 'will/delay', 5)
+            subscribe(watcher, 'will/short', 5)
+            subscribe(watcher, 'will/clean', 5)
+            subscribe(watcher, 'will/nl', 5)
+
+            delayed = Client(broker.port, False)
+            try:
+                open_session(delayed, will_packet(
+                    'will-delay', 'will/delay', b'later', delay=5, session_expiry=60))
+            finally:
+                delayed.close()
+            elapsed = expect_will(watcher, 'will/delay', b'later', timeout=9)
+            if not 4.0 <= elapsed <= 8.5:
+                raise AssertionError('delayed will after %.2fs' % elapsed)
+
+            cancelled = Client(broker.port, False)
+            try:
+                open_session(cancelled, will_packet(
+                    'will-cancel', 'will/delay', b'cancelled', delay=5, session_expiry=60))
+            finally:
+                cancelled.close()
+            cancel_at = time.monotonic()
+            resumed = Client(broker.port, False)
+            try:
+                present = open_session(resumed, session_packet('will-cancel', False, 60))
+                if present[0] & 1 != 1:
+                    raise AssertionError('resume did not present the session: %s' % present.hex())
+                remaining = 7 - (time.monotonic() - cancel_at)
+                if remaining < 1:
+                    remaining = 1
+                quiet(watcher, remaining)
+            finally:
+                resumed.close()
+
+            short = Client(broker.port, False)
+            try:
+                open_session(short, will_packet(
+                    'will-short', 'will/short', b'short', delay=30, session_expiry=2))
+            finally:
+                short.close()
+            short_elapsed = expect_will(watcher, 'will/short', b'short', timeout=6)
+            if not 1.2 <= short_elapsed <= 5.0:
+                raise AssertionError('session expiry capped will after %.2fs' % short_elapsed)
+
+            cleaning = Client(broker.port, False)
+            try:
+                open_session(cleaning, will_packet(
+                    'will-clean', 'will/clean', b'clean', delay=30, session_expiry=60))
+            finally:
+                cleaning.close()
+            quiet(watcher, 0.8)
+            replacement = Client(broker.port, False)
+            try:
+                open_session(replacement, session_packet('will-clean', True, 60))
+                clean_elapsed = expect_will(watcher, 'will/clean', b'clean', timeout=2)
+                if clean_elapsed > 2:
+                    raise AssertionError('clean start will after %.2fs' % clean_elapsed)
+            finally:
+                replacement.close()
+
+            def queued_will(client_id, flags):
+                owner = Client(broker.port, False)
+                try:
+                    open_session(owner, will_packet(client_id, 'will/nl', client_id.encode(), qos=1, session_expiry=60))
+                    granted = sub_code(owner, 'will/nl', 5, flags, packet_id=1)
+                    if granted != 1:
+                        raise AssertionError('granted %s for flags 0x%02x' % (granted, flags))
+                finally:
+                    owner.close()
+                expect_will(watcher, 'will/nl', client_id.encode(), timeout=3)
+                again = Client(broker.port, False)
+                try:
+                    present = open_session(again, session_packet(client_id, False, 60))
+                    if present[0] & 1 != 1:
+                        raise AssertionError('queued resume missing session')
+                    if flags & 0x04:
+                        quiet(again, 0.8)
+                    else:
+                        topic, payload = publish_of(*again.read(2), 5)
+                        if topic != 'will/nl' or payload != client_id.encode():
+                            raise AssertionError((topic, payload))
+                finally:
+                    again.close()
+
+            queued_will('will-nolocal', 0x05)
+            queued_will('will-local', 0x01)
+        finally:
+            watcher.close()
+    finally:
+        broker.close()
+    print('PASS P0-6 delay', flush=True)
+
+
 def run(binary):
     for websocket in (False, True):
+        will_rejections(binary, websocket)
+        will_delivery(binary, websocket)
+        will_authorization(binary, websocket)
         topic_alias(binary, websocket)
         subscription_options(binary, websocket)
         silent_close(binary, websocket)
@@ -1316,6 +1659,7 @@ def run(binary):
         max_qos_cap(binary, websocket)
         packet_id_wrap(binary, websocket)
         print('PASS P0-3 websocket=%s' % websocket, flush=True)
+    will_delay_and_no_local(binary)
 
 
 def main():

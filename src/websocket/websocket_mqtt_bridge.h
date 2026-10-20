@@ -128,7 +128,10 @@ private:
     int handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet);
     int handle_mqtt_publish_packet(const std::string& client_id, mqtt::PublishPacket* packet);
     int handle_mqtt_pingreq(const std::string& client_id);
-    int handle_mqtt_disconnect(const std::string& client_id);
+    int handle_mqtt_disconnect(const std::string& client_id, const mqtt::DisconnectPacket* packet);
+    void dispose_will(const std::string& transport_id);
+    bool remember_connection_will(const std::string& transport_id, const std::string& mqtt_client_id,
+                                  const mqtt::ConnectPacket* packet);
     int send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet);
     void destroy_packet(mqtt::Packet* packet);
     bool topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission);
@@ -181,6 +184,17 @@ private:
     const mqtt::ProtocolLimits* protocol_limits_ = nullptr;
     mqtt::auth::AuthManager* auth_manager_ = nullptr;
     std::unordered_map<std::string, std::shared_ptr<mqtt::auth::ClientAuthContext>> auth_contexts_;
+
+    // 遗嘱挂在桥上，不放进适配器。适配器析构也会走会话清理，不能再发一次。
+    struct ConnectionWill {
+        bool present = false;
+        bool settled = false;
+        bool discard = false;
+        uint32_t session_expiry_seconds = 0;
+        std::string mqtt_client_id;
+        mqtt::WillBody body;
+    };
+    std::unordered_map<std::string, ConnectionWill> connection_wills_;
 };
 
 }  // namespace websocket
