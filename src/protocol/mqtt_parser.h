@@ -2,6 +2,8 @@
 #define MQTT_PARSER_H
 
 #include <cstdint>
+#include <new>
+#include <utility>
 #include <vector>
 #include "mqtt_allocator.h"
 #include "mqtt_packet.h"
@@ -60,7 +62,36 @@ class MQTTParser
   int serialize_disconnect(const DisconnectPacket* packet, MQTTBuffer& buffer);
   int serialize_auth(const AuthPacket* packet, MQTTBuffer& buffer);
 
+  // Serializes everything except the payload bytes; the remaining length still covers
+  // payload_size so the caller can transmit the payload separately without copying it.
+  int serialize_publish_header(const MQTTString& topic, uint8_t qos, bool retain, bool dup,
+                               uint16_t packet_id, const Properties& properties,
+                               size_t payload_size, MQTTBuffer& buffer);
+
  private:
+  int dispatch_packet(const uint8_t* buffer, size_t length, Packet** packet);
+
+  // Tracks the packet under construction so parse_packet can release it when a
+  // budgeted STL container throws std::bad_alloc midway through parsing.
+  template <typename T, typename... Args>
+  T* begin_packet(Args&&... args)
+  {
+    void* memory = allocator_->allocate(sizeof(T));
+    if (!memory) {
+      return nullptr;
+    }
+    T* packet = nullptr;
+    try {
+      packet = new (memory) T(std::forward<Args>(args)...);
+    } catch (...) {
+      allocator_->deallocate(memory, sizeof(T));
+      throw;
+    }
+    building_ = packet;
+    building_size_ = sizeof(T);
+    return packet;
+  }
+
   // Helper functions for parsing
   int parse_remaining_length(const uint8_t* buffer, size_t length, uint32_t& remaining_length,
                              size_t& bytes_read);
@@ -94,6 +125,8 @@ class MQTTParser
 
   MQTTAllocator* allocator_;
   uint8_t protocol_version_hint_;
+  Packet* building_ = nullptr;
+  size_t building_size_ = 0;
 };
 
 }  // namespace mqtt

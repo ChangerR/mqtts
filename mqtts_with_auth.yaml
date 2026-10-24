@@ -10,15 +10,15 @@ server:
 
 # MQTT协议配置
 mqtt:
-  max_packet_size: 268435455  # 256MB
+  max_packet_size: 1048576  # 1MiB
   max_client_id_length: 23
   max_topic_length: 256
   max_payload_size: 1048576   # 1MB
 
 # 内存管理配置
 memory:
-  # 268435455 + 64KiB。mqtt.max_packet_size 不得超过 client_max_size - 64KiB。
-  client_max_size: 268500991
+  # 2 × 1MiB + 128KiB。client_max_size 至少为 2 × mqtt.max_packet_size + 128KiB。
+  client_max_size: 2228224
   max_memory_per_client: 10485760  # 10MB
   enable_memory_tracking: true
   

@@ -116,6 +116,9 @@ class MQTTProtocolHandler
                    const Properties& properties = Properties(),
                    std::shared_ptr<auth::AuthorizationRequest>* pending = nullptr);
   virtual int send_publish(const PublishPacket& packet);
+  // Sends DISCONNECT 0x97 when negotiated and closes; the connection cannot keep
+  // its delivery guarantees once its memory budget is exhausted.
+  int close_for_memory_budget();
 
   // Session management
   virtual bool is_connected() const { return connected_; }
@@ -158,9 +161,17 @@ class MQTTProtocolHandler
   int ensure_buffer_size(size_t needed_size);
   int read_packet();
   int parse_packet();
+  int process_loop();
+  int deliver_publish(const MQTTString& topic, const MQTTByteVector& payload, uint8_t qos,
+                      bool retain, bool dup, const Properties& properties,
+                      std::shared_ptr<auth::AuthorizationRequest>* pending);
+  void release_grown_read_buffer();
 
   // 统一的协程安全写入函数，timeout_ms控制锁等待时间
   int send_data_with_lock(const char* data, size_t size, int timeout_ms = 5000);
+  // Writes head and body back to back under one write lock.
+  int send_parts_with_lock(const uint8_t* head, size_t head_size, const uint8_t* body,
+                           size_t body_size, int timeout_ms = 5000);
 
   // Packet reading state
   enum class ReadState {
@@ -289,6 +300,8 @@ class MQTTProtocolHandler
 
  protected:
   virtual int transmit_serialized(const uint8_t* data, size_t size);
+  virtual int transmit_parts(const uint8_t* head, size_t head_size, const uint8_t* body,
+                             size_t body_size);
 };
 
 }  // namespace mqtt

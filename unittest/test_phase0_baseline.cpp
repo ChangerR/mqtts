@@ -243,12 +243,28 @@ TEST(Phase0Config, LimitValidation)
 {
   const std::string packet = write_yaml(
       "server:\n  port: 1883\n"
-      "memory:\n  client_max_size: 131072\n"
+      "memory:\n  client_max_size: 393215\n"
       "mqtt:\n  max_packet_size: 131072\n");
   mqtt::ConfigManager packet_manager;
   EXPECT_NE(packet_manager.load_from_file(packet), 0);
   EXPECT_NE(packet_manager.last_error().find("max_packet_size"), std::string::npos);
   ::unlink(packet.c_str());
+
+  const std::string exact = write_yaml(
+      "server:\n  port: 1883\n"
+      "memory:\n  client_max_size: 393216\n"
+      "mqtt:\n  max_packet_size: 131072\n");
+  mqtt::ConfigManager exact_manager;
+  EXPECT_EQ(exact_manager.load_from_file(exact), 0) << exact_manager.last_error();
+  ::unlink(exact.c_str());
+
+  const std::string connect_timeout = write_yaml(
+      "server:\n  port: 1883\nmqtt:\n  connect_timeout_seconds: 0\n");
+  mqtt::ConfigManager connect_timeout_manager;
+  EXPECT_NE(connect_timeout_manager.load_from_file(connect_timeout), 0);
+  EXPECT_NE(connect_timeout_manager.last_error().find("connect_timeout_seconds"),
+            std::string::npos);
+  ::unlink(connect_timeout.c_str());
 
   const std::string receive = write_yaml(
       "server:\n  port: 1883\nmqtt:\n  receive_maximum: 0\n");
@@ -269,9 +285,9 @@ TEST(Phase0Config, SampleConfigs)
 {
   mqtt::ConfigManager auth;
   EXPECT_EQ(auth.load_from_file(std::string(MQTTS_SOURCE_DIR) + "/mqtts_with_auth.yaml"), 0);
-  EXPECT_EQ(auth.get_config().mqtt.max_packet_size, 268435455u);
+  EXPECT_EQ(auth.get_config().mqtt.max_packet_size, 1048576u);
   EXPECT_GE(auth.get_config().memory.client_max_size,
-            static_cast<size_t>(auth.get_config().mqtt.max_packet_size) + 64 * 1024);
+            2 * static_cast<size_t>(auth.get_config().mqtt.max_packet_size) + 128 * 1024);
 
   mqtt::ConfigManager stock;
   EXPECT_EQ(stock.load_from_file(std::string(MQTTS_SOURCE_DIR) + "/mqtts.yaml"), 0);

@@ -12,6 +12,29 @@ MQTTParser::~MQTTParser() {}
 
 int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** packet)
 {
+  building_ = nullptr;
+  building_size_ = 0;
+  int ret;
+  try {
+    ret = dispatch_packet(buffer, length, packet);
+  } catch (const std::bad_alloc&) {
+    if (building_) {
+      building_->~Packet();
+      allocator_->deallocate(building_, building_size_);
+    }
+    building_ = nullptr;
+    building_size_ = 0;
+    *packet = nullptr;
+    LOG_WARN("Packet parsing exceeded the connection memory budget");
+    return MQ_ERR_MEMORY_ALLOC;
+  }
+  building_ = nullptr;
+  building_size_ = 0;
+  return ret;
+}
+
+int MQTTParser::dispatch_packet(const uint8_t* buffer, size_t length, Packet** packet)
+{
   if (length < 2) {
     LOG_ERROR("Packet too short");
     return MQ_ERR_PACKET_INCOMPLETE;
@@ -151,7 +174,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
   }
 
   ConnectPacket* connect =
-      new (allocator_->allocate(sizeof(ConnectPacket))) ConnectPacket(allocator_);
+      begin_packet<ConnectPacket>(allocator_);
   if (!connect) {
     LOG_ERROR("Failed to allocate CONNECT packet");
     return MQ_ERR_MEMORY_ALLOC;
@@ -244,7 +267,7 @@ int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacke
       LOG_ERROR("Failed to parse properties");
       connect->~ConnectPacket();
       allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return MQ_ERR_PACKET_INVALID;
+      return ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
     }
     pos += properties_bytes_read;
   }
@@ -343,7 +366,7 @@ int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacke
   }
 
   PublishPacket* publish =
-      new (allocator_->allocate(sizeof(PublishPacket))) PublishPacket(allocator_);
+      begin_packet<PublishPacket>(allocator_);
   if (!publish) {
     LOG_ERROR("Failed to allocate PUBLISH packet");
     return MQ_ERR_MEMORY_ALLOC;
@@ -451,7 +474,7 @@ int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribeP
   }
 
   SubscribePacket* subscribe =
-      new (allocator_->allocate(sizeof(SubscribePacket))) SubscribePacket(allocator_);
+      begin_packet<SubscribePacket>(allocator_);
   if (!subscribe) {
     LOG_ERROR("Failed to allocate SUBSCRIBE packet");
     return MQ_ERR_MEMORY_ALLOC;
@@ -545,7 +568,7 @@ int MQTTParser::parse_connack(const uint8_t* buffer, size_t length, ConnAckPacke
     return MQ_ERR_PACKET_INVALID;
   }
 
-  ConnAckPacket* connack = new (allocator_->allocate(sizeof(ConnAckPacket))) ConnAckPacket(allocator_);
+  ConnAckPacket* connack = begin_packet<ConnAckPacket>(allocator_);
   connack->type = PacketType::CONNACK;
 
   size_t pos = 0;
@@ -631,7 +654,7 @@ int MQTTParser::parse_puback(const uint8_t* buffer, size_t length, PubAckPacket*
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubAckPacket* puback = new (allocator_->allocate(sizeof(PubAckPacket))) PubAckPacket(allocator_);
+  PubAckPacket* puback = begin_packet<PubAckPacket>(allocator_);
   puback->type = PacketType::PUBACK;
 
   size_t pos = 0;
@@ -706,7 +729,7 @@ int MQTTParser::parse_pubrec(const uint8_t* buffer, size_t length, PubRecPacket*
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubRecPacket* pubrec = new (allocator_->allocate(sizeof(PubRecPacket))) PubRecPacket(allocator_);
+  PubRecPacket* pubrec = begin_packet<PubRecPacket>(allocator_);
   pubrec->type = PacketType::PUBREC;
 
   size_t pos = 0;
@@ -781,7 +804,7 @@ int MQTTParser::parse_pubrel(const uint8_t* buffer, size_t length, PubRelPacket*
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubRelPacket* pubrel = new (allocator_->allocate(sizeof(PubRelPacket))) PubRelPacket(allocator_);
+  PubRelPacket* pubrel = begin_packet<PubRelPacket>(allocator_);
   pubrel->type = PacketType::PUBREL;
 
   size_t pos = 0;
@@ -860,7 +883,7 @@ int MQTTParser::parse_pubcomp(const uint8_t* buffer, size_t length, PubCompPacke
     return MQ_ERR_PACKET_INVALID;
   }
 
-  PubCompPacket* pubcomp = new (allocator_->allocate(sizeof(PubCompPacket))) PubCompPacket(allocator_);
+  PubCompPacket* pubcomp = begin_packet<PubCompPacket>(allocator_);
   pubcomp->type = PacketType::PUBCOMP;
 
   size_t pos = 0;
@@ -939,7 +962,7 @@ int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket*
     return MQ_ERR_PACKET_INVALID;
   }
 
-  SubAckPacket* suback = new (allocator_->allocate(sizeof(SubAckPacket))) SubAckPacket(allocator_);
+  SubAckPacket* suback = begin_packet<SubAckPacket>(allocator_);
   suback->type = PacketType::SUBACK;
 
   size_t pos = 0;
@@ -1015,7 +1038,7 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
     return MQ_ERR_PACKET_INVALID;
   }
 
-  UnsubAckPacket* unsuback = new (allocator_->allocate(sizeof(UnsubAckPacket))) UnsubAckPacket(allocator_);
+  UnsubAckPacket* unsuback = begin_packet<UnsubAckPacket>(allocator_);
   unsuback->type = PacketType::UNSUBACK;
 
   size_t pos = 0;
@@ -1094,7 +1117,7 @@ int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPac
 
 int MQTTParser::parse_pingreq(const uint8_t* buffer, size_t length, PingReqPacket** packet)
 {
-  PingReqPacket* pingreq = new (allocator_->allocate(sizeof(PingReqPacket))) PingReqPacket();
+  PingReqPacket* pingreq = begin_packet<PingReqPacket>();
   pingreq->type = PacketType::PINGREQ;
   *packet = pingreq;
   return MQ_SUCCESS;
@@ -1102,7 +1125,7 @@ int MQTTParser::parse_pingreq(const uint8_t* buffer, size_t length, PingReqPacke
 
 int MQTTParser::parse_pingresp(const uint8_t* buffer, size_t length, PingRespPacket** packet)
 {
-  PingRespPacket* pingresp = new (allocator_->allocate(sizeof(PingRespPacket))) PingRespPacket();
+  PingRespPacket* pingresp = begin_packet<PingRespPacket>();
   pingresp->type = PacketType::PINGRESP;
   *packet = pingresp;
   return MQ_SUCCESS;
@@ -1116,7 +1139,7 @@ int MQTTParser::parse_disconnect(const uint8_t* buffer, size_t length, Disconnec
   }
 
   DisconnectPacket* disconnect =
-      new (allocator_->allocate(sizeof(DisconnectPacket))) DisconnectPacket();
+      begin_packet<DisconnectPacket>();
   disconnect->type = PacketType::DISCONNECT;
   disconnect->reason_code = ReasonCode::NormalDisconnection;
 
@@ -1193,7 +1216,7 @@ int MQTTParser::parse_auth(const uint8_t* buffer, size_t length, AuthPacket** pa
     return MQ_ERR_PACKET_INCOMPLETE;
   }
 
-  AuthPacket* auth = new (allocator_->allocate(sizeof(AuthPacket))) AuthPacket(allocator_);
+  AuthPacket* auth = begin_packet<AuthPacket>(allocator_);
   if (!auth) {
     LOG_ERROR("Failed to allocate AUTH packet");
     return MQ_ERR_MEMORY_ALLOC;
@@ -1500,6 +1523,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       }
       case PropertyType::ReceiveMaximum:
+        properties.has_receive_maximum = true;
         properties.receive_maximum = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
         bytes_read += 2;
         break;
@@ -1542,6 +1566,7 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         break;
       }
       case PropertyType::MaximumPacketSize:
+        properties.has_maximum_packet_size = true;
         properties.maximum_packet_size = (buffer[bytes_read] << 24) |
                                          (buffer[bytes_read + 1] << 16) |
                                          (buffer[bytes_read + 2] << 8) | buffer[bytes_read + 3];
@@ -1705,6 +1730,19 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffe
 
 int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = serialize_publish_header(packet->topic_name, packet->qos, packet->retain, packet->dup,
+                                     packet->packet_id, packet->properties,
+                                     packet->payload.size(), buffer);
+  if (ret != 0)
+    return ret;
+  return buffer.append(packet->payload.data(), packet->payload.size());
+}
+
+int MQTTParser::serialize_publish_header(const MQTTString& topic, uint8_t qos, bool retain,
+                                         bool dup, uint16_t packet_id,
+                                         const Properties& properties, size_t payload_size,
+                                         MQTTBuffer& buffer)
+{
   buffer.clear();  // 重置buffer以便复用
   const bool is_legacy = is_legacy_protocol_hint();
 
@@ -1712,55 +1750,57 @@ int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffe
   int ret = MQ_SUCCESS;
   if (!is_legacy) {
     // First, serialize properties to calculate their actual size
-    ret = serialize_properties(packet->properties, temp_properties_buffer);
+    ret = serialize_properties(properties, temp_properties_buffer);
     if (ret != 0)
       return ret;
   }
 
   // Calculate total length (properties buffer already includes length encoding)
   size_t total_length = 0;
-  total_length += 2 + packet->topic_name.length();  // Topic name
-  if (packet->qos > 0) {
+  total_length += 2 + topic.length();  // Topic name
+  if (qos > 0) {
     total_length += 2;  // Packet ID
   }
-  
+
   if (!is_legacy) {
     // Properties: complete properties buffer (already includes length encoding)
     total_length += temp_properties_buffer.size();
   }
-  
-  total_length += packet->payload.size();  // Payload
 
-  // Reserve buffer space
-  ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
+  total_length += payload_size;
+  if (total_length > 268435455) {
+    return MQ_ERR_PACKET_TOO_LARGE;
+  }
+
+  ret = buffer.reserve(1 + 4 + total_length - payload_size);
   if (ret != 0)
     return ret;
 
   // Packet type and flags
   uint8_t type_flags = static_cast<uint8_t>(PacketType::PUBLISH);
-  type_flags |= (packet->dup << 3);
-  type_flags |= (packet->qos << 1);
-  type_flags |= packet->retain;
+  type_flags |= dup ? 0x08 : 0x00;
+  type_flags |= (qos & 0x03) << 1;
+  type_flags |= retain ? 0x01 : 0x00;
   ret = buffer.push_back(type_flags);
   if (ret != 0)
     return ret;
 
   // Remaining length
-  ret = serialize_remaining_length(total_length, buffer);
+  ret = serialize_remaining_length(static_cast<uint32_t>(total_length), buffer);
   if (ret != 0)
     return ret;
 
   // Topic name
-  ret = serialize_mqtt_string(packet->topic_name, buffer);
+  ret = serialize_mqtt_string(topic, buffer);
   if (ret != 0)
     return ret;
 
   // Packet ID
-  if (packet->qos > 0) {
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+  if (qos > 0) {
+    ret = buffer.push_back((packet_id >> 8) & 0xFF);
     if (ret != 0)
       return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
+    ret = buffer.push_back(packet_id & 0xFF);
     if (ret != 0)
       return ret;
   }
@@ -1771,11 +1811,6 @@ int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffe
     if (ret != 0)
       return ret;
   }
-
-  // Payload
-  ret = buffer.append(packet->payload.data(), packet->payload.size());
-  if (ret != 0)
-    return ret;
 
   return MQ_SUCCESS;
 }
@@ -2942,7 +2977,7 @@ int MQTTParser::parse_unsubscribe(const uint8_t* buffer, size_t length, Unsubscr
   }
 
   UnsubscribePacket* unsubscribe =
-      new (allocator_->allocate(sizeof(UnsubscribePacket))) UnsubscribePacket(allocator_);
+      begin_packet<UnsubscribePacket>(allocator_);
   if (!unsubscribe) {
     LOG_ERROR("Failed to allocate UNSUBSCRIBE packet");
     return MQ_ERR_MEMORY_ALLOC;

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -105,18 +106,27 @@ class WillScheduler {
   bool generation_matches(const std::string& client_id, uint64_t generation) const;
 
  private:
+  // Each owner thread keeps its wills ordered by due time, so a tick only looks
+  // at the entries that are actually due.
+  using DueQueue = std::multimap<std::chrono::steady_clock::time_point, std::unique_ptr<Entry>>;
+  struct Queued {
+    std::thread::id owner;
+    DueQueue::iterator position;
+  };
   struct ClientGenerations {
     uint64_t next = 0;
     std::unordered_set<uint64_t> live;
     std::unordered_set<uint64_t> inflight;
+    std::vector<Queued> queued;
   };
 
   void suppress_pending(const std::string& client_id, std::chrono::steady_clock::time_point now);
   void drop_client_if_idle(const std::string& client_id);
+  void forget_queued(ClientGenerations& state, const Entry* entry);
 
   mutable std::mutex mutex_;
   std::unordered_map<std::string, ClientGenerations> generations_;
-  std::vector<std::unique_ptr<Entry>> entries_;
+  std::unordered_map<std::thread::id, DueQueue> queues_;
 };
 
 // 取出本线程到期的遗嘱，并在协程里发布。flush_all 用于停机时尽力发布尚未到期的条目。
