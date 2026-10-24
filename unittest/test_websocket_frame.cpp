@@ -481,6 +481,34 @@ void test_close_frame_with_code() {
     std::cout << "CLOSE frame with status code test passed" << std::endl;
 }
 
+void test_oversized_frame_rejected_from_header() {
+    std::cout << "\nTesting oversized frame is rejected from its header alone..." << std::endl;
+
+    MQTTAllocator allocator("test_ws", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    WebSocketFrameParser parser(&allocator, 1024);
+
+    // BINARY, masked, 64-bit length 2 MiB; no payload bytes have arrived yet.
+    uint8_t header[] = {0x82, 0xFF, 0, 0, 0, 0, 0, 0x20, 0, 0, 1, 2, 3, 4};
+    WebSocketFrame frame(&allocator);
+    size_t consumed = 0;
+    int ret = parser.parse_frame(header, sizeof(header), frame, consumed);
+    assert(ret == MQ_ERR_WS_FRAME_TOO_LARGE);
+    assert(frame.payload.empty());
+
+    // The header alone parses without a cap, for callers that stream the payload.
+    size_t header_len = 0;
+    ret = parser.parse_header(header, sizeof(header), frame, header_len);
+    assert(ret == MQ_SUCCESS);
+    assert(header_len == sizeof(header));
+    assert(frame.payload_length == 2u * 1024 * 1024);
+
+    parser.set_max_payload_size(4 * 1024 * 1024);
+    ret = parser.parse_frame(header, sizeof(header), frame, consumed);
+    assert(ret == MQ_ERR_WS_INCOMPLETE_FRAME);
+
+    std::cout << "Oversized frame header test passed" << std::endl;
+}
+
 int main() {
     std::cout << "Starting WebSocket frame parser tests\n" << std::endl;
 
@@ -501,6 +529,7 @@ int main() {
         test_utf8_validation();
         test_fragmented_message();
         test_close_frame_with_code();
+        test_oversized_frame_rejected_from_header();
 
         std::cout << "\n✓ All WebSocket frame tests passed!" << std::endl;
         return 0;
