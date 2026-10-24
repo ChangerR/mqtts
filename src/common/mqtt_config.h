@@ -63,7 +63,7 @@ struct MQTTProtocolConfig
   bool wildcard_subscription_available = true;    // 是否支持通配符订阅
   bool subscription_identifier_available = false; // 本版本不实现，配成 true 时启动失败
   bool shared_subscription_available = false;     // 本版本不实现，配成 true 时启动失败
-  uint16_t topic_alias_maximum = 65535;           // 主题别名最大值
+  uint16_t topic_alias_maximum = 16;              // 主题别名最大值
   uint16_t receive_maximum = 65535;               // 接收最大值
   bool allow_mqtt3x = true;                       // 是否允许 MQTT 3.1 / 3.1.1
 };
@@ -82,8 +82,9 @@ struct RetainConfig
  */
 struct MemoryConfig
 {
-  // 1MiB 报文加上 64KiB 每连接状态空间，满足 max_packet_size 不得超过 client_max_size - 64KiB。
-  size_t client_max_size = 1048576 + 64 * 1024;
+  // 读缓冲和解析出的报文各占一份 1MiB 报文，再加 128KiB 每连接状态空间：
+  // client_max_size 至少为 2 × max_packet_size + 128KiB。
+  size_t client_max_size = 2 * 1048576 + 128 * 1024;
 };
 
 /**
@@ -239,7 +240,7 @@ struct ProtocolLimits
   bool wildcard_subscription_available = true;
   bool subscription_identifier_available = false;
   bool shared_subscription_available = false;
-  uint16_t topic_alias_maximum = 65535;
+  uint16_t topic_alias_maximum = 16;
   uint16_t receive_maximum = 65535;
   bool allow_mqtt3x = true;
   bool persistence_enabled = false;

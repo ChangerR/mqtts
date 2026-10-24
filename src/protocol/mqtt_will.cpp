@@ -278,44 +278,60 @@ void WillScheduler::schedule(std::unique_ptr<Entry> entry)
   }
   entry->generation = generation;
   state.live.insert(generation);
-  entries_.push_back(std::move(entry));
+  const std::thread::id owner = entry->owner;
+  const std::chrono::steady_clock::time_point due = entry->due;
+  Queued queued;
+  queued.owner = owner;
+  queued.position = queues_[owner].emplace(due, std::move(entry));
+  state.queued.push_back(queued);
+}
+
+void WillScheduler::forget_queued(ClientGenerations& state, const Entry* entry)
+{
+  for (size_t i = 0; i < state.queued.size(); ++i) {
+    if (state.queued[i].position->second.get() == entry) {
+      state.queued[i] = state.queued.back();
+      state.queued.pop_back();
+      return;
+    }
+  }
 }
 
 void WillScheduler::suppress_pending(const std::string& client_id,
                                     std::chrono::steady_clock::time_point now)
 {
-  std::vector<std::unique_ptr<Entry>> keep;
-  keep.reserve(entries_.size());
-  for (size_t i = 0; i < entries_.size(); ++i) {
-    Entry* entry = entries_[i].get();
-    if (entry && entry->client_id == client_id && entry->due > now) {
-      const std::unordered_map<std::string, ClientGenerations>::iterator state =
-          generations_.find(client_id);
-      if (state != generations_.end()) {
-        state->second.live.erase(entry->generation);
+  const std::unordered_map<std::string, ClientGenerations>::iterator state =
+      generations_.find(client_id);
+  if (state == generations_.end()) {
+    return;
+  }
+  std::vector<Queued>& queued = state->second.queued;
+  for (size_t i = 0; i < queued.size();) {
+    Entry* entry = queued[i].position->second.get();
+    if (entry->due > now) {
+      state->second.live.erase(entry->generation);
+      DueQueue& queue = queues_[queued[i].owner];
+      queue.erase(queued[i].position);
+      if (queue.empty()) {
+        queues_.erase(queued[i].owner);
       }
+      queued[i] = queued.back();
+      queued.pop_back();
       continue;
     }
-    keep.push_back(std::move(entries_[i]));
+    ++i;
   }
-  entries_.swap(keep);
   drop_client_if_idle(client_id);
 }
 
 void WillScheduler::drop_client_if_idle(const std::string& client_id)
 {
-  bool queued = false;
-  for (size_t i = 0; i < entries_.size(); ++i) {
-    if (entries_[i] && entries_[i]->client_id == client_id) {
-      queued = true;
-      break;
-    }
-  }
   const std::unordered_map<std::string, ClientGenerations>::iterator state = generations_.find(client_id);
   if (state == generations_.end()) {
     return;
   }
-  if (!queued && state->second.live.empty() && state->second.inflight.empty()) {
+  if (state->second.queued.empty() && state->second.live.empty() &&
+      state->second.inflight.empty()) {
     generations_.erase(state);
   }
 }
@@ -335,11 +351,20 @@ void WillScheduler::expire_now(const std::string& client_id)
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
-  for (size_t i = 0; i < entries_.size(); ++i) {
-    Entry* entry = entries_[i].get();
-    if (entry && entry->client_id == client_id) {
-      entry->due = std::chrono::steady_clock::time_point::min();
-    }
+  const std::unordered_map<std::string, ClientGenerations>::iterator state =
+      generations_.find(client_id);
+  if (state == generations_.end()) {
+    return;
+  }
+  const std::chrono::steady_clock::time_point immediately =
+      std::chrono::steady_clock::time_point::min();
+  for (size_t i = 0; i < state->second.queued.size(); ++i) {
+    Queued& queued = state->second.queued[i];
+    DueQueue& queue = queues_[queued.owner];
+    std::unique_ptr<Entry> entry = std::move(queued.position->second);
+    queue.erase(queued.position);
+    entry->due = immediately;
+    queued.position = queue.emplace(immediately, std::move(entry));
   }
 }
 
@@ -365,8 +390,8 @@ void WillScheduler::complete(const std::string& client_id, uint64_t generation)
   }
   state->second.inflight.erase(generation);
   bool queued = false;
-  for (size_t i = 0; i < entries_.size(); ++i) {
-    if (entries_[i] && entries_[i]->client_id == client_id && entries_[i]->generation == generation) {
+  for (size_t i = 0; i < state->second.queued.size(); ++i) {
+    if (state->second.queued[i].position->second->generation == generation) {
       queued = true;
       break;
     }
@@ -382,26 +407,32 @@ std::vector<std::unique_ptr<WillScheduler::Entry>> WillScheduler::take_due(
 {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::unique_ptr<Entry>> due;
-  std::vector<std::unique_ptr<Entry>> keep;
-  for (size_t i = 0; i < entries_.size(); ++i) {
-    if (!entries_[i]) {
-      continue;
-    }
-    const std::unordered_map<std::string, ClientGenerations>::iterator state =
-        generations_.find(entries_[i]->client_id);
-    const bool live = state != generations_.end() &&
-                      state->second.live.find(entries_[i]->generation) != state->second.live.end();
-    if (!live) {
-      continue;
-    }
-    if (entries_[i]->owner == owner && (flush_all || entries_[i]->due <= now)) {
-      state->second.inflight.insert(entries_[i]->generation);
-      due.push_back(std::move(entries_[i]));
-    } else {
-      keep.push_back(std::move(entries_[i]));
-    }
+  const std::unordered_map<std::thread::id, DueQueue>::iterator found = queues_.find(owner);
+  if (found == queues_.end()) {
+    return due;
   }
-  entries_.swap(keep);
+  DueQueue& queue = found->second;
+  while (!queue.empty() && (flush_all || queue.begin()->first <= now)) {
+    const std::unordered_map<std::string, ClientGenerations>::iterator state =
+        generations_.find(queue.begin()->second->client_id);
+    if (state != generations_.end()) {
+      forget_queued(state->second, queue.begin()->second.get());
+    }
+    std::unique_ptr<Entry> entry = std::move(queue.begin()->second);
+    queue.erase(queue.begin());
+    if (state == generations_.end()) {
+      continue;
+    }
+    if (state->second.live.find(entry->generation) == state->second.live.end()) {
+      drop_client_if_idle(entry->client_id);
+      continue;
+    }
+    state->second.inflight.insert(entry->generation);
+    due.push_back(std::move(entry));
+  }
+  if (queue.empty()) {
+    queues_.erase(found);
+  }
   return due;
 }
 

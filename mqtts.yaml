@@ -10,22 +10,22 @@ server:
 # MQTT协议配置
 # keep_alive_default 已废弃。写进配置会打 WARN，并且不会生效。
 mqtt:
-  max_packet_size: 1048576  # 最大包大小(字节)。不得超过 memory.client_max_size - 64KiB。CONNACK 通告此值
+  max_packet_size: 1048576  # 最大包大小(字节)。memory.client_max_size 至少为 2 × 此值 + 128KiB。CONNACK 通告此值
   keep_alive_max: 3600  # 保活上限(秒)。v5 客户端 Keep Alive 为 0 或超过此值时改写为该值，CONNACK 带 Server Keep Alive；1.5 倍时间内无控制报文则断开
-  connect_timeout_seconds: 10  # 连接建立后等待完整 CONNECT 的秒数，超时直接关闭，不回报文
+  connect_timeout_seconds: 10  # 连接建立后等待完整 CONNECT 的秒数，必须 >= 1。超时直接关闭，不回报文
   implicit_no_local: false  # 默认 false，发布者会收到自己的消息。true 恢复“总是排除发布者”的旧行为
   max_qos: 2  # 最大 QoS。开启持久化时 CONNACK Maximum QoS 不超过 1
   retain_available: true  # CONNACK Retain Available。false 时带 retain 的 PUBLISH 断开（v5 为 0x9A）
   wildcard_subscription_available: true  # CONNACK Wildcard Subscription Available
   subscription_identifier_available: false  # 本版本不实现。设为 true 时启动失败
   shared_subscription_available: false  # 本版本不实现。设为 true 时启动失败
-  topic_alias_maximum: 65535  # CONNACK Topic Alias Maximum。入站别名只属于当前连接，1 到该值有效。出站别名不在本期
+  topic_alias_maximum: 16  # CONNACK Topic Alias Maximum。入站别名只属于当前连接，1 到该值有效。出站别名不在本期
   receive_maximum: 65535  # 必须 >= 1。CONNACK Receive Maximum
   allow_mqtt3x: true  # 允许 MQTT 3.1 / 3.1.1 客户端
 
 # 内存配置
 memory:
-  client_max_size: 1114112  # 1MiB + 64KiB，给最大报文留出每连接状态空间
+  client_max_size: 2228224  # 2 × 1MiB + 128KiB：读缓冲和解析出的报文各一份，再留每连接状态空间
 
 # 保留消息限额。超限不入库但仍转发给在线订阅者。重启后保留消息不恢复，落盘留给后续格式变更。
 retain:

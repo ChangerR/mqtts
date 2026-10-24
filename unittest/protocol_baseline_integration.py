@@ -69,7 +69,7 @@ class Broker:
                 'wildcard_subscription_available': wildcard_subscription_available,
                 'retain_available': retain_available,
             },
-            'memory': {'client_max_size': max(1114112, max_packet_size + 65536)},
+            'memory': {'client_max_size': 2 * max_packet_size + 131072},
             'log': {'level': 'info', 'file_path': str(self.root / 'broker.log'), 'flush_immediately': True},
             'monitoring': {
                 'enabled': monitor,
@@ -556,9 +556,16 @@ def rewritten_keep_alive(binary, websocket):
         try:
             connect(legacy, 'ka-legacy-zero', 4, 0)
             legacy.send(b'\xc0\x00')
-            time.sleep(4)
-            legacy.send(b'\xc0\x00')
             header, _ = legacy.read(2)
+            if header != 0xD0:
+                raise AssertionError('3.x K=0 first PINGRESP: 0x%02x' % header)
+            # 先读掉第一个 PINGRESP。否则缓冲里的旧应答会让“已被断开”的连接也通过。
+            time.sleep(4)
+            try:
+                legacy.send(b'\xc0\x00')
+                header, _ = legacy.read(2)
+            except (EOFError, ConnectionError, OSError, TimeoutError) as error:
+                raise AssertionError('3.x K=0 was disconnected: %r' % error)
             if header != 0xD0:
                 raise AssertionError('3.x K=0 was disconnected: 0x%02x' % header)
         finally:

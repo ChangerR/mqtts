@@ -157,6 +157,41 @@ TEST(WillScheduler, OtherThreadAndFlush)
   EXPECT_EQ(flushed[0]->client_id, "owned");
 }
 
+TEST(WillScheduler, TakesOnlyDueEntriesInDueOrder)
+{
+  mqtt::WillScheduler scheduler;
+  const auto now = std::chrono::steady_clock::now();
+  for (int i = 0; i < 1000; ++i) {
+    scheduler.schedule(entry_for("late-" + std::to_string(i), "late", now + std::chrono::hours(1)));
+  }
+  scheduler.schedule(entry_for("second", "second", now - std::chrono::seconds(1)));
+  scheduler.schedule(entry_for("first", "first", now - std::chrono::seconds(2)));
+  std::unique_ptr<mqtt::WillScheduler::Entry> foreign =
+      entry_for("foreign", "foreign", now - std::chrono::seconds(3));
+  foreign->owner = std::thread::id();
+  scheduler.schedule(std::move(foreign));
+
+  const auto due = scheduler.take_due(std::this_thread::get_id(), now, false);
+  ASSERT_EQ(due.size(), 2u);
+  EXPECT_EQ(due[0]->client_id, "first");
+  EXPECT_EQ(due[1]->client_id, "second");
+  EXPECT_TRUE(scheduler.take_due(std::this_thread::get_id(), now, false).empty());
+
+  scheduler.observe_connect("late-500", true);
+  const auto expired = scheduler.take_due(std::this_thread::get_id(), now, false);
+  ASSERT_EQ(expired.size(), 1u);
+  EXPECT_EQ(expired[0]->client_id, "late-500");
+
+  scheduler.observe_connect("late-7", false);
+  EXPECT_FALSE(scheduler.generation_matches("late-7", 1));
+  const auto flushed = scheduler.take_due(std::this_thread::get_id(), now, true);
+  EXPECT_EQ(flushed.size(), 998u);
+
+  const auto foreign_due = scheduler.take_due(std::thread::id(), now, false);
+  ASSERT_EQ(foreign_due.size(), 1u);
+  EXPECT_EQ(foreign_due[0]->client_id, "foreign");
+}
+
 TEST(WillBody, CopiesConnectFields)
 {
   MQTTAllocator allocator("will-body", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
