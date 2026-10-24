@@ -201,8 +201,9 @@ size reservation including unique live payload bytes. Reducing limits below reco
 discarding the backlog. Admission waits cooperatively for up to 500 ms; event threads
 do not block on disk. A topic/consumer hot spot can still create queueing.
 
-Three quarters of `max_disk_bytes` is divided equally among the message and session
-logs; the remaining quarter covers two checkpoint generations/temporary files.
+`max_disk_bytes` is split so every durable file stays inside it: one quarter for two
+checkpoint generations, 1/32 for the retain log, 1/16 for two `RETAIN` snapshot
+generations, and the rest equally among the message and session logs.
 A hot partition can fill its own allowance before other partitions fill theirs.
 High disk usage triggers earlier checkpoint/reclamation. A quota rejection does not
 poison the writer; real I/O failure does. Segment sizes are rotation targets: a single
@@ -242,20 +243,23 @@ sessions first. Clean Start has its standard explicit backlog-discard semantics.
 
 ## Upgrade from the SQLite version
 
-The wire contract remains QoS 1, but `durable_sessions_contract` is now **5** because
-subscription records gained a version and option byte. Existing configured basenames are deliberately preserved.
+The wire contract remains QoS 1, but `durable_sessions_contract` is now **6**. Format 5
+added a version and option byte to subscription records. Format 6 adds the `retain/`
+append log and the `RETAIN` snapshot (`MQTTS-RETAIN-2`; older snapshots use
+`MQTTS-RETAIN-1`). Existing configured basenames are deliberately preserved.
 An old SQLite file at that path refuses startup instead of starting an empty store at
 a different implicit path. Do not delete or rename the old volume to make startup pass.
 
-Native format 2/3/4 directories upgrade in place after successful recovery. The new
-reader accepts checkpoint formats 2, 3, 4 and 5. Checkpoints 2–4 store each
+Native format 2, 3, 4 and 5 directories upgrade in place after successful recovery.
+The new reader accepts checkpoint formats 2, 3, 4 and 5. Checkpoints 2–4 store each
 subscription as filter plus QoS; those options decode as clear. Checkpoint 5 and new
 session-journal SUBSCRIBE records append version `1` and the MQTT option byte (No
 Local, Retain As Published, Retain Handling). A journal SUBSCRIBE that ends after QoS
-is the legacy body. The FORMAT marker is atomically advanced to 5 before admitting
-writes, so an older binary refuses the upgraded directory instead of misreading the
-new tail. Back up the stopped
-store before upgrading; rollback requires restoring that backup. Compacted formats reserve
+is the legacy body. Retained messages live in `retain/` and `RETAIN`, not in the
+session checkpoint. A retain record of version 1 has no property tail. The FORMAT
+marker is atomically advanced to 6 before admitting writes, so an older binary refuses
+the upgraded directory instead of misreading the new tail. The upgrade is one-way:
+back up the stopped store before upgrading, and roll back by restoring that backup. Compacted formats reserve
 checkpoint space for all unique live payloads as well as metadata. If a custom
 format 2 backlog exceeds that budget, startup refuses without deleting records;
 raise `max_disk_bytes` or drain with the old binary before upgrading. Existing
@@ -294,7 +298,8 @@ new broker. Retain the source until recovery and message counts are verified.
 
 This is single-broker, local-disk durability for TCP persistent consumers and QoS 1.
 There is no cross-node replication, leader election, shared subscription load balancing,
-durable retained-message store, durable QoS 2, or persistent WebSocket consumer support.
+durable QoS 2, or persistent WebSocket consumer support. Retained messages are durable
+on a single broker: `retain/` is the mutation log and `RETAIN` is its snapshot.
 TCP and WebSocket publishers both enter the same durable publication path. Persistence
 advertises maximum QoS 1 and rejects QoS 2 publication / persistent WebSocket sessions.
 Disk loss, expired records and intentional session reset remain outside this guarantee.
