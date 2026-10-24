@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
@@ -255,4 +256,82 @@ TEST(RetainStore, ConcurrentReadersAndWriters)
   }
   EXPECT_FALSE(failed.load());
   EXPECT_LE(store.message_count(), 8u);
+}
+
+TEST(RetainStore, ExpiryIndexFollowsReplaceRemoveAndInstall)
+{
+  MQTTAllocator allocator("retain-index", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+  mqtt::RetainStore store(&allocator);
+  const mqtt::MQTTString sender = mqtt::to_mqtt_string("pub", &allocator);
+  const mqtt::RetainConfig limits = limits_of(100, 100, 10000);
+  const auto now = clock_type::time_point(std::chrono::seconds(100));
+
+  mqtt::PublishPacket short_lived = publish(&allocator, "e/a", "1");
+  short_lived.properties.has_message_expiry_interval = true;
+  short_lived.properties.message_expiry_interval = 2;
+  store.store(short_lived, sender, limits, now);
+  // 换成不过期的值后，旧的到期时间不能再把它删掉。
+  store.store(publish(&allocator, "e/a", "forever"), sender, limits, now);
+  mqtt::PublishPacket longer = publish(&allocator, "e/b", "2");
+  longer.properties.has_message_expiry_interval = true;
+  longer.properties.message_expiry_interval = 2;
+  store.store(longer, sender, limits, now);
+  longer.properties.message_expiry_interval = 20;
+  store.store(longer, sender, limits, now);
+  mqtt::PublishPacket removed = publish(&allocator, "e/c", "3");
+  removed.properties.has_message_expiry_interval = true;
+  removed.properties.message_expiry_interval = 1;
+  store.store(removed, sender, limits, now);
+  store.remove("e/c");
+  EXPECT_EQ(store.message_count(), 2u);
+
+  const mqtt::RetainWriteResult later =
+      store.store(publish(&allocator, "e/d", "4"), sender, limits, now + std::chrono::seconds(5));
+  EXPECT_EQ(later.message_delta, 1);
+  EXPECT_EQ(store.message_count(), 3u);
+  EXPECT_EQ(topics_of(store.match("e/+", 10, now + std::chrono::seconds(5))),
+            (std::vector<std::string>{"e/a", "e/b", "e/d"}));
+
+  mqtt::RetainedCopy previous;
+  ASSERT_TRUE(store.peek("e/b", previous, now));
+  store.store(publish(&allocator, "e/b", "replacement"), sender, limits, now);
+  EXPECT_EQ(store.install(previous).kind, mqtt::RetainWriteResult::Replaced);
+  const mqtt::RetainWriteResult reclaimed =
+      store.store(publish(&allocator, "e/z", "z"), sender, limits, now + std::chrono::seconds(20));
+  EXPECT_EQ(reclaimed.message_delta, 0);
+  EXPECT_EQ(store.message_count(), 3u);
+  EXPECT_EQ(topics_of(store.match("e/+", 10, now + std::chrono::seconds(20))),
+            (std::vector<std::string>{"e/a", "e/d", "e/z"}));
+}
+
+// 回归：写入曾在写锁内遍历整棵树，库越大越慢（10 万条时单次写入 10 ms 以上）。
+TEST(RetainStore, WriteCostDoesNotGrowWithStoreSize)
+{
+  MQTTAllocator allocator("retain-scale", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+  mqtt::RetainStore store(&allocator);
+  const mqtt::MQTTString sender = mqtt::to_mqtt_string("pub", &allocator);
+  const mqtt::RetainConfig limits = limits_of(200000, 100, size_t(1) << 32);
+  const auto now = clock_type::now();
+  const int total = 100000;
+  const int batch = 2000;
+  std::vector<mqtt::PublishPacket> packets;
+  packets.reserve(total);
+  for (int i = 0; i < total; ++i) {
+    packets.push_back(publish(&allocator, "s/" + std::to_string(i % 100) + "/" + std::to_string(i), "v"));
+  }
+  auto timed = [&](int from) {
+    const auto start = clock_type::now();
+    for (int i = from; i < from + batch; ++i) {
+      store.store(packets[i], sender, limits, now);
+    }
+    return std::chrono::duration<double, std::micro>(clock_type::now() - start).count() / batch;
+  };
+  const double first = timed(0);
+  for (int i = batch; i < total - batch; ++i) {
+    store.store(packets[i], sender, limits, now);
+  }
+  const double last = timed(total - batch);
+  EXPECT_EQ(store.message_count(), static_cast<size_t>(total));
+  std::printf("retain write: %.2f us/op at empty, %.2f us/op at %d entries\n", first, last, total);
+  EXPECT_LT(last, first * 20 + 20.0);
 }
