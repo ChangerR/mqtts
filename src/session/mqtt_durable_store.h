@@ -15,6 +15,9 @@
 #include "mqtt_log_codec.h"
 
 namespace mqtt {
+namespace journal {
+struct Completion;
+}
 
 // Topic-partitioned append logs and separate sharded session journals.
 // Filesystem work is performed by OS workers, never MQTT event threads.
@@ -46,6 +49,9 @@ class DurableStore
   {
     bool ok = false, present = false, stale = false, wake = false, not_authorized = false;
     bool quota_exceeded = false;
+    // The durable mutex was busy or frozen. Nothing was mutated; retry outside any
+    // lock that must not be held across a wait.
+    bool deferred = false;
     std::shared_ptr<Signal> revision;
     uint64_t epoch = 0;
     int64_t overflow_sequence = 0;
@@ -56,15 +62,22 @@ class DurableStore
     std::vector<Delivery> deliveries;
     // Shared lifetime bounds delivery copies even when a socket remains slow.
     std::shared_ptr<void> reservation;
+    // Set when the caller passed wait = false: the record is admitted and ordered,
+    // but not yet durable. await() blocks the calling coroutine until it is.
+    std::shared_ptr<journal::Completion> commit;
   };
+  // Waits for a deferred commit and folds its outcome into ok/error.
+  static void await(Result& result);
   explicit DurableStore(const PersistenceConfig& config);
   ~DurableStore();
   DurableStore(const DurableStore&) = delete;
   DurableStore& operator=(const DurableStore&) = delete;
   Result connect(const std::string& client, const std::string& owner, bool clean, uint32_t expiry);
   Result disconnect(const std::string& client, uint64_t epoch, int64_t expiry_override = -1);
+  // no_spin returns deferred instead of waiting when the journal mutex is busy.
   Result subscribe(const std::string& client, uint64_t epoch, const std::string& filter,
-                   const journal::StoredSubscription& subscription);
+                   const journal::StoredSubscription& subscription, bool wait = true,
+                   bool no_spin = false);
   Result subscribe(const std::string& client, uint64_t epoch, const std::string& filter,
                    uint8_t qos)
   {
@@ -77,7 +90,8 @@ class DurableStore
   // Otherwise the publisher is skipped only when every matching stored subscription
   // has No Local set. Legacy records decode with that flag clear.
   Result publish(const std::string& topic, const std::string& wire, const std::string& sender,
-                 int64_t expires, bool implicit_no_local = false);
+                 int64_t expires, bool implicit_no_local = false, bool wait = true,
+                 bool no_spin = false);
   Result fetch(const std::string& client, uint64_t epoch, int64_t after, uint16_t receive_maximum);
   Result begin_delivery(const std::string& client, uint64_t epoch, int64_t sequence,
                         uint16_t packet_id);
@@ -106,7 +120,9 @@ class DurableStore
   };
   Statistics statistics() const;
   // Versioned retain log under the store directory. Empty payload is not a put;
-  // deletion is clear_retained. wait is false for QoS 0 (the worker commits later).
+  // deletion is clear_retained. With wait false the call returns once the record is
+  // admitted; Result::commit then tracks durability. A failed put or clear restores
+  // the previous value.
   struct RetainedProperties
   {
     uint8_t payload_format_indicator = 0;
@@ -128,13 +144,15 @@ class DurableStore
                       const std::string& sender, int64_t expires_ms, bool wait);
   Result put_retained(const std::string& topic, uint8_t qos, const std::string& payload,
                       const std::string& sender, int64_t expires_ms, bool wait,
-                      const RetainedProperties& properties);
-  Result clear_retained(const std::string& topic, bool wait);
+                      const RetainedProperties& properties, bool no_spin = false);
+  Result clear_retained(const std::string& topic, bool wait, bool no_spin = false);
   // Committed, unexpired messages. Absent on journals that predate the retain log.
   std::vector<RetainedMessage> retained_messages() const;
-  // Queue one QoS 1 publish into an online persistent session.
-  // present is false when that client has no online durable session.
-  Result enqueue_directed(const std::string& client, const std::string& wire, int64_t expires);
+  // Queue one QoS 1 publish into the online persistent session opened with epoch.
+  // present is false when that client has no online durable session; stale is set
+  // when a different session (another epoch) is online for the same client.
+  Result enqueue_directed(const std::string& client, uint64_t epoch, const std::string& wire,
+                          int64_t expires, bool wait = true);
   // Maintenance/administration API; performs blocking disk work outside MQTT threads.
   void checkpoint();
   void import_legacy(const std::string& exported);

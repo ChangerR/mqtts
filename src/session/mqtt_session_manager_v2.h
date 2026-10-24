@@ -22,6 +22,7 @@
 #include "mqtt_stl_allocator.h"
 #include "mqtt_topic_tree.h"
 #include "mqtt_config.h"
+#include "mqtt_retain_store.h"
 #include "mqtt_will.h"
 #include "pthread_rwlock_wrapper.h"
 #include "singleton.h"
@@ -33,12 +34,44 @@
 
 namespace mqtt {
 
+class RetainReplayGuard
+{
+ public:
+  RetainReplayGuard() : flag_(nullptr) {}
+  RetainReplayGuard(RetainReplayGuard&& other) noexcept : flag_(other.flag_) { other.flag_ = nullptr; }
+  RetainReplayGuard& operator=(RetainReplayGuard&& other) noexcept
+  {
+    if (this != &other) {
+      unlock();
+      flag_ = other.flag_;
+      other.flag_ = nullptr;
+    }
+    return *this;
+  }
+  ~RetainReplayGuard() { unlock(); }
+  void unlock()
+  {
+    if (!flag_)
+      return;
+    std::atomic<uint32_t>* flag = flag_;
+    flag_ = nullptr;
+    flag->store(0, std::memory_order_release);
+  }
+  bool owns_lock() const { return flag_ != nullptr; }
+
+  RetainReplayGuard(const RetainReplayGuard&) = delete;
+  RetainReplayGuard& operator=(const RetainReplayGuard&) = delete;
+
+ private:
+  friend class GlobalSessionManager;
+  explicit RetainReplayGuard(std::atomic<uint32_t>* flag);
+  std::atomic<uint32_t>* flag_;
+};
+
 // 前向声明
 class MQTTProtocolHandler;
 struct SessionInfo;
 class SafeHandlerRef;
-class RetainStore;
-struct RetainWriteResult;
 
 /**
  * @brief 线程本地会话管理器，管理单个线程下的所有Handler
@@ -334,6 +367,9 @@ class GlobalSessionManager
   int subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id, uint8_t qos = 0);
   int subscribe_topic(const MQTTString& topic_filter, const MQTTString& client_id,
                       const SubscriptionOptions& options);
+  // 集群路由 RPC，不含本地主题树。没有路由器时直接成功。
+  int announce_subscription_to_router(const MQTTString& topic_filter, const MQTTString& client_id,
+                                      const SubscriptionOptions& options);
 
   /**
    * @brief 客户端取消订阅主题
@@ -431,14 +467,20 @@ class GlobalSessionManager
   void note_retained_delivery_truncated();
   void collect_protocol_counters(ProtocolCounterSnapshot& out) const;
 
-  // 订阅变为可见之前加锁，直到 deliver_retained 入队结束再放开。
-  // 和保留发布的“写入 + 扇出”互斥，避免新订阅先看到新值再补上旧快照。
-  std::unique_lock<std::recursive_mutex> lock_retain_replay();
+  // 只保护内存里的“订阅可见”和“保留快照”。不得跨过 socket 写、fsync 或 RPC。
+  RetainReplayGuard lock_retain_replay();
+  // 调用方已持有 lock_retain_replay()。只读保留库。
+  RetainMatchResult match_retained(const std::string& filter);
+  // 不持有保留锁。定向入队先准入再在锁外等待提交。epoch 不匹配时不投递给当前会话。
+  int enqueue_retained_snapshot(const MQTTString& client_id, uint64_t durable_epoch,
+                                const SubscriptionOptions& options, bool subscription_existed,
+                                RetainMatchResult matched);
 
   // SUBACK 之后调用。retain 恒为 1，QoS 取订阅和消息的较小值。
   // 持久化会话的 QoS>0 进入 DurableStore 定向队列；在线路径会拒绝这种发送。
   int deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
-                       const SubscriptionOptions& options, bool subscription_existed);
+                       const SubscriptionOptions& options, bool subscription_existed,
+                       uint64_t durable_epoch = 0);
 
   /**
    * @brief 获取总的Handler数量
@@ -635,8 +677,8 @@ class GlobalSessionManager
   std::atomic<int64_t> retained_gauge_messages_{0};
   std::atomic<int64_t> retained_gauge_bytes_{0};
   std::unique_ptr<RetainStore> retain_store_;
-  // 递归锁：订阅侧持有它再调用 deliver_retained，投递内部会再锁一次。
-  std::recursive_mutex retain_replay_mu_;
+  // 跨线程的让出锁。临界区里没有阻塞等待，所以不需要可重入。
+  std::atomic<uint32_t> retain_replay_flag_{0};
   WillScheduler will_scheduler_;
   // 运行状态
   enum class ManagerState {
@@ -714,9 +756,8 @@ class GlobalSessionManager
    */
   int batch_forward_publish(const std::vector<MQTTString>& target_client_ids,
                             const SharedMessageContentPtr& content);
-  // retain = 0 的发布不得调用这里，避免热路径碰到保留库的锁。
-  // QoS>0 时会等保留日志提交；失败时返回错误，调用方不得回成功 PUBACK。
-  int remember_retained(const PublishPacket& packet, const MQTTString& sender);
+  void rollback_retained(const std::string& topic, bool had_previous, const RetainedCopy& previous,
+                         const SharedMessageContent* installed);
   void restore_retained_messages();
 };
 

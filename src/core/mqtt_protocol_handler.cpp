@@ -1589,10 +1589,9 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
     MQTTString topic;
     SubscriptionOptions options;
     bool existed;
+    RetainMatchResult matched;
   };
   std::vector<RetainedGrant> retained_grants;
-  // 从订阅进入主题树开始持有，直到保留快照入队。SUBACK 也在锁内，避免 PUBLISH 抢在 SUBACK 前面。
-  std::unique_lock<std::recursive_mutex> retained_replay;
 
   if (MQ_SUCC(ret)) {
     for (const TopicSubscription& subscription : packet->subscriptions) {
@@ -1617,7 +1616,6 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
           break;
         }
       }
-      DurableStore::Result previous;
       ReasonCode reason_code = ReasonCode::UnspecifiedError;
       auth::AuthResult auth_result = auth::AuthResult::INTERNAL_ERROR;
       const bool shared = is_shared_subscription_filter(topic);
@@ -1666,60 +1664,116 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
         }
       }
 
-      if (local_added && durable_epoch_) {
-        journal::StoredSubscription record;
-        record.qos = granted.qos;
-        record.no_local = granted.no_local;
-        record.retain_as_published = granted.retain_as_published;
-        record.retain_handling = granted.retain_handling;
-        auto stored = session_manager_->durable_store()->subscribe(
-            from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), record);
-        if (!stored.ok) {
-          if (existed)
-            (void)add_subscription(topic, previous_options, nullptr);
-          else
-            remove_subscription(topic);
-          local_added = false;
-          reason_code = stored.quota_exceeded ? ReasonCode::QuotaExceeded : ReasonCode::UnspecifiedError;
+      auto rollback_local = [&]() {
+        rollback_ret = existed ? add_subscription(topic, previous_options, nullptr)
+                               : remove_subscription(topic);
+        if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
+          LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
+                   client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);
         }
-        previous = std::move(stored);
-      }
+      };
+      journal::StoredSubscription record;
+      record.qos = granted.qos;
+      record.no_local = granted.no_local;
+      record.retain_as_published = granted.retain_as_published;
+      record.retain_handling = granted.retain_handling;
+      journal::StoredSubscription previous_record;
+      previous_record.qos = previous_options.qos;
+      previous_record.no_local = previous_options.no_local;
+      previous_record.retain_as_published = previous_options.retain_as_published;
+      previous_record.retain_handling = previous_options.retain_handling;
+
       if (local_added && session_manager_) {
-        if (!retained_replay.owns_lock()) {
-          retained_replay = session_manager_->lock_retain_replay();
+        // 路由 RPC 在保留锁外。失败时本地订阅还没进主题树。
+        subscribe_ret = session_manager_->announce_subscription_to_router(topic, client_id_, granted);
+        if (MQ_FAIL(subscribe_ret)) {
+          LOG_WARN(
+              "Failed to register subscription with router for client {}:{}, topic: {}, error: {}",
+              client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
+          rollback_local();
+          local_added = false;
+          reason_code = ReasonCode::UnspecifiedError;
         }
-        subscribe_ret = session_manager_->subscribe_topic_with_router(topic, client_id_, granted);
-        if (MQ_SUCC(subscribe_ret)) {
+      }
+
+      DurableStore::Result admitted;
+      bool admitted_durable = false;
+      RetainMatchResult matched;
+      if (local_added && session_manager_) {
+        for (;;) {
+          RetainReplayGuard guard = session_manager_->lock_retain_replay();
+          if (durable_epoch_) {
+            admitted = session_manager_->durable_store()->subscribe(
+                from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), record,
+                false, true);
+            if (admitted.deferred) {
+              guard.unlock();
+              runtime::current_runtime().wait(-1, 0, 1);
+              continue;
+            }
+            if (!admitted.ok) {
+              guard.unlock();
+              rollback_local();
+              local_added = false;
+              reason_code = admitted.quota_exceeded ? ReasonCode::QuotaExceeded
+                                                    : ReasonCode::UnspecifiedError;
+              break;
+            }
+            admitted_durable = true;
+          }
+          subscribe_ret = session_manager_->subscribe_topic(topic, client_id_, granted);
+          if (MQ_FAIL(subscribe_ret)) {
+            guard.unlock();
+            LOG_WARN(
+                "Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}",
+                client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
+            if (admitted_durable) {
+              DurableStore::await(admitted);
+              if (admitted.ok) {
+                auto* store = session_manager_->durable_store();
+                auto restored = existed
+                    ? store->subscribe(from_mqtt_string(client_id_), durable_epoch_,
+                                       from_mqtt_string(topic), previous_record)
+                    : store->unsubscribe(from_mqtt_string(client_id_), durable_epoch_,
+                                         from_mqtt_string(topic));
+                if (!restored.ok) {
+                  if (socket_)
+                    socket_->close();
+                  return MQ_ERR_INTERNAL;
+                }
+              }
+            }
+            rollback_local();
+            local_added = false;
+            reason_code = ReasonCode::UnspecifiedError;
+            break;
+          }
+          if (retain_handling_delivers(granted.retain_handling, existed))
+            matched = session_manager_->match_retained(from_mqtt_string(topic));
           LOG_DEBUG(
               "Successfully registered subscription with session manager for client {}:{}, topic: {}",
               client_ip_.c_str(), client_port_, from_mqtt_string(topic));
-        } else {
-          LOG_WARN(
-              "Failed to register subscription with session manager for client {}:{}, topic: {}, error: {}",
-              client_ip_.c_str(), client_port_, from_mqtt_string(topic), subscribe_ret);
+          break;
+        }
+      }
+      if (local_added && admitted_durable) {
+        DurableStore::await(admitted);
+        if (!admitted.ok) {
+          LOG_WARN("Persistent subscribe was not durable for {}: {}", from_mqtt_string(client_id_),
+                   admitted.error);
+          if (existed)
+            (void)session_manager_->subscribe_topic(topic, client_id_, previous_options);
+          else
+            (void)session_manager_->unsubscribe_topic(topic, client_id_);
+          rollback_local();
+          local_added = false;
           reason_code = ReasonCode::UnspecifiedError;
-          if (durable_epoch_) {
-            auto* store = session_manager_->durable_store();
-            auto restored = previous.present
-                ? store->subscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic), previous.subscriptions.front().second)
-                : store->unsubscribe(from_mqtt_string(client_id_), durable_epoch_, from_mqtt_string(topic));
-            if (!restored.ok) {
-              if (socket_) socket_->close();
-              return MQ_ERR_INTERNAL;
-            }
-          }
-          rollback_ret = existed ? add_subscription(topic, previous_options, nullptr)
-                                 : remove_subscription(topic);
-          if (MQ_FAIL(rollback_ret) && MQ_ERR_NOT_FOUND_V2 != rollback_ret) {
-            LOG_WARN("Failed to rollback local subscription for client {}:{}, topic: {}, error: {}",
-                     client_ip_.c_str(), client_port_, from_mqtt_string(topic), rollback_ret);
-          }
         }
       }
 
       reason_codes.push_back(reason_code);
       if (static_cast<ReasonCode>(granted.qos) == reason_code) {
-        retained_grants.push_back(RetainedGrant{topic, granted, existed});
+        retained_grants.push_back(RetainedGrant{topic, granted, existed, std::move(matched)});
         LOG_DEBUG("Successfully subscribed client {}:{} to topic: {} with QoS: {}",
                   client_ip_.c_str(), client_port_, from_mqtt_string(topic), granted.qos);
       }
@@ -1732,8 +1786,9 @@ int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
 
   if (MQ_SUCC(ret) && session_manager_) {
     for (size_t i = 0; i < retained_grants.size(); ++i) {
-      const RetainedGrant& grant = retained_grants[i];
-      (void)session_manager_->deliver_retained(client_id_, grant.topic, grant.options, grant.existed);
+      RetainedGrant& grant = retained_grants[i];
+      (void)session_manager_->enqueue_retained_snapshot(client_id_, durable_epoch_, grant.options,
+                                                        grant.existed, std::move(grant.matched));
     }
   }
 

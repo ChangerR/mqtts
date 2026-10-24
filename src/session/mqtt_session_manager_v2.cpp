@@ -7,6 +7,7 @@
 #include "logger.h"
 #include "mqtt_define.h"
 #include "mqtt_protocol_handler.h"
+#include "mqtt_runtime.h"
 
 // 错误代码已在mqtt_define.h中统一定义
 
@@ -1038,9 +1039,57 @@ void GlobalSessionManager::note_retained_delivery_truncated()
   }
 }
 
-std::unique_lock<std::recursive_mutex> GlobalSessionManager::lock_retain_replay()
+RetainReplayGuard::RetainReplayGuard(std::atomic<uint32_t>* flag) : flag_(nullptr)
 {
-  return std::unique_lock<std::recursive_mutex>(retain_replay_mu_);
+  for (;;) {
+    uint32_t expected = 0;
+    if (flag->compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      flag_ = flag;
+      return;
+    }
+    runtime::current_runtime().wait(-1, 0, 1);
+  }
+}
+
+RetainReplayGuard GlobalSessionManager::lock_retain_replay()
+{
+  return RetainReplayGuard(&retain_replay_flag_);
+}
+
+void GlobalSessionManager::rollback_retained(const std::string& topic, bool had_previous,
+                                            const RetainedCopy& previous,
+                                            const SharedMessageContent* installed)
+{
+  if (!retain_store_)
+    return;
+  RetainedCopy current;
+  const bool present = retain_store_->peek(topic, current, std::chrono::steady_clock::now());
+  if (installed) {
+    if (!present || current.content.get() != installed)
+      return;
+  } else if (present) {
+    return;
+  }
+  if (had_previous) {
+    const RetainWriteResult restored = retain_store_->install(previous);
+    note_retained_delta(restored.message_delta, restored.byte_delta);
+  } else {
+    const RetainWriteResult removed = retain_store_->remove(topic);
+    note_retained_delta(removed.message_delta, removed.byte_delta);
+  }
+}
+
+RetainMatchResult GlobalSessionManager::match_retained(const std::string& filter)
+{
+  RetainMatchResult matched;
+  if (!retain_available_ || !retain_store_ || filter.empty())
+    return matched;
+  matched = retain_store_->match(filter, retain_config_.max_deliver_per_subscribe,
+                                 std::chrono::steady_clock::now());
+  note_retained_delta(matched.message_delta, matched.byte_delta);
+  if (matched.truncated)
+    note_retained_delivery_truncated();
+  return matched;
 }
 
 void GlobalSessionManager::configure_persistence(const PersistenceConfig& config)
@@ -1103,104 +1152,30 @@ void GlobalSessionManager::restore_retained_messages()
   }
 }
 
-int GlobalSessionManager::remember_retained(const PublishPacket& packet, const MQTTString& sender)
+int GlobalSessionManager::enqueue_retained_snapshot(const MQTTString& client_id,
+                                                          uint64_t durable_epoch,
+                                                          const SubscriptionOptions& options,
+                                                          bool subscription_existed,
+                                                          RetainMatchResult matched)
 {
-  if (!packet.retain || !retain_store_) {
+  if (!retain_handling_delivers(options.retain_handling, subscription_existed))
     return 0;
-  }
-  const std::string topic = from_mqtt_string(packet.topic_name);
-  const bool deleting =
-      packet.payload.empty() || (packet.properties.has_message_expiry_interval &&
-                                 packet.properties.message_expiry_interval == 0);
-  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  RetainedCopy previous;
-  const bool had_previous = retain_store_->peek(topic, previous, now);
-  const RetainWriteResult result = retain_store_->store(packet, sender, retain_config_, now);
-  note_retained_delta(result.message_delta, result.byte_delta);
-  if (result.kind == RetainWriteResult::Rejected) {
-    note_retained_not_stored();
-    if (result.warn) {
-      LOG_WARN("Retained message on topic {} was not stored: {}", topic, result.warn);
-    }
-    return 0;
-  }
-  if (durable_store_ && deleting) {
-    const bool wait = packet.qos > 0;
-    const DurableStore::Result committed = durable_store_->clear_retained(topic, wait);
-    if (wait && !committed.ok) {
-      if (had_previous) {
-        const RetainWriteResult restored = retain_store_->install(previous);
-        note_retained_delta(restored.message_delta, restored.byte_delta);
-      }
-      LOG_WARN("Retained delete was not durable: {}", committed.error);
-      return committed.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
-    }
-  } else if (durable_store_ &&
-             (result.kind == RetainWriteResult::Stored || result.kind == RetainWriteResult::Replaced)) {
-    int64_t expires = 0;
-    if (packet.properties.has_message_expiry_interval) {
-      expires = DurableStore::now_ms() +
-                static_cast<int64_t>(packet.properties.message_expiry_interval) * 1000;
-    }
-    const bool wait = packet.qos > 0;
-    const std::string payload(packet.payload.begin(), packet.payload.end());
-    DurableStore::RetainedProperties retained_properties;
-    retained_properties.payload_format_indicator = packet.properties.payload_format_indicator;
-    retained_properties.content_type = from_mqtt_string(packet.properties.content_type);
-    retained_properties.response_topic = from_mqtt_string(packet.properties.response_topic);
-    retained_properties.correlation_data.assign(packet.properties.correlation_data.begin(),
-                                                packet.properties.correlation_data.end());
-    retained_properties.user_properties.reserve(packet.properties.user_properties.size());
-    for (size_t i = 0; i < packet.properties.user_properties.size(); ++i) {
-      retained_properties.user_properties.emplace_back(
-          from_mqtt_string(packet.properties.user_properties[i].first),
-          from_mqtt_string(packet.properties.user_properties[i].second));
-    }
-    const DurableStore::Result committed = durable_store_->put_retained(
-        topic, packet.qos, payload, from_mqtt_string(sender), expires, wait, retained_properties);
-    if (wait && !committed.ok) {
-      if (had_previous) {
-        const RetainWriteResult restored = retain_store_->install(previous);
-        note_retained_delta(restored.message_delta, restored.byte_delta);
-      } else {
-        const RetainWriteResult removed = retain_store_->remove(topic);
-        note_retained_delta(removed.message_delta, removed.byte_delta);
-      }
-      LOG_WARN("Retained message on topic {} was not durable: {}", topic, committed.error);
-      return committed.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
-    }
-  }
-  return 0;
-}
-
-int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
-                                           const SubscriptionOptions& options, bool subscription_existed)
-{
-  if (!retain_available_ || !retain_store_ ||
-      !retain_handling_delivers(options.retain_handling, subscription_existed)) {
-    return 0;
-  }
-  // 调用方应已持有同一把锁，这里再锁一次，保证快照和入队相对保留发布是原子的。
-  std::unique_lock<std::recursive_mutex> retained_replay = lock_retain_replay();
-  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-  RetainMatchResult matched =
-      retain_store_->match(from_mqtt_string(topic_filter), retain_config_.max_deliver_per_subscribe, now);
-  note_retained_delta(matched.message_delta, matched.byte_delta);
-  if (matched.truncated) {
-    note_retained_delivery_truncated();
-  }
   const std::string subscriber_id = from_mqtt_string(client_id);
   int delivered = 0;
+  std::vector<DurableStore::Result> commits;
   try {
     for (size_t i = 0; i < matched.messages.size(); ++i) {
       const RetainedCopy& item = matched.messages[i];
-      if (!item.content.is_valid()) {
+      if (!item.content.is_valid())
         continue;
-      }
       const std::string sender_id = from_mqtt_string(item.content->sender_client_id);
-      if (subscriber_id == sender_id && (implicit_no_local_ || options.no_local)) {
+      if (subscriber_id == sender_id && (implicit_no_local_ || options.no_local))
         continue;
-      }
+      RetainedCopy current;
+      if (!retain_store_ ||
+          !retain_store_->peek(item.topic, current, std::chrono::steady_clock::now()) ||
+          current.content.get() != item.content.get())
+        continue;
       const uint8_t qos = std::min(options.qos, item.content->qos);
       Properties properties(item.content->properties, global_allocator_);
       properties.topic_alias = 0;
@@ -1209,9 +1184,8 @@ int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQ
         const int64_t remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       item.expires_at - std::chrono::steady_clock::now())
                                       .count();
-        if (remain_ms <= 0) {
+        if (remain_ms <= 0)
           continue;
-        }
         const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
         properties.has_message_expiry_interval = true;
         properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
@@ -1229,9 +1203,8 @@ int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQ
           const int64_t remain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         item.expires_at - std::chrono::steady_clock::now())
                                         .count();
-          if (remain_ms <= 0) {
+          if (remain_ms <= 0)
             continue;
-          }
           expires = DurableStore::now_ms() + remain_ms;
         }
         MQTTAllocator wire_allocator("retain_directed", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
@@ -1251,31 +1224,61 @@ int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQ
         wire_packet.properties.has_topic_alias = false;
         MQTTBuffer wire(&wire_allocator);
         if (serializer.serialize_publish(&wire_packet, wire) != MQ_SUCCESS) {
-          LOG_WARN("Failed to serialize retained publish for {}", from_mqtt_string(client_id));
+          LOG_WARN("Failed to serialize retained publish for {}", subscriber_id);
           continue;
         }
-        const DurableStore::Result queued = durable_store_->enqueue_directed(
-            from_mqtt_string(client_id),
-            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()), expires);
+        DurableStore::Result queued = durable_store_->enqueue_directed(
+            subscriber_id, durable_epoch,
+            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()), expires, false);
+        if (queued.deferred) {
+          DurableStore::await(queued);
+          if (queued.deferred)
+            queued = durable_store_->enqueue_directed(
+                subscriber_id, durable_epoch,
+                std::string(reinterpret_cast<const char*>(wire.data()), wire.size()), expires, true);
+        }
         if (!queued.ok) {
-          LOG_WARN("Directed retained delivery failed for {}: {}", from_mqtt_string(client_id),
-                   queued.error);
+          LOG_WARN("Directed retained delivery failed for {}: {}", subscriber_id, queued.error);
           continue;
         }
+        if (queued.stale)
+          continue;
         if (queued.present) {
+          if (queued.commit)
+            commits.push_back(std::move(queued));
           ++delivered;
           continue;
         }
       }
-      if (forward_publish_shared(client_id, outbound) == MQ_SUCCESS) {
+      if (forward_publish_shared(client_id, outbound) == MQ_SUCCESS)
         ++delivered;
-      }
     }
   } catch (const std::bad_alloc&) {
-    LOG_WARN("Insufficient memory while queueing retained messages for {}", from_mqtt_string(client_id));
+    LOG_WARN("Insufficient memory while queueing retained messages for {}", subscriber_id);
     return MQ_ERR_MEMORY_ALLOC;
   }
+  for (size_t i = 0; i < commits.size(); ++i) {
+    DurableStore::await(commits[i]);
+    if (!commits[i].ok)
+      LOG_WARN("Directed retained delivery was not durable for {}: {}", subscriber_id, commits[i].error);
+  }
   return delivered;
+}
+
+int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQTTString& topic_filter,
+                                           const SubscriptionOptions& options, bool subscription_existed,
+                                           uint64_t durable_epoch)
+{
+  if (!retain_available_ || !retain_store_ ||
+      !retain_handling_delivers(options.retain_handling, subscription_existed))
+    return 0;
+  RetainMatchResult matched;
+  {
+    RetainReplayGuard guard = lock_retain_replay();
+    matched = match_retained(from_mqtt_string(topic_filter));
+  }
+  return enqueue_retained_snapshot(client_id, durable_epoch, options, subscription_existed,
+                                   std::move(matched));
 }
 
 void GlobalSessionManager::process_due_wills(auth::AuthManager* auth, bool flush_all)
@@ -1667,27 +1670,191 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
       topic.find('#') != MQTTString::npos || topic.find('\0') != MQTTString::npos ||
       packet.properties.topic_alias != 0)
     return MQ_ERR_PUBLISH_TOPIC;
-  // 保留发布的写入和扇出占同一把锁，避免插在“订阅已可见、快照还没入队”之间。
-  std::unique_lock<std::recursive_mutex> retained_replay;
-  if (packet.retain)
-    retained_replay = lock_retain_replay();
   const bool expired_now = packet.properties.has_message_expiry_interval &&
                            packet.properties.message_expiry_interval == 0;
+  if (durable_store_ && packet.qos > 1)
+    return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
   std::vector<std::string> persisted_targets;
   size_t persisted_count = 0;
   const std::string sender_id = from_mqtt_string(sender_client_id);
-  std::vector<SubscriberInfo> subscribers;
-  const int lookup = find_topic_subscribers(topic, subscribers);
   std::vector<PlannedDelivery> planned;
-  if (lookup == MQ_SUCCESS) {
-    planned = plan_subscription_deliveries(subscribers, sender_id, packet.qos, packet.retain,
-                                           implicit_no_local_);
+  int lookup = MQ_SUCCESS;
+  bool planned_ready = false;
+
+  if (packet.retain && retain_store_) {
+    const std::string topic_str = from_mqtt_string(topic);
+    const bool deleting =
+        packet.payload.empty() || (packet.properties.has_message_expiry_interval &&
+                                   packet.properties.message_expiry_interval == 0);
+    const bool may_publish = durable_store_ && packet.qos == 1 && !expired_now;
+    std::string wire;
+    bool wire_ready = false;
+    int64_t publish_expires = 0;
+    bool memory_done = false;
+    bool publish_done = false;
+    bool put_done = false;
+    bool lookup_done = false;
+    bool had_previous = false;
+    RetainedCopy previous;
+    const SharedMessageContent* installed = nullptr;
+    DurableStore::Result publish_result;
+    DurableStore::Result put_result;
+    auto fill_lookup = [&]() {
+      if (lookup_done)
+        return;
+      std::vector<SubscriberInfo> subscribers;
+      lookup = find_topic_subscribers(topic, subscribers);
+      if (lookup == MQ_SUCCESS)
+        planned = plan_subscription_deliveries(subscribers, sender_id, packet.qos, packet.retain,
+                                               implicit_no_local_);
+      lookup_done = true;
+    };
+    for (;;) {
+      const bool want_publish = may_publish && durable_store_->has_subscriptions();
+      if (want_publish && !wire_ready && !publish_done && !memory_done) {
+        try {
+          MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
+                                       4 * 1024 * 1024);
+          MQTTParser serializer(&wire_allocator);
+          serializer.set_protocol_version_hint(5);
+          PublishPacket copy(&wire_allocator);
+          copy.type = PacketType::PUBLISH;
+          copy.topic_name = packet.topic_name;
+          copy.payload = packet.payload;
+          copy.qos = 1;
+          copy.packet_id = 1;
+          // One stored wire is shared by every durable recipient, so it cannot
+          // carry a different retain flag per subscription. Restored Retain As
+          // Published still applies on the live path. This copy keeps retain clear.
+          copy.retain = false;
+          copy.dup = false;
+          copy.properties = Properties(packet.properties, &wire_allocator);
+          copy.properties.topic_alias = 0;
+          MQTTBuffer encoded(&wire_allocator);
+          if (serializer.serialize_publish(&copy, encoded) != MQ_SUCCESS)
+            return MQ_ERR_INTERNAL;
+          wire.assign(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+          publish_expires = packet.properties.message_expiry_interval
+                                ? DurableStore::now_ms() +
+                                      int64_t(packet.properties.message_expiry_interval) * 1000
+                                : 0;
+          wire_ready = true;
+        } catch (const std::exception& error) {
+          LOG_WARN("Persistent publish failed: {}", error.what());
+          return MQ_ERR_INTERNAL;
+        }
+      }
+      RetainReplayGuard guard = lock_retain_replay();
+      const bool want_publish_now = may_publish && !memory_done && !publish_done &&
+                                    durable_store_->has_subscriptions();
+      if (want_publish_now) {
+        if (!wire_ready) {
+          guard.unlock();
+          continue;
+        }
+        fill_lookup();
+        publish_result = durable_store_->publish(topic_str, wire, sender_id, publish_expires,
+                                                 implicit_no_local_, false, true);
+        if (publish_result.deferred) {
+          lookup_done = false;
+          planned.clear();
+          guard.unlock();
+          runtime::current_runtime().wait(-1, 0, 1);
+          continue;
+        }
+        if (!publish_result.ok) {
+          LOG_WARN("Persistent publish refused: {}", publish_result.error);
+          return publish_result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+        }
+        publish_done = true;
+        persisted_count = publish_result.accepted_targets;
+        persisted_targets = publish_result.targets;
+      }
+      if (!memory_done) {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        had_previous = retain_store_->peek(topic_str, previous, now);
+        const RetainWriteResult stored =
+            retain_store_->store(packet, sender_client_id, retain_config_, now);
+        note_retained_delta(stored.message_delta, stored.byte_delta);
+        if (stored.kind == RetainWriteResult::Rejected) {
+          note_retained_not_stored();
+          if (stored.warn)
+            LOG_WARN("Retained message on topic {} was not stored: {}", topic_str, stored.warn);
+          fill_lookup();
+          break;
+        }
+        if (!deleting) {
+          RetainedCopy current;
+          if (retain_store_->peek(topic_str, current, now))
+            installed = current.content.get();
+        }
+        memory_done = true;
+        fill_lookup();
+      }
+      if (durable_store_ && !put_done) {
+        int64_t retain_expires = 0;
+        if (!deleting && packet.properties.has_message_expiry_interval) {
+          retain_expires = DurableStore::now_ms() +
+                           static_cast<int64_t>(packet.properties.message_expiry_interval) * 1000;
+        }
+        if (deleting) {
+          put_result = durable_store_->clear_retained(topic_str, false, true);
+        } else {
+          DurableStore::RetainedProperties retained_properties;
+          retained_properties.payload_format_indicator = packet.properties.payload_format_indicator;
+          retained_properties.content_type = from_mqtt_string(packet.properties.content_type);
+          retained_properties.response_topic = from_mqtt_string(packet.properties.response_topic);
+          retained_properties.correlation_data.assign(packet.properties.correlation_data.begin(),
+                                                      packet.properties.correlation_data.end());
+          retained_properties.user_properties.reserve(packet.properties.user_properties.size());
+          for (size_t i = 0; i < packet.properties.user_properties.size(); ++i) {
+            retained_properties.user_properties.emplace_back(
+                from_mqtt_string(packet.properties.user_properties[i].first),
+                from_mqtt_string(packet.properties.user_properties[i].second));
+          }
+          const std::string payload(packet.payload.begin(), packet.payload.end());
+          put_result = durable_store_->put_retained(topic_str, packet.qos, payload, sender_id,
+                                                    retain_expires, false, retained_properties, true);
+        }
+        if (put_result.deferred) {
+          guard.unlock();
+          runtime::current_runtime().wait(-1, 0, 1);
+          continue;
+        }
+        if (!put_result.ok) {
+          rollback_retained(topic_str, had_previous, previous, installed);
+          LOG_WARN("Retained message on topic {} was not durable: {}", topic_str, put_result.error);
+          note_retained_not_stored();
+          return put_result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+        }
+        put_done = true;
+      }
+      break;
+    }
+    if (put_done)
+      DurableStore::await(put_result);
+    if (publish_done)
+      DurableStore::await(publish_result);
+    if (put_done && !put_result.ok) {
+      rollback_retained(topic_str, had_previous, previous, installed);
+      LOG_WARN("Retained message on topic {} was not durable: {}", topic_str, put_result.error);
+      note_retained_not_stored();
+      return put_result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+    }
+    if (publish_done && !publish_result.ok) {
+      LOG_WARN("Persistent publish refused: {}", publish_result.error);
+      return publish_result.quota_exceeded ? MQ_ERR_PUBLISH_QUOTA : MQ_ERR_INTERNAL;
+    }
+    planned_ready = true;
   }
-  if (durable_store_) {
-    if (packet.qos > 1)
-      return MQ_ERR_PACKET_INVALID;  // This mode advertises maximum QoS 1.
-    // 过期间隔为 0 的报文不入库，但保留位仍要删掉旧值。失败路径必须先于保留变更返回。
-    if (!expired_now && packet.qos == 1 && durable_store_->has_subscriptions()) {
+
+  if (!planned_ready) {
+    std::vector<SubscriberInfo> subscribers;
+    lookup = find_topic_subscribers(topic, subscribers);
+    if (lookup == MQ_SUCCESS)
+      planned = plan_subscription_deliveries(subscribers, sender_id, packet.qos, packet.retain,
+                                             implicit_no_local_);
+    if (durable_store_ && !expired_now && packet.qos == 1 && durable_store_->has_subscriptions()) {
       try {
         MQTTAllocator wire_allocator("durable_publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER,
                                      4 * 1024 * 1024);
@@ -1699,15 +1866,12 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         copy.payload = packet.payload;
         copy.qos = 1;
         copy.packet_id = 1;
-        // One stored wire is shared by every durable recipient, so it cannot
-        // carry a different retain flag per subscription. Restored Retain As
-        // Published still applies on the live path. This copy keeps retain clear.
         copy.retain = false;
         copy.dup = false;
         copy.properties = Properties(packet.properties, &wire_allocator);
         copy.properties.topic_alias = 0;
-        MQTTBuffer wire(&wire_allocator);
-        if (serializer.serialize_publish(&copy, wire) != MQ_SUCCESS)
+        MQTTBuffer encoded(&wire_allocator);
+        if (serializer.serialize_publish(&copy, encoded) != MQ_SUCCESS)
           return MQ_ERR_INTERNAL;
         int64_t expires =
             packet.properties.message_expiry_interval
@@ -1715,7 +1879,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
                 : 0;
         auto result = durable_store_->publish(
             from_mqtt_string(topic),
-            std::string(reinterpret_cast<const char*>(wire.data()), wire.size()),
+            std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()),
             from_mqtt_string(sender_client_id), expires, implicit_no_local_);
         if (!result.ok) {
           LOG_WARN("Persistent publish refused: {}", result.error);
@@ -1728,12 +1892,6 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
         return MQ_ERR_INTERNAL;
       }
     }
-  }
-  // 会话日志接受之后才改保留库。QoS>0 会等保留日志提交，PUBACK 不早于它。
-  if (packet.retain) {
-    const int retained = remember_retained(packet, sender_client_id);
-    if (retained != 0)
-      return retained;
   }
   if (expired_now)
     return 0;
@@ -2551,31 +2709,32 @@ int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter
   return subscribe_topic_cluster(topic_filter, client_id, options);
 }
 
+int GlobalSessionManager::announce_subscription_to_router(const MQTTString& topic_filter,
+                                                          const MQTTString& client_id,
+                                                          const SubscriptionOptions& options)
+{
+  if (router_client_.get() == NULL)
+    return MQ_SUCCESS;
+  // Router RPC stays QoS-only; cluster delivery does not carry No Local / RAP.
+  MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
+  request.server_id = server_id_;
+  request.client_id = client_id;
+  request.topic_filter = topic_filter;
+  request.qos = options.qos;
+  if (cluster_config_.cluster_enabled)
+    return router_client_->subscribe(request);
+  return router_client_->subscribe_async(request);
+}
+
 int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter,
                                                   const MQTTString& client_id,
                                                   const SubscriptionOptions& options)
 {
-  int ret = MQ_SUCCESS;
-  MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
-  bool strict_cluster_mode = false;
-
   // Do not replace an existing local filter until router admission succeeds.
   // A failed re-SUBSCRIBE must retain its previous QoS and routing entry.
-  // Router RPC stays QoS-only; cluster delivery does not carry No Local / RAP.
-  if (router_client_.get() != NULL) {
-    strict_cluster_mode = cluster_config_.cluster_enabled;
-    request.server_id = server_id_;
-    request.client_id = client_id;
-    request.topic_filter = topic_filter;
-    request.qos = options.qos;
-    if (strict_cluster_mode) {
-      ret = router_client_->subscribe(request);
-    } else {
-      ret = router_client_->subscribe_async(request);
-    }
-    if (MQ_SUCCESS != ret)
-      return ret;
-  }
+  const int ret = announce_subscription_to_router(topic_filter, client_id, options);
+  if (MQ_SUCCESS != ret)
+    return ret;
   return subscribe_topic(topic_filter, client_id, options);
 }
 

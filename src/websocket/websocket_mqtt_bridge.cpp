@@ -380,15 +380,21 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
                         mqtt::SubscriptionOptions options;
                         options.qos = static_cast<uint8_t>(qos);
                         bool existed = false;
-                        std::unique_lock<std::recursive_mutex> retained_replay;
+                        mqtt::RetainMatchResult retained_match;
                         if (session_manager_) {
-                            retained_replay = session_manager_->lock_retain_replay();
+                            mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
+                            ret = subscribe_topic(client_id, topic, options, &existed);
+                            if (ret == MQ_SUCCESS &&
+                                mqtt::retain_handling_delivers(options.retain_handling, existed)) {
+                                retained_match = session_manager_->match_retained(topic);
+                            }
+                        } else {
+                            ret = subscribe_topic(client_id, topic, options, &existed);
                         }
-                        ret = subscribe_topic(client_id, topic, options, &existed);
                         if (ret == MQ_SUCCESS && session_manager_) {
-                            session_manager_->deliver_retained(
-                                mqtt::to_mqtt_string(client_id, allocator_),
-                                mqtt::to_mqtt_string(topic, allocator_), options, existed);
+                            session_manager_->enqueue_retained_snapshot(
+                                mqtt::to_mqtt_string(client_id, allocator_), 0, options, existed,
+                                std::move(retained_match));
                         }
                     } else if (type == "unsubscribe") {
                         std::string topic;
@@ -1136,9 +1142,9 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
         std::string topic;
         mqtt::SubscriptionOptions options;
         bool existed;
+        mqtt::RetainMatchResult matched;
     };
     std::vector<GrantedRetain> retained_grants;
-    std::unique_lock<std::recursive_mutex> retained_replay;
 
     auto session = session_handlers_.find(client_id);
     mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
@@ -1166,12 +1172,21 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
             granted.qos = qos_cap;
         }
         bool existed = false;
-        if (!retained_replay.owns_lock() && session_manager_) {
-            retained_replay = session_manager_->lock_retain_replay();
+        mqtt::RetainMatchResult matched;
+        int sub_ret;
+        if (session_manager_) {
+            mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
+            sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
+            if (sub_ret == MQ_SUCCESS &&
+                mqtt::retain_handling_delivers(granted.retain_handling, existed)) {
+                matched = session_manager_->match_retained(mqtt::from_mqtt_string(topic));
+            }
+        } else {
+            sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
         }
-        int sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
         if (sub_ret == MQ_SUCCESS) {
-          retained_grants.push_back(GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed});
+          retained_grants.push_back(
+              GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed, std::move(matched)});
           switch (granted.qos) {
             case 0:
               suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
@@ -1195,9 +1210,9 @@ int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id, con
     if (sent == MQ_SUCCESS && session_manager_) {
         mqtt::MQTTString subscriber = mqtt::to_mqtt_string(client_id, allocator_);
         for (size_t i = 0; i < retained_grants.size(); ++i) {
-            const GrantedRetain& grant = retained_grants[i];
-            (void)session_manager_->deliver_retained(
-                subscriber, mqtt::to_mqtt_string(grant.topic, allocator_), grant.options, grant.existed);
+            GrantedRetain& grant = retained_grants[i];
+            (void)session_manager_->enqueue_retained_snapshot(
+                subscriber, 0, grant.options, grant.existed, std::move(grant.matched));
         }
     }
     return sent;
