@@ -85,15 +85,22 @@ struct WebSocketFrame {
 // WebSocket frame parser and serializer
 class WebSocketFrameParser {
 public:
-    explicit WebSocketFrameParser(MQTTAllocator* allocator, size_t max_payload_size = 10 * 1024 * 1024);
+    explicit WebSocketFrameParser(MQTTAllocator* allocator, size_t max_payload_size = 1024 * 1024);
     ~WebSocketFrameParser();
+
+    void set_max_payload_size(size_t max_payload_size) { max_payload_size_ = max_payload_size; }
+    size_t max_payload_size() const { return max_payload_size_; }
 
     // Parse a frame from buffer
     // Returns:
     //   MQ_SUCCESS: frame parsed successfully, bytes_consumed indicates consumed bytes
     //   MQ_ERR_WS_INCOMPLETE_FRAME: need more data
+    //   MQ_ERR_WS_FRAME_TOO_LARGE: payload above max_payload_size, checked before buffering it
     //   Other negative values: parsing error
     int parse_frame(const uint8_t* data, size_t data_len, WebSocketFrame& frame, size_t& bytes_consumed);
+
+    // Parse only the frame header (no payload and no size cap), for callers that stream the payload.
+    int parse_header(const uint8_t* data, size_t data_len, WebSocketFrame& frame, size_t& header_len);
 
     // Serialize a frame to buffer
     // Returns:
@@ -120,8 +127,6 @@ private:
     MQTTAllocator* allocator_;
     size_t max_payload_size_;
 
-    // Internal parsing helpers
-    int parse_header(const uint8_t* data, size_t data_len, WebSocketFrame& frame, size_t& header_len);
     int parse_payload(const uint8_t* data, size_t data_len, WebSocketFrame& frame, size_t header_len, size_t& bytes_consumed);
 };
 

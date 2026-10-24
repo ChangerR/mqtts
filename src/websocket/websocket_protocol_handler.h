@@ -162,7 +162,6 @@ private:
     // Configuration
     int ping_interval_ms_;      // Ping interval in milliseconds
     int pong_timeout_ms_;       // Pong timeout in milliseconds
-    size_t max_message_size_;   // Maximum message size
 
     // Statistics
     WebSocketStatistics stats_;
@@ -171,6 +170,13 @@ private:
     WebSocketOpcode fragmented_opcode_;
     Buffer fragmented_payload_;
     bool is_fragmenting_;
+
+    // MQTT 子协议下二进制帧的载荷边到边交给桥。WS 帧和消息边界对 MQTT 没有意义，
+    // 桥按 MQTT 报文切分并按 max_packet_size 限长，所以这里既不攒整帧也不攒整条消息。
+    uint64_t stream_remaining_ = 0;
+    uint8_t stream_mask_[4] = {0, 0, 0, 0};
+    size_t stream_mask_offset_ = 0;
+    bool stream_masked_ = false;
 
     mqtt::ConnectionWatch watch_;
     std::chrono::steady_clock::time_point established_{};
@@ -182,6 +188,10 @@ private:
     void arm_connection_watch();
     int64_t read_deadline_ms() const;
     int reject_oversized_mqtt_fragment(size_t incoming);
+    bool streams_mqtt_payload(const WebSocketFrame& header) const;
+    int begin_streamed_frame(const WebSocketFrame& header, size_t header_len);
+    int pump_streamed_payload();
+    void compact_read_buffer();
     void finish_session_takeover();
     void signal_takeover_done();
 };

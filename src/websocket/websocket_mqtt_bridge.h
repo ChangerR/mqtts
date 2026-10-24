@@ -72,6 +72,8 @@ public:
     // Handle incoming WebSocket messages
     int handle_websocket_text(const std::string& client_id, const std::string& message);
     int handle_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data);
+    // MQTT 子协议：WS 帧只是字节流，可以分多次喂入；按 MQTT 报文边界切分，单个报文受 max_packet_size 约束。
+    int handle_websocket_binary(const std::string& client_id, const uint8_t* data, size_t len);
 
     // Handle incoming MQTT messages (from session manager)
     int handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet);
@@ -121,7 +123,7 @@ private:
     std::string format_text_protocol(const std::string& topic, const std::vector<uint8_t>& payload);
 
     // Binary MQTT packet handling
-    int parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet,
+    int parse_mqtt_packet(const uint8_t* data, size_t len, mqtt::Packet*& packet,
                           uint8_t protocol_version_hint);
     int handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet);
     int handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet);
@@ -163,8 +165,9 @@ private:
                                                mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>>;
     SubscriptionMap subscriptions_;
 
-    // Pending MQTT byte stream per WebSocket client (for fragmented/partial packets)
-    using BinaryBuffer = std::vector<uint8_t, mqtt::mqtt_stl_allocator<uint8_t>>;
+    // 重组缓冲不走每连接分配器。解析器还要再拷一份载荷，两份都算进 client_max_size 会让
+    // 一条低于 max_packet_size 的 PUBLISH 直接 bad_alloc。这里按报文上限预留，用完即释放。
+    using BinaryBuffer = std::vector<uint8_t>;
     using BinaryBufferMap = std::unordered_map<std::string, BinaryBuffer,
                                                std::hash<std::string>,
                                                std::equal_to<std::string>,

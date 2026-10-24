@@ -123,6 +123,11 @@ int WebSocketFrameParser::parse_frame(const uint8_t* data, size_t data_len,
         return ret;
     }
 
+    if (frame.payload_length > max_payload_size_) {
+        LOG_ERROR("Payload length {} exceeds maximum {}", frame.payload_length, max_payload_size_);
+        return MQ_ERR_WS_FRAME_TOO_LARGE;
+    }
+
     // Parse payload
     ret = parse_payload(data, data_len, frame, header_len, bytes_consumed);
     if (ret != MQ_SUCCESS) {
@@ -188,12 +193,6 @@ int WebSocketFrameParser::parse_header(const uint8_t* data, size_t data_len,
             frame.payload_length = (frame.payload_length << 8) | static_cast<uint64_t>(data[offset + i]);
         }
         offset += 8;
-    }
-
-    // Check payload length limit
-    if (frame.payload_length > max_payload_size_) {
-        LOG_ERROR("Payload length {} exceeds maximum {}", frame.payload_length, max_payload_size_);
-        return MQ_ERR_WS_FRAME_TOO_LARGE;
     }
 
     // Control frames must have payload <= 125 bytes

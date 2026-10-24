@@ -19,6 +19,8 @@
 
 namespace websocket {
 
+static const size_t kRetainedPendingCapacity = 64 * 1024;
+
 static int mqtt_packet_total_length(const uint8_t* data, size_t data_len, size_t max_packet,
                                      size_t& total_len) {
     total_len = 0;
@@ -299,7 +301,10 @@ uint8_t WebSocketMQTTBridge::mqtt_protocol_version(const std::string& client_id)
 }
 
 int WebSocketMQTTBridge::send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason) {
-    if (mqtt_protocol_version(client_id) < 5 || format_ != MessageFormat::MQTT_PACKET) {
+    // MQTT-3.14.0-1: nothing may precede a successful CONNACK, so an unknown version means silence.
+    auto version = client_protocol_versions_.find(client_id);
+    if (version == client_protocol_versions_.end() || version->second < 5 ||
+        format_ != MessageFormat::MQTT_PACKET) {
         return MQ_SUCCESS;
     }
     mqtt::DisconnectPacket packet(allocator_);
@@ -451,9 +456,14 @@ int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id, con
 }
 
 int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data) {
+    return handle_websocket_binary(client_id, data.data(), data.size());
+}
+
+int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, const uint8_t* data,
+                                                 size_t len) {
     stats_.ws_messages_received++;
 
-    LOG_DEBUG("Handling WebSocket binary message from {}: {} bytes", client_id, data.size());
+    LOG_DEBUG("Handling WebSocket binary data from {}: {} bytes", client_id, len);
 
     if (format_ != MessageFormat::MQTT_PACKET) {
         LOG_ERROR("Binary messages only supported in MQTT_PACKET format");
@@ -461,15 +471,25 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         return MQ_ERR_INVALID_STATE;
     }
 
-    BinaryBuffer& pending = pending_binary_buffers_[client_id];
-    pending.insert(pending.end(), data.begin(), data.end());
+    pending_binary_buffers_[client_id].insert(pending_binary_buffers_[client_id].end(), data,
+                                              data + len);
 
     int ret = MQ_SUCCESS;
-    while (!pending.empty()) {
+    while (true) {
+        // Packet handlers may unregister the client (DISCONNECT, takeover), which drops this buffer.
+        auto pending_it = pending_binary_buffers_.find(client_id);
+        if (pending_it == pending_binary_buffers_.end() || pending_it->second.empty()) {
+            break;
+        }
+        BinaryBuffer& pending = pending_it->second;
         size_t packet_len = 0;
         ret = mqtt_packet_total_length(pending.data(), pending.size(),
                                        effective_limits().max_packet_size, packet_len);
         if (ret == MQ_ERR_PACKET_INCOMPLETE) {
+            // Size the buffer once from Remaining Length; geometric growth would briefly hold ~3x the packet.
+            if (packet_len > pending.capacity()) {
+                pending.reserve(packet_len);
+            }
             LOG_TRACE("MQTT packet for client {} is incomplete, buffered {} bytes",
                       client_id, pending.size());
             return MQ_SUCCESS;
@@ -498,25 +518,23 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         }
 
         if (session_manager_) session_manager_->note_bytes_received(packet_len);
-        std::vector<uint8_t> packet_bytes(pending.begin(), pending.begin() + packet_len);
         uint8_t protocol_version_hint = 5;
         auto version_it = client_protocol_versions_.find(client_id);
         if (version_it != client_protocol_versions_.end()) {
             protocol_version_hint = version_it->second;
         }
         mqtt::Packet* packet = nullptr;
-        ret = parse_mqtt_packet(packet_bytes, packet, protocol_version_hint);
+        ret = parse_mqtt_packet(pending.data(), packet_len, packet, protocol_version_hint);
+        // The parser copies everything it keeps, so the bytes can go before the handlers run.
+        pending.erase(pending.begin(), pending.begin() + packet_len);
+        if (pending.empty() && pending.capacity() > kRetainedPendingCapacity) {
+            BinaryBuffer(pending.get_allocator()).swap(pending);
+        }
         if (ret != MQ_SUCCESS || !packet) {
-            if (ret == MQ_ERR_PACKET_INCOMPLETE) {
-                // Parser认为不完整时，继续等待更多数据，避免误断开。
-                LOG_TRACE("Parser reported incomplete MQTT packet for client {}, buffered {} bytes",
-                          client_id, pending.size());
-                return MQ_SUCCESS;
-            }
-
+            // Remaining Length already says the packet is complete; a short field inside it is malformed.
             LOG_ERROR("Failed to parse MQTT packet for client {}: {}", client_id, ret);
             stats_.translation_errors++;
-            pending.erase(pending.begin(), pending.begin() + packet_len);
+            pending.clear();
             if (session_manager_) {
                 session_manager_->note_malformed_disconnect();
             }
@@ -531,7 +549,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
             packet->type != mqtt::PacketType::CONNECT) {
             LOG_WARN("WebSocket client {} must send CONNECT as first MQTT packet", client_id);
             destroy_packet(packet);
-            pending.erase(pending.begin(), pending.begin() + packet_len);
+            pending.clear();
             stats_.translation_errors++;
             if (session_manager_) {
                 session_manager_->note_malformed_disconnect();
@@ -663,7 +681,6 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         }
 
         destroy_packet(packet);
-        pending.erase(pending.begin(), pending.begin() + packet_len);
         if (auto* handler = get_handler(client_id)) {
             handler->observe_mqtt_packet();
         }
@@ -760,7 +777,7 @@ std::string WebSocketMQTTBridge::format_text_protocol(const std::string& topic,
     return text.str();
 }
 
-int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqtt::Packet*& packet,
+int WebSocketMQTTBridge::parse_mqtt_packet(const uint8_t* data, size_t len, mqtt::Packet*& packet,
                                            uint8_t protocol_version_hint) {
     if (!allocator_) {
         LOG_ERROR("Allocator is null");
@@ -769,7 +786,7 @@ int WebSocketMQTTBridge::parse_mqtt_packet(const std::vector<uint8_t>& data, mqt
 
     mqtt::MQTTParser parser(allocator_);
     parser.set_protocol_version_hint(protocol_version_hint);
-    return parser.parse_packet(data.data(), data.size(), &packet);
+    return parser.parse_packet(data, len, &packet);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet) {
@@ -1273,6 +1290,11 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     }
     std::string topic = mqtt::from_mqtt_string(packet->topic_name);
     std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
+    // 转发会在同一条连接的预算里再放一份载荷。先释放解析器那份，否则接近上限的 PUBLISH 会 bad_alloc。
+    {
+        mqtt::MQTTByteVector released(packet->payload.get_allocator());
+        packet->payload.swap(released);
+    }
     int ret =
         publish_message(client_id, topic, payload, packet->qos, packet->retain, packet->properties);
     const auto protocol = client_protocol_versions_.find(client_id);
@@ -1390,7 +1412,11 @@ int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id,
         }
         found->second.discard = packet->reason_code == mqtt::ReasonCode::NormalDisconnection;
     }
+    WebSocketProtocolHandler* handler = get_handler(client_id);
     unregister_handler(client_id);
+    if (handler) {
+        handler->close_connection();
+    }
     return MQ_SUCCESS;
 }
 
