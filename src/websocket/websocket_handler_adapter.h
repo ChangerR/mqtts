@@ -31,6 +31,8 @@ public:
 
 protected:
     int transmit_serialized(const uint8_t* data, size_t size) override;
+    int transmit_parts(const uint8_t* head, size_t head_size, const uint8_t* body,
+                       size_t body_size) override;
 
 private:
     MQTTAllocator* adapter_allocator_;

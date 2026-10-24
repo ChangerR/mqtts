@@ -8,6 +8,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mqtt_coroutine_utils.h"
@@ -40,6 +41,7 @@ struct WorkerSendTask
   std::chrono::steady_clock::time_point retry_after;
   std::shared_ptr<auth::AuthorizationRequest> authorization;
   uint64_t ticket = 0;
+  bool window_delay_counted = false;
 
   WorkerSendTask() : enqueue_time(std::chrono::steady_clock::now()) {}
 
@@ -152,6 +154,9 @@ class SendWorkerPool
     uint64_t next_ticket = 0;
     // Ticket order also covers messages arriving while the head is deferred.
     std::unordered_map<std::string, std::deque<uint64_t>> client_order;
+    // Clients whose head task waits for the receive window; their queued tasks
+    // are not aging while they cannot be sent.
+    std::unordered_set<std::string> window_blocked;
     runtime::TaskHandle worker_task;
   };
 

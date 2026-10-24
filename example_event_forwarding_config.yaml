@@ -17,12 +17,12 @@ mqtt:
   wildcard_subscription_available: true  
   subscription_identifier_available: true  
   shared_subscription_available: false  
-  topic_alias_maximum: 65535  
+  topic_alias_maximum: 16  
   receive_maximum: 65535  
 
 # 内存配置
 memory:
-  client_max_size: 1048576  
+  client_max_size: 2228224  
 
 # 日志配置
 log:

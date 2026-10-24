@@ -31,10 +31,20 @@ void WebSocketHandlerAdapter::request_session_takeover(
 }
 
 int WebSocketHandlerAdapter::transmit_serialized(const uint8_t* data, size_t size) {
+    return transmit_parts(data, size, nullptr, 0);
+}
+
+int WebSocketHandlerAdapter::transmit_parts(const uint8_t* head, size_t head_size,
+                                            const uint8_t* body, size_t body_size) {
     if (!ws_handler_ || !ws_handler_->is_connected()) {
         return MQ_ERR_SESSION_INVALID_HANDLER;
     }
-    std::vector<uint8_t> payload(data, data + size);
+    std::vector<uint8_t> payload;
+    payload.reserve(head_size + body_size);
+    payload.insert(payload.end(), head, head + head_size);
+    if (body_size > 0) {
+        payload.insert(payload.end(), body, body + body_size);
+    }
     const int ret = ws_handler_->send_binary(payload);
     if (ret == MQ_SUCCESS && bridge_) {
         bridge_->get_statistics().ws_messages_sent.fetch_add(1, std::memory_order_relaxed);

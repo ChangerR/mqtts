@@ -9,7 +9,7 @@ mqtt:
   keep_alive_default: 60
 
 memory:
-  client_max_size: 1048576
+  client_max_size: 2228224
 
 log:
   level: "info"
