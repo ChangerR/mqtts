@@ -1836,14 +1836,8 @@ int MQTTProtocolHandler::send_parts_with_lock(const uint8_t* head, size_t head_s
     bool expected = false;
     if (write_lock_acquired_.compare_exchange_weak(expected, true)) {
       // 成功获取锁，执行发送操作
-      int result = socket_->send(head, static_cast<int>(head_size));
-      if (result == 0 && body_size > 0) {
-        result = socket_->send(body, static_cast<int>(body_size));
-        if (result != 0) {
-          // The header is already on the wire; the stream cannot be resynchronized.
-          socket_->close();
-        }
-      }
+      const int result = socket_->send_parts(head, static_cast<int>(head_size), body,
+                                             static_cast<int>(body_size));
 
       // 释放锁并通知等待的协程
       write_lock_acquired_.store(false);
