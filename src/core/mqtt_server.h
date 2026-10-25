@@ -68,4 +68,9 @@ class MQTTServer
   // 连接管理
   std::atomic<int> current_connections_;
   mqtt::auth::AuthManager* auth_manager_ = nullptr;
+
+  // 多个事件线程抢同一个监听 fd 时，后醒来的线程会一直赢。按成功 accept 轮转，
+  // 下一条连接交给另一个线程，跨线程接管才不会靠运气。
+  std::atomic<uint32_t> accept_slot_next_{0};
+  std::atomic<uint64_t> accept_turn_{0};
 };
