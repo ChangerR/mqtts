@@ -2,8 +2,8 @@
 #include <vector>
 #include "mqtt_allocator.h"
 #include "mqtt_packet.h"
-#include "mqtt_stl_allocator.h"
 #include "mqtt_server.h"
+#include "mqtt_stl_allocator.h"
 
 // Test fixture for allocator tests
 class MQTTAllocatorTest : public ::testing::Test
@@ -161,7 +161,7 @@ TEST_F(MQTTAllocatorTest, AllocatedPacketNestedPublishReturnsToBaseline)
 TEST(ClientContextTest, DestroyRemovesRegistrationFromOwningAllocator)
 {
   MQTTAllocator parent("context_owner", MQTTMemoryTag::MEM_TAG_ROOT);
-  const std::vector<std::string> ids = {"short", "client_127.0.0.1_42001"};
+  const std::vector<std::string> ids = {"short", "client_127.0.0.1_42001_1"};
   for (const auto& id : ids) {
     MQTTAllocator* child = parent.create_child(id, MQTTMemoryTag::MEM_TAG_CLIENT);
     ASSERT_NE(child, nullptr);
@@ -179,6 +179,25 @@ TEST(ClientContextTest, DestroyRemovesRegistrationFromOwningAllocator)
     ASSERT_NE(parent.create_child(id, MQTTMemoryTag::MEM_TAG_CLIENT), nullptr);
     parent.remove_child(id);
   }
+}
+
+TEST(ClientContextTest, DestroyUnregistersByAllocatorIdWhenContextIdDiffers)
+{
+  MQTTAllocator parent("context_owner", MQTTMemoryTag::MEM_TAG_ROOT);
+  MQTTAllocator* child = parent.create_child("registered_id", MQTTMemoryTag::MEM_TAG_CLIENT);
+  ASSERT_NE(child, nullptr);
+  void* storage = child->allocate(sizeof(ClientContext));
+  ASSERT_NE(storage, nullptr);
+  ClientContext* ctx = new (storage) ClientContext();
+  ctx->allocator = child;
+  ctx->client_id = "stale_or_moved";
+  ctx->trace_id = "context-lifecycle-unit-test";
+
+  ClientContext::destroy(ctx);
+
+  EXPECT_EQ(parent.get_child("registered_id"), nullptr);
+  EXPECT_EQ(parent.get_child("stale_or_moved"), nullptr);
+  EXPECT_EQ(parent.get_total_memory_usage(), 0u);
 }
 
 // Google Test main function

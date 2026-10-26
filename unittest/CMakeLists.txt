@@ -15,7 +15,7 @@ add_executable(test_mqtt_allocator test_mqtt_allocator.cpp)
 add_executable(test_mqtt_socket_state test_mqtt_socket_state.cpp
     ${CMAKE_SOURCE_DIR}/src/core/mqtt_socket.cpp)
 target_include_directories(test_mqtt_socket_state PRIVATE ${TEST_INCLUDE_DIRS})
-target_link_libraries(test_mqtt_socket_state PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
+target_link_libraries(test_mqtt_socket_state PRIVATE mqtt_parser mqtt_runtime tcmalloc_minimal gtest pthread dl)
 add_test(NAME test_mqtt_socket_state COMMAND test_mqtt_socket_state)
 add_executable(test_mqtt_parser test_mqtt_parser.cpp)
 add_executable(test_mqtt_runtime test_mqtt_runtime.cpp)

@@ -2,17 +2,16 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <utility>
 #include <unordered_map>
 #include <vector>
 #include "logger.h"
 #include "mqtt_allocator.h"
+#include "mqtt_auth_interface.h"
 #include "mqtt_config.h"
 #include "mqtt_define.h"
 #include "mqtt_parser.h"
 #include "mqtt_runtime.h"
 #include "mqtt_socket.h"
-#include "mqtt_auth_interface.h"
 
 class MQTTServer;
 
@@ -27,11 +26,16 @@ struct ClientContext
   MQTTAllocator* allocator;  // Client-specific allocator
 
   // Run on the owning event thread, after the handler and socket are released.
+  // The child is unregistered by the allocator id, not by ctx->client_id, so a
+  // destroyed or moved-from context string cannot leave a registration behind.
   static void destroy(ClientContext* ctx)
   {
+    if (MQ_ISNULL(ctx) || MQ_ISNULL(ctx->allocator)) {
+      return;
+    }
     MQTTAllocator* allocator = ctx->allocator;
     MQTTAllocator* parent = allocator->get_parent();
-    std::string id = std::move(ctx->client_id);
+    const std::string id = allocator->get_id();
     ctx->~ClientContext();
     allocator->deallocate(ctx, sizeof(ClientContext));
     if (parent) {

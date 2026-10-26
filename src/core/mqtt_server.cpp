@@ -1,6 +1,6 @@
 #include "mqtt_server.h"
-#include <algorithm>
 #include <arpa/inet.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -11,9 +11,9 @@
 #include "mqtt_protocol_handler.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_string_utils.h"
-#include "websocket_protocol_handler.h"
-#include "websocket_mqtt_bridge.h"
 #include "websocket_handler_adapter.h"
+#include "websocket_mqtt_bridge.h"
+#include "websocket_protocol_handler.h"
 using namespace mqtt;
 
 namespace {
@@ -72,6 +72,15 @@ static void release_finished_client_tasks()
   tasks.resize(kept);
 }
 
+static std::string make_client_allocator_id(const std::string& ip, int port)
+{
+  // Thread-local root allocators already isolate ids across event threads.
+  // Keep the endpoint in the id for logs, and append a per-thread sequence so
+  // a reused ephemeral port cannot collide with a child that is still alive.
+  static thread_local uint64_t seq = 0;
+  return "client_" + ip + "_" + std::to_string(port) + "_" + std::to_string(++seq);
+}
+
 static std::string generate_session_trace_id(const std::string& client_ip, int client_port)
 {
   const uint64_t ts_us =
@@ -89,11 +98,7 @@ static std::string generate_session_trace_id(const std::string& client_ip, int c
 }  // namespace
 
 MQTTServer::MQTTServer(const std::string& host, int port)
-    : server_socket_(NULL),
-      running_(false),
-      host_(host),
-      port_(port),
-      current_connections_(0)
+    : server_socket_(NULL), running_(false), host_(host), port_(port), current_connections_(0)
 {
   // 使用默认配置
   server_config_.bind_address = host;
@@ -249,9 +254,8 @@ void* MQTTServer::accept_routine(void* arg)
   const int workers = configured_workers > 1 ? configured_workers : 1;
   const uint32_t slot = server->accept_slot_next_.fetch_add(1, std::memory_order_relaxed);
   while (server->running_ && MQ_SUCC(ret)) {
-    if (workers > 1 &&
-        (server->accept_turn_.load(std::memory_order_relaxed) % static_cast<uint64_t>(workers)) !=
-            slot) {
+    if (workers > 1 && (server->accept_turn_.load(std::memory_order_relaxed) %
+                        static_cast<uint64_t>(workers)) != slot) {
       // 不在监听 fd 上等待，避免和当前轮次的线程一起被 epoll 唤醒后再抢走连接。
       mqtt::runtime::current_runtime().wait(-1, 0, 1);
       continue;
@@ -280,19 +284,21 @@ void* MQTTServer::accept_routine(void* arg)
       LOG_ERROR("Failed to accept connection");
       break;
     }
+    if (MQ_ISNULL(client)) {
+      continue;
+    }
     if (workers > 1) {
       server->accept_turn_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Create client-specific allocator with a memory limit
     std::string client_id =
-        "client_" + client->get_peer_addr() + "_" +
-        std::to_string(client->get_peer_port());  // Use IP and port for client ID
+        make_client_allocator_id(client->get_peer_addr(), client->get_peer_port());
     MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
     MQTTAllocator* client_allocator = root->create_child(
         client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, server->memory_config_.client_max_size);
     if (MQ_ISNULL(client_allocator)) {
-      LOG_ERROR("Failed to create client allocator");
+      LOG_ERROR("Failed to create client allocator {}", client_id);
       if (MQ_NOT_NULL(client)) {
         client->~MQTTSocket();  // Call destructor explicitly
         root->deallocate(client, sizeof(MQTTSocket));
@@ -375,10 +381,7 @@ void* MQTTServer::client_routine(void* arg)
   // 减少连接计数
   ctx->server->remove_connection();
 
-  // Cleanup client allocator and context
-  if (MQ_NOT_NULL(ctx->allocator)) {
-    ClientContext::destroy(ctx);
-  }
+  ClientContext::destroy(ctx);
 
   return NULL;
 }
@@ -408,19 +411,19 @@ void MQTTServer::handle_client(ClientContext* ctx)
     // Create WebSocket protocol handler
     websocket::WebSocketProtocolHandler* ws_handler =
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketProtocolHandler)))
-        websocket::WebSocketProtocolHandler(ctx->allocator);
+            websocket::WebSocketProtocolHandler(ctx->allocator);
 
     // Create WebSocket-MQTT bridge
     websocket::WebSocketMQTTBridge* bridge =
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketMQTTBridge)))
-        websocket::WebSocketMQTTBridge(ctx->allocator, websocket::MessageFormat::JSON);
+            websocket::WebSocketMQTTBridge(ctx->allocator, websocket::MessageFormat::JSON);
     bridge->set_protocol_limits(&ctx->server->protocol_limits_);
     bridge->set_auth_manager(ctx->server->auth_manager_);
 
     // Create adapter to bridge WebSocket and MQTT protocol handlers
     websocket::WebSocketHandlerAdapter* adapter =
         new (ctx->allocator->allocate(sizeof(websocket::WebSocketHandlerAdapter)))
-        websocket::WebSocketHandlerAdapter(ctx->allocator, bridge, ws_handler, ctx->client_id);
+            websocket::WebSocketHandlerAdapter(ctx->allocator, bridge, ws_handler, ctx->client_id);
     adapter->set_protocol_limits(&ctx->server->protocol_limits_);
 
     // Initialize bridge with session manager
@@ -455,8 +458,8 @@ void MQTTServer::handle_client(ClientContext* ctx)
             ret = MQ_ERR_MEMORY_ALLOC;
           }
           if (ret != 0) {
-            LOG_WARN("WebSocket client {}:{} disconnected with error: {}",
-                     ctx->client_ip, ctx->client_port, ret);
+            LOG_WARN("WebSocket client {}:{} disconnected with error: {}", ctx->client_ip,
+                     ctx->client_port, ret);
           }
 
         } else {
