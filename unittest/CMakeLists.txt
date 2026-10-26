@@ -127,6 +127,9 @@ target_include_directories(test_mqtt_session_manager_router PRIVATE ${TEST_INCLU
 # WebSocket 测试的头文件搜索路径
 target_include_directories(test_websocket_frame PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_websocket_mqtt_bridge PRIVATE ${TEST_INCLUDE_DIRS} ${YAML_CPP_INCLUDE_DIRS})
+# Both tests check everything with assert(); RelWithDebInfo's NDEBUG would compile the checks out.
+target_compile_options(test_websocket_frame PRIVATE -UNDEBUG)
+target_compile_options(test_websocket_mqtt_bridge PRIVATE -UNDEBUG)
 
 # 链接必要的库（包括Google Test）
 target_link_libraries(test_connect PRIVATE mqtt_parser tcmalloc_minimal gtest pthread)
@@ -232,6 +235,8 @@ add_test(NAME test_phase0_baseline COMMAND test_phase0_baseline)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME mqtt_protocol_baseline_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/protocol_baseline_integration.py --broker $<TARGET_FILE:mqtts>)
 set_tests_properties(mqtt_protocol_baseline_integration PROPERTIES TIMEOUT 300)
+add_test(NAME mqtt_connection_lifecycle_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/connection_lifecycle_integration.py --broker $<TARGET_FILE:mqtts>)
+set_tests_properties(mqtt_connection_lifecycle_integration PROPERTIES TIMEOUT 180)
 add_executable(test_mqtt_auth_grpc test_mqtt_auth_grpc.cpp)
 target_link_libraries(test_mqtt_auth_grpc PRIVATE mqtt_auth mqtt_runtime tcmalloc_minimal pthread dl)
 add_test(NAME test_mqtt_auth_grpc COMMAND test_mqtt_auth_grpc)

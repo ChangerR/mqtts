@@ -183,7 +183,9 @@ void MQTTProtocolHandler::request_session_takeover(const std::shared_ptr<Session
 
 int MQTTProtocolHandler::fail_protocol(ReasonCode reason, int err)
 {
-  if (negotiated_protocol_version_ >= 5 && socket_ && socket_->is_connected()) {
+  // MQTT-3.14.0-1: no DISCONNECT before a successful CONNACK, so a fault during CONNECT just closes.
+  if (connected_ && version_negotiated_ && negotiated_protocol_version_ >= 5 && socket_ &&
+      socket_->is_connected()) {
     (void)send_disconnect(reason);
   }
   if (session_manager_ && !protocol_fault_noted_) {
@@ -1513,7 +1515,8 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
         socket_->close();
       return MQ_ERR_PACKET_INVALID;
     }
-    session_expiry_interval_ = packet->properties.session_expiry_interval;
+    session_expiry_interval_ = std::min(packet->properties.session_expiry_interval,
+                                        session_manager_->durable_store()->max_session_expiry());
     session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_,
                                                   packet->properties.session_expiry_interval);
   } else if (packet->properties.has_session_expiry_interval) {

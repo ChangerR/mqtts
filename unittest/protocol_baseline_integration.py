@@ -85,6 +85,8 @@ class Broker:
             journal = self.root / 'journal'
             journal.mkdir()
             config['persistence'] = {'enabled': True, 'path': str(journal)}
+            if isinstance(persistence, dict):
+                config['persistence'].update(persistence)
         if retain is not None:
             config['retain'] = retain
         (self.root / 'config.json').write_text(json.dumps(config))
@@ -185,9 +187,13 @@ class Broker:
 
 
 class Client:
-    def __init__(self, port, websocket=False):
+    def __init__(self, port, websocket=False, rcvbuf=None):
         self.websocket = websocket
-        self.sock = socket.create_connection(('127.0.0.1', port), timeout=3)
+        self.sock = socket.socket()
+        self.sock.settimeout(3)
+        if rcvbuf is not None:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        self.sock.connect(('127.0.0.1', port))
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.wire = b''
         self.mqtt = b''
@@ -556,11 +562,18 @@ def rewritten_keep_alive(binary, websocket):
         try:
             connect(legacy, 'ka-legacy-zero', 4, 0)
             legacy.send(b'\xc0\x00')
-            time.sleep(4)
-            legacy.send(b'\xc0\x00')
             header, _ = legacy.read(2)
             if header != 0xD0:
-                raise AssertionError('3.x K=0 was disconnected: 0x%02x' % header)
+                raise AssertionError('PINGRESP missing: 0x%02x' % header)
+            # Twice keep_alive_max with no traffic: a rewritten K would have closed it by now.
+            time.sleep(4)
+            try:
+                legacy.send(b'\xc0\x00')
+                header, _ = legacy.read(2)
+            except (EOFError, ConnectionError, OSError) as error:
+                raise AssertionError('3.x K=0 was disconnected: %r' % error)
+            if header != 0xD0:
+                raise AssertionError('3.x K=0 got 0x%02x instead of PINGRESP' % header)
         finally:
             legacy.close()
     finally:
@@ -571,13 +584,11 @@ def malformed(binary, websocket):
     broker = Broker(binary, 1, 30, 10)
     bad = b'\x30\x80\x80\x80\x80'
     try:
+        # MQTT-3.14.0-1: before CONNACK the broker closes without sending DISCONNECT.
         early = Client(broker.port, websocket)
         try:
             early.send(b'\xc0\x00')
-            header, body = early.read(2)
-            if disconnect_reason(header, body) != 0x82:
-                raise AssertionError(body.hex())
-            early.expect_closed(1)
+            early.expect_closed(2)
         finally:
             early.close()
 

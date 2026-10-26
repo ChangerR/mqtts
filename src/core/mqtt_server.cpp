@@ -244,7 +244,17 @@ void* MQTTServer::accept_routine(void* arg)
   }
 
   LOG_INFO("Accept routine started, running: {}", server->running_);
+  const int configured_workers = server->server_config_.thread_count;
+  const int workers = configured_workers > 1 ? configured_workers : 1;
+  const uint32_t slot = server->accept_slot_next_.fetch_add(1, std::memory_order_relaxed);
   while (server->running_ && MQ_SUCC(ret)) {
+    if (workers > 1 &&
+        (server->accept_turn_.load(std::memory_order_relaxed) % static_cast<uint64_t>(workers)) !=
+            slot) {
+      // 不在监听 fd 上等待，避免和当前轮次的线程一起被 epoll 唤醒后再抢走连接。
+      mqtt::runtime::current_runtime().wait(-1, 0, 1);
+      continue;
+    }
     // 检查连接数限制
     if (!server->can_accept_connection()) {
       LOG_WARN("达到最大连接数限制 ({}), 等待连接释放", server->server_config_.max_connections);
@@ -268,6 +278,9 @@ void* MQTTServer::accept_routine(void* arg)
       }
       LOG_ERROR("Failed to accept connection");
       break;
+    }
+    if (workers > 1) {
+      server->accept_turn_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Create client-specific allocator with a memory limit

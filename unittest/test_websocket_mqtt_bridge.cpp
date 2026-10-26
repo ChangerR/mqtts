@@ -161,6 +161,65 @@ void test_text_publish_counted_when_forward_fails() {
     std::cout << "WebSocket publish receipt counting test passed" << std::endl;
 }
 
+void test_parser_incomplete_is_malformed() {
+    std::cout << "\nTesting a framed packet the parser calls incomplete is malformed..." << std::endl;
+
+    MQTTAllocator allocator("test_ws_bridge_incomplete", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    websocket::WebSocketMQTTBridge bridge(&allocator);
+    bridge.set_message_format(websocket::MessageFormat::MQTT_PACKET);
+
+    // Remaining Length 6 is complete, but the SUBSCRIBE lacks its options byte.
+    const std::vector<uint8_t> truncated{0x82, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01, 0x61};
+    int ret = bridge.handle_websocket_binary("ws_client_incomplete", truncated);
+    assert(ret != MQ_SUCCESS);
+    assert(bridge.get_statistics().translation_errors.load() == 1);
+
+    // Nothing is left behind to swallow later bytes.
+    const std::vector<uint8_t> tail(4096, 0xC0);
+    ret = bridge.handle_websocket_binary("ws_client_incomplete", tail.data(), 1);
+    assert(ret == MQ_SUCCESS);
+    assert(allocator.get_memory_usage() < 4096);
+
+    std::cout << "Parser-incomplete packet test passed" << std::endl;
+}
+
+void test_oversized_packet_rejected_before_buffering() {
+    std::cout << "\nTesting an oversized packet is rejected from its fixed header..." << std::endl;
+
+    MQTTAllocator allocator("test_ws_bridge_oversize", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    mqtt::ProtocolLimits limits;
+    limits.max_packet_size = 256;
+    websocket::WebSocketMQTTBridge bridge(&allocator);
+    bridge.set_protocol_limits(&limits);
+    bridge.set_message_format(websocket::MessageFormat::MQTT_PACKET);
+
+    // PUBLISH with Remaining Length 301; only the fixed header has arrived.
+    const uint8_t header[] = {0x30, 0xAD, 0x02};
+    int ret = bridge.handle_websocket_binary("ws_client_oversize", header, sizeof(header));
+    assert(ret == MQ_ERR_PACKET_TOO_LARGE);
+
+    std::cout << "Oversized packet header test passed" << std::endl;
+}
+
+void test_packet_streamed_byte_by_byte() {
+    std::cout << "\nTesting one packet streamed one byte at a time..." << std::endl;
+
+    MQTTAllocator allocator("test_ws_bridge_stream", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
+    websocket::WebSocketMQTTBridge bridge(&allocator);
+    bridge.set_message_format(websocket::MessageFormat::MQTT_PACKET);
+
+    // A 200-byte PUBLISH before CONNECT: every prefix is buffered, the last byte is rejected.
+    std::vector<uint8_t> publish{0x30, 0xC5, 0x01, 0x00, 0x01, 't', 0x00};
+    publish.resize(200, 'x');
+    for (size_t i = 0; i + 1 < publish.size(); ++i) {
+        assert(bridge.handle_websocket_binary("ws_client_stream", &publish[i], 1) == MQ_SUCCESS);
+    }
+    int ret = bridge.handle_websocket_binary("ws_client_stream", &publish.back(), 1);
+    assert(ret == MQ_ERR_PROTOCOL);
+
+    std::cout << "Byte-by-byte packet test passed" << std::endl;
+}
+
 }  // namespace
 
 int main() {
@@ -171,6 +230,9 @@ int main() {
     test_reject_multiple_packets_before_connect();
     test_first_packet_must_be_connect();
     test_text_publish_counted_when_forward_fails();
+    test_parser_incomplete_is_malformed();
+    test_oversized_packet_rejected_before_buffering();
+    test_packet_streamed_byte_by_byte();
 
     std::cout << "\nAll WebSocket MQTT bridge tests passed!" << std::endl;
     return 0;

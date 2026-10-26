@@ -1413,9 +1413,8 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
       release_reservation();
       return posted;
     }
-    const auto takeover_deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::milliseconds(existing->get_session_removal_timeout_ms());
-    bool finished = false;
+    // One deadline covers both waits, so CONNECT always gets its CONNACK within the removal timeout.
+    const auto takeover_deadline = deadline;
     while (!gate->done.load(std::memory_order_acquire)) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= takeover_deadline) {
@@ -1431,15 +1430,14 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
       }
       runtime::current_runtime().wait(-1, 0, slice_ms);
     }
-    finished = gate->done.load(std::memory_order_acquire);
-    if (!finished) {
-      if (gate->cancel()) {
-        LOG_WARN("Timed out waiting for session takeover of {}", client_id_str);
+    if (!gate->done.load(std::memory_order_acquire)) {
+      // Once armed, the old thread finishes its own cleanup and only touches the gate, never us.
+      const bool armed = !gate->cancel();
+      if (!armed || !gate->done.load(std::memory_order_acquire)) {
+        LOG_WARN("Timed out waiting for session takeover of {} ({})", client_id_str,
+                 armed ? "old connection still cleaning up" : "request never picked up");
         release_reservation();
         return MQ_ERR_TIMEOUT_V2;
-      }
-      while (!gate->done.load(std::memory_order_acquire)) {
-        runtime::current_runtime().wait(-1, 0, 10);
       }
     }
   }
