@@ -1042,6 +1042,19 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id, const
     connack.type = mqtt::PacketType::CONNACK;
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::Success;
+    if (packet->protocol_version >= 5 &&
+        ((packet->properties.has_receive_maximum && packet->properties.receive_maximum == 0) ||
+         (packet->properties.has_maximum_packet_size &&
+          packet->properties.maximum_packet_size == 0))) {
+        LOG_WARN("WebSocket client {} uses Receive Maximum or Maximum Packet Size 0", client_id);
+        connack.reason_code = mqtt::ReasonCode::ProtocolError;
+        send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        if (auto* socket_handler = get_handler(client_id)) {
+            socket_handler->close_connection();
+        }
+        return MQ_ERR_PROTOCOL;
+    }
     if (session_manager_ && session_manager_->durable_store()) {
       // Persistent consumers use TCP; reject unsupported WS session semantics.
       if ((packet->protocol_version < 5 && !packet->flags.clean_start) ||

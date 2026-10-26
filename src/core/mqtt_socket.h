@@ -17,6 +17,10 @@ class MQTTSocket
   int connect(const char* ip, int port);
   int send(const uint8_t* buf, int len, int timeout_ms = 5000);
   int send(const mqtt::MQTTBuffer& buffer);
+  // 一次系统调用提交头部和载荷。拆成两次 send 时，TCP_NODELAY 会把头部单独推出去，
+  // 对端一次 recv 就只看到没有载荷的 PUBLISH。
+  int send_parts(const uint8_t* head, int head_len, const uint8_t* body, int body_len,
+                 int timeout_ms = 5000);
   int recv(char* buf, int& len);
   // deadline_ms 是 steady_clock 的绝对毫秒。小于 0 表示一直等到有数据或对端关闭。
   // 截止时间到了仍没有字节时返回 MQ_ERR_SOCKET_TIMEOUT，不把套接字标成断开。

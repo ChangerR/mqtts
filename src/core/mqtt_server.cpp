@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include "logger.h"
 #include "mqtt_allocator.h"
 #include "mqtt_memory_tags.h"
@@ -451,7 +452,14 @@ void MQTTServer::handle_client(ClientContext* ctx)
           LOG_INFO("WebSocket handler adapter registered for client {}", ctx->client_id);
 
           // Process WebSocket connection
-          ret = ws_handler->process();
+          try {
+            ret = ws_handler->process();
+          } catch (const std::bad_alloc&) {
+            LOG_WARN("WebSocket client {}:{} exceeded its memory budget, closing", ctx->client_ip,
+                     ctx->client_port);
+            ctx->client->close();
+            ret = MQ_ERR_MEMORY_ALLOC;
+          }
           if (ret != 0) {
             LOG_WARN("WebSocket client {}:{} disconnected with error: {}",
                      ctx->client_ip, ctx->client_port, ret);
@@ -500,7 +508,14 @@ void MQTTServer::handle_client(ClientContext* ctx)
       handler->set_connection_established(established);
 
       // Process packets until client disconnects
-      ret = handler->process();
+      try {
+        ret = handler->process();
+      } catch (const std::bad_alloc&) {
+        LOG_WARN("Client {}:{} exceeded its memory budget, closing", ctx->client_ip,
+                 ctx->client_port);
+        ctx->client->close();
+        ret = MQ_ERR_MEMORY_ALLOC;
+      }
       if (ret != 0) {
         LOG_WARN("Client {}:{} disconnected with error: {}", ctx->client_ip, ctx->client_port, ret);
       }

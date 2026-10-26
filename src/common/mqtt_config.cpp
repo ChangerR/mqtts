@@ -379,13 +379,19 @@ int ConfigManager::validate()
     return -1;
   }
 
-  constexpr size_t kPacketHeadroom = 64 * 1024;
-  if (config_.memory.client_max_size <= kPacketHeadroom ||
-      static_cast<size_t>(config_.mqtt.max_packet_size) >
-          config_.memory.client_max_size - kPacketHeadroom) {
-    note_error("mqtt.max_packet_size (" + std::to_string(config_.mqtt.max_packet_size) +
-               ") 不得超过 memory.client_max_size (" +
-               std::to_string(config_.memory.client_max_size) + ") - 64KiB");
+  // 读缓冲和解析出的报文各占一份完整报文，另留 128KiB 给连接状态（别名表、会话属性、遗嘱等）。
+  constexpr uint64_t kConnectionStateHeadroom = 128 * 1024;
+  const uint64_t required_client_memory =
+      2 * static_cast<uint64_t>(config_.mqtt.max_packet_size) + kConnectionStateHeadroom;
+  if (static_cast<uint64_t>(config_.memory.client_max_size) < required_client_memory) {
+    note_error("memory.client_max_size (" + std::to_string(config_.memory.client_max_size) +
+               ") 至少要为 2 × mqtt.max_packet_size + 128KiB (" +
+               std::to_string(required_client_memory) + ")");
+    return -1;
+  }
+
+  if (config_.mqtt.connect_timeout_seconds < 1) {
+    note_error("mqtt.connect_timeout_seconds 必须大于等于 1");
     return -1;
   }
 

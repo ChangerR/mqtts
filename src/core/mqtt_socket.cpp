@@ -199,6 +199,88 @@ int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
   return ret;
 }
 
+int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* body, int body_len,
+                           int timeout_ms)
+{
+  if (head_len < 0 || body_len < 0 || (head_len == 0 && body_len == 0) ||
+      (head_len > 0 && !head) || (body_len > 0 && !body)) {
+    return MQ_ERR_INVALID_ARGS;
+  }
+  if (body_len == 0) {
+    return send(head, head_len, timeout_ms);
+  }
+  if (head_len == 0) {
+    return send(body, body_len, timeout_ms);
+  }
+
+  int ret = MQ_SUCCESS;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(std::max(1, timeout_ms));
+  const int total = head_len + body_len;
+  if (!connected_) {
+    LOG_ERROR("Socket not connected");
+    return MQ_ERR_SOCKET;
+  }
+
+  int sent_total = 0;
+  while (sent_total < total && MQ_SUCC(ret)) {
+    if (!connected_ || fd_ < 0 || std::chrono::steady_clock::now() >= deadline) {
+      ret = MQ_ERR_SOCKET_SEND;
+      break;
+    }
+    struct iovec iov[2];
+    int iovcnt = 0;
+    if (sent_total < head_len) {
+      iov[iovcnt].iov_base = const_cast<uint8_t*>(head) + sent_total;
+      iov[iovcnt].iov_len = static_cast<size_t>(head_len - sent_total);
+      ++iovcnt;
+      iov[iovcnt].iov_base = const_cast<uint8_t*>(body);
+      iov[iovcnt].iov_len = static_cast<size_t>(body_len);
+      ++iovcnt;
+    } else {
+      const int body_off = sent_total - head_len;
+      iov[iovcnt].iov_base = const_cast<uint8_t*>(body) + body_off;
+      iov[iovcnt].iov_len = static_cast<size_t>(body_len - body_off);
+      ++iovcnt;
+    }
+    struct msghdr message = {};
+    message.msg_iov = iov;
+    message.msg_iovlen = static_cast<size_t>(iovcnt);
+    const int sent = ::sendmsg(fd_, &message, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (sent < 0) {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        int write_poll = static_cast<int>(::syscall(SYS_fcntl, fd_, F_DUPFD_CLOEXEC, 0));
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - std::chrono::steady_clock::now())
+                             .count();
+        int ready = write_poll < 0 ? -1
+                                   : mqtt::runtime::current_runtime().wait_writable(
+                                         write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
+        if (write_poll >= 0)
+          ::close(write_poll);
+        if (ready < 0) {
+          LOG_ERROR("Failed to wait for socket to become writable - {}", strerror(errno));
+          connected_ = false;
+          ret = MQ_ERR_SOCKET_SEND;
+        }
+        continue;
+      }
+      LOG_ERROR("Failed to send data - {}", strerror(errno));
+      connected_ = false;
+      ret = MQ_ERR_SOCKET_SEND;
+    } else if (sent == 0) {
+      ret = MQ_ERR_SOCKET_SEND;
+    } else {
+      sent_total += sent;
+    }
+  }
+  if (MQ_FAIL(ret))
+    close();
+  return ret;
+}
+
 int MQTTSocket::send(const mqtt::MQTTBuffer& buffer)
 {
   if (buffer.empty()) {

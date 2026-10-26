@@ -46,7 +46,9 @@ struct Properties
   uint32_t session_expiry_interval = 0;
   bool has_session_expiry_interval = false;
   uint16_t receive_maximum = 0;
+  bool has_receive_maximum = false;
   uint32_t maximum_packet_size = 0;
+  bool has_maximum_packet_size = false;
   uint16_t topic_alias_maximum = 0;
   uint16_t topic_alias = 0;
   // 区分“没有 Topic Alias 属性”和“属性存在且值为 0”。值为 0 是非法别名。
@@ -107,7 +109,9 @@ struct Properties
       : session_expiry_interval(other.session_expiry_interval),
         has_session_expiry_interval(other.has_session_expiry_interval),
         receive_maximum(other.receive_maximum),
+        has_receive_maximum(other.has_receive_maximum),
         maximum_packet_size(other.maximum_packet_size),
+        has_maximum_packet_size(other.has_maximum_packet_size),
         topic_alias_maximum(other.topic_alias_maximum),
         topic_alias(other.topic_alias),
         has_topic_alias(other.has_topic_alias),

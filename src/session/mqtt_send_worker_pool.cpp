@@ -208,10 +208,12 @@ void SendWorkerPool::worker_main(size_t worker_id)
       auto start_time = std::chrono::steady_clock::now();
       const std::string client = from_mqtt_string(task.get_target_client_id());
       bool behind_head = false;
+      bool head_window_blocked = false;
       {
         CoroLockGuard lock(&worker->queue_mutex);
         const auto order = worker->client_order.find(client);
         behind_head = order != worker->client_order.end() && order->second.front() != task.ticket;
+        head_window_blocked = worker->window_blocked.count(client) != 0;
       }
       const bool too_early = start_time < task.retry_after;
       const int result = behind_head || too_early ? MQ_ERR_AUTH_PENDING : process_send_task(task, worker_id);
@@ -219,20 +221,27 @@ void SendWorkerPool::worker_main(size_t worker_id)
 
       if (result == MQ_ERR_AUTH_PENDING || result == MQ_ERR_INFLIGHT_WINDOW) {
         // 授权未完成和出站窗口满都把任务按 ticket 顺序放回队尾，短暂后再试。
-        // 窗口满时记一次延迟。队头还没轮到、或还没到 retry_after 的不算新的延迟。
+        // 每条消息只在第一次被窗口挡住时记一次延迟，5 ms 一次的重试不算新的延迟。
         if (!behind_head && !too_early) {
           task.retry_after = end_time + std::chrono::milliseconds(5);
-          if (result == MQ_ERR_INFLIGHT_WINDOW && session_manager_) {
-            session_manager_->protocol_counters().inflight_window_delays.fetch_add(
-                1, std::memory_order_relaxed);
+          if (result == MQ_ERR_INFLIGHT_WINDOW && !task.window_delay_counted) {
+            task.window_delay_counted = true;
+            if (session_manager_) {
+              session_manager_->protocol_counters().inflight_window_delays.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
           }
         }
         // 接收窗口堵住时不要沿用最初入队时间，否则慢确认会把还没发出的 QoS 报文判成过期。
-        if (result == MQ_ERR_INFLIGHT_WINDOW) {
+        // 排在被窗口挡住的队头后面的任务同样还没轮到，也一起刷新。
+        if (result == MQ_ERR_INFLIGHT_WINDOW || (behind_head && head_window_blocked)) {
           task.enqueue_time = end_time;
         }
         {
           CoroLockGuard lock(&worker->queue_mutex);
+          if (result == MQ_ERR_INFLIGHT_WINDOW) {
+            worker->window_blocked.insert(client);
+          }
           worker->task_queue.push(std::move(task));
         }
         if (++deferred_scanned >= worker->pending_count.load()) {
@@ -249,6 +258,7 @@ void SendWorkerPool::worker_main(size_t worker_id)
           order->second.pop_front();
           if (order->second.empty()) worker->client_order.erase(order);
         }
+        worker->window_blocked.erase(client);
         --worker->pending_count;
       }
 
