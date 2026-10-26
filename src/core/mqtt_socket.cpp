@@ -13,8 +13,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <limits>
 #include <chrono>
+#include <limits>
 
 #include "mqtt_runtime.h"
 
@@ -71,11 +71,15 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
 
 int MQTTSocket::accept(MQTTSocket*& client)
 {
+  client = nullptr;
   int ret = MQ_SUCCESS;
-  struct sockaddr addr;
-  socklen_t len = sizeof(struct sockaddr);
+  struct sockaddr_in addr;
 
   while (true) {
+    // accept() writes the actual address length back into len. Reset it every
+    // iteration, including after a discarded connection, or later accepts can
+    // get a truncated endpoint.
+    socklen_t len = sizeof(addr);
     int fd = mqtt::runtime::current_runtime().accept(fd_, (struct sockaddr*)&addr, &len);
 
     if (fd < 0) {
@@ -110,7 +114,14 @@ int MQTTSocket::accept(MQTTSocket*& client)
 
       new (client) MQTTSocket(fd);
       client->connected_ = true;
-      client->update_peer_info();
+      if (!client->set_peer_endpoint(reinterpret_cast<struct sockaddr*>(&addr), len)) {
+        // Discard this connection without stopping the listener or registering
+        // an allocator under an unknown endpoint.
+        client->~MQTTSocket();
+        root->deallocate(client, sizeof(MQTTSocket));
+        client = nullptr;
+        continue;
+      }
       client->set_nonblocking(true);
       LOG_DEBUG("Accepted new connection from {}:{}", client->get_peer_addr(),
                 client->get_peer_port());
@@ -134,7 +145,10 @@ int MQTTSocket::connect(const char* ip, int port)
     close();
   } else {
     connected_ = true;
-    update_peer_info();
+    if (!update_peer_info()) {
+      close();
+      return MQ_ERR_SOCKET_CONNECT;
+    }
     LOG_INFO("Connected to {}:{}", ip, port);
   }
 
@@ -144,8 +158,8 @@ int MQTTSocket::connect(const char* ip, int port)
 int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
 {
   int ret = MQ_SUCCESS;
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(std::max(1, timeout_ms));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
 
   if (!connected_) {
     LOG_ERROR("Socket not connected");
@@ -169,9 +183,13 @@ int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
           // libco does not forward F_DUPFD_CLOEXEC in its fcntl hook.
           int write_poll = static_cast<int>(::syscall(SYS_fcntl, fd_, F_DUPFD_CLOEXEC, 0));
           auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               deadline - std::chrono::steady_clock::now()).count();
-          int ready = write_poll < 0 ? -1 : mqtt::runtime::current_runtime().wait_writable(
-              write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
+                               deadline - std::chrono::steady_clock::now())
+                               .count();
+          int ready =
+              write_poll < 0
+                  ? -1
+                  : mqtt::runtime::current_runtime().wait_writable(
+                        write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
           if (write_poll >= 0)
             ::close(write_poll);
           if (ready < 0) {
@@ -202,8 +220,8 @@ int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
 int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* body, int body_len,
                            int timeout_ms)
 {
-  if (head_len < 0 || body_len < 0 || (head_len == 0 && body_len == 0) ||
-      (head_len > 0 && !head) || (body_len > 0 && !body)) {
+  if (head_len < 0 || body_len < 0 || (head_len == 0 && body_len == 0) || (head_len > 0 && !head) ||
+      (body_len > 0 && !body)) {
     return MQ_ERR_INVALID_ARGS;
   }
   if (body_len == 0) {
@@ -214,8 +232,8 @@ int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* bod
   }
 
   int ret = MQ_SUCCESS;
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(std::max(1, timeout_ms));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
   const int total = head_len + body_len;
   if (!connected_) {
     LOG_ERROR("Socket not connected");
@@ -255,9 +273,11 @@ int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* bod
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                              deadline - std::chrono::steady_clock::now())
                              .count();
-        int ready = write_poll < 0 ? -1
-                                   : mqtt::runtime::current_runtime().wait_writable(
-                                         write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
+        int ready =
+            write_poll < 0
+                ? -1
+                : mqtt::runtime::current_runtime().wait_writable(
+                      write_poll, int(std::max<int64_t>(1, std::min<int64_t>(100, remaining))));
         if (write_poll >= 0)
           ::close(write_poll);
         if (ready < 0) {
@@ -393,14 +413,14 @@ int MQTTSocket::recv(mqtt::MQTTBuffer& buffer, int& len)
   }
 
   if (read_len > 0 && !buffer.resize(old_size + static_cast<size_t>(read_len))) {
-    LOG_ERROR("Failed to resize MQTTBuffer after recv, old_size={}, read_len={}", old_size, read_len);
+    LOG_ERROR("Failed to resize MQTTBuffer after recv, old_size={}, read_len={}", old_size,
+              read_len);
     return MQ_ERR_MEMORY_ALLOC;
   }
 
   len = read_len;
   return MQ_SUCCESS;
 }
-
 
 bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
 {
@@ -424,7 +444,8 @@ bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
     return false;
   }
 
-  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' && peek_buffer[3] == ' ');
+  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' &&
+          peek_buffer[3] == ' ');
 }
 
 int MQTTSocket::close()
@@ -536,15 +557,40 @@ int MQTTSocket::get_peer_port() const
   return peer_port_;
 }
 
-void MQTTSocket::update_peer_info()
+bool MQTTSocket::set_peer_endpoint(const struct sockaddr* addr, socklen_t len)
 {
-  struct sockaddr_in addr;
+  peer_addr_.clear();
+  peer_port_ = 0;
+  if (!addr || len < static_cast<socklen_t>(sizeof(struct sockaddr_in))) {
+    LOG_WARN("Unsupported socket peer address");
+    return false;
+  }
+  if (addr->sa_family != AF_INET) {
+    LOG_WARN("Unsupported socket peer address");
+    return false;
+  }
+
+  const struct sockaddr_in* in = reinterpret_cast<const struct sockaddr_in*>(addr);
+  char address[INET_ADDRSTRLEN];
+  if (!inet_ntop(AF_INET, &in->sin_addr, address, sizeof(address))) {
+    LOG_WARN("Failed to format socket peer address - {}", strerror(errno));
+    return false;
+  }
+  peer_addr_ = address;
+  peer_port_ = ntohs(in->sin_port);
+  return true;
+}
+
+bool MQTTSocket::update_peer_info()
+{
+  struct sockaddr_in addr = {};
   socklen_t len = sizeof(addr);
 
-  if (getpeername(fd_, (struct sockaddr*)&addr, &len) == 0) {
-    peer_addr_ = inet_ntoa(addr.sin_addr);
-    peer_port_ = ntohs(addr.sin_port);
+  if (getpeername(fd_, (struct sockaddr*)&addr, &len) != 0) {
+    LOG_WARN("Failed to get socket peer endpoint - {}", strerror(errno));
+    return false;
   }
+  return set_peer_endpoint(reinterpret_cast<struct sockaddr*>(&addr), len);
 }
 
 int MQTTSocket::check_socket_error()
