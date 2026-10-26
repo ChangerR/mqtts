@@ -2,6 +2,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 #include "logger.h"
@@ -24,6 +25,19 @@ struct ClientContext
   std::string client_ip;
   int client_port;
   MQTTAllocator* allocator;  // Client-specific allocator
+
+  // Run on the owning event thread, after the handler and socket are released.
+  static void destroy(ClientContext* ctx)
+  {
+    MQTTAllocator* allocator = ctx->allocator;
+    MQTTAllocator* parent = allocator->get_parent();
+    std::string id = std::move(ctx->client_id);
+    ctx->~ClientContext();
+    allocator->deallocate(ctx, sizeof(ClientContext));
+    if (parent) {
+      parent->remove_child(id);
+    }
+  }
 };
 
 class MQTTServer

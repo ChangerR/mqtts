@@ -71,6 +71,7 @@ int MQTTSocket::listen(const char* ip, int port, bool reuse, int backlog)
 
 int MQTTSocket::accept(MQTTSocket*& client)
 {
+  client = nullptr;
   int ret = MQ_SUCCESS;
   struct sockaddr addr;
   socklen_t len = sizeof(struct sockaddr);
@@ -110,7 +111,14 @@ int MQTTSocket::accept(MQTTSocket*& client)
 
       new (client) MQTTSocket(fd);
       client->connected_ = true;
-      client->update_peer_info();
+      if (!client->update_peer_info()) {
+        // Discard this connection without stopping the listener or registering
+        // an allocator under an unknown endpoint.
+        client->~MQTTSocket();
+        root->deallocate(client, sizeof(MQTTSocket));
+        client = nullptr;
+        continue;
+      }
       client->set_nonblocking(true);
       LOG_DEBUG("Accepted new connection from {}:{}", client->get_peer_addr(),
                 client->get_peer_port());
@@ -134,7 +142,10 @@ int MQTTSocket::connect(const char* ip, int port)
     close();
   } else {
     connected_ = true;
-    update_peer_info();
+    if (!update_peer_info()) {
+      close();
+      return MQ_ERR_SOCKET_CONNECT;
+    }
     LOG_INFO("Connected to {}:{}", ip, port);
   }
 
@@ -536,15 +547,29 @@ int MQTTSocket::get_peer_port() const
   return peer_port_;
 }
 
-void MQTTSocket::update_peer_info()
+bool MQTTSocket::update_peer_info()
 {
-  struct sockaddr_in addr;
+  peer_addr_.clear();
+  peer_port_ = 0;
+  struct sockaddr_in addr = {};
   socklen_t len = sizeof(addr);
 
-  if (getpeername(fd_, (struct sockaddr*)&addr, &len) == 0) {
-    peer_addr_ = inet_ntoa(addr.sin_addr);
-    peer_port_ = ntohs(addr.sin_port);
+  if (getpeername(fd_, (struct sockaddr*)&addr, &len) != 0) {
+    LOG_WARN("Failed to get socket peer endpoint - {}", strerror(errno));
+    return false;
   }
+  if (len < sizeof(addr) || addr.sin_family != AF_INET) {
+    LOG_WARN("Unsupported socket peer address");
+    return false;
+  }
+  char address[INET_ADDRSTRLEN];
+  if (!inet_ntop(AF_INET, &addr.sin_addr, address, sizeof(address))) {
+    LOG_WARN("Failed to format socket peer address - {}", strerror(errno));
+    return false;
+  }
+  peer_addr_ = address;
+  peer_port_ = ntohs(addr.sin_port);
+  return true;
 }
 
 int MQTTSocket::check_socket_error()

@@ -339,9 +339,7 @@ void* MQTTServer::accept_routine(void* arg)
         root->deallocate(client, sizeof(MQTTSocket));
       }
       server->remove_connection();
-      ctx->~ClientContext();
-      client_allocator->deallocate(ctx, sizeof(ClientContext));
-      root->remove_child(client_id);
+      ClientContext::destroy(ctx);
       continue;
     }
 
@@ -379,11 +377,7 @@ void* MQTTServer::client_routine(void* arg)
 
   // Cleanup client allocator and context
   if (MQ_NOT_NULL(ctx->allocator)) {
-    MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
-    // Free the context using the same allocator
-    ctx->~ClientContext();  // Call destructor explicitly
-    ctx->allocator->deallocate(ctx, sizeof(ClientContext));
-    root->remove_child(ctx->client_id);
+    ClientContext::destroy(ctx);
   }
 
   return NULL;

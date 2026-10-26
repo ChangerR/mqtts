@@ -8,7 +8,7 @@
 class MQTTSocket
 {
  public:
-  MQTTSocket(int fd = -1) : fd_(fd), connected_(true) {}
+  MQTTSocket(int fd = -1) : fd_(fd), connected_(fd >= 0), peer_port_(0) {}
   virtual ~MQTTSocket() { close(); }
 
   // Socket operations
@@ -53,5 +53,5 @@ class MQTTSocket
   int peer_port_;
 
   int check_socket_error();
-  void update_peer_info();
+  bool update_peer_info();
 };
