@@ -165,6 +165,10 @@ static void test_native_upgrade(const std::string& path, uint32_t version)
   checkpoint.u32(1);
   checkpoint.text("topic");
   checkpoint.u8(1);
+  if (version >= 5) {
+    checkpoint.u8(kStoredSubscriptionVersion);
+    checkpoint.u8(1);
+  }
   checkpoint.u32(1);
   checkpoint.u64(2);
   checkpoint.u32(7);
@@ -231,9 +235,11 @@ static void test_retain_journal(const std::string& path)
     auto session = store.connect("reader", "owner", false, 60);
     assert(session.ok);
     assert(store.subscribe("reader", session.epoch, "keep/#", 1).ok);
-    auto queued = store.enqueue_directed("reader", "directed-wire", soon);
+    auto other_epoch = store.enqueue_directed("reader", session.epoch + 1, "directed-wire", soon);
+    assert(other_epoch.ok && other_epoch.stale && !other_epoch.present);
+    auto queued = store.enqueue_directed("reader", session.epoch, "directed-wire", soon);
     assert(queued.ok && queued.present && queued.accepted_targets == 1);
-    auto absent = store.enqueue_directed("missing", "directed-wire", 0);
+    auto absent = store.enqueue_directed("missing", 1, "directed-wire", 0);
     assert(absent.ok && !absent.present);
     auto batch = store.fetch("reader", session.epoch, 0, 8);
     assert(batch.ok && batch.deliveries.size() == 1);
@@ -275,7 +281,8 @@ static void test_retain_journal(const std::string& path)
   // A complete corrupt frame stays on disk. A torn tail is the incomplete
   // header/body case AppendLog already repairs.
   auto logs = log_files(path + "/retain");
-  if (logs.empty()) {
+  const bool added_tail = logs.empty();
+  if (added_tail) {
     DurableStore store(cfg);
     assert(store.put_retained("keep/tail", 0, "body", "pub", 0, true).ok);
   }
@@ -288,7 +295,7 @@ static void test_retain_journal(const std::string& path)
   }
   {
     DurableStore store(cfg);
-    assert(store.retained_messages().size() == 3 || store.retained_messages().size() == 4);
+    assert(store.retained_messages().size() == (added_tail ? 4u : 3u));
   }
   assert(std::filesystem::file_size(logs[0]) == good_size);
   {
@@ -580,6 +587,221 @@ static void test_incremental_routing_and_expiry(const std::string& path)
   // Unrelated filters remain live after repeated branch removal and node reuse.
   assert(store.publish("other-63/15/leaf", "still routed", "writer", 0).targets.size() == 1);
 }
+
+static bool has_retained(const DurableStore& store, const std::string& topic, const std::string& payload)
+{
+  for (const auto& m : store.retained_messages())
+    if (m.topic == topic && m.payload == payload)
+      return true;
+  return false;
+}
+
+static mqtt::PersistenceConfig retain_config(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 1;
+  cfg.segment_bytes = 8192;
+  cfg.max_disk_bytes = 1024 * 1024;
+  cfg.checkpoint_interval_ms = 600000;
+  return cfg;
+}
+
+// RETAIN snapshots and retain log records written before properties were stored.
+static void test_legacy_retain_encodings(const std::string& path)
+{
+  using namespace mqtt::journal;
+  auto cfg = retain_config(path);
+  { DurableStore store(cfg); }
+  Encoder snapshot;
+  snapshot.text("MQTTS-RETAIN-1");
+  snapshot.u64(0);
+  snapshot.u32(2);
+  snapshot.text("old/snap");
+  snapshot.u8(1);
+  snapshot.u64(0);
+  snapshot.text("from-snapshot");
+  snapshot.text("pub");
+  snapshot.text("old/cleared");
+  snapshot.u8(0);
+  snapshot.u64(0);
+  snapshot.text("cleared-later");
+  snapshot.text("pub");
+  atomic_file(path + "/RETAIN", checked(snapshot.data));
+  {
+    AppendLog log(path + "/retain", cfg.segment_bytes, cfg.max_disk_bytes / 32);
+    Encoder set;
+    set.u8(kRetainSet);
+    set.u8(1);
+    set.text("old/log");
+    set.u8(1);
+    set.u64(0);
+    set.text("from-log");
+    set.text("writer");
+    Encoder clear;
+    clear.u8(kRetainClear);
+    clear.u8(1);
+    clear.text("old/cleared");
+    assert(log.append(set.data, [](bool ok, const Location&) { assert(ok); })->wait());
+    assert(log.append(clear.data, [](bool ok, const Location&) { assert(ok); })->wait());
+  }
+  DurableStore store(cfg);
+  auto kept = store.retained_messages();
+  assert(kept.size() == 2);
+  assert(has_retained(store, "old/snap", "from-snapshot"));
+  assert(has_retained(store, "old/log", "from-log"));
+  for (const auto& item : kept)
+    assert(item.properties.content_type.empty() && item.properties.user_properties.empty());
+  store.checkpoint();
+  assert(read_file(path + "/RETAIN", 4096).find("MQTTS-RETAIN-2") != std::string::npos);
+}
+
+// Fill the retain log until a record smaller than the mutations under test no
+// longer fits. A rejected 1000-byte put used to leave a gap a clear could occupy.
+// wait=false only reserves bytes, so this finishes before the 1 s pressure checkpoint.
+static void fill_retain_log(DurableStore& store)
+{
+  for (int i = 0; i < 10000; ++i) {
+    auto filled = store.clear_retained("a", false);
+    if (!filled.ok) {
+      assert(filled.quota_exceeded);
+      assert(filled.error.find("disk") != std::string::npos);
+      return;
+    }
+  }
+  assert(!"retain log never filled");
+}
+
+// Regression: a refused replace or clear used to erase the committed value, and the
+// next checkpoint made that loss permanent.
+static void test_retain_failure_keeps_previous(const std::string& path)
+{
+  {
+    auto cfg = retain_config(path + "-oversize");
+    cfg.max_request_bytes = 4096;
+    {
+      DurableStore store(cfg);
+      assert(store.put_retained("keep", 1, "old-value", "pub", 0, true).ok);
+      auto replaced = store.put_retained("keep", 1, std::string(5000, 'n'), "pub", 0, true);
+      assert(!replaced.ok && replaced.quota_exceeded);
+      auto async = store.put_retained("keep", 0, std::string(5000, 'n'), "pub", 0, false);
+      assert(!async.ok && async.quota_exceeded && !async.commit);
+      assert(has_retained(store, "keep", "old-value"));
+      store.checkpoint();
+    }
+    DurableStore store(cfg);
+    assert(has_retained(store, "keep", "old-value"));
+  }
+  const char* cases[] = {"clear", "expired", "replace"};
+  for (const char* name : cases) {
+    const std::string mode(name);
+    // One segment for the retain log, so admission fills in a few dozen records.
+    auto cfg = retain_config(path + "-" + mode);
+    cfg.segment_bytes = 4096;
+    cfg.max_disk_bytes = 32 * 4096;
+    {
+      DurableStore store(cfg);
+      assert(store.put_retained("keep", 1, "old-value", "pub", 0, true).ok);
+      fill_retain_log(store);
+      DurableStore::Result refused;
+      if (mode == "clear")
+        refused = store.clear_retained("keep", true);
+      else if (mode == "expired")
+        refused = store.put_retained("keep", 1, "new", "pub", DurableStore::now_ms() - 1, true);
+      else
+        refused = store.put_retained("keep", 1, "new-value", "pub", 0, true);
+      assert(!refused.ok && refused.quota_exceeded);
+      assert(has_retained(store, "keep", "old-value"));
+      store.checkpoint();
+      // The rolled-back value is still the latest mutation for later writes.
+      assert(store.put_retained("other", 1, "after", "pub", 0, true).ok);
+    }
+    DurableStore store(cfg);
+    assert(has_retained(store, "keep", "old-value"));
+    assert(has_retained(store, "other", "after"));
+  }
+  {
+    auto cfg = retain_config(path + "-deferred");
+    DurableStore store(cfg);
+    auto pending = store.put_retained("keep", 0, "v1", "pub", 0, false);
+    assert(pending.ok && pending.commit);
+    DurableStore::await(pending);
+    assert(pending.ok && !pending.commit);
+    assert(has_retained(store, "keep", "v1"));
+  }
+}
+
+// Regression: each put walked and copied every retained payload to size the snapshot.
+static void test_retain_put_cost(const std::string& path)
+{
+  mqtt::PersistenceConfig cfg;
+  cfg.path = path;
+  cfg.partitions = 4;
+  cfg.max_disk_bytes = 4294967296ULL;
+  cfg.checkpoint_interval_ms = 600000;
+  DurableStore store(cfg);
+  const std::string payload(256, 'p');
+  const int total = 50000, batch = 1000;
+  auto timed = [&](int from) {
+    auto start = std::chrono::steady_clock::now();
+    for (int i = from; i < from + batch; ++i) {
+      auto r = store.put_retained("store/" + std::to_string(i), 0, payload, "pub", 0, false);
+      assert(r.ok);
+    }
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() /
+           batch;
+  };
+  const double first = timed(0);
+  for (int i = batch; i < total - batch; ++i)
+    assert(store.put_retained("store/" + std::to_string(i), 0, payload, "pub", 0, false).ok);
+  const double last = timed(total - batch);
+  std::printf("durable put_retained: %.1f us/op at empty, %.1f us/op at %d entries\n", first, last,
+              total);
+  assert(last < first * 10 + 200.0);
+}
+
+// Regression: the retain log and both RETAIN generations sat outside max_disk_bytes.
+static void test_retain_disk_budget(const std::string& path)
+{
+  auto cfg = retain_config(path);
+  {
+    DurableStore store(cfg);
+    for (int i = 0;; ++i) {
+      auto r = store.put_retained("big/" + std::to_string(i), 1, std::string(2000, 'b'), "pub", 0, true);
+      if (!r.ok) {
+        assert(r.quota_exceeded);
+        break;
+      }
+      if (i % 4 == 3)
+        store.checkpoint();
+      assert(i < 10000);
+    }
+    store.checkpoint();
+  }
+  const auto retain_bytes = std::filesystem::file_size(path + "/RETAIN");
+  assert(retain_bytes <= cfg.max_disk_bytes / 32);
+  uintmax_t total = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(path)) {
+    if (!entry.is_regular_file())
+      continue;
+    const auto name = entry.path().filename().string();
+    // FORMAT and the ownership lock sit outside the data budget.
+    if (name == "FORMAT" || name.find(".lock") != std::string::npos)
+      continue;
+    total += entry.file_size();
+  }
+  assert(total <= cfg.max_disk_bytes);
+  bool rejected = false;
+  try {
+    auto bad = retain_config(path + "-small");
+    bad.max_disk_bytes = 31 * 8192;
+    DurableStore store(bad);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
 int main()
 {
   char dir[] = "/tmp/mqtts-store-XXXXXX";
@@ -721,6 +943,11 @@ int main()
   test_native_upgrade(std::string(dir) + "/upgrade-2", 2);
   test_native_upgrade(std::string(dir) + "/upgrade-3", 3);
   test_native_upgrade(std::string(dir) + "/upgrade-4", 4);
+  test_native_upgrade(std::string(dir) + "/upgrade-5", 5);
+  test_legacy_retain_encodings(std::string(dir) + "/retain-v1");
+  test_retain_failure_keeps_previous(std::string(dir) + "/retain-failure");
+  test_retain_put_cost(std::string(dir) + "/retain-cost");
+  test_retain_disk_budget(std::string(dir) + "/retain-budget");
   test_subscription_options(std::string(dir) + "/options");
   test_retain_journal(std::string(dir) + "/retain");
   test_legacy_subscription_journal(std::string(dir) + "/legacy-options");

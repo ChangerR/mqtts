@@ -273,5 +273,7 @@ add_test(NAME mqtt_durable_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CUR
 set_tests_properties(mqtt_durable_integration PROPERTIES TIMEOUT 90)
 add_test(NAME mqtt_durable_review_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/durable_review_integration.py --broker $<TARGET_FILE:mqtts> --fault-library $<TARGET_FILE:mqtt_journal_fault>)
 set_tests_properties(mqtt_durable_review_integration PROPERTIES TIMEOUT 90)
+add_test(NAME mqtt_retain_replay_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/retain_replay_lock.py --broker $<TARGET_FILE:mqtts>)
+set_tests_properties(mqtt_retain_replay_lock PROPERTIES TIMEOUT 60)
 
 set_property(TARGET test_send_publish PROPERTY CXX_STANDARD 17)
