@@ -1,20 +1,24 @@
 #pragma once
+#include <sys/socket.h>
 #include <cstdint>
 #include <string>
-#include "mqtt_buffer.h"
 #include "logger.h"
+#include "mqtt_buffer.h"
 #include "mqtt_define.h"
 
 class MQTTSocket
 {
  public:
-  MQTTSocket(int fd = -1) : fd_(fd), connected_(true) {}
+  MQTTSocket(int fd = -1) : fd_(fd), connected_(fd >= 0), peer_port_(0) {}
   virtual ~MQTTSocket() { close(); }
 
   // Socket operations
   int listen(const char* ip, int port, bool reuse = true, int backlog = 128);
   int accept(MQTTSocket*& client);  // 返回具体错误码
   int connect(const char* ip, int port);
+  // Fill peer_addr_/peer_port_ from an address already returned by accept().
+  // getpeername() can fail after a RST even when accept() supplied the endpoint.
+  bool set_peer_endpoint(const struct sockaddr* addr, socklen_t len);
   int send(const uint8_t* buf, int len, int timeout_ms = 5000);
   int send(const mqtt::MQTTBuffer& buffer);
   // 一次系统调用提交头部和载荷。拆成两次 send 时，TCP_NODELAY 会把头部单独推出去，
@@ -53,5 +57,5 @@ class MQTTSocket
   int peer_port_;
 
   int check_socket_error();
-  void update_peer_info();
+  bool update_peer_info();
 };
