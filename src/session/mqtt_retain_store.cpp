@@ -80,12 +80,33 @@ RetainStore::Node* RetainStore::descend(Node* node, const std::vector<std::strin
   return node;
 }
 
-bool RetainStore::erase_at(Node* node, const std::vector<std::string>& segments, size_t index, size_t& bytes)
+void RetainStore::unindex(const Node* node, const std::string& topic)
+{
+  if (node->has_message && node->has_expiry) {
+    expiry_.erase(ExpiryKey(node->expires_at, topic));
+  }
+}
+
+void RetainStore::account_removed(size_t bytes)
+{
+  if (message_count_ > 0) {
+    --message_count_;
+  }
+  if (total_bytes_ >= bytes) {
+    total_bytes_ -= bytes;
+  } else {
+    total_bytes_ = 0;
+  }
+}
+
+bool RetainStore::erase_at(Node* node, const std::string& topic, const std::vector<std::string>& segments,
+                           size_t index, size_t& bytes)
 {
   if (index == segments.size()) {
     if (!node->has_message) {
       return false;
     }
+    unindex(node, topic);
     bytes = node->payload_bytes;
     node->content.reset();
     node->has_message = false;
@@ -98,7 +119,7 @@ bool RetainStore::erase_at(Node* node, const std::vector<std::string>& segments,
     return false;
   }
   size_t removed = 0;
-  const bool erased = erase_at(found->second, segments, index + 1, removed);
+  const bool erased = erase_at(found->second, topic, segments, index + 1, removed);
   if (erased && found->second->children.empty() && !found->second->has_message) {
     delete found->second;
     node->children.erase(found);
@@ -160,6 +181,12 @@ RetainWriteResult RetainStore::install(const RetainedCopy& copy)
   if (!node) {
     node = descend(&root_, segments, true);
   }
+  if (copy.has_expiry) {
+    expiry_.insert(ExpiryKey(copy.expires_at, copy.topic));
+  }
+  if (replacing && !(copy.has_expiry && node->has_expiry && node->expires_at == copy.expires_at)) {
+    unindex(node, copy.topic);
+  }
   node->content = copy.content;
   node->has_message = true;
   node->has_expiry = copy.has_expiry;
@@ -185,17 +212,10 @@ RetainWriteResult RetainStore::remove(const std::string& topic)
   }
   WriteLockGuard lock(mutex_);
   size_t bytes = 0;
-  if (!erase_at(&root_, split(topic), 0, bytes)) {
+  if (!erase_at(&root_, topic, split(topic), 0, bytes)) {
     return result;
   }
-  if (message_count_ > 0) {
-    --message_count_;
-  }
-  if (total_bytes_ >= bytes) {
-    total_bytes_ -= bytes;
-  } else {
-    total_bytes_ = 0;
-  }
+  account_removed(bytes);
   result.kind = RetainWriteResult::Removed;
   result.message_delta = -1;
   result.byte_delta = -static_cast<int64_t>(bytes);
@@ -248,7 +268,7 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
   WriteLockGuard lock(mutex_);
   int64_t reclaimed_messages = 0;
   int64_t reclaimed_bytes = 0;
-  reclaim_expired(&root_, "", true, now, reclaimed_messages, reclaimed_bytes);
+  reclaim_expired(now, reclaimed_messages, reclaimed_bytes);
   Node* existing = descend(&root_, segments, false);
   const bool replacing = existing && existing->has_message;
   const size_t old_bytes = replacing ? existing->payload_bytes : 0;
@@ -278,6 +298,21 @@ RetainWriteResult RetainStore::store(const PublishPacket& packet, const MQTTStri
     }
   }
 
+  const bool same_key = replacing && node->has_expiry && has_expiry && node->expires_at == expires_at;
+  if (has_expiry && !same_key) {
+    try {
+      expiry_.insert(ExpiryKey(expires_at, topic));
+    } catch (const std::bad_alloc&) {
+      result.kind = RetainWriteResult::Rejected;
+      result.message_delta = reclaimed_messages;
+      result.byte_delta = reclaimed_bytes;
+      result.warn = warn_locked("out of memory");
+      return result;
+    }
+  }
+  if (replacing && !same_key) {
+    unindex(node, topic);
+  }
   node->content = content;
   node->has_message = true;
   node->has_expiry = has_expiry;
@@ -378,46 +413,19 @@ void RetainStore::walk(Node* node, const std::string& topic, const std::vector<s
   walk(found->second, join_topic(topic, segment, root_level), filter, index + 1, false, now, pick, expired);
 }
 
-void RetainStore::reclaim_expired(Node* node, const std::string& topic, bool at_root,
-                                  std::chrono::steady_clock::time_point now, int64_t& message_delta,
+void RetainStore::reclaim_expired(std::chrono::steady_clock::time_point now, int64_t& message_delta,
                                   int64_t& byte_delta)
 {
-  if (!node) {
-    return;
-  }
-  if (node->has_message && !topic.empty() && node->has_expiry && now >= node->expires_at) {
-    if (total_bytes_ >= node->payload_bytes) {
-      total_bytes_ -= node->payload_bytes;
-    } else {
-      total_bytes_ = 0;
-    }
-    byte_delta -= static_cast<int64_t>(node->payload_bytes);
-    if (message_count_ > 0) {
-      --message_count_;
-    }
-    --message_delta;
-    node->content.reset();
-    node->has_message = false;
-    node->has_expiry = false;
-    node->payload_bytes = 0;
-  }
-  std::vector<std::string> names;
-  names.reserve(node->children.size());
-  for (std::unordered_map<std::string, Node*>::const_iterator it = node->children.begin();
-       it != node->children.end(); ++it) {
-    names.push_back(it->first);
-  }
-  for (size_t i = 0; i < names.size(); ++i) {
-    std::unordered_map<std::string, Node*>::iterator found = node->children.find(names[i]);
-    if (found == node->children.end()) {
+  while (!expiry_.empty() && expiry_.begin()->first <= now) {
+    const std::string topic = expiry_.begin()->second;
+    size_t bytes = 0;
+    if (!erase_at(&root_, topic, split(topic), 0, bytes)) {
+      expiry_.erase(expiry_.begin());
       continue;
     }
-    reclaim_expired(found->second, join_topic(topic, names[i], at_root), false, now, message_delta,
-                    byte_delta);
-    if (found->second->children.empty() && !found->second->has_message) {
-      delete found->second;
-      node->children.erase(found);
-    }
+    account_removed(bytes);
+    --message_delta;
+    byte_delta -= static_cast<int64_t>(bytes);
   }
 }
 
@@ -436,17 +444,10 @@ void RetainStore::purge(const std::vector<std::string>& topics, std::chrono::ste
       continue;
     }
     size_t bytes = 0;
-    if (!erase_at(&root_, split(topics[i]), 0, bytes)) {
+    if (!erase_at(&root_, topics[i], split(topics[i]), 0, bytes)) {
       continue;
     }
-    if (message_count_ > 0) {
-      --message_count_;
-    }
-    if (total_bytes_ >= bytes) {
-      total_bytes_ -= bytes;
-    } else {
-      total_bytes_ = 0;
-    }
+    account_removed(bytes);
     --message_delta;
     byte_delta -= static_cast<int64_t>(bytes);
   }

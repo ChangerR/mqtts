@@ -328,7 +328,7 @@ int ConfigManager::validate()
   if (p.enabled &&
       (p.path.empty() || !p.partitions || p.partitions > 32 || p.segment_bytes < 4096 ||
        p.max_disk_bytes / (p.partitions * 4) < p.segment_bytes ||
-       p.checkpoint_interval_ms < 100 || !p.max_session_expiry_seconds || !p.max_sessions ||
+       p.max_disk_bytes / 32 < p.segment_bytes || p.checkpoint_interval_ms < 100 || !p.max_session_expiry_seconds || !p.max_sessions ||
        !p.max_subscriptions_per_session || !p.max_messages || !p.max_messages_per_session ||
        !p.max_bytes || !p.max_bytes_per_session ||
        (p.overflow_policy != "reject" && p.overflow_policy != "isolate") ||

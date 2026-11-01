@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <queue>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -104,9 +105,13 @@ class RetainStore
     Node() : has_message(false), has_expiry(false), payload_bytes(0) {}
   };
 
+  typedef std::pair<std::chrono::steady_clock::time_point, std::string> ExpiryKey;
+
   MQTTAllocator* allocator_;
   mutable RWMutex mutex_;
   Node root_;
+  // 带过期时间的条目按到期先后排序，写入时只回收已到期的，不扫整棵树。
+  std::set<ExpiryKey> expiry_;
   size_t message_count_;
   size_t total_bytes_;
   bool warned_;
@@ -126,7 +131,10 @@ class RetainStore
   // at_root 为真时 parent 是 trie 根，不能用 parent.empty() 判断，否则前导空层级会被吃掉。
   static std::string join_topic(const std::string& parent, const std::string& segment, bool at_root);
   Node* descend(Node* node, const std::vector<std::string>& segments, bool create);
-  bool erase_at(Node* node, const std::vector<std::string>& segments, size_t index, size_t& bytes);
+  bool erase_at(Node* node, const std::string& topic, const std::vector<std::string>& segments,
+                size_t index, size_t& bytes);
+  void unindex(const Node* node, const std::string& topic);
+  void account_removed(size_t bytes);
   void destroy_node(Node* node);
   const char* warn_locked(const char* reason);
   void offer(MatchPick& pick, RetainedCopy copy) const;
@@ -138,8 +146,7 @@ class RetainStore
   void walk(Node* node, const std::string& topic, const std::vector<std::string>& filter, size_t index,
             bool root_level, std::chrono::steady_clock::time_point now, MatchPick& pick,
             std::vector<std::string>& expired) const;
-  void reclaim_expired(Node* node, const std::string& topic, bool at_root,
-                       std::chrono::steady_clock::time_point now, int64_t& message_delta,
+  void reclaim_expired(std::chrono::steady_clock::time_point now, int64_t& message_delta,
                        int64_t& byte_delta);
   void purge(const std::vector<std::string>& topics, std::chrono::steady_clock::time_point now,
              int64_t& message_delta, int64_t& byte_delta);

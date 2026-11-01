@@ -202,20 +202,25 @@ struct DurableStore::Impl
   std::vector<uint64_t> message_cuts, state_cuts;
   struct RetainedItem
   {
-    uint8_t qos = 0;
-    int64_t expires_ms = 0;
-    std::string payload;
-    std::string sender;
+    // Immutable once stored: checkpoints and rollbacks share it instead of copying payloads.
+    std::shared_ptr<const journal::StoredRetain> record;
+    size_t width = 0;
     uint64_t generation = 0;
-    bool committed = false;
-    RetainedProperties properties;
+    // Shared with copies held for rollback, so a restored entry sees its own commit.
+    std::shared_ptr<bool> committed = std::make_shared<bool>(false);
   };
-  std::map<std::string, RetainedItem> retained;
+  using RetainedMap = std::map<std::string, RetainedItem>;
+  RetainedMap retained;
+  // Encoded RETAIN width of every entry in retained, and their expiry order.
+  // Both are maintained per mutation so a put never walks the whole map.
+  size_t retain_bytes = 0;
+  std::set<std::pair<int64_t, std::string>> retain_expiry;
   // Latest mutation per topic, including clears that removed the map entry.
   // An older append callback must not resurrect a topic a newer clear removed.
   std::map<std::string, uint64_t> retain_epoch;
   uint64_t next_retain_generation = 1;
   uint64_t retain_cut = 0;
+  size_t retain_snapshot_limit = 0;
   std::unique_ptr<AppendLog> retain_log;
   std::thread maintenance;
   explicit Impl(const PersistenceConfig& cfg);
@@ -228,8 +233,14 @@ struct DurableStore::Impl
         item.second->signal->notify();
   }
   Result call(const std::function<Ticket(const std::shared_ptr<Result>&)>& fn, bool wait = true,
-              bool inspect_unavailable = false)
+              bool inspect_unavailable = false, bool no_spin = false)
   {
+    auto deferred_now = [](const std::shared_ptr<Result>& r) {
+      r->ok = false;
+      r->deferred = true;
+      r->error = "persistent admission deferred";
+      return *r;
+    };
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     for (;;) {
       auto r = std::make_shared<Result>();
@@ -238,6 +249,8 @@ struct DurableStore::Impl
         {
           // A coroutine must never block its event thread behind snapshot work.
           std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
+          if (no_spin && (!guard.owns_lock() || (frozen.load() && !inspect_unavailable)))
+            return deferred_now(r);
           if (!guard.owns_lock() && frozen.load())
             throw MaintenancePause();
           if (!guard.owns_lock())
@@ -255,11 +268,17 @@ struct DurableStore::Impl
           r->ok = false;
           r->error = ticket->error;
         }
+        if (ticket && !wait)
+          r->commit = ticket;
         return *r;
       } catch (const MaintenancePause&) {
+        if (no_spin)
+          return deferred_now(r);
         deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         runtime::current_runtime().wait(-1, 0, 1);
       } catch (const Deferred&) {
+        if (no_spin)
+          return deferred_now(r);
         if (std::chrono::steady_clock::now() >= deadline) {
           r->ok = false;
           r->error = "persistent admission timeout";
@@ -634,9 +653,13 @@ struct DurableStore::Impl
                                           const Location& location, bool attach);
   void apply_retain_record(const std::string& data);
   void restore_retained();
-  void erase_expired_retained_locked(int64_t now);
-  size_t encoded_retain_snapshot_locked(const std::string& replacing,
-                                       const journal::StoredRetain& incoming) const;
+  void erase_retained(RetainedMap::iterator it);
+  void set_retained(const std::string& topic, RetainedItem item);
+  // Takes the current entry out of the map; the caller restores it on failure.
+  std::shared_ptr<RetainedItem> take_retained(const std::string& topic);
+  void restore_retained_item(const std::string& topic, uint64_t generation,
+                             uint64_t previous_epoch, const std::shared_ptr<RetainedItem>& previous);
+  void erase_expired_retained(int64_t now);
   void restore();
   void checkpoint();
   void maintain();
@@ -650,7 +673,7 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
 {
   if (!config.partitions || config.partitions > 32 || config.segment_bytes < 4096 ||
       config.max_disk_bytes / (config.partitions * 4) < config.segment_bytes ||
-      config.checkpoint_interval_ms < 100 || !config.max_bytes_per_session ||
+      config.max_disk_bytes / 32 < config.segment_bytes || config.checkpoint_interval_ms < 100 || !config.max_bytes_per_session ||
       (config.overflow_policy != "reject" && config.overflow_policy != "isolate"))
     throw std::runtime_error("invalid partition journal configuration");
   lock_fd = open((config.path + ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -694,8 +717,14 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
             "journal format/partition count differs; offline migration required");
       d.end();
     }
+    // max_disk_bytes split: two CHECKPOINT generations 1/4, retain log 1/32, two
+    // RETAIN generations 2/32, message and session logs the rest.
+    const uint64_t retain_disk = config.max_disk_bytes / 32;
+    retain_snapshot_limit = size_t(config.max_disk_bytes / 32);
     size_t disk_per_log =
-        size_t((config.max_disk_bytes - config.max_disk_bytes / 4) / (2 * config.partitions));
+        size_t((config.max_disk_bytes - config.max_disk_bytes / 4 - retain_disk -
+                2 * uint64_t(retain_snapshot_limit)) /
+               (2 * config.partitions));
     for (size_t p = 0; p < config.partitions; ++p) {
       messages.emplace_back(new AppendLog(config.path + "/messages-" + std::to_string(p),
                                           config.segment_bytes, disk_per_log));
@@ -704,12 +733,7 @@ DurableStore::Impl::Impl(const PersistenceConfig& cfg) : config(cfg)
     }
     message_cuts.resize(config.partitions);
     state_cuts.resize(config.partitions);
-    // Retain log shares the quarter reserved for checkpoints. Message and session
-    // quotas stay as they were so older stores keep the same partition budget.
-    size_t retain_disk = size_t(config.max_disk_bytes / 16);
-    if (retain_disk < config.segment_bytes)
-      retain_disk = config.segment_bytes;
-    retain_log.reset(new AppendLog(config.path + "/retain", config.segment_bytes, retain_disk));
+    retain_log.reset(new AppendLog(config.path + "/retain", config.segment_bytes, size_t(retain_disk)));
     restore();
     // Subscription tails and checkpoint 5 are not readable by an older binary.
     if (format_version < kFormatVersion) {
@@ -786,9 +810,9 @@ DurableStore::Statistics DurableStore::statistics() const
   s.discarded_malformed = impl_->discarded_malformed.load();
   const int64_t now = now_ms();
   for (const auto& item : impl_->retained) {
-    if (!item.second.committed)
+    if (!*item.second.committed)
       continue;
-    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
+    if (item.second.record->expires_ms > 0 && item.second.record->expires_ms <= now)
       continue;
     ++s.retained;
   }
@@ -866,6 +890,80 @@ size_t retain_record_width(const journal::StoredRetain& item)
 }
 }  // namespace
 
+void DurableStore::Impl::erase_retained(RetainedMap::iterator it)
+{
+  retain_bytes -= it->second.width;
+  if (it->second.record->expires_ms > 0)
+    retain_expiry.erase({it->second.record->expires_ms, it->first});
+  retained.erase(it);
+}
+
+void DurableStore::Impl::set_retained(const std::string& topic, RetainedItem item)
+{
+  item.width = retain_record_width(*item.record);
+  auto found = retained.find(topic);
+  if (found != retained.end())
+    erase_retained(found);
+  const int64_t expires_ms = item.record->expires_ms;
+  if (expires_ms > 0)
+    retain_expiry.insert({expires_ms, topic});
+  retain_bytes += item.width;
+  retained.emplace(topic, std::move(item));
+}
+
+std::shared_ptr<DurableStore::Impl::RetainedItem> DurableStore::Impl::take_retained(
+    const std::string& topic)
+{
+  auto found = retained.find(topic);
+  if (found == retained.end())
+    return {};
+  auto previous = std::make_shared<RetainedItem>(found->second);
+  erase_retained(found);
+  return previous;
+}
+
+void DurableStore::Impl::restore_retained_item(const std::string& topic, uint64_t generation,
+                                               uint64_t previous_epoch,
+                                               const std::shared_ptr<RetainedItem>& previous)
+{
+  auto epoch = retain_epoch.find(topic);
+  if (epoch == retain_epoch.end() || epoch->second != generation)
+    return;
+  auto found = retained.find(topic);
+  if (found != retained.end() && found->second.generation == generation)
+    erase_retained(found);
+  if (previous_epoch)
+    epoch->second = previous_epoch;
+  else
+    retain_epoch.erase(epoch);
+  if (previous && (previous->record->expires_ms == 0 ||
+                   previous->record->expires_ms > DurableStore::now_ms()))
+    set_retained(topic, *previous);
+}
+
+void DurableStore::Impl::erase_expired_retained(int64_t now)
+{
+  while (!retain_expiry.empty() && retain_expiry.begin()->first <= now) {
+    auto found = retained.find(retain_expiry.begin()->second);
+    if (found == retained.end()) {
+      retain_expiry.erase(retain_expiry.begin());
+      continue;
+    }
+    erase_retained(found);
+  }
+}
+
+void DurableStore::await(Result& result)
+{
+  if (!result.commit)
+    return;
+  if (!result.commit->wait() && result.ok) {
+    result.ok = false;
+    result.error = result.commit->error.empty() ? "persistent commit failed" : result.commit->error;
+  }
+  result.commit.reset();
+}
+
 DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_t qos,
                                                 const std::string& payload, const std::string& sender,
                                                 int64_t expires_ms, bool wait)
@@ -876,7 +974,7 @@ DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_
 DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_t qos,
                                                 const std::string& payload, const std::string& sender,
                                                 int64_t expires_ms, bool wait,
-                                                const RetainedProperties& properties)
+                                                const RetainedProperties& properties, bool no_spin)
 {
   auto& v = *impl_;
   if (!retain_topic_ok(topic) || payload.empty() || qos > 2 || expires_ms < 0) {
@@ -884,78 +982,70 @@ DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_
     r.error = "invalid retained message";
     return r;
   }
+  auto record = std::make_shared<journal::StoredRetain>();
+  record->topic = topic;
+  record->qos = qos;
+  record->expires_ms = expires_ms;
+  record->payload = payload;
+  record->sender = sender;
+  fill_retain_record(*record, properties);
+  const size_t width = retain_record_width(*record);
+  const bool expired = expires_ms > 0 && expires_ms <= now_ms();
+  Encoder e;
+  if (expired)
+    journal::write_retain_clear(e, topic);
+  else
+    journal::write_retain_set(e, *record);
   return v.call(
       [&](const std::shared_ptr<Result>& r) -> Ticket {
         *r = success();
-        v.erase_expired_retained_locked(now_ms());
-        journal::StoredRetain record;
-        record.topic = topic;
-        record.qos = qos;
-        record.expires_ms = expires_ms;
-        record.payload = payload;
-        record.sender = sender;
-        fill_retain_record(record, properties);
-        if (expires_ms == 0 || expires_ms > now_ms()) {
-          const size_t snapshot_bytes = v.encoded_retain_snapshot_locked(topic, record);
-          if (snapshot_bytes + 4 > v.config.max_disk_bytes / 16)
+        v.erase_expired_retained(now_ms());
+        if (!expired) {
+          auto current = v.retained.find(topic);
+          const size_t replaced = current == v.retained.end() ? 0 : current->second.width;
+          const size_t snapshot_bytes = journal_text_width("MQTTS-RETAIN-2") + 8 + 4 + 4 +
+                                        v.retain_bytes - replaced + width;
+          if (snapshot_bytes > v.retain_snapshot_limit)
             throw journal::AdmissionFull("retain snapshot exceeds reserved disk budget");
         }
         const uint64_t generation = ++v.next_retain_generation;
+        auto previous_epoch_it = v.retain_epoch.find(topic);
+        const uint64_t previous_epoch =
+            previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
+        // The previous value stays authoritative until this record commits. Every
+        // failure below puts it back, so a refused replace never deletes it.
+        std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
         v.retain_epoch[topic] = generation;
-        if (expires_ms > 0 && expires_ms <= now_ms()) {
-          v.retained.erase(topic);
-          Encoder e;
-          journal::write_retain_clear(e, topic);
-          return v.enqueue(
-              *v.retain_log, std::move(e.data),
-              [&, topic, generation](bool, const Location&) {
-                auto epoch = v.retain_epoch.find(topic);
-                if (epoch != v.retain_epoch.end() && epoch->second == generation)
-                  v.retain_epoch.erase(epoch);
-              },
-              wait);
-        }
-        Impl::RetainedItem item;
-        item.qos = qos;
-        item.expires_ms = expires_ms;
-        item.payload = payload;
-        item.sender = sender;
-        item.properties = properties;
-        item.generation = generation;
-        v.retained[topic] = std::move(item);
-        Encoder e;
-        journal::write_retain_set(e, record);
         try {
+          Impl::RetainedItem item;
+          item.record = record;
+          item.generation = generation;
+          std::shared_ptr<bool> committed = item.committed;
+          if (!expired)
+            v.set_retained(topic, std::move(item));
           return v.enqueue(
-              *v.retain_log, std::move(e.data),
-              [&, topic, generation](bool ok, const Location&) {
-                auto epoch = v.retain_epoch.find(topic);
-                if (epoch == v.retain_epoch.end() || epoch->second != generation)
-                  return;
-                auto found = v.retained.find(topic);
-                if (found == v.retained.end() || found->second.generation != generation)
-                  return;
+              *v.retain_log, e.data,
+              [&v, topic, generation, previous_epoch, previous, committed](bool ok, const Location&) {
                 if (!ok) {
-                  v.retained.erase(found);
-                  v.retain_epoch.erase(epoch);
+                  v.restore_retained_item(topic, generation, previous_epoch, previous);
                   return;
                 }
-                found->second.committed = true;
+                *committed = true;
+                auto epoch = v.retain_epoch.find(topic);
+                if (epoch != v.retain_epoch.end() && epoch->second == generation &&
+                    v.retained.find(topic) == v.retained.end())
+                  v.retain_epoch.erase(epoch);
               },
-              wait);
+              true);
         } catch (...) {
-          auto epoch = v.retain_epoch.find(topic);
-          if (epoch != v.retain_epoch.end() && epoch->second == generation) {
-            v.retained.erase(topic);
-            v.retain_epoch.erase(epoch);
-          }
+          v.restore_retained_item(topic, generation, previous_epoch, previous);
           throw;
         }
       },
-      wait);
+      wait, false, no_spin);
 }
 
-DurableStore::Result DurableStore::clear_retained(const std::string& topic, bool wait)
+DurableStore::Result DurableStore::clear_retained(const std::string& topic, bool wait, bool no_spin)
 {
   auto& v = *impl_;
   if (!retain_topic_ok(topic)) {
@@ -963,25 +1053,36 @@ DurableStore::Result DurableStore::clear_retained(const std::string& topic, bool
     r.error = "invalid retained topic";
     return r;
   }
+  Encoder e;
+  journal::write_retain_clear(e, topic);
   return v.call(
       [&](const std::shared_ptr<Result>& r) -> Ticket {
         *r = success();
         const uint64_t generation = ++v.next_retain_generation;
+        auto previous_epoch_it = v.retain_epoch.find(topic);
+        const uint64_t previous_epoch =
+            previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
+        std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
         v.retain_epoch[topic] = generation;
-        v.retained.erase(topic);
-        Encoder e;
-        journal::write_retain_clear(e, topic);
-        return v.enqueue(
-            *v.retain_log, std::move(e.data),
-            [&, topic, generation](bool ok, const Location&) {
-              auto epoch = v.retain_epoch.find(topic);
-              if (epoch == v.retain_epoch.end() || epoch->second != generation || !ok)
-                return;
-              v.retain_epoch.erase(epoch);
-            },
-            wait);
+        try {
+          return v.enqueue(
+              *v.retain_log, e.data,
+              [&v, topic, generation, previous_epoch, previous](bool ok, const Location&) {
+                if (!ok) {
+                  v.restore_retained_item(topic, generation, previous_epoch, previous);
+                  return;
+                }
+                auto epoch = v.retain_epoch.find(topic);
+                if (epoch != v.retain_epoch.end() && epoch->second == generation)
+                  v.retain_epoch.erase(epoch);
+              },
+              true);
+        } catch (...) {
+          v.restore_retained_item(topic, generation, previous_epoch, previous);
+          throw;
+        }
       },
-      wait);
+      wait, false, no_spin);
 }
 
 std::vector<DurableStore::RetainedMessage> DurableStore::retained_messages() const
@@ -990,24 +1091,25 @@ std::vector<DurableStore::RetainedMessage> DurableStore::retained_messages() con
   std::vector<RetainedMessage> out;
   const int64_t now = now_ms();
   for (const auto& item : impl_->retained) {
-    if (!item.second.committed)
+    const journal::StoredRetain& record = *item.second.record;
+    if (!*item.second.committed)
       continue;
-    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
+    if (record.expires_ms > 0 && record.expires_ms <= now)
       continue;
     RetainedMessage message;
     message.topic = item.first;
-    message.qos = item.second.qos;
-    message.payload = item.second.payload;
-    message.sender = item.second.sender;
-    message.expires_ms = item.second.expires_ms;
-    message.properties = item.second.properties;
+    message.qos = record.qos;
+    message.payload = record.payload;
+    message.sender = record.sender;
+    message.expires_ms = record.expires_ms;
+    message.properties = properties_from_record(record);
     out.push_back(std::move(message));
   }
   return out;
 }
 
-DurableStore::Result DurableStore::enqueue_directed(const std::string& client, const std::string& wire,
-                                                   int64_t expires)
+DurableStore::Result DurableStore::enqueue_directed(const std::string& client, uint64_t epoch,
+                                                   const std::string& wire, int64_t expires, bool wait)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
@@ -1017,6 +1119,12 @@ DurableStore::Result DurableStore::enqueue_directed(const std::string& client, c
       return {};
     }
     auto s = found->second;
+    // A Clean Start takeover after the SUBSCRIBE must not inherit its retained replay.
+    if (s->epoch != epoch) {
+      *r = success();
+      r->stale = true;
+      return {};
+    }
     if (s->busy)
       throw Deferred();
     *r = success();
@@ -1060,7 +1168,8 @@ DurableStore::Result DurableStore::enqueue_directed(const std::string& client, c
                               message->committed = true;
                               v.schedule_message(message);
                               v.notify(s);
-                            });
+                            },
+                            wait);
     Impl::DeliveryState entry;
     entry.message = message;
     entry.packet = packet;
@@ -1076,7 +1185,7 @@ DurableStore::Result DurableStore::enqueue_directed(const std::string& client, c
     r->present = true;
     r->accepted_targets = 1;
     return ticket;
-  });
+  }, wait);
 }
 
 DurableStore::Result DurableStore::connect(const std::string& client, const std::string& owner,
@@ -1225,7 +1334,8 @@ DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_
 }
 DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t epoch,
                                              const std::string& filter,
-                                             const journal::StoredSubscription& subscription)
+                                             const journal::StoredSubscription& subscription,
+                                             bool wait, bool no_spin)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
@@ -1261,15 +1371,19 @@ DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t
           if (!ok)
             return;
           v.set_subscription(s, filter, subscription);
-          *r = success();
-          r->present = existed;
-          if (existed)
-            r->subscriptions.emplace_back(filter, previous_sub);
         });
     v.metadata_reserved += reservation;
     s->busy = true;
+    // Admission is success even when the caller does not wait. The callback used to
+    // be the only place that set ok, so wait=false looked like a failed subscribe
+    // and the handler deleted a subscription the journal was about to commit.
+    *r = success();
+    r->present = existed;
+    if (existed)
+      r->subscriptions.emplace_back(filter, previous_sub);
     return ticket;
-  });
+  },
+                                                     wait, false, no_spin);
 }
 DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64_t epoch,
                                                const std::string& filter)
@@ -1339,7 +1453,7 @@ std::vector<DurableStore::Impl::SubscriptionHit> DurableStore::Impl::match(
 }
 DurableStore::Result DurableStore::publish(const std::string& topic, const std::string& wire,
                                            const std::string& sender, int64_t expires,
-                                           bool implicit_no_local)
+                                           bool implicit_no_local, bool wait, bool no_spin)
 {
   auto& v = *impl_;
   return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
@@ -1469,7 +1583,8 @@ DurableStore::Result DurableStore::publish(const std::string& topic, const std::
       ++v.pending;
     }
     return ticket;
-  });
+  },
+            wait, false, no_spin);
 }
 DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epoch, int64_t after,
                                          uint16_t receive_maximum)
@@ -1843,69 +1958,31 @@ std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
   d.end();
   return m;
 }
-void DurableStore::Impl::erase_expired_retained_locked(int64_t now)
-{
-  std::vector<std::string> expired_topics;
-  for (const auto& item : retained) {
-    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
-      expired_topics.push_back(item.first);
-  }
-  for (size_t i = 0; i < expired_topics.size(); ++i)
-    retained.erase(expired_topics[i]);
-}
-
-size_t DurableStore::Impl::encoded_retain_snapshot_locked(const std::string& replacing,
-                                                        const journal::StoredRetain& incoming) const
-{
-  const int64_t now = DurableStore::now_ms();
-  size_t bytes = journal_text_width("MQTTS-RETAIN-2") + 8 + 4;
-  bool replaced = false;
-  for (const auto& item : retained) {
-    if (item.second.expires_ms > 0 && item.second.expires_ms <= now)
-      continue;
-    if (item.first == replacing) {
-      bytes += retain_record_width(incoming);
-      replaced = true;
-      continue;
-    }
-    journal::StoredRetain record;
-    record.topic = item.first;
-    record.qos = item.second.qos;
-    record.expires_ms = item.second.expires_ms;
-    record.payload = item.second.payload;
-    record.sender = item.second.sender;
-    fill_retain_record(record, item.second.properties);
-    bytes += retain_record_width(record);
-  }
-  if (!replaced && (incoming.expires_ms == 0 || incoming.expires_ms > now))
-    bytes += retain_record_width(incoming);
-  return bytes;
-}
-
 void DurableStore::Impl::apply_retain_record(const std::string& data)
 {
   Decoder d(data);
   bool cleared = false;
   auto record = journal::read_retain_record(d, cleared);
   if (cleared || (record.expires_ms > 0 && record.expires_ms <= DurableStore::now_ms())) {
-    retained.erase(record.topic);
+    auto found = retained.find(record.topic);
+    if (found != retained.end())
+      erase_retained(found);
     return;
   }
+  const std::string topic = record.topic;
   RetainedItem item;
-  item.qos = record.qos;
-  item.expires_ms = record.expires_ms;
-  item.payload = std::move(record.payload);
-  item.sender = std::move(record.sender);
-  item.properties = properties_from_record(record);
-  item.committed = true;
-  retained[record.topic] = std::move(item);
+  item.record = std::make_shared<journal::StoredRetain>(std::move(record));
+  *item.committed = true;
+  set_retained(topic, std::move(item));
 }
 void DurableStore::Impl::restore_retained()
 {
   retained.clear();
+  retain_expiry.clear();
+  retain_bytes = 0;
   retain_epoch.clear();
   retain_cut = 0;
-  auto file = journal::read_file(config.path + "/RETAIN", size_t(config.max_disk_bytes / 16));
+  auto file = journal::read_file(config.path + "/RETAIN", retain_snapshot_limit);
   if (!file.empty()) {
     auto body = unchecked(file);
     Decoder d(body);
@@ -1916,23 +1993,23 @@ void DurableStore::Impl::restore_retained()
     retain_cut = d.u64();
     uint32_t count = d.u32();
     for (uint32_t i = 0; i < count; ++i) {
-      RetainedItem item;
-      auto topic = d.text();
-      item.qos = d.u8();
-      item.expires_ms = static_cast<int64_t>(d.u64());
-      item.payload = d.text();
-      item.sender = d.text();
-      if (with_properties) {
-        journal::StoredRetain record;
-        journal::read_retain_properties(d, record);
-        item.properties = properties_from_record(record);
-      }
-      item.committed = true;
-      if (!retain_topic_ok(topic) || item.qos > 2 || item.expires_ms < 0 || item.payload.empty())
+      auto record = std::make_shared<journal::StoredRetain>();
+      record->topic = d.text();
+      record->qos = d.u8();
+      record->expires_ms = static_cast<int64_t>(d.u64());
+      record->payload = d.text();
+      record->sender = d.text();
+      if (with_properties)
+        journal::read_retain_properties(d, *record);
+      if (!retain_topic_ok(record->topic) || record->qos > 2 || record->expires_ms < 0 ||
+          record->payload.empty())
         throw std::runtime_error("invalid retain snapshot");
-      if (item.expires_ms > 0 && item.expires_ms <= DurableStore::now_ms())
+      if (record->expires_ms > 0 && record->expires_ms <= DurableStore::now_ms())
         continue;
-      retained[std::move(topic)] = std::move(item);
+      RetainedItem item;
+      item.record = record;
+      *item.committed = true;
+      set_retained(record->topic, std::move(item));
     }
     d.end();
   }
@@ -2133,7 +2210,7 @@ void DurableStore::Impl::checkpoint()
     uint64_t snapshot_id;
     std::vector<SnapshotSession> snapshot;
     std::vector<uint64_t> message_fences(messages.size()), state_fences(states.size());
-    std::vector<journal::StoredRetain> retain_snapshot;
+    std::vector<std::shared_ptr<const journal::StoredRetain>> retain_snapshot;
     uint64_t retain_fence = 0;
     {
       std::lock_guard<std::mutex> guard(mutex);
@@ -2142,26 +2219,11 @@ void DurableStore::Impl::checkpoint()
       snapshot_id = next_id;
       if (retain_log)
         retain_fence = retain_log->serial();
-      const int64_t now = DurableStore::now_ms();
-      std::vector<std::string> expired_topics;
-      for (const auto& item : retained) {
-        if (item.second.expires_ms > 0 && item.second.expires_ms <= now) {
-          expired_topics.push_back(item.first);
-          continue;
-        }
-        if (!item.second.committed)
-          continue;
-        journal::StoredRetain copy;
-        copy.topic = item.first;
-        copy.qos = item.second.qos;
-        copy.expires_ms = item.second.expires_ms;
-        copy.payload = item.second.payload;
-        copy.sender = item.second.sender;
-        fill_retain_record(copy, item.second.properties);
-        retain_snapshot.push_back(std::move(copy));
-      }
-      for (size_t i = 0; i < expired_topics.size(); ++i)
-        retained.erase(expired_topics[i]);
+      erase_expired_retained(DurableStore::now_ms());
+      retain_snapshot.reserve(retained.size());
+      for (const auto& item : retained)
+        if (*item.second.committed)
+          retain_snapshot.push_back(item.second.record);
       for (size_t p = 0; p < config.partitions; ++p) {
         message_fences[p] = messages[p]->serial();
         state_fences[p] = states[p]->serial();
@@ -2253,14 +2315,14 @@ void DurableStore::Impl::checkpoint()
       retain_body.u64(retain_fence);
       retain_body.u32(uint32_t(retain_snapshot.size()));
       for (const auto& item : retain_snapshot) {
-        retain_body.text(item.topic);
-        retain_body.u8(item.qos);
-        retain_body.u64(static_cast<uint64_t>(item.expires_ms));
-        retain_body.text(item.payload);
-        retain_body.text(item.sender);
-        journal::write_retain_properties(retain_body, item);
+        retain_body.text(item->topic);
+        retain_body.u8(item->qos);
+        retain_body.u64(static_cast<uint64_t>(item->expires_ms));
+        retain_body.text(item->payload);
+        retain_body.text(item->sender);
+        journal::write_retain_properties(retain_body, *item);
       }
-      if (retain_body.data.size() + 4 > config.max_disk_bytes / 16)
+      if (retain_body.data.size() + 4 > retain_snapshot_limit)
         throw std::runtime_error("retain snapshot exceeds reserved disk budget");
       journal::atomic_file(config.path + "/RETAIN", checked(retain_body.data));
       retain_log->prune(retain_fence, {});
