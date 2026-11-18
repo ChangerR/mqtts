@@ -162,7 +162,10 @@ int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
 
   if (!connected_) {
-    // Logged once in SendWorkerPool::process_send_task (MQ_ERR_SOCKET).
+    // MQ_ERR_SOCKET is not logged here. send_parts_with_lock and
+    // deliver_publish also skip this code. PUBACK, retain replay, and will
+    // delivery do not go through process_send_task; a peer disconnect is
+    // recorded on the connection/teardown path.
     ret = MQ_ERR_SOCKET;
   } else {
     int total_sent = 0;
@@ -236,7 +239,10 @@ int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* bod
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
   const int total = head_len + body_len;
   if (!connected_) {
-    // Logged once in SendWorkerPool::process_send_task (MQ_ERR_SOCKET).
+    // MQ_ERR_SOCKET is not logged here. send_parts_with_lock and
+    // deliver_publish also skip this code. PUBACK, retain replay, and will
+    // delivery do not go through process_send_task; a peer disconnect is
+    // recorded on the connection/teardown path.
     return MQ_ERR_SOCKET;
   }
 

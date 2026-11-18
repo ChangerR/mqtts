@@ -308,8 +308,8 @@ int SendWorkerPool::process_send_task(WorkerSendTask& task, size_t worker_id)
   try {
     SafeHandlerRef safe_handler = session_manager_->get_safe_handler(task.get_target_client_id());
     if (!safe_handler.is_valid()) {
-      LOG_WARN("Worker {}: handler not found for client: {}", worker_id,
-               from_mqtt_string(task.get_target_client_id()));
+      session_manager_->note_handler_not_found(task.get_target_client_id(),
+                                               static_cast<int>(worker_id));
       return MQ_ERR_SESSION_INVALID_HANDLER;
     }
 

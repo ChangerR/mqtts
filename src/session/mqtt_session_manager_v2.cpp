@@ -110,6 +110,95 @@ void flush_dispatch_fail_log()
   emit_dispatch_fail_log();
 }
 
+// Temporary postpone: destination worker is full, message stays in pending.
+thread_local uint64_t dispatch_defer_count = 0;
+thread_local MQTTString dispatch_defer_client;
+thread_local std::chrono::steady_clock::time_point dispatch_defer_last_report{};
+thread_local std::chrono::steady_clock::time_point dispatch_defer_last{};
+
+void emit_dispatch_defer_log()
+{
+  LOG_WARN("deferred: worker full ({} since last report, last client: {})", dispatch_defer_count,
+           from_mqtt_string(dispatch_defer_client));
+  dispatch_defer_count = 0;
+  dispatch_defer_last_report = std::chrono::steady_clock::now();
+}
+
+void log_dispatch_deferred(const MQTTString& client_id)
+{
+  const auto now = std::chrono::steady_clock::now();
+  ++dispatch_defer_count;
+  dispatch_defer_client = client_id;
+  dispatch_defer_last = now;
+  if (dispatch_defer_last_report.time_since_epoch().count() != 0 &&
+      now - dispatch_defer_last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_dispatch_defer_log();
+}
+
+void flush_dispatch_defer_log()
+{
+  if (dispatch_defer_count == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - dispatch_defer_last < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_dispatch_defer_log();
+}
+
+// "handler not found" after clients disconnect while pending/worker queues
+// still hold messages. Both call sites run on the owner libco event thread
+// (SendWorkerPool workers are coroutines on that thread;
+// internal_process_messages is the event-thread fallback). Flushed from
+// eventloop_callback via flush_queue_full_reports.
+thread_local uint64_t handler_nf_count = 0;
+thread_local MQTTString handler_nf_client;
+thread_local int handler_nf_worker = -1;
+thread_local std::chrono::steady_clock::time_point handler_nf_last_report{};
+thread_local std::chrono::steady_clock::time_point handler_nf_last{};
+
+void emit_handler_not_found_log()
+{
+  if (handler_nf_worker >= 0) {
+    LOG_WARN("Worker {}: handler not found for client: {} ({} since last report)", handler_nf_worker,
+             from_mqtt_string(handler_nf_client), handler_nf_count);
+  } else {
+    LOG_WARN("Handler not found or invalid for client: {} ({} since last report)",
+             from_mqtt_string(handler_nf_client), handler_nf_count);
+  }
+  handler_nf_count = 0;
+  handler_nf_last_report = std::chrono::steady_clock::now();
+}
+
+void log_handler_not_found(const MQTTString& client_id, int worker_id)
+{
+  const auto now = std::chrono::steady_clock::now();
+  ++handler_nf_count;
+  handler_nf_client = client_id;
+  handler_nf_worker = worker_id;
+  handler_nf_last = now;
+  if (handler_nf_last_report.time_since_epoch().count() != 0 &&
+      now - handler_nf_last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_handler_not_found_log();
+}
+
+void flush_handler_not_found_log()
+{
+  if (handler_nf_count == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - handler_nf_last < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_handler_not_found_log();
+}
+
 }  // namespace
 
 //==============================================================================
@@ -501,10 +590,17 @@ int ThreadLocalSessionManager::process_pending_messages(int max_process_count, i
   return internal_process_messages(max_process_count);
 }
 
+void ThreadLocalSessionManager::note_handler_not_found(const MQTTString& client_id, int worker_id)
+{
+  log_handler_not_found(client_id, worker_id);
+}
+
 void ThreadLocalSessionManager::flush_queue_full_reports()
 {
   flush_queue_full_log();
   flush_dispatch_fail_log();
+  flush_dispatch_defer_log();
+  flush_handler_not_found_log();
 }
 
 int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_count)
@@ -546,7 +642,7 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
     }
 
     if (worker_full) {
-      log_dispatch_fail(full_client_id);
+      log_dispatch_deferred(full_client_id);
       break;
     }
     if (!has_message) {
@@ -664,8 +760,7 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
         LOG_WARN("Session not found or invalid for client: {}", client_id_str);
       }
     } else {
-      LOG_WARN("Handler not found or invalid for client: {}",
-               from_mqtt_string(message.target_client_id));
+      note_handler_not_found(message.target_client_id);
     }
     // SafeHandlerRef析构时自动释放引用计数
   }

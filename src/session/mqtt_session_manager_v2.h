@@ -143,7 +143,10 @@ class ThreadLocalSessionManager
    */
   int process_pending_messages_nowait(int max_process_count = 0);
 
-  // Emit leftover queue-full / dispatch-fail summaries after 1s of quiet.
+  // Rate-limited "handler not found" (worker_id < 0 if not from a send worker).
+  void note_handler_not_found(const MQTTString& client_id, int worker_id = -1);
+
+  // Emit leftover queue-full / dispatch / handler-not-found summaries after 1s of quiet.
   void flush_queue_full_reports();
 
   // 跨线程会话接管。只入队，由本事件线程的事件循环回调执行。
