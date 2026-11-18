@@ -28,6 +28,18 @@
 
 namespace mqtt {
 
+// Cooperative scheduling for live (non-durable) fanout on a libco event thread.
+// process_loop yields every kProcessLoopYieldEveryPackets complete packets so
+// send-worker coroutines and eventloop_callback can run when a publisher socket
+// stays readable (recv only yields on EAGAIN). eventloop_callback then drains
+// up to kEventLoopPendingDrainBatch pending messages. Four publishers can each
+// process 8 packets before yielding (32 enqueues per turn); 512 leaves headroom
+// so the 10000-deep pending queue is not refilled before workers run. Chosen
+// from loopback QoS1 64-byte multi-publisher saturation at 357ed27: 4x4 / 10x1
+// delivery recovered from ~0-260 msg/s to ~14k-59k msg/s.
+constexpr int kProcessLoopYieldEveryPackets = 8;
+constexpr int kEventLoopPendingDrainBatch = 512;
+
 // 前向声明
 class GlobalSessionManager;
 

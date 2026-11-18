@@ -536,12 +536,14 @@ int MQTTServer::eventloop_callback(void* arg)
   mqtt::ThreadLocalSessionManager* local_manager = session_manager.get_thread_manager();
   if (local_manager) {
     if (server->running_) {
-      // Process pending messages without blocking (process up to 50 messages per callback)
-      int processed = local_manager->process_pending_messages_nowait(50);
+      // Drain enough of the pending queue that a burst of publisher coroutines
+      // cannot refill it before send workers get another turn.
+      int processed = local_manager->process_pending_messages_nowait(kEventLoopPendingDrainBatch);
       if (processed > 0) {
         LOG_DEBUG("Processed {} pending messages in eventloop callback", processed);
       }
       local_manager->process_control_messages();
+      local_manager->flush_queue_full_reports();
     }
     // 停机时尽力发布尚未到期的遗嘱，不保证一定赶上进程退出。
     session_manager.process_due_wills(server->auth_manager_, !server->running_);

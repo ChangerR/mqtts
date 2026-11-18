@@ -142,6 +142,9 @@ class ThreadLocalSessionManager
    */
   int process_pending_messages_nowait(int max_process_count = 0);
 
+  // Emit any pending queue-full drop summary after drops have been quiet for 1s.
+  void flush_queue_full_reports();
+
   // 跨线程会话接管。只入队，由本事件线程的事件循环回调执行。
   int enqueue_takeover(const std::string& client_id, MQTTProtocolHandler* newcomer,
                        const std::shared_ptr<SessionTakeoverGate>& gate);
