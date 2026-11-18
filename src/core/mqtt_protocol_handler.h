@@ -32,8 +32,11 @@ namespace mqtt {
 // process_loop yields every kProcessLoopYieldEveryPackets complete packets so
 // send-worker coroutines and eventloop_callback can run when a publisher socket
 // stays readable (recv only yields on EAGAIN). eventloop_callback then drains
-// up to kEventLoopPendingDrainBatch pending messages. Four publishers can each
-// process 8 packets before yielding (32 enqueues per turn); 512 leaves headroom
+// up to kEventLoopPendingDrainBatch pending messages, and stops early when the
+// destination send-worker has no free slots (one subscriber hashes to one
+// worker of size 1000; over-submit used to fail submit_task and copy the whole
+// pending queue under queue_mutex_). Four publishers can each process 8 packets
+// before yielding (32 enqueues per turn); 512 is an upper bound with headroom
 // so the 10000-deep pending queue is not refilled before workers run. Chosen
 // from loopback QoS1 64-byte multi-publisher saturation at 357ed27: 4x4 / 10x1
 // delivery recovered from ~0-260 msg/s to ~14k-59k msg/s.

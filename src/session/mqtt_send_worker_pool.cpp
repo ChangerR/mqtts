@@ -166,6 +166,16 @@ int SendWorkerPool::submit_task(const WorkerSendTask& task)
   return MQ_SUCCESS;
 }
 
+size_t SendWorkerPool::free_capacity_for(const MQTTString& client_id) const
+{
+  if (!running_.load() || workers_.empty()) {
+    return 0;
+  }
+  const size_t worker_id = select_worker(client_id);
+  const size_t pending = workers_[worker_id]->pending_count.load();
+  return pending >= max_queue_size_ ? 0 : max_queue_size_ - pending;
+}
+
 SendWorkerPool::Statistics SendWorkerPool::get_statistics() const
 {
   Statistics stats = {};

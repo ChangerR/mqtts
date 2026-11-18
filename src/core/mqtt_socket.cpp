@@ -162,7 +162,7 @@ int MQTTSocket::send(const uint8_t* buf, int len, int timeout_ms)
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
 
   if (!connected_) {
-    LOG_ERROR("Socket not connected");
+    // Logged once in SendWorkerPool::process_send_task (MQ_ERR_SOCKET).
     ret = MQ_ERR_SOCKET;
   } else {
     int total_sent = 0;
@@ -236,7 +236,7 @@ int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* bod
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
   const int total = head_len + body_len;
   if (!connected_) {
-    LOG_ERROR("Socket not connected");
+    // Logged once in SendWorkerPool::process_send_task (MQ_ERR_SOCKET).
     return MQ_ERR_SOCKET;
   }
 

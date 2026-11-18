@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <utility>
 #include <unordered_map>
 #include "logger.h"
 #include "mqtt_define.h"
@@ -56,6 +57,57 @@ void flush_queue_full_log()
     return;
   }
   emit_queue_full_log();
+}
+
+// Rate-limit "Failed to dispatch" the same way as log_queue_full. Counters are
+// thread_local and flushed from eventloop_callback on the calling thread.
+//
+// Live MQTT publish, SUBSCRIBE retain replay, and will delivery all run on
+// libco event-thread coroutines (handle_publish; eventloop_callback ->
+// process_due_wills / deliver_retained). A publisher may enqueue onto another
+// event thread's pending_messages_ (see the header note that other threads
+// write this queue); the increment still lives on the publisher's event
+// thread, which also runs flush_queue_full_reports.
+// Cluster MQTTForwardingService may enqueue from its own worker thread /
+// runtime, which does not call flush_queue_full_reports. Drops there are
+// still reported on the first event and every 1s while dropping, but a
+// leftover <1s window may be missed when drops stop on that thread.
+thread_local uint64_t dispatch_fail_count = 0;
+thread_local MQTTString dispatch_fail_client;
+thread_local std::chrono::steady_clock::time_point dispatch_fail_last_report{};
+thread_local std::chrono::steady_clock::time_point dispatch_fail_last{};
+
+void emit_dispatch_fail_log()
+{
+  LOG_WARN("Failed to dispatch message to worker pool ({} since last report, last client: {})",
+           dispatch_fail_count, from_mqtt_string(dispatch_fail_client));
+  dispatch_fail_count = 0;
+  dispatch_fail_last_report = std::chrono::steady_clock::now();
+}
+
+void log_dispatch_fail(const MQTTString& client_id)
+{
+  const auto now = std::chrono::steady_clock::now();
+  ++dispatch_fail_count;
+  dispatch_fail_client = client_id;
+  dispatch_fail_last = now;
+  if (dispatch_fail_last_report.time_since_epoch().count() != 0 &&
+      now - dispatch_fail_last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_dispatch_fail_log();
+}
+
+void flush_dispatch_fail_log()
+{
+  if (dispatch_fail_count == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - dispatch_fail_last < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_dispatch_fail_log();
 }
 
 }  // namespace
@@ -137,7 +189,7 @@ ThreadLocalSessionManager::~ThreadLocalSessionManager()
 
   // 清空待发送队列
   while (!pending_messages_.empty()) {
-    pending_messages_.pop();
+    pending_messages_.pop_front();
   }
 
   // 通知所有等待的协程退出
@@ -279,7 +331,7 @@ int ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
     } else {
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        pending_messages_.push(message);
+        pending_messages_.push_back(message);
         has_new_messages_.store(true);
       }
 
@@ -316,7 +368,7 @@ int ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContent
 
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        pending_messages_.push(message);
+        pending_messages_.push_back(message);
         has_new_messages_.store(true);
       }
 
@@ -360,7 +412,7 @@ int ThreadLocalSessionManager::enqueue_shared_messages(
 
           PendingMessageInfo message_info(content, client_id);
           PendingMessage message(message_info);
-          pending_messages_.push(message);
+          pending_messages_.push_back(message);
         }
 
         has_new_messages_.store(true);
@@ -452,6 +504,7 @@ int ThreadLocalSessionManager::process_pending_messages(int max_process_count, i
 void ThreadLocalSessionManager::flush_queue_full_reports()
 {
   flush_queue_full_log();
+  flush_dispatch_fail_log();
 }
 
 int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_count)
@@ -470,27 +523,36 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
   while (dispatched_count != max_process_count) {
     PendingMessage message(PublishPacket{}, MQTTString(), MQTTString());
     bool has_message = false;
+    bool worker_full = false;
+    MQTTString full_client_id;
 
-    // 从队列中取出一个消息
+    // Peek the front and pop only when the destination worker has a free slot.
+    // On a rare submit race, push_front the moved message back (O(1)).
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       if (!pending_messages_.empty()) {
-        message = pending_messages_.front();
-        pending_messages_.pop();
-        has_message = true;
-
-        // 如果队列空了，重置新消息标志
-        if (pending_messages_.empty()) {
-          has_new_messages_.store(false);
+        if (worker_pool_->free_capacity_for(pending_messages_.front().target_client_id) == 0) {
+          full_client_id = pending_messages_.front().target_client_id;
+          worker_full = true;
+        } else {
+          message = std::move(pending_messages_.front());
+          pending_messages_.pop_front();
+          has_message = true;
+          if (pending_messages_.empty()) {
+            has_new_messages_.store(false);
+          }
         }
       }
     }
 
+    if (worker_full) {
+      log_dispatch_fail(full_client_id);
+      break;
+    }
     if (!has_message) {
-      break;  // 队列为空
+      break;
     }
 
-    // 直接从PendingMessage创建Worker任务
     WorkerSendTask task(message);
 
     int submit_result = worker_pool_->submit_task(task);
@@ -499,19 +561,10 @@ int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_c
       LOG_DEBUG("Message dispatched to worker pool for client: {}",
                 from_mqtt_string(message.target_client_id));
     } else {
-      LOG_WARN("Failed to dispatch message to worker pool for client: {}, error: {}",
-               from_mqtt_string(message.target_client_id), submit_result);
-
-      // Worker池满了或出错，将消息放回队列头部
+      log_dispatch_fail(message.target_client_id);
       {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        std::queue<PendingMessage> temp_queue;
-        temp_queue.push(message);
-        while (!pending_messages_.empty()) {
-          temp_queue.push(pending_messages_.front());
-          pending_messages_.pop();
-        }
-        pending_messages_ = std::move(temp_queue);
+        pending_messages_.push_front(std::move(message));
         has_new_messages_.store(true);
       }
       break;
@@ -564,8 +617,8 @@ int ThreadLocalSessionManager::internal_process_messages(int max_process_count)
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       if (!pending_messages_.empty()) {
-        message = pending_messages_.front();
-        pending_messages_.pop();
+        message = std::move(pending_messages_.front());
+        pending_messages_.pop_front();
         has_message = true;
 
         // 如果队列空了，重置新消息标志
