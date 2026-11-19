@@ -12,6 +12,53 @@
 // 错误代码已在mqtt_define.h中统一定义
 
 namespace mqtt {
+namespace {
+
+thread_local uint64_t queue_full_dropped = 0;
+thread_local const char* queue_full_detail = "";
+thread_local std::chrono::steady_clock::time_point queue_full_last_report{};
+thread_local std::chrono::steady_clock::time_point queue_full_last_drop{};
+
+void emit_queue_full_log()
+{
+  LOG_ERROR("Message queue is full, {} ({} drops since last report)", queue_full_detail,
+            queue_full_dropped);
+  queue_full_dropped = 0;
+  queue_full_last_report = std::chrono::steady_clock::now();
+}
+
+void log_queue_full(const char* detail, size_t n = 1)
+{
+  // One ERROR line per dropped message fills a 10 MiB log in a few seconds and
+  // contends the shared sink mutex on every publisher coroutine.
+  if (n == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  queue_full_dropped += n;
+  queue_full_detail = detail;
+  queue_full_last_drop = now;
+  if (queue_full_last_report.time_since_epoch().count() != 0 &&
+      now - queue_full_last_report < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_queue_full_log();
+}
+
+void flush_queue_full_log()
+{
+  // Report the last incomplete 1s window after drops have stopped.
+  if (queue_full_dropped == 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - queue_full_last_drop < std::chrono::seconds(1)) {
+    return;
+  }
+  emit_queue_full_log();
+}
+
+}  // namespace
 
 //==============================================================================
 // ThreadLocalSessionManager实现
@@ -227,7 +274,7 @@ int ThreadLocalSessionManager::enqueue_message(const PendingMessage& message)
   } else {
     // Pre-check queue capacity to avoid potential allocation failures
     if (get_pending_message_count() >= 10000) {  // Reasonable queue limit
-      LOG_ERROR("Message queue is full, cannot enqueue more messages");
+      log_queue_full("cannot enqueue more messages");
       ret = MQ_ERR_QUEUE_FULL;
     } else {
       {
@@ -261,7 +308,7 @@ int ThreadLocalSessionManager::enqueue_shared_message(const SharedMessageContent
   } else {
     // Pre-check queue capacity
     if (get_pending_message_count() >= 10000) {
-      LOG_ERROR("Message queue is full, cannot enqueue shared message");
+      log_queue_full("cannot enqueue shared message");
       ret = MQ_ERR_QUEUE_FULL;
     } else {
       PendingMessageInfo message_info(content, target_client_id);
@@ -299,7 +346,7 @@ int ThreadLocalSessionManager::enqueue_shared_messages(
     // Pre-check queue capacity for batch operation
     size_t current_queue_size = get_pending_message_count();
     if (current_queue_size + target_client_ids.size() >= 10000) {
-      LOG_ERROR("Message queue would exceed capacity with batch enqueue");
+      log_queue_full("batch enqueue would exceed capacity", target_client_ids.size());
       ret = MQ_ERR_QUEUE_FULL;
     } else {
       {
@@ -400,6 +447,11 @@ int ThreadLocalSessionManager::process_pending_messages(int max_process_count, i
   }
 
   return internal_process_messages(max_process_count);
+}
+
+void ThreadLocalSessionManager::flush_queue_full_reports()
+{
+  flush_queue_full_log();
 }
 
 int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_count)

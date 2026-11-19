@@ -201,6 +201,7 @@ int MQTTProtocolHandler::fail_protocol(ReasonCode reason, int err)
 int MQTTProtocolHandler::process_loop()
 {
   int ret = MQ_SUCCESS;
+  int packets_since_yield = 0;
   while (MQ_SUCC(ret)) {
     if (takeover_pending_.load(std::memory_order_acquire)) {
       ret = MQ_ERR_SESSION;
@@ -294,6 +295,20 @@ int MQTTProtocolHandler::process_loop()
       bytes_needed_ = 1;
       remaining_length_ = 0;  // 重置remaining length
       header_size_ = 0;       // 重置header_size_
+
+      // Socket recv only yields on EAGAIN. A publisher that keeps the socket
+      // readable would otherwise monopolize this event thread, so the drain
+      // callback and send-worker coroutines never run and live fanout starves.
+      // Wait on the same fd (level-triggered) so a still-busy socket resumes
+      // immediately after other coroutines and eventloop_callback run.
+      if (++packets_since_yield >= kProcessLoopYieldEveryPackets) {
+        packets_since_yield = 0;
+        if (socket_ && socket_->is_connected()) {
+          // The return value is ignored on purpose: POLLHUP and recv errors
+          // are handled by the next read_packet()/recv().
+          (void)mqtt::runtime::current_runtime().wait_readable(socket_->get_fd(), 1);
+        }
+      }
     }
   }
 
