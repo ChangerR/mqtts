@@ -1913,10 +1913,13 @@ int MQTTProtocolHandler::send_parts_with_lock(const uint8_t* head, size_t head_s
       write_lock_acquired_.store(false);
       write_lock_condition_.broadcast();
 
-      if (result != 0) {
+      // Skip MQ_ERR_SOCKET: the peer already left. PUBACK, retain replay,
+      // and will delivery also reach this path and do not go through
+      // process_send_task; disconnect is logged on the connection/teardown path.
+      if (result != 0 && result != MQ_ERR_SOCKET) {
         LOG_ERROR("Failed to send data to client {}:{}, error: {}", client_ip_.c_str(),
                   client_port_, result);
-      } else {
+      } else if (result == 0) {
         if (session_manager_) {
           session_manager_->note_bytes_sent(size);
         }
@@ -2584,8 +2587,13 @@ int MQTTProtocolHandler::deliver_publish(const MQTTString& topic, const MQTTByte
     if (allocated_id) {
       release_outbound_packet_id(allocated_id);
     }
-    LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
-              client_port_, ret);
+    // Skip MQ_ERR_SOCKET: same as send_parts_with_lock. This path is also
+    // used for retain replay and will delivery, which do not go through
+    // process_send_task; disconnect is logged on the connection/teardown path.
+    if (ret != MQ_ERR_SOCKET) {
+      LOG_ERROR("Failed to send PUBLISH packet to client {}:{}, error: {}", client_ip_.c_str(),
+                client_port_, ret);
+    }
   } else {
     if (session_manager_) {
       session_manager_->note_publish_sent(payload.size());

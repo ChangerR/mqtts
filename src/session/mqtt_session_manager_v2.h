@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -142,7 +143,10 @@ class ThreadLocalSessionManager
    */
   int process_pending_messages_nowait(int max_process_count = 0);
 
-  // Emit any pending queue-full drop summary after drops have been quiet for 1s.
+  // Rate-limited "handler not found" (worker_id < 0 if not from a send worker).
+  void note_handler_not_found(const MQTTString& client_id, int worker_id = -1);
+
+  // Emit leftover queue-full / dispatch / handler-not-found summaries after 1s of quiet.
   void flush_queue_full_reports();
 
   // 跨线程会话接管。只入队，由本事件线程的事件循环回调执行。
@@ -225,9 +229,10 @@ class ThreadLocalSessionManager
   mutable CoroMutex sessions_mutex_;
   std::unordered_map<std::string, std::unique_ptr<SessionInfo>> sessions_;
 
-  // 消息队列需要支持多线程访问（其他线程会向此队列写入消息）
+  // 消息队列需要支持多线程访问（其他事件线程的协程会向此队列写入消息）。
+  // deque 以便 submit 失败时 O(1) push_front，避免在 queue_mutex_ 下整队拷贝。
   mutable std::mutex queue_mutex_;
-  std::queue<PendingMessage> pending_messages_;
+  std::deque<PendingMessage> pending_messages_;
   std::queue<SessionTakeoverRequest> takeover_requests_;
 
   CoroCondition new_message_cond_;

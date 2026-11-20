@@ -166,6 +166,16 @@ int SendWorkerPool::submit_task(const WorkerSendTask& task)
   return MQ_SUCCESS;
 }
 
+size_t SendWorkerPool::free_capacity_for(const MQTTString& client_id) const
+{
+  if (!running_.load() || workers_.empty()) {
+    return 0;
+  }
+  const size_t worker_id = select_worker(client_id);
+  const size_t pending = workers_[worker_id]->pending_count.load();
+  return pending >= max_queue_size_ ? 0 : max_queue_size_ - pending;
+}
+
 SendWorkerPool::Statistics SendWorkerPool::get_statistics() const
 {
   Statistics stats = {};
@@ -298,8 +308,8 @@ int SendWorkerPool::process_send_task(WorkerSendTask& task, size_t worker_id)
   try {
     SafeHandlerRef safe_handler = session_manager_->get_safe_handler(task.get_target_client_id());
     if (!safe_handler.is_valid()) {
-      LOG_WARN("Worker {}: handler not found for client: {}", worker_id,
-               from_mqtt_string(task.get_target_client_id()));
+      session_manager_->note_handler_not_found(task.get_target_client_id(),
+                                               static_cast<int>(worker_id));
       return MQ_ERR_SESSION_INVALID_HANDLER;
     }
 

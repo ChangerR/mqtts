@@ -114,6 +114,11 @@ class SendWorkerPool
    */
   int submit_task(const WorkerSendTask& task);
 
+  // Remaining slots on the worker that would receive this client_id.
+  // Clients are sticky-hashed; a single hot subscriber uses one worker
+  // (max_queue_size_), so a drain batch must not exceed this.
+  size_t free_capacity_for(const MQTTString& client_id) const;
+
   /**
    * @brief 获取统计信息
    */
