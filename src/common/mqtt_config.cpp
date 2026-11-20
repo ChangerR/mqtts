@@ -89,129 +89,122 @@ void ConfigManager::note_error(const std::string& message)
 
 void ConfigManager::warn_leaves(const YAML::Node& node, const std::string& path, const char* reason)
 {
-  if (!node || node.IsNull()) {
-    return;
-  }
-  if (node.IsMap()) {
-    if (node.size() == 0) {
+  if (!(!node || node.IsNull())) {
+    if (node.IsMap()) {
+      if (node.size() == 0) {
+        note_warning("配置键 " + path + " " + reason);
+      } else {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+          std::string key = it->first.as<std::string>();
+          warn_leaves(it->second, path.empty() ? key : path + "." + key, reason);
+        }
+      }
+    } else if (node.IsSequence()) {
+      if (node.size() == 0) {
+        note_warning("配置键 " + path + " " + reason);
+      } else {
+        int index = 0;
+        for (const auto& item : node) {
+          warn_leaves(item, path + "[" + std::to_string(index++) + "]", reason);
+        }
+      }
+    } else {
       note_warning("配置键 " + path + " " + reason);
-      return;
     }
-    for (auto it = node.begin(); it != node.end(); ++it) {
-      std::string key = it->first.as<std::string>();
-      warn_leaves(it->second, path.empty() ? key : path + "." + key, reason);
-    }
-    return;
   }
-  if (node.IsSequence()) {
-    if (node.size() == 0) {
-      note_warning("配置键 " + path + " " + reason);
-      return;
-    }
-    int index = 0;
-    for (const auto& item : node) {
-      warn_leaves(item, path + "[" + std::to_string(index++) + "]", reason);
-    }
-    return;
-  }
-  note_warning("配置键 " + path + " " + reason);
 }
 
 void ConfigManager::audit_map(const YAML::Node& node, const std::string& path,
                               const std::vector<const char*>& effective,
                               const std::vector<const char*>& deprecated)
 {
-  if (!node || node.IsNull()) {
-    return;
-  }
-  if (!node.IsMap()) {
-    note_warning("配置键 " + path + " 应为映射，已忽略");
-    return;
-  }
-  for (auto it = node.begin(); it != node.end(); ++it) {
-    const std::string key = it->first.as<std::string>();
-    const std::string child = path.empty() ? key : path + "." + key;
-    if (key_in(deprecated, key)) {
-      note_warning("配置键 " + child + " 已废弃并忽略");
-    } else if (!key_in(effective, key)) {
-      warn_leaves(it->second, child, "未识别，已忽略");
+  if (!(!node || node.IsNull())) {
+    if (!node.IsMap()) {
+      note_warning("配置键 " + path + " 应为映射，已忽略");
+    } else {
+      for (auto it = node.begin(); it != node.end(); ++it) {
+        const std::string key = it->first.as<std::string>();
+        const std::string child = path.empty() ? key : path + "." + key;
+        if (key_in(deprecated, key)) {
+          note_warning("配置键 " + child + " 已废弃并忽略");
+        } else if (!key_in(effective, key)) {
+          warn_leaves(it->second, child, "未识别，已忽略");
+        }
+      }
     }
   }
 }
 
 void ConfigManager::audit_auth(const YAML::Node& node)
 {
-  if (!node || node.IsNull()) {
-    return;
-  }
-  if (!node.IsMap()) {
-    note_warning("配置键 auth 应为映射，已忽略");
-    return;
-  }
-  for (auto it = node.begin(); it != node.end(); ++it) {
-    const std::string key = it->first.as<std::string>();
-    if (key == "sqlite") {
-      audit_map(it->second, "auth.sqlite", kSqliteKeys, {});
-    } else if (key == "redis") {
-      audit_map(it->second, "auth.redis", kRedisKeys, {});
-    } else if (key == "providers") {
-      if (!it->second.IsSequence()) {
-        note_warning("配置键 auth.providers 应为列表，已忽略");
-        continue;
-      }
-      int index = 0;
-      for (const auto& provider : it->second) {
-        const std::string path = "auth.providers[" + std::to_string(index++) + "]";
-        if (!provider.IsMap()) {
-          note_warning("配置键 " + path + " 应为映射，已忽略");
-          continue;
-        }
-        for (auto field = provider.begin(); field != provider.end(); ++field) {
-          const std::string field_key = field->first.as<std::string>();
-          if (field_key == "settings") {
+  if (!(!node || node.IsNull())) {
+    if (!node.IsMap()) {
+      note_warning("配置键 auth 应为映射，已忽略");
+    } else {
+      for (auto it = node.begin(); it != node.end(); ++it) {
+        const std::string key = it->first.as<std::string>();
+        if (key == "sqlite") {
+          audit_map(it->second, "auth.sqlite", kSqliteKeys, {});
+        } else if (key == "redis") {
+          audit_map(it->second, "auth.redis", kRedisKeys, {});
+        } else if (key == "providers") {
+          if (!it->second.IsSequence()) {
+            note_warning("配置键 auth.providers 应为列表，已忽略");
             continue;
           }
-          if (!key_in(kProviderKeys, field_key)) {
-            warn_leaves(field->second, path + "." + field_key, "未识别，已忽略");
+          int index = 0;
+          for (const auto& provider : it->second) {
+            const std::string path = "auth.providers[" + std::to_string(index++) + "]";
+            if (!provider.IsMap()) {
+              note_warning("配置键 " + path + " 应为映射，已忽略");
+              continue;
+            }
+            for (auto field = provider.begin(); field != provider.end(); ++field) {
+              const std::string field_key = field->first.as<std::string>();
+              if (field_key == "settings") {
+                continue;
+              }
+              if (!key_in(kProviderKeys, field_key)) {
+                warn_leaves(field->second, path + "." + field_key, "未识别，已忽略");
+              }
+            }
           }
+        } else if (!key_in(kAuthKeys, key)) {
+          warn_leaves(it->second, "auth." + key, "未识别，已忽略");
         }
       }
-    } else if (!key_in(kAuthKeys, key)) {
-      warn_leaves(it->second, "auth." + key, "未识别，已忽略");
     }
   }
 }
 
 void ConfigManager::audit_config(const YAML::Node& root)
 {
-  if (!root || !root.IsMap()) {
-    return;
-  }
-  for (auto it = root.begin(); it != root.end(); ++it) {
-    const std::string key = it->first.as<std::string>();
-    if (key == "server") {
-      audit_map(it->second, "server", kServerKeys, {});
-    } else if (key == "mqtt") {
-      audit_map(it->second, "mqtt", kMqttKeys, kMqttDeprecated);
-    } else if (key == "memory") {
-      audit_map(it->second, "memory", kMemoryKeys, {});
-    } else if (key == "retain") {
-      audit_map(it->second, "retain", kRetainKeys, {});
-    } else if (key == "log") {
-      audit_map(it->second, "log", kLogKeys, {});
-    } else if (key == "monitoring") {
-      audit_map(it->second, "monitoring", kMonitoringKeys, {});
-    } else if (key == "persistence") {
-      audit_map(it->second, "persistence", kPersistenceKeys, {});
-    } else if (key == "auth") {
-      audit_auth(it->second);
-    } else if (key == "websocket") {
-      warn_leaves(it->second, "websocket",
-                  "已忽略：WebSocket 复用 server.port，本段不生效");
-    } else if (key == "event_forwarding") {
-      warn_leaves(it->second, "event_forwarding", "本版本不生效：事件转发未接线");
-    } else {
-      warn_leaves(it->second, key, "未识别，已忽略");
+  if (!(!root || !root.IsMap())) {
+    for (auto it = root.begin(); it != root.end(); ++it) {
+      const std::string key = it->first.as<std::string>();
+      if (key == "server") {
+        audit_map(it->second, "server", kServerKeys, {});
+      } else if (key == "mqtt") {
+        audit_map(it->second, "mqtt", kMqttKeys, kMqttDeprecated);
+      } else if (key == "memory") {
+        audit_map(it->second, "memory", kMemoryKeys, {});
+      } else if (key == "retain") {
+        audit_map(it->second, "retain", kRetainKeys, {});
+      } else if (key == "log") {
+        audit_map(it->second, "log", kLogKeys, {});
+      } else if (key == "monitoring") {
+        audit_map(it->second, "monitoring", kMonitoringKeys, {});
+      } else if (key == "persistence") {
+        audit_map(it->second, "persistence", kPersistenceKeys, {});
+      } else if (key == "auth") {
+        audit_auth(it->second);
+      } else if (key == "websocket") {
+        warn_leaves(it->second, "websocket", "已忽略：WebSocket 复用 server.port，本段不生效");
+      } else if (key == "event_forwarding") {
+        warn_leaves(it->second, "event_forwarding", "本版本不生效：事件转发未接线");
+      } else {
+        warn_leaves(it->second, key, "未识别，已忽略");
+      }
     }
   }
 }
@@ -324,83 +317,73 @@ int ConfigManager::load_from_file(const std::string& config_file)
 
 int ConfigManager::validate()
 {
+  int ret = 0;
   const auto& p = config_.persistence;
   if (p.enabled &&
       (p.path.empty() || !p.partitions || p.partitions > 32 || p.segment_bytes < 4096 ||
        p.max_disk_bytes / (p.partitions * 4) < p.segment_bytes ||
-       p.max_disk_bytes / 32 < p.segment_bytes || p.checkpoint_interval_ms < 100 || !p.max_session_expiry_seconds || !p.max_sessions ||
-       !p.max_subscriptions_per_session || !p.max_messages || !p.max_messages_per_session ||
-       !p.max_bytes || !p.max_bytes_per_session ||
-       (p.overflow_policy != "reject" && p.overflow_policy != "isolate") ||
-       !p.max_requests || p.max_request_bytes < 4 * 1024 * 1024 ||
-       !p.max_inflight || p.max_inflight > 65535)) {
+       p.max_disk_bytes / 32 < p.segment_bytes || p.checkpoint_interval_ms < 100 ||
+       !p.max_session_expiry_seconds || !p.max_sessions || !p.max_subscriptions_per_session ||
+       !p.max_messages || !p.max_messages_per_session || !p.max_bytes || !p.max_bytes_per_session ||
+       (p.overflow_policy != "reject" && p.overflow_policy != "isolate") || !p.max_requests ||
+       p.max_request_bytes < 4 * 1024 * 1024 || !p.max_inflight || p.max_inflight > 65535)) {
     note_error("Invalid bounded persistence configuration");
-    return -1;
+    ret = -1;
+  } else {
+    // 验证服务器配置
+    if (config_.server.port == 0 || config_.server.port > 65535) {
+      note_error("无效的端口号: " + std::to_string(config_.server.port));
+      ret = -1;
+    } else if (config_.server.max_connections <= 0) {
+      note_error("无效的最大连接数: " + std::to_string(config_.server.max_connections));
+      ret = -1;
+    } else if (config_.server.thread_count <= 0) {
+      note_error("无效的线程数: " + std::to_string(config_.server.thread_count));
+      ret = -1;
+    } else {
+      // 验证MQTT配置
+      if (config_.mqtt.max_packet_size == 0) {
+        note_error("最大包大小不能为0");
+        ret = -1;
+      } else if (config_.mqtt.max_qos > 2) {
+        note_error("无效的最大QoS级别: " + std::to_string(config_.mqtt.max_qos));
+        ret = -1;
+      } else if (config_.mqtt.shared_subscription_available) {
+        note_error("mqtt.shared_subscription_available 本版本不支持，不能为 true");
+        ret = -1;
+      } else if (config_.mqtt.subscription_identifier_available) {
+        note_error("mqtt.subscription_identifier_available 本版本不支持，不能为 true");
+        ret = -1;
+      } else if (config_.mqtt.receive_maximum < 1) {
+        note_error("mqtt.receive_maximum 必须大于等于 1");
+        ret = -1;
+      } else {
+        // 读缓冲和解析出的报文各占一份完整报文，另留 128KiB
+        // 给连接状态（别名表、会话属性、遗嘱等）。
+        constexpr uint64_t kConnectionStateHeadroom = 128 * 1024;
+        const uint64_t required_client_memory =
+            2 * static_cast<uint64_t>(config_.mqtt.max_packet_size) + kConnectionStateHeadroom;
+        if (static_cast<uint64_t>(config_.memory.client_max_size) < required_client_memory) {
+          note_error("memory.client_max_size (" + std::to_string(config_.memory.client_max_size) +
+                     ") 至少要为 2 × mqtt.max_packet_size + 128KiB (" +
+                     std::to_string(required_client_memory) + ")");
+          ret = -1;
+        } else if (config_.mqtt.connect_timeout_seconds < 1) {
+          note_error("mqtt.connect_timeout_seconds 必须大于等于 1");
+          ret = -1;
+        } else {
+          // 验证内存配置
+          if (config_.memory.client_max_size == 0) {
+            note_error("客户端内存大小不能为0");
+            ret = -1;
+          } else {
+            ret = 0;
+          }
+        }
+      }
+    }
   }
-  // 验证服务器配置
-  if (config_.server.port == 0 || config_.server.port > 65535) {
-    note_error("无效的端口号: " + std::to_string(config_.server.port));
-    return -1;
-  }
-
-  if (config_.server.max_connections <= 0) {
-    note_error("无效的最大连接数: " + std::to_string(config_.server.max_connections));
-    return -1;
-  }
-
-  if (config_.server.thread_count <= 0) {
-    note_error("无效的线程数: " + std::to_string(config_.server.thread_count));
-    return -1;
-  }
-
-  // 验证MQTT配置
-  if (config_.mqtt.max_packet_size == 0) {
-    note_error("最大包大小不能为0");
-    return -1;
-  }
-
-  if (config_.mqtt.max_qos > 2) {
-    note_error("无效的最大QoS级别: " + std::to_string(config_.mqtt.max_qos));
-    return -1;
-  }
-
-  if (config_.mqtt.shared_subscription_available) {
-    note_error("mqtt.shared_subscription_available 本版本不支持，不能为 true");
-    return -1;
-  }
-
-  if (config_.mqtt.subscription_identifier_available) {
-    note_error("mqtt.subscription_identifier_available 本版本不支持，不能为 true");
-    return -1;
-  }
-
-  if (config_.mqtt.receive_maximum < 1) {
-    note_error("mqtt.receive_maximum 必须大于等于 1");
-    return -1;
-  }
-
-  // 读缓冲和解析出的报文各占一份完整报文，另留 128KiB 给连接状态（别名表、会话属性、遗嘱等）。
-  constexpr uint64_t kConnectionStateHeadroom = 128 * 1024;
-  const uint64_t required_client_memory =
-      2 * static_cast<uint64_t>(config_.mqtt.max_packet_size) + kConnectionStateHeadroom;
-  if (static_cast<uint64_t>(config_.memory.client_max_size) < required_client_memory) {
-    note_error("memory.client_max_size (" + std::to_string(config_.memory.client_max_size) +
-               ") 至少要为 2 × mqtt.max_packet_size + 128KiB (" +
-               std::to_string(required_client_memory) + ")");
-    return -1;
-  }
-
-  if (config_.mqtt.connect_timeout_seconds < 1) {
-    note_error("mqtt.connect_timeout_seconds 必须大于等于 1");
-    return -1;
-  }
-
-  // 验证内存配置
-  if (config_.memory.client_max_size == 0) {
-    note_error("客户端内存大小不能为0");
-    return -1;
-  }
-  return 0;
+  return ret;
 }
 
 void ConfigManager::parse_server_config(const YAML::Node& node)

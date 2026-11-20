@@ -126,9 +126,9 @@ inline void read_subscription_options(Decoder& d, StoredSubscription& sub)
 // Legacy journal subscriptions have no tail. A versioned tail must be complete.
 inline void read_legacy_subscription_options(Decoder& d, StoredSubscription& sub)
 {
-  if (d.remaining() == 0)
-    return;
-  read_subscription_options(d, sub);
+  if (!(d.remaining() == 0)) {
+    read_subscription_options(d, sub);
+  }
 }
 
 // Retain log version 1. A missing retain log is an empty set (journals written

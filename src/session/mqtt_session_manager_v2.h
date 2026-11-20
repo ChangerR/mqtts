@@ -52,11 +52,11 @@ class RetainReplayGuard
   ~RetainReplayGuard() { unlock(); }
   void unlock()
   {
-    if (!flag_)
-      return;
-    std::atomic<uint32_t>* flag = flag_;
-    flag_ = nullptr;
-    flag->store(0, std::memory_order_release);
+    if (flag_) {
+      std::atomic<uint32_t>* flag = flag_;
+      flag_ = nullptr;
+      flag->store(0, std::memory_order_release);
+    }
   }
   bool owns_lock() const { return flag_ != nullptr; }
 

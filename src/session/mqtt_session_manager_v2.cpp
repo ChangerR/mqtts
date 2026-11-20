@@ -32,31 +32,27 @@ void log_queue_full(const char* detail, size_t n = 1)
 {
   // One ERROR line per dropped message fills a 10 MiB log in a few seconds and
   // contends the shared sink mutex on every publisher coroutine.
-  if (n == 0) {
-    return;
+  if (!(n == 0)) {
+    const auto now = std::chrono::steady_clock::now();
+    queue_full_dropped += n;
+    queue_full_detail = detail;
+    queue_full_last_drop = now;
+    if (!(queue_full_last_report.time_since_epoch().count() != 0 &&
+          now - queue_full_last_report < std::chrono::seconds(1))) {
+      emit_queue_full_log();
+    }
   }
-  const auto now = std::chrono::steady_clock::now();
-  queue_full_dropped += n;
-  queue_full_detail = detail;
-  queue_full_last_drop = now;
-  if (queue_full_last_report.time_since_epoch().count() != 0 &&
-      now - queue_full_last_report < std::chrono::seconds(1)) {
-    return;
-  }
-  emit_queue_full_log();
 }
 
 void flush_queue_full_log()
 {
   // Report the last incomplete 1s window after drops have stopped.
-  if (queue_full_dropped == 0) {
-    return;
+  if (!(queue_full_dropped == 0)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!(now - queue_full_last_drop < std::chrono::seconds(1))) {
+      emit_queue_full_log();
+    }
   }
-  const auto now = std::chrono::steady_clock::now();
-  if (now - queue_full_last_drop < std::chrono::seconds(1)) {
-    return;
-  }
-  emit_queue_full_log();
 }
 
 // Rate-limit "Failed to dispatch" the same way as log_queue_full. Counters are
@@ -91,23 +87,20 @@ void log_dispatch_fail(const MQTTString& client_id)
   ++dispatch_fail_count;
   dispatch_fail_client = client_id;
   dispatch_fail_last = now;
-  if (dispatch_fail_last_report.time_since_epoch().count() != 0 &&
-      now - dispatch_fail_last_report < std::chrono::seconds(1)) {
-    return;
+  if (!(dispatch_fail_last_report.time_since_epoch().count() != 0 &&
+        now - dispatch_fail_last_report < std::chrono::seconds(1))) {
+    emit_dispatch_fail_log();
   }
-  emit_dispatch_fail_log();
 }
 
 void flush_dispatch_fail_log()
 {
-  if (dispatch_fail_count == 0) {
-    return;
+  if (!(dispatch_fail_count == 0)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!(now - dispatch_fail_last < std::chrono::seconds(1))) {
+      emit_dispatch_fail_log();
+    }
   }
-  const auto now = std::chrono::steady_clock::now();
-  if (now - dispatch_fail_last < std::chrono::seconds(1)) {
-    return;
-  }
-  emit_dispatch_fail_log();
 }
 
 // Temporary postpone: destination worker is full, message stays in pending.
@@ -130,23 +123,20 @@ void log_dispatch_deferred(const MQTTString& client_id)
   ++dispatch_defer_count;
   dispatch_defer_client = client_id;
   dispatch_defer_last = now;
-  if (dispatch_defer_last_report.time_since_epoch().count() != 0 &&
-      now - dispatch_defer_last_report < std::chrono::seconds(1)) {
-    return;
+  if (!(dispatch_defer_last_report.time_since_epoch().count() != 0 &&
+        now - dispatch_defer_last_report < std::chrono::seconds(1))) {
+    emit_dispatch_defer_log();
   }
-  emit_dispatch_defer_log();
 }
 
 void flush_dispatch_defer_log()
 {
-  if (dispatch_defer_count == 0) {
-    return;
+  if (!(dispatch_defer_count == 0)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!(now - dispatch_defer_last < std::chrono::seconds(1))) {
+      emit_dispatch_defer_log();
+    }
   }
-  const auto now = std::chrono::steady_clock::now();
-  if (now - dispatch_defer_last < std::chrono::seconds(1)) {
-    return;
-  }
-  emit_dispatch_defer_log();
 }
 
 // "handler not found" after clients disconnect while pending/worker queues
@@ -180,23 +170,20 @@ void log_handler_not_found(const MQTTString& client_id, int worker_id)
   handler_nf_client = client_id;
   handler_nf_worker = worker_id;
   handler_nf_last = now;
-  if (handler_nf_last_report.time_since_epoch().count() != 0 &&
-      now - handler_nf_last_report < std::chrono::seconds(1)) {
-    return;
+  if (!(handler_nf_last_report.time_since_epoch().count() != 0 &&
+        now - handler_nf_last_report < std::chrono::seconds(1))) {
+    emit_handler_not_found_log();
   }
-  emit_handler_not_found_log();
 }
 
 void flush_handler_not_found_log()
 {
-  if (handler_nf_count == 0) {
-    return;
+  if (!(handler_nf_count == 0)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!(now - handler_nf_last < std::chrono::seconds(1))) {
+      emit_handler_not_found_log();
+    }
   }
-  const auto now = std::chrono::steady_clock::now();
-  if (now - handler_nf_last < std::chrono::seconds(1)) {
-    return;
-  }
-  emit_handler_not_found_log();
 }
 
 }  // namespace
@@ -336,49 +323,47 @@ int ThreadLocalSessionManager::register_handler(const MQTTString& client_id,
 
 int ThreadLocalSessionManager::unregister_handler(const MQTTString& client_id)
 {
+  int ret = 0;
   std::string client_id_str = from_mqtt_string(client_id);
-
   CoroLockGuard lock(&sessions_mutex_);
-
   auto it = sessions_.find(client_id_str);
-
   if (it == sessions_.end()) {
     LOG_WARN("Attempt to unregister non-existent handler: {}", client_id_str);
-    return MQ_ERR_NOT_FOUND_V2;
+    ret = MQ_ERR_NOT_FOUND_V2;
+  } else {
+    // 安全移除session：引用未归零时保留 SessionInfo，避免 UAF
+    int remove_ret = safe_remove_session(client_id_str, it->second.get());
+    if (remove_ret != MQ_SUCCESS) {
+      LOG_WARN("Failed to unregister handler, session retained: {} (error: {})", client_id_str,
+               remove_ret);
+      ret = remove_ret;
+    } else {
+      sessions_.erase(it);
+      LOG_INFO("Handler unregistered from thread: {} (remaining sessions: {})", client_id_str,
+               sessions_.size());
+      ret = MQ_SUCCESS;
+    }
   }
-
-  // 安全移除session：引用未归零时保留 SessionInfo，避免 UAF
-  int remove_ret = safe_remove_session(client_id_str, it->second.get());
-  if (remove_ret != MQ_SUCCESS) {
-    LOG_WARN("Failed to unregister handler, session retained: {} (error: {})", client_id_str,
-             remove_ret);
-    return remove_ret;
-  }
-
-  sessions_.erase(it);
-
-  LOG_INFO("Handler unregistered from thread: {} (remaining sessions: {})", client_id_str,
-           sessions_.size());
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int ThreadLocalSessionManager::safe_remove_session(const std::string& client_id, SessionInfo* info)
 {
+  int ret = 0;
   // 标记为无效和等待移除
   info->is_valid.store(false);
   info->pending_removal.store(true);
-
   // 协程安全的等待所有引用释放
   if (!info->wait_for_zero_refs(session_removal_timeout_ms_)) {
     LOG_WARN("Timeout waiting for session references during removal: {}", client_id);
     info->is_valid.store(true);
     info->pending_removal.store(false);
-    return MQ_ERR_TIMEOUT_V2;
+    ret = MQ_ERR_TIMEOUT_V2;
+  } else {
+    LOG_DEBUG("Session safely removed: {}", client_id);
+    ret = MQ_SUCCESS;
   }
-
-  LOG_DEBUG("Session safely removed: {}", client_id);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 SafeHandlerRef ThreadLocalSessionManager::get_safe_handler(const MQTTString& client_id)
@@ -522,58 +507,61 @@ int ThreadLocalSessionManager::enqueue_takeover(const std::string& client_id,
                                                 MQTTProtocolHandler* newcomer,
                                                 const std::shared_ptr<SessionTakeoverGate>& gate)
 {
+  int ret = 0;
   if (!initialized_) {
-    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+    ret = MQ_ERR_SESSION_MANAGER_NOT_READY;
+  } else if (!gate) {
+    ret = MQ_ERR_PARAM_V2;
+  } else {
+    SessionTakeoverRequest request;
+    request.client_id = client_id;
+    request.newcomer = newcomer;
+    request.gate = gate;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      takeover_requests_.push(std::move(request));
+    }
+    ret = MQ_SUCCESS;
   }
-  if (!gate) {
-    return MQ_ERR_PARAM_V2;
-  }
-
-  SessionTakeoverRequest request;
-  request.client_id = client_id;
-  request.newcomer = newcomer;
-  request.gate = gate;
-  {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    takeover_requests_.push(std::move(request));
-  }
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int ThreadLocalSessionManager::process_control_messages()
 {
+  int ret = 0;
   if (!initialized_) {
-    return 0;
-  }
-
-  int processed = 0;
-  while (true) {
-    SessionTakeoverRequest request;
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      if (takeover_requests_.empty()) {
-        break;
+    ret = 0;
+  } else {
+    int processed = 0;
+    while (true) {
+      SessionTakeoverRequest request;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (takeover_requests_.empty()) {
+          break;
+        }
+        request = std::move(takeover_requests_.front());
+        takeover_requests_.pop();
       }
-      request = std::move(takeover_requests_.front());
-      takeover_requests_.pop();
-    }
 
-    if (!request.gate || !request.gate->arm()) {
-      if (request.gate) {
+      if (!request.gate || !request.gate->arm()) {
+        if (request.gate) {
+          request.gate->done.store(true, std::memory_order_release);
+        }
+        processed++;
+        continue;
+      }
+      SafeHandlerRef current = get_safe_handler(to_mqtt_string(request.client_id, allocator_));
+      if (!current.is_valid() || current.get() == request.newcomer) {
         request.gate->done.store(true, std::memory_order_release);
+      } else {
+        current->request_session_takeover(request.gate);
       }
       processed++;
-      continue;
     }
-    SafeHandlerRef current = get_safe_handler(to_mqtt_string(request.client_id, allocator_));
-    if (!current.is_valid() || current.get() == request.newcomer) {
-      request.gate->done.store(true, std::memory_order_release);
-    } else {
-      current->request_session_takeover(request.gate);
-    }
-    processed++;
+    ret = processed;
   }
-  return processed;
+  return ret;
 }
 
 int ThreadLocalSessionManager::process_pending_messages(int max_process_count, int timeout_ms)
@@ -605,73 +593,71 @@ void ThreadLocalSessionManager::flush_queue_full_reports()
 
 int ThreadLocalSessionManager::process_pending_messages_nowait(int max_process_count)
 {
+  int ret = 0;
   if (!worker_pool_ || !worker_pool_->is_running()) {
     LOG_WARN("Worker pool not available, falling back to direct processing");
-    return internal_process_messages(max_process_count);
-  }
+    ret = internal_process_messages(max_process_count);
+  } else {
+    if (max_process_count < 0) {
+      max_process_count = 0;  // 0表示处理所有
+    }
+    int dispatched_count = 0;
+    while (dispatched_count != max_process_count) {
+      PendingMessage message(PublishPacket{}, MQTTString(), MQTTString());
+      bool has_message = false;
+      bool worker_full = false;
+      MQTTString full_client_id;
 
-  if (max_process_count < 0) {
-    max_process_count = 0;  // 0表示处理所有
-  }
-
-  int dispatched_count = 0;
-
-  while (dispatched_count != max_process_count) {
-    PendingMessage message(PublishPacket{}, MQTTString(), MQTTString());
-    bool has_message = false;
-    bool worker_full = false;
-    MQTTString full_client_id;
-
-    // Peek the front and pop only when the destination worker has a free slot.
-    // On a rare submit race, push_front the moved message back (O(1)).
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      if (!pending_messages_.empty()) {
-        if (worker_pool_->free_capacity_for(pending_messages_.front().target_client_id) == 0) {
-          full_client_id = pending_messages_.front().target_client_id;
-          worker_full = true;
-        } else {
-          message = std::move(pending_messages_.front());
-          pending_messages_.pop_front();
-          has_message = true;
-          if (pending_messages_.empty()) {
-            has_new_messages_.store(false);
+      // Peek the front and pop only when the destination worker has a free slot.
+      // On a rare submit race, push_front the moved message back (O(1)).
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (!pending_messages_.empty()) {
+          if (worker_pool_->free_capacity_for(pending_messages_.front().target_client_id) == 0) {
+            full_client_id = pending_messages_.front().target_client_id;
+            worker_full = true;
+          } else {
+            message = std::move(pending_messages_.front());
+            pending_messages_.pop_front();
+            has_message = true;
+            if (pending_messages_.empty()) {
+              has_new_messages_.store(false);
+            }
           }
         }
       }
-    }
 
-    if (worker_full) {
-      log_dispatch_deferred(full_client_id);
-      break;
-    }
-    if (!has_message) {
-      break;
-    }
-
-    WorkerSendTask task(message);
-
-    int submit_result = worker_pool_->submit_task(task);
-    if (submit_result == MQ_SUCCESS) {
-      dispatched_count++;
-      LOG_DEBUG("Message dispatched to worker pool for client: {}",
-                from_mqtt_string(message.target_client_id));
-    } else {
-      log_dispatch_fail(message.target_client_id);
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        pending_messages_.push_front(std::move(message));
-        has_new_messages_.store(true);
+      if (worker_full) {
+        log_dispatch_deferred(full_client_id);
+        break;
       }
-      break;
+      if (!has_message) {
+        break;
+      }
+
+      WorkerSendTask task(message);
+
+      int submit_result = worker_pool_->submit_task(task);
+      if (submit_result == MQ_SUCCESS) {
+        dispatched_count++;
+        LOG_DEBUG("Message dispatched to worker pool for client: {}",
+                  from_mqtt_string(message.target_client_id));
+      } else {
+        log_dispatch_fail(message.target_client_id);
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          pending_messages_.push_front(std::move(message));
+          has_new_messages_.store(true);
+        }
+        break;
+      }
     }
+    if (dispatched_count > 0) {
+      LOG_DEBUG("Dispatched {} messages to worker pool in thread", dispatched_count);
+    }
+    ret = dispatched_count;
   }
-
-  if (dispatched_count > 0) {
-    LOG_DEBUG("Dispatched {} messages to worker pool in thread", dispatched_count);
-  }
-
-  return dispatched_count;
+  return ret;
 }
 
 int ThreadLocalSessionManager::wait_for_new_message(int timeout_ms, bool& has_message)
@@ -842,33 +828,35 @@ int ThreadLocalSessionManager::cleanup_invalid_handlers()
 
 int ThreadLocalSessionManager::configure_worker_pool(size_t worker_count, size_t max_queue_size)
 {
+  int ret = 0;
   if (worker_pool_ && worker_pool_->is_running()) {
     worker_pool_->stop();
   }
-
   worker_pool_.reset(new SendWorkerPool(worker_count, max_queue_size));
   worker_pool_->set_session_manager(this);
-
   int result = worker_pool_->start();
   if (result != MQ_SUCCESS) {
     LOG_ERROR("Failed to start worker pool: {}", result);
     worker_pool_.reset();
-    return result;
+    ret = result;
+  } else {
+    LOG_INFO("Worker pool configured with {} workers, max queue size: {}", worker_count,
+             max_queue_size);
+    ret = MQ_SUCCESS;
   }
-
-  LOG_INFO("Worker pool configured with {} workers, max queue size: {}", worker_count,
-           max_queue_size);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 SendWorkerPool::Statistics ThreadLocalSessionManager::get_worker_statistics() const
 {
+  SendWorkerPool::Statistics ret{};
   if (worker_pool_) {
-    return worker_pool_->get_statistics();
+    ret = worker_pool_->get_statistics();
+  } else {
+    SendWorkerPool::Statistics empty_stats = {};
+    ret = std::move(empty_stats);
   }
-
-  SendWorkerPool::Statistics empty_stats = {};
-  return empty_stats;
+  return ret;
 }
 
 bool ThreadLocalSessionManager::is_handler_valid(MQTTProtocolHandler* handler) const
@@ -975,137 +963,132 @@ GlobalSessionManager::~GlobalSessionManager()
 
 int GlobalSessionManager::pre_register_threads(size_t thread_count, size_t reserve_client_count)
 {
+  int ret = 0;
   if (state_.load() != ManagerState::INITIALIZING) {
     LOG_ERROR("pre_register_threads can only be called in INITIALIZING state");
-    return MQ_ERR_INVALID_STATE;
+    ret = MQ_ERR_INVALID_STATE;
+  } else {
+    WriteLockGuard managers_lock(managers_mutex_);
+    WriteLockGuard client_lock(client_index_mutex_);
+    // 预分配容量以避免重新分配
+    thread_managers_.reserve(thread_count);
+    thread_manager_array_.reserve(thread_count);
+    client_to_manager_.reserve(reserve_client_count);
+    state_.store(ManagerState::REGISTERING);
+    LOG_INFO("Pre-registered capacity for {} threads and {} clients", thread_count,
+             reserve_client_count);
+    ret = MQ_SUCCESS;
   }
-
-  WriteLockGuard managers_lock(managers_mutex_);
-  WriteLockGuard client_lock(client_index_mutex_);
-
-  // 预分配容量以避免重新分配
-  thread_managers_.reserve(thread_count);
-  thread_manager_array_.reserve(thread_count);
-  client_to_manager_.reserve(reserve_client_count);
-
-  state_.store(ManagerState::REGISTERING);
-
-  LOG_INFO("Pre-registered capacity for {} threads and {} clients", thread_count,
-           reserve_client_count);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 ThreadLocalSessionManager* GlobalSessionManager::register_thread_manager(std::thread::id thread_id)
 {
+  ThreadLocalSessionManager* ret = NULL;
   if (state_.load() != ManagerState::REGISTERING) {
     LOG_ERROR("register_thread_manager can only be called in REGISTERING state");
-    return nullptr;
+    ret = nullptr;
+  } else {
+    WriteLockGuard lock(managers_mutex_);
+    // 检查是否已经注册
+    auto it = thread_managers_.find(thread_id);
+    if (it != thread_managers_.end()) {
+      LOG_WARN("Thread manager already registered for thread: {}",
+               std::hash<std::thread::id>{}(thread_id));
+      claim_retained_seed(it->second->protocol_counters());
+      ret = it->second.get();
+    } else {
+      // 为每个线程创建专用的allocator
+      MQTTAllocator* thread_allocator = global_allocator_->create_child(
+          "thread_" + std::to_string(std::hash<std::thread::id>{}(thread_id)),
+          MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+      // 创建新的线程管理器
+      std::unique_ptr<ThreadLocalSessionManager> manager(
+          new ThreadLocalSessionManager(thread_id, thread_allocator));
+      ThreadLocalSessionManager* manager_ptr = manager.get();
+      // 初始化线程管理器
+      int init_result = manager_ptr->init();
+      if (init_result != MQ_SUCCESS) {
+        LOG_ERROR("Failed to initialize ThreadLocalSessionManager for thread: {}",
+                  std::hash<std::thread::id>{}(thread_id));
+        ret = nullptr;
+      } else {
+        thread_managers_[thread_id] = std::move(manager);
+        thread_manager_array_.push_back(manager_ptr);
+        claim_retained_seed(manager_ptr->protocol_counters());
+        // 设置线程本地缓存
+        cached_manager_owner_ = this;
+        cached_thread_manager_ = manager_ptr;
+        LOG_INFO("Registered thread manager for thread: {} (total: {})",
+                 std::hash<std::thread::id>{}(thread_id), thread_managers_.size());
+        ret = manager_ptr;
+      }
+    }
   }
-
-  WriteLockGuard lock(managers_mutex_);
-
-  // 检查是否已经注册
-  auto it = thread_managers_.find(thread_id);
-  if (it != thread_managers_.end()) {
-    LOG_WARN("Thread manager already registered for thread: {}",
-             std::hash<std::thread::id>{}(thread_id));
-    claim_retained_seed(it->second->protocol_counters());
-    return it->second.get();
-  }
-
-  // 为每个线程创建专用的allocator
-  MQTTAllocator* thread_allocator = global_allocator_->create_child("thread_" + std::to_string(std::hash<std::thread::id>{}(thread_id)), MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
-
-  // 创建新的线程管理器
-  std::unique_ptr<ThreadLocalSessionManager> manager(new ThreadLocalSessionManager(thread_id, thread_allocator));
-  ThreadLocalSessionManager* manager_ptr = manager.get();
-  
-  // 初始化线程管理器
-  int init_result = manager_ptr->init();
-  if (init_result != MQ_SUCCESS) {
-    LOG_ERROR("Failed to initialize ThreadLocalSessionManager for thread: {}", 
-              std::hash<std::thread::id>{}(thread_id));
-    return nullptr;
-  }
-
-  thread_managers_[thread_id] = std::move(manager);
-  thread_manager_array_.push_back(manager_ptr);
-  claim_retained_seed(manager_ptr->protocol_counters());
-
-  // 设置线程本地缓存
-  cached_manager_owner_ = this;
-  cached_thread_manager_ = manager_ptr;
-
-  LOG_INFO("Registered thread manager for thread: {} (total: {})",
-           std::hash<std::thread::id>{}(thread_id), thread_managers_.size());
-
-  return manager_ptr;
+  return ret;
 }
 
 int GlobalSessionManager::finalize_thread_registration()
 {
+  int ret = 0;
   if (state_.load() != ManagerState::REGISTERING) {
     LOG_ERROR("finalize_thread_registration can only be called in REGISTERING state");
-    return MQ_ERR_INVALID_STATE;
+    ret = MQ_ERR_INVALID_STATE;
+  } else {
+    state_.store(ManagerState::RUNNING);
+    LOG_INFO("Thread registration finalized, switched to RUNNING mode with {} threads",
+             thread_managers_.size());
+    ret = MQ_SUCCESS;
   }
-
-  state_.store(ManagerState::RUNNING);
-
-  LOG_INFO("Thread registration finalized, switched to RUNNING mode with {} threads",
-           thread_managers_.size());
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 ProtocolCounters* GlobalSessionManager::current_thread_counters()
 {
+  ProtocolCounters* ret = NULL;
   if (cached_manager_owner_ == this && cached_thread_manager_) {
-    return &cached_thread_manager_->protocol_counters();
+    ret = &cached_thread_manager_->protocol_counters();
+  } else if (state_.load() != ManagerState::RUNNING) {
+    ret = nullptr;
+  } else {
+    ThreadLocalSessionManager* local = get_thread_manager();
+    ret = local ? &local->protocol_counters() : nullptr;
   }
-  if (state_.load() != ManagerState::RUNNING) {
-    return nullptr;
-  }
-  ThreadLocalSessionManager* local = get_thread_manager();
-  return local ? &local->protocol_counters() : nullptr;
+  return ret;
 }
 
 void GlobalSessionManager::note_publish_received(uint64_t payload_bytes)
 {
   ProtocolCounters* counters = current_thread_counters();
-  if (!counters) {
-    return;
+  if (counters) {
+    counters->publish_received.fetch_add(1, std::memory_order_relaxed);
+    counters->publish_received_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
   }
-  counters->publish_received.fetch_add(1, std::memory_order_relaxed);
-  counters->publish_received_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::note_publish_sent(uint64_t payload_bytes)
 {
   ProtocolCounters* counters = current_thread_counters();
-  if (!counters) {
-    return;
+  if (counters) {
+    counters->publish_sent.fetch_add(1, std::memory_order_relaxed);
+    counters->publish_sent_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
   }
-  counters->publish_sent.fetch_add(1, std::memory_order_relaxed);
-  counters->publish_sent_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::note_bytes_received(uint64_t bytes)
 {
   ProtocolCounters* counters = current_thread_counters();
-  if (!counters) {
-    return;
+  if (counters) {
+    counters->bytes_received.fetch_add(bytes, std::memory_order_relaxed);
   }
-  counters->bytes_received.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::note_bytes_sent(uint64_t bytes)
 {
   ProtocolCounters* counters = current_thread_counters();
-  if (!counters) {
-    return;
+  if (counters) {
+    counters->bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
   }
-  counters->bytes_sent.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::note_connect_timeout()
@@ -1185,15 +1168,14 @@ void GlobalSessionManager::account_retained_result(const RetainWriteResult& resu
   // 恢复发生在事件线程注册之前。条数和字节只记在有符号总量上；
   // 监控汇总会用总量覆盖线程计数，种子里的条数重启后看不见。
   note_retained_delta(result.message_delta, result.byte_delta);
-  if (result.kind != RetainWriteResult::Rejected) {
-    return;
+  if (!(result.kind != RetainWriteResult::Rejected)) {
+    ProtocolCounters* counters = current_thread_counters();
+    if (counters) {
+      counters->retained_not_stored.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      retained_seed_not_stored_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
-  ProtocolCounters* counters = current_thread_counters();
-  if (counters) {
-    counters->retained_not_stored.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  retained_seed_not_stored_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GlobalSessionManager::claim_retained_seed(ProtocolCounters& counters)
@@ -1294,60 +1276,59 @@ RetainMatchResult GlobalSessionManager::match_retained(const std::string& filter
 
 void GlobalSessionManager::configure_persistence(const PersistenceConfig& config)
 {
-  if (!config.enabled) {
-    return;
+  if (config.enabled) {
+    durable_store_.reset(new DurableStore(config));
+    // 监听打开之前恢复。configure_persistence 在 server.start 之前调用。
+    restore_retained_messages();
   }
-  durable_store_.reset(new DurableStore(config));
-  // 监听打开之前恢复。configure_persistence 在 server.start 之前调用。
-  restore_retained_messages();
 }
 
 void GlobalSessionManager::restore_retained_messages()
 {
-  if (!retain_available_ || !durable_store_ || !retain_store_) {
-    return;
-  }
-  const std::vector<DurableStore::RetainedMessage> stored = durable_store_->retained_messages();
-  MQTTAllocator restore_allocator("retain_restore", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
-  const int64_t now_ms = DurableStore::now_ms();
-  for (size_t i = 0; i < stored.size(); ++i) {
-    const DurableStore::RetainedMessage& item = stored[i];
-    PublishPacket packet(&restore_allocator);
-    packet.type = PacketType::PUBLISH;
-    packet.topic_name = to_mqtt_string(item.topic, &restore_allocator);
-    std::vector<uint8_t> bytes(item.payload.begin(), item.payload.end());
-    packet.payload = to_mqtt_bytes(bytes, &restore_allocator);
-    packet.qos = item.qos;
-    packet.retain = true;
-    packet.dup = false;
-    if (item.properties.payload_format_indicator != 0) {
-      packet.properties.payload_format_indicator = item.properties.payload_format_indicator;
-    }
-    packet.properties.content_type =
-        to_mqtt_string(item.properties.content_type, &restore_allocator);
-    packet.properties.response_topic =
-        to_mqtt_string(item.properties.response_topic, &restore_allocator);
-    if (!item.properties.correlation_data.empty()) {
-      packet.properties.correlation_data.assign(item.properties.correlation_data.begin(),
-                                                item.properties.correlation_data.end());
-    }
-    for (size_t p = 0; p < item.properties.user_properties.size(); ++p) {
-      packet.properties.user_properties.emplace_back(
-          to_mqtt_string(item.properties.user_properties[p].first, &restore_allocator),
-          to_mqtt_string(item.properties.user_properties[p].second, &restore_allocator));
-    }
-    if (item.expires_ms > now_ms) {
-      const int64_t remain_ms = item.expires_ms - now_ms;
-      const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
-      packet.properties.has_message_expiry_interval = true;
-      packet.properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
-    }
-    const RetainWriteResult result = retain_store_->store(
-        packet, to_mqtt_string(item.sender, &restore_allocator), retain_config_,
-        std::chrono::steady_clock::now());
-    account_retained_result(result);
-    if (result.kind == RetainWriteResult::Rejected && result.warn) {
-      LOG_WARN("Recovered retained message on topic {} was not stored: {}", item.topic, result.warn);
+  if (!(!retain_available_ || !durable_store_ || !retain_store_)) {
+    const std::vector<DurableStore::RetainedMessage> stored = durable_store_->retained_messages();
+    MQTTAllocator restore_allocator("retain_restore", MQTTMemoryTag::MEM_TAG_RETAIN, 0);
+    const int64_t now_ms = DurableStore::now_ms();
+    for (size_t i = 0; i < stored.size(); ++i) {
+      const DurableStore::RetainedMessage& item = stored[i];
+      PublishPacket packet(&restore_allocator);
+      packet.type = PacketType::PUBLISH;
+      packet.topic_name = to_mqtt_string(item.topic, &restore_allocator);
+      std::vector<uint8_t> bytes(item.payload.begin(), item.payload.end());
+      packet.payload = to_mqtt_bytes(bytes, &restore_allocator);
+      packet.qos = item.qos;
+      packet.retain = true;
+      packet.dup = false;
+      if (item.properties.payload_format_indicator != 0) {
+        packet.properties.payload_format_indicator = item.properties.payload_format_indicator;
+      }
+      packet.properties.content_type =
+          to_mqtt_string(item.properties.content_type, &restore_allocator);
+      packet.properties.response_topic =
+          to_mqtt_string(item.properties.response_topic, &restore_allocator);
+      if (!item.properties.correlation_data.empty()) {
+        packet.properties.correlation_data.assign(item.properties.correlation_data.begin(),
+                                                  item.properties.correlation_data.end());
+      }
+      for (size_t p = 0; p < item.properties.user_properties.size(); ++p) {
+        packet.properties.user_properties.emplace_back(
+            to_mqtt_string(item.properties.user_properties[p].first, &restore_allocator),
+            to_mqtt_string(item.properties.user_properties[p].second, &restore_allocator));
+      }
+      if (item.expires_ms > now_ms) {
+        const int64_t remain_ms = item.expires_ms - now_ms;
+        const uint32_t seconds = static_cast<uint32_t>((remain_ms + 999) / 1000);
+        packet.properties.has_message_expiry_interval = true;
+        packet.properties.message_expiry_interval = seconds == 0 ? 1 : seconds;
+      }
+      const RetainWriteResult result =
+          retain_store_->store(packet, to_mqtt_string(item.sender, &restore_allocator),
+                               retain_config_, std::chrono::steady_clock::now());
+      account_retained_result(result);
+      if (result.kind == RetainWriteResult::Rejected && result.warn) {
+        LOG_WARN("Recovered retained message on topic {} was not stored: {}", item.topic,
+                 result.warn);
+      }
     }
   }
 }
@@ -1469,16 +1450,20 @@ int GlobalSessionManager::deliver_retained(const MQTTString& client_id, const MQ
                                            const SubscriptionOptions& options, bool subscription_existed,
                                            uint64_t durable_epoch)
 {
+  int ret = 0;
   if (!retain_available_ || !retain_store_ ||
-      !retain_handling_delivers(options.retain_handling, subscription_existed))
-    return 0;
-  RetainMatchResult matched;
-  {
-    RetainReplayGuard guard = lock_retain_replay();
-    matched = match_retained(from_mqtt_string(topic_filter));
+      !retain_handling_delivers(options.retain_handling, subscription_existed)) {
+    ret = 0;
+  } else {
+    RetainMatchResult matched;
+    {
+      RetainReplayGuard guard = lock_retain_replay();
+      matched = match_retained(from_mqtt_string(topic_filter));
+    }
+    ret = enqueue_retained_snapshot(client_id, durable_epoch, options, subscription_existed,
+                                    std::move(matched));
   }
-  return enqueue_retained_snapshot(client_id, durable_epoch, options, subscription_existed,
-                                   std::move(matched));
+  return ret;
 }
 
 void GlobalSessionManager::process_due_wills(auth::AuthManager* auth, bool flush_all)
@@ -1675,25 +1660,24 @@ int GlobalSessionManager::register_session(const MQTTString& client_id,
 
 int GlobalSessionManager::unregister_session(const MQTTString& client_id)
 {
+  int ret = 0;
   std::string client_id_str = from_mqtt_string(client_id);
-
   // 直接获取当前线程的管理器，避免全局查找开销
   ThreadLocalSessionManager* thread_manager = get_thread_manager();
   if (!thread_manager) {
     LOG_ERROR("No thread manager available for session unregistration");
-    return MQ_ERR_SESSION_THREAD_MISMATCH;
+    ret = MQ_ERR_SESSION_THREAD_MISMATCH;
+  } else {
+    // 从线程管理器中注销
+    int result = thread_manager->unregister_handler(client_id);
+    // 只有注销成功才从客户端索引中移除
+    if (result == MQ_SUCCESS) {
+      remove_client_index(client_id_str);
+      LOG_INFO("Session unregistered globally: {}", client_id_str);
+    }
+    ret = result;
   }
-
-  // 从线程管理器中注销
-  int result = thread_manager->unregister_handler(client_id);
-
-  // 只有注销成功才从客户端索引中移除
-  if (result == MQ_SUCCESS) {
-    remove_client_index(client_id_str);
-    LOG_INFO("Session unregistered globally: {}", client_id_str);
-  }
-
-  return result;
+  return ret;
 }
 
 ThreadLocalSessionManager* GlobalSessionManager::find_client_manager(const MQTTString& client_id)
@@ -1733,18 +1717,19 @@ int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
                                           const PublishPacket& packet,
                                           const MQTTString& sender_client_id)
 {
+  int ret = 0;
   ThreadLocalSessionManager* thread_manager = find_client_manager(target_client_id);
   if (!thread_manager) {
     LOG_WARN("Target client not found: {}", from_mqtt_string(target_client_id));
-    return MQ_ERR_NOT_FOUND_V2;
+    ret = MQ_ERR_NOT_FOUND_V2;
+  } else {
+    // 将消息加入目标线程的队列
+    PendingMessage message(packet, target_client_id, sender_client_id);
+    thread_manager->enqueue_message(message);
+    LOG_DEBUG("Message forwarded to client: {}", from_mqtt_string(target_client_id));
+    ret = MQ_SUCCESS;
   }
-
-  // 将消息加入目标线程的队列
-  PendingMessage message(packet, target_client_id, sender_client_id);
-  thread_manager->enqueue_message(message);
-
-  LOG_DEBUG("Message forwarded to client: {}", from_mqtt_string(target_client_id));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int GlobalSessionManager::forward_publish_shared(const MQTTString& target_client_id,
@@ -1783,41 +1768,37 @@ SharedMessageContentPtr GlobalSessionManager::get_or_create_shared_content(
 int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& target_client_ids,
                                                 const SharedMessageContentPtr& content)
 {
+  int ret = 0;
   if (!content.is_valid()) {
     LOG_ERROR("Cannot forward invalid shared message content");
-    return MQ_ERR_PARAM_V2;
-  }
-
-  if (target_client_ids.empty()) {
-    return 0;
-  }
-
-  // 将客户端按线程分组
-  std::unordered_map<ThreadLocalSessionManager*, std::vector<MQTTString>> manager_groups;
-
-  for (const MQTTString& client_id : target_client_ids) {
-    ThreadLocalSessionManager* thread_manager = find_client_manager(client_id);
-    if (thread_manager) {
-      manager_groups[thread_manager].push_back(client_id);
-    } else {
-      LOG_WARN("Target client not found: {}", from_mqtt_string(client_id));
+    ret = MQ_ERR_PARAM_V2;
+  } else if (target_client_ids.empty()) {
+    ret = 0;
+  } else {
+    // 将客户端按线程分组
+    std::unordered_map<ThreadLocalSessionManager*, std::vector<MQTTString>> manager_groups;
+    for (const MQTTString& client_id : target_client_ids) {
+      ThreadLocalSessionManager* thread_manager = find_client_manager(client_id);
+      if (thread_manager) {
+        manager_groups[thread_manager].push_back(client_id);
+      } else {
+        LOG_WARN("Target client not found: {}", from_mqtt_string(client_id));
+      }
     }
+    int forwarded_count = 0;
+    // 批量转发到每个线程
+    for (const auto& group : manager_groups) {
+      ThreadLocalSessionManager* manager = group.first;
+      const std::vector<MQTTString>& client_ids = group.second;
+
+      manager->enqueue_shared_messages(content, client_ids);
+      forwarded_count += client_ids.size();
+    }
+    LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", forwarded_count,
+              manager_groups.size());
+    ret = forwarded_count;
   }
-
-  int forwarded_count = 0;
-
-  // 批量转发到每个线程
-  for (const auto& group : manager_groups) {
-    ThreadLocalSessionManager* manager = group.first;
-    const std::vector<MQTTString>& client_ids = group.second;
-
-    manager->enqueue_shared_messages(content, client_ids);
-    forwarded_count += client_ids.size();
-  }
-
-  LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", forwarded_count,
-            manager_groups.size());
-  return forwarded_count;
+  return ret;
 }
 
 namespace {
@@ -2387,28 +2368,30 @@ bool GlobalSessionManager::match_topic_filter(const MQTTString& topic,
 
 int GlobalSessionManager::cleanup_message_cache(int max_age_seconds)
 {
+  int ret = 0;
   if (!message_cache_) {
     LOG_ERROR("Message cache not initialized");
-    return MQ_ERR_INTERNAL;
+    ret = MQ_ERR_INTERNAL;
+  } else {
+    message_cache_->cleanup_expired_content(max_age_seconds);
+    LOG_DEBUG("Message cache cleanup completed, max age: {} seconds", max_age_seconds);
+    ret = MQ_SUCCESS;
   }
-
-  message_cache_->cleanup_expired_content(max_age_seconds);
-  LOG_DEBUG("Message cache cleanup completed, max age: {} seconds", max_age_seconds);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int GlobalSessionManager::get_message_cache_size(size_t& cache_size) const
 {
+  int ret = 0;
   cache_size = 0;
-
   if (!message_cache_) {
     LOG_ERROR("Message cache not initialized");
-    return MQ_ERR_INTERNAL;
+    ret = MQ_ERR_INTERNAL;
+  } else {
+    cache_size = message_cache_->get_cache_size();
+    ret = MQ_SUCCESS;
   }
-
-  cache_size = message_cache_->get_cache_size();
-  return MQ_SUCCESS;
+  return ret;
 }
 
 // ============================================================================
@@ -2427,55 +2410,58 @@ int GlobalSessionManager::subscribe_topic(const MQTTString& topic_filter,
                                           const MQTTString& client_id,
                                           const SubscriptionOptions& options)
 {
+  int ret = 0;
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return MQ_ERR_INTERNAL;
-  }
-
-  int result = topic_tree_->subscribe(topic_filter, client_id, options);
-  if (result == MQ_SUCCESS) {
-    LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", from_mqtt_string(client_id),
-              from_mqtt_string(topic_filter), options.qos);
+    ret = MQ_ERR_INTERNAL;
   } else {
-    LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}",
-              from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+    int result = topic_tree_->subscribe(topic_filter, client_id, options);
+    if (result == MQ_SUCCESS) {
+      LOG_DEBUG("Client {} subscribed to topic filter {} with QoS {}", from_mqtt_string(client_id),
+                from_mqtt_string(topic_filter), options.qos);
+    } else {
+      LOG_ERROR("Failed to subscribe client {} to topic filter {}: error {}",
+                from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+    }
+    ret = result;
   }
-
-  return result;
+  return ret;
 }
 
 int GlobalSessionManager::unsubscribe_topic(const MQTTString& topic_filter,
                                             const MQTTString& client_id)
 {
+  int ret = 0;
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return MQ_ERR_INTERNAL;
-  }
-
-  int result = topic_tree_->unsubscribe(topic_filter, client_id);
-  if (result == MQ_SUCCESS) {
-    LOG_DEBUG("Client {} unsubscribed from topic filter {}", from_mqtt_string(client_id),
-              from_mqtt_string(topic_filter));
+    ret = MQ_ERR_INTERNAL;
   } else {
-    LOG_WARN("Failed to unsubscribe client {} from topic filter {}: error {}",
-             from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+    int result = topic_tree_->unsubscribe(topic_filter, client_id);
+    if (result == MQ_SUCCESS) {
+      LOG_DEBUG("Client {} unsubscribed from topic filter {}", from_mqtt_string(client_id),
+                from_mqtt_string(topic_filter));
+    } else {
+      LOG_WARN("Failed to unsubscribe client {} from topic filter {}: error {}",
+               from_mqtt_string(client_id), from_mqtt_string(topic_filter), result);
+    }
+    ret = result;
   }
-
-  return result;
+  return ret;
 }
 
 int GlobalSessionManager::unsubscribe_all_topics(const MQTTString& client_id)
 {
+  int ret = 0;
   if (!topic_tree_) {
     LOG_ERROR("Topic tree not initialized");
-    return 0;
+    ret = 0;
+  } else {
+    int unsubscribed_count = topic_tree_->unsubscribe_all(client_id);
+    LOG_INFO("Unsubscribed client {} from {} topics", from_mqtt_string(client_id),
+             unsubscribed_count);
+    ret = unsubscribed_count;
   }
-
-  int unsubscribed_count = topic_tree_->unsubscribe_all(client_id);
-  LOG_INFO("Unsubscribed client {} from {} topics", from_mqtt_string(client_id),
-           unsubscribed_count);
-
-  return unsubscribed_count;
+  return ret;
 }
 
 int GlobalSessionManager::get_client_subscriptions(const MQTTString& client_id,
@@ -2620,26 +2606,20 @@ void GlobalSessionManager::trigger_login_event(const MQTTString& client_id,
                                                const MQTTString& client_ip,
                                                int client_port)
 {
-  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
-    return;  // Event forwarding is disabled
-  }
-  
-  // Create login event data
-  events::LoginEventData login_data;
-  login_data.metadata = events::createEventMetadata(
-      to_mqtt_string("mqtt_server", global_allocator_), 
-      client_id, 
-      client_ip, 
-      client_port);
-  login_data.username = username;
-  login_data.protocol_version = protocol_version;
-  login_data.keep_alive = keep_alive;
-  login_data.clean_session = clean_session;
-  
-  // Create and forward event
-  auto event = events::createLoginEvent(login_data);
-  if (!event_forwarding_service_->forwardEvent(event)) {
-    LOG_DEBUG("Failed to forward login event for client: {}", from_mqtt_string(client_id));
+  if (!(!event_forwarding_service_ || !event_forwarding_service_->isEnabled())) {
+    // Create login event data
+    events::LoginEventData login_data;
+    login_data.metadata = events::createEventMetadata(
+        to_mqtt_string("mqtt_server", global_allocator_), client_id, client_ip, client_port);
+    login_data.username = username;
+    login_data.protocol_version = protocol_version;
+    login_data.keep_alive = keep_alive;
+    login_data.clean_session = clean_session;
+    // Create and forward event
+    auto event = events::createLoginEvent(login_data);
+    if (!event_forwarding_service_->forwardEvent(event)) {
+      LOG_DEBUG("Failed to forward login event for client: {}", from_mqtt_string(client_id));
+    }
   }
 }
 
@@ -2653,28 +2633,22 @@ void GlobalSessionManager::trigger_logout_event(const MQTTString& client_id,
                                                 const MQTTString& client_ip,
                                                 int client_port)
 {
-  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
-    return;  // Event forwarding is disabled
-  }
-  
-  // Create logout event data
-  events::LogoutEventData logout_data;
-  logout_data.metadata = events::createEventMetadata(
-      to_mqtt_string("mqtt_server", global_allocator_), 
-      client_id, 
-      client_ip, 
-      client_port);
-  logout_data.reason = reason;
-  logout_data.session_duration_seconds = session_duration_seconds;
-  logout_data.bytes_sent = bytes_sent;
-  logout_data.bytes_received = bytes_received;
-  logout_data.messages_sent = messages_sent;
-  logout_data.messages_received = messages_received;
-  
-  // Create and forward event
-  auto event = events::createLogoutEvent(logout_data);
-  if (!event_forwarding_service_->forwardEvent(event)) {
-    LOG_DEBUG("Failed to forward logout event for client: {}", from_mqtt_string(client_id));
+  if (!(!event_forwarding_service_ || !event_forwarding_service_->isEnabled())) {
+    // Create logout event data
+    events::LogoutEventData logout_data;
+    logout_data.metadata = events::createEventMetadata(
+        to_mqtt_string("mqtt_server", global_allocator_), client_id, client_ip, client_port);
+    logout_data.reason = reason;
+    logout_data.session_duration_seconds = session_duration_seconds;
+    logout_data.bytes_sent = bytes_sent;
+    logout_data.bytes_received = bytes_received;
+    logout_data.messages_sent = messages_sent;
+    logout_data.messages_received = messages_received;
+    // Create and forward event
+    auto event = events::createLogoutEvent(logout_data);
+    if (!event_forwarding_service_->forwardEvent(event)) {
+      LOG_DEBUG("Failed to forward logout event for client: {}", from_mqtt_string(client_id));
+    }
   }
 }
 
@@ -2688,33 +2662,26 @@ void GlobalSessionManager::trigger_publish_event(const MQTTString& client_id,
                                                  const MQTTString& client_ip,
                                                  int client_port)
 {
-  if (!event_forwarding_service_ || !event_forwarding_service_->isEnabled()) {
-    return;  // Event forwarding is disabled
-  }
-  
-  // Create publish event data
-  events::PublishEventData publish_data;
-  publish_data.metadata = events::createEventMetadata(
-      to_mqtt_string("mqtt_server", global_allocator_), 
-      client_id, 
-      client_ip, 
-      client_port);
-  publish_data.topic = topic;
-  publish_data.qos = qos;
-  publish_data.retain = retain;
-  publish_data.duplicate = duplicate;
-  publish_data.payload_size = payload_size;
-  
-  // Only include payload if it's small (to save bandwidth)
-  if (payload.size() <= 1024) {  // 1KB limit
-    publish_data.payload = payload;
-  }
-  
-  // Create and forward event
-  auto event = events::createPublishEvent(publish_data);
-  if (!event_forwarding_service_->forwardEvent(event)) {
-    LOG_DEBUG("Failed to forward publish event for client: {}, topic: {}", 
-              from_mqtt_string(client_id), from_mqtt_string(topic));
+  if (!(!event_forwarding_service_ || !event_forwarding_service_->isEnabled())) {
+    // Create publish event data
+    events::PublishEventData publish_data;
+    publish_data.metadata = events::createEventMetadata(
+        to_mqtt_string("mqtt_server", global_allocator_), client_id, client_ip, client_port);
+    publish_data.topic = topic;
+    publish_data.qos = qos;
+    publish_data.retain = retain;
+    publish_data.duplicate = duplicate;
+    publish_data.payload_size = payload_size;
+    // Only include payload if it's small (to save bandwidth)
+    if (payload.size() <= 1024) {  // 1KB limit
+      publish_data.payload = payload;
+    }
+    // Create and forward event
+    auto event = events::createPublishEvent(publish_data);
+    if (!event_forwarding_service_->forwardEvent(event)) {
+      LOG_DEBUG("Failed to forward publish event for client: {}, topic: {}",
+                from_mqtt_string(client_id), from_mqtt_string(topic));
+    }
   }
 }
 
@@ -2911,17 +2878,23 @@ int GlobalSessionManager::announce_subscription_to_router(const MQTTString& topi
                                                           const MQTTString& client_id,
                                                           const SubscriptionOptions& options)
 {
-  if (router_client_.get() == NULL)
-    return MQ_SUCCESS;
-  // Router RPC stays QoS-only; cluster delivery does not carry No Local / RAP.
-  MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
-  request.server_id = server_id_;
-  request.client_id = client_id;
-  request.topic_filter = topic_filter;
-  request.qos = options.qos;
-  if (cluster_config_.cluster_enabled)
-    return router_client_->subscribe(request);
-  return router_client_->subscribe_async(request);
+  int ret = 0;
+  if (router_client_.get() == NULL) {
+    ret = MQ_SUCCESS;
+  } else {
+    // Router RPC stays QoS-only; cluster delivery does not carry No Local / RAP.
+    MQTTRouterRpcClient::SubscribeRequest request(global_allocator_);
+    request.server_id = server_id_;
+    request.client_id = client_id;
+    request.topic_filter = topic_filter;
+    request.qos = options.qos;
+    if (cluster_config_.cluster_enabled) {
+      ret = router_client_->subscribe(request);
+    } else {
+      ret = router_client_->subscribe_async(request);
+    }
+  }
+  return ret;
 }
 
 int GlobalSessionManager::subscribe_topic_cluster(const MQTTString& topic_filter,

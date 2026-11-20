@@ -65,54 +65,46 @@ class PerformanceAnalyzer
 
   int run_performance_test()
   {
+    int ret = 0;
     std::cout << "Starting Performance Analysis..." << std::endl;
-
     // 初始化路由服务
     if (setup_router_service() != 0) {
       std::cerr << "Failed to setup router service" << std::endl;
-      return -1;
+      ret = -1;
+    } else {
+      // 记录初始内存使用
+      if (config_.enable_memory_tracking) {
+        metrics_.initial_memory_usage = get_memory_usage();
+      }
+      // 运行性能测试
+      auto start_time = std::chrono::high_resolution_clock::now();
+      if (run_subscription_test() != 0) {
+        std::cerr << "Subscription test failed" << std::endl;
+        ret = -1;
+      } else if (run_publish_test() != 0) {
+        std::cerr << "Publish test failed" << std::endl;
+        ret = -1;
+      } else if (run_unsubscribe_test() != 0) {
+        std::cerr << "Unsubscribe test failed" << std::endl;
+        ret = -1;
+      } else {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        // 记录最终内存使用
+        if (config_.enable_memory_tracking) {
+          metrics_.final_memory_usage = get_memory_usage();
+        }
+        // 生成报告
+        generate_performance_report(total_time);
+        // 清理
+        cleanup_router_service();
+        std::cout << "Performance analysis completed. Report saved to: " << config_.output_file
+                  << std::endl;
+        ret = 0;
+      }
     }
-
-    // 记录初始内存使用
-    if (config_.enable_memory_tracking) {
-      metrics_.initial_memory_usage = get_memory_usage();
-    }
-
-    // 运行性能测试
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    if (run_subscription_test() != 0) {
-      std::cerr << "Subscription test failed" << std::endl;
-      return -1;
-    }
-
-    if (run_publish_test() != 0) {
-      std::cerr << "Publish test failed" << std::endl;
-      return -1;
-    }
-
-    if (run_unsubscribe_test() != 0) {
-      std::cerr << "Unsubscribe test failed" << std::endl;
-      return -1;
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-
-    // 记录最终内存使用
-    if (config_.enable_memory_tracking) {
-      metrics_.final_memory_usage = get_memory_usage();
-    }
-
-    // 生成报告
-    generate_performance_report(total_time);
-
-    // 清理
-    cleanup_router_service();
-
-    std::cout << "Performance analysis completed. Report saved to: " << config_.output_file
-              << std::endl;
-    return 0;
+    return ret;
   }
 
  private:
@@ -277,11 +269,14 @@ class PerformanceAnalyzer
 
   size_t get_memory_usage()
   {
+    size_t ret = 0;
     // 简化的内存使用统计
     if (test_allocator_) {
-      return test_allocator_->get_total_memory_usage();
+      ret = test_allocator_->get_total_memory_usage();
+    } else {
+      ret = 0;
     }
-    return 0;
+    return ret;
   }
 
   void generate_performance_report(std::chrono::milliseconds total_time)

@@ -26,43 +26,52 @@ class SimpleTestServer
 
   int start()
   {
+    int ret = 0;
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) return -1;
-
-    int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr {};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = 0;  // 让 OS 分配端口
-
-    if (::bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -1;
-    if (::listen(listen_fd_, 32) < 0) return -1;
-
-    socklen_t len = sizeof(addr);
-    ::getsockname(listen_fd_, (struct sockaddr*)&addr, &len);
-    port_ = ntohs(addr.sin_port);
-
-    accept_thread_ = std::thread([this] {
-      while (!stop_.load()) {
-        struct timeval tv {0, 50000};  // 50ms timeout
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(listen_fd_, &rfds);
-        int r = ::select(listen_fd_ + 1, &rfds, NULL, NULL, &tv);
-        if (r > 0) {
-          int cli = ::accept(listen_fd_, NULL, NULL);
-          if (cli >= 0) {
-            // 保持连接打开直到服务端关闭，让池中的 socket 保持 connected 状态
-            std::lock_guard<std::mutex> lk(cli_mutex_);
-            client_fds_.push_back(cli);
+    if (listen_fd_ < 0) {
+      ret = -1;
+    } else {
+      int opt = 1;
+      ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct sockaddr_in addr
+      {
+      };
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      addr.sin_port = 0;
+      // 让 OS 分配端口
+      if (::bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        ret = -1;
+      } else if (::listen(listen_fd_, 32) < 0) {
+        ret = -1;
+      } else {
+        socklen_t len = sizeof(addr);
+        ::getsockname(listen_fd_, (struct sockaddr*)&addr, &len);
+        port_ = ntohs(addr.sin_port);
+        accept_thread_ = std::thread([this] {
+          while (!stop_.load()) {
+            struct timeval tv
+            {
+              0, 50000
+            };  // 50ms timeout
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listen_fd_, &rfds);
+            int r = ::select(listen_fd_ + 1, &rfds, NULL, NULL, &tv);
+            if (r > 0) {
+              int cli = ::accept(listen_fd_, NULL, NULL);
+              if (cli >= 0) {
+                // 保持连接打开直到服务端关闭，让池中的 socket 保持 connected 状态
+                std::lock_guard<std::mutex> lk(cli_mutex_);
+                client_fds_.push_back(cli);
+              }
+            }
           }
-        }
+        });
+        ret = 0;
       }
-    });
-
-    return 0;
+    }
+    return ret;
   }
 
   void stop()

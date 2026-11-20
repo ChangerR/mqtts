@@ -26,10 +26,10 @@ void WebSocketHandlerAdapter::request_session_takeover(
 {
   if (ws_handler_) {
     ws_handler_->request_session_takeover(gate);
-    return;
-  }
-  if (gate) {
-    gate->done.store(true, std::memory_order_release);
+  } else {
+    if (gate) {
+      gate->done.store(true, std::memory_order_release);
+    }
   }
 }
 

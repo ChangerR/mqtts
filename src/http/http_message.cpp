@@ -7,10 +7,12 @@ namespace http {
 
 mqtt::MQTTString to_lower_ascii(const mqtt::MQTTString& value, MQTTAllocator* allocator)
 {
+  mqtt::MQTTString ret{};
   mqtt::MQTTString lower(value, mqtt::MQTTStrAllocator(allocator));
   std::transform(lower.begin(), lower.end(), lower.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return lower;
+  ret = std::move(lower);
+  return ret;
 }
 
 HttpRequest::HttpRequest(MQTTAllocator* in_allocator)
@@ -44,12 +46,15 @@ bool HttpRequest::has_header(const mqtt::MQTTString& key) const
 
 mqtt::MQTTString HttpRequest::get_header(const mqtt::MQTTString& key) const
 {
+  mqtt::MQTTString ret{};
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   HeaderMap::const_iterator iter = headers.find(key_lower);
   if (iter == headers.end()) {
-    return mqtt::MQTTString(mqtt::MQTTStrAllocator(allocator));
+    ret = mqtt::MQTTString(mqtt::MQTTStrAllocator(allocator));
+  } else {
+    ret = iter->second;
   }
-  return iter->second;
+  return ret;
 }
 
 void HttpRequest::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value)

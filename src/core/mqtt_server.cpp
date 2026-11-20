@@ -39,11 +39,14 @@ static std::string to_fixed_base62(uint64_t value, size_t width)
 
 static uint32_t encode_client_ip(const std::string& ip)
 {
+  uint32_t ret = 0;
   struct in_addr addr;
   if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
-    return ntohl(addr.s_addr);
+    ret = ntohl(addr.s_addr);
+  } else {
+    ret = static_cast<uint32_t>(std::hash<std::string>{}(ip));
   }
-  return static_cast<uint32_t>(std::hash<std::string>{}(ip));
+  return ret;
 }
 
 // Client tasks belong to the thread that accepted them: every worker thread runs
@@ -169,73 +172,66 @@ int MQTTServer::start()
   int ret = MQ_SUCCESS;
   if (running_) {
     LOG_WARN("Server is already running");
-    return MQ_SUCCESS;
-  }
-
-  // Create server socket
-  if (MQ_FAIL(MQTTSocket::create_tcp_socket(server_socket_))) {
-    LOG_ERROR("Failed to create server socket for {}:{}", host_, port_);
-    return MQ_ERR_SOCKET;
-  }
-
-  // Start listening - 使用配置中的backlog参数
-  if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true, server_config_.backlog))) {
-    LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
-    MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
-    if (MQ_NOT_NULL(server_socket_)) {
-      server_socket_->~MQTTSocket();  // Call destructor explicitly
-      root->deallocate(server_socket_, sizeof(MQTTSocket));
-      server_socket_ = NULL;
+    ret = MQ_SUCCESS;
+  } else {
+    // Create server socket
+    if (MQ_FAIL(MQTTSocket::create_tcp_socket(server_socket_))) {
+      LOG_ERROR("Failed to create server socket for {}:{}", host_, port_);
+      ret = MQ_ERR_SOCKET;
+    } else {
+      // Start listening - 使用配置中的backlog参数
+      if (MQ_FAIL(server_socket_->listen(host_.c_str(), port_, true, server_config_.backlog))) {
+        LOG_ERROR("Failed to start listening on {}:{}", host_, port_);
+        MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
+        if (MQ_NOT_NULL(server_socket_)) {
+          server_socket_->~MQTTSocket();  // Call destructor explicitly
+          root->deallocate(server_socket_, sizeof(MQTTSocket));
+          server_socket_ = NULL;
+        }
+        ret = MQ_ERR_SOCKET;
+      } else {
+        running_ = true;
+        LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", host_,
+                 port_, server_config_.max_connections, server_config_.backlog);
+        ret = MQ_SUCCESS;
+      }
     }
-    return MQ_ERR_SOCKET;
   }
-
-  running_ = true;
-  LOG_INFO("MQTT Server initialized on {}:{} (max_connections: {}, backlog: {})", host_, port_,
-           server_config_.max_connections, server_config_.backlog);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void MQTTServer::run()
 {
   if (!running_) {
     LOG_WARN("Server is not running");
-    return;
+  } else {
+    mqtt::runtime::TaskHandle accept_task =
+        mqtt::runtime::current_runtime().spawn(accept_routine, this);
+    if (!accept_task.is_valid()) {
+      LOG_ERROR("Failed to create accept task");
+    } else {
+      LOG_INFO("MQTT Server running on {}:{}", host_, port_);
+      // Use eventloop with callback for pending message processing
+      mqtt::runtime::current_runtime().run_event_loop(eventloop_callback, this);
+      thread_client_tasks().clear();
+    }
   }
-
-  mqtt::runtime::TaskHandle accept_task =
-      mqtt::runtime::current_runtime().spawn(accept_routine, this);
-  if (!accept_task.is_valid()) {
-    LOG_ERROR("Failed to create accept task");
-    return;
-  }
-
-  LOG_INFO("MQTT Server running on {}:{}", host_, port_);
-
-  // Use eventloop with callback for pending message processing
-  mqtt::runtime::current_runtime().run_event_loop(eventloop_callback, this);
-
-  thread_client_tasks().clear();
 }
 
 void MQTTServer::stop()
 {
-  if (!running_) {
-    return;
+  if (running_) {
+    LOG_INFO("Stopping MQTT Server on {}:{}", host_, port_);
+    running_ = false;
+    if (MQ_NOT_NULL(server_socket_)) {
+      server_socket_->close();
+      MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
+      server_socket_->~MQTTSocket();  // Call destructor explicitly
+      root->deallocate(server_socket_, sizeof(MQTTSocket));
+      server_socket_ = NULL;
+    }
+    LOG_INFO("MQTT Server stopped");
   }
-
-  LOG_INFO("Stopping MQTT Server on {}:{}", host_, port_);
-  running_ = false;
-
-  if (MQ_NOT_NULL(server_socket_)) {
-    server_socket_->close();
-    MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
-    server_socket_->~MQTTSocket();  // Call destructor explicitly
-    root->deallocate(server_socket_, sizeof(MQTTSocket));
-    server_socket_ = NULL;
-  }
-
-  LOG_INFO("MQTT Server stopped");
 }
 
 void* MQTTServer::accept_routine(void* arg)
@@ -243,116 +239,113 @@ void* MQTTServer::accept_routine(void* arg)
   MQTTServer* server = (MQTTServer*)arg;
   MQTTSocket* client = NULL;
   int ret = MQ_SUCCESS;
-
   if (MQ_ISNULL(server->server_socket_)) {
     LOG_ERROR("Server socket is NULL");
-    return NULL;
-  }
-
-  LOG_INFO("Accept routine started, running: {}", server->running_);
-  const int configured_workers = server->server_config_.thread_count;
-  const int workers = configured_workers > 1 ? configured_workers : 1;
-  const uint32_t slot = server->accept_slot_next_.fetch_add(1, std::memory_order_relaxed);
-  while (server->running_ && MQ_SUCC(ret)) {
-    if (workers > 1 && (server->accept_turn_.load(std::memory_order_relaxed) %
-                        static_cast<uint64_t>(workers)) != slot) {
-      // 不在监听 fd 上等待，避免和当前轮次的线程一起被 epoll 唤醒后再抢走连接。
-      mqtt::runtime::current_runtime().wait(-1, 0, 1);
-      continue;
-    }
-    // 检查连接数限制
-    if (!server->can_accept_connection()) {
-      LOG_WARN("达到最大连接数限制 ({}), 等待连接释放", server->server_config_.max_connections);
-      // 等待一段时间后继续检查
-      mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
-      continue;
-    }
-
-    mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
-    // Check if socket is still valid
-    if (!server->server_socket_->is_connected()) {
-      LOG_WARN("Server socket disconnected");
-      ret = MQ_ERR_SOCKET;
-      break;
-    }
-    ret = server->server_socket_->accept(client);
-    if (MQ_FAIL(ret)) {
-      if (ret == MQ_ERR_SOCKET_ACCEPT_WOULDBLOCK) {
-        ret = MQ_SUCCESS;
+  } else {
+    LOG_INFO("Accept routine started, running: {}", server->running_);
+    const int configured_workers = server->server_config_.thread_count;
+    const int workers = configured_workers > 1 ? configured_workers : 1;
+    const uint32_t slot = server->accept_slot_next_.fetch_add(1, std::memory_order_relaxed);
+    while (server->running_ && MQ_SUCC(ret)) {
+      if (workers > 1 && (server->accept_turn_.load(std::memory_order_relaxed) %
+                          static_cast<uint64_t>(workers)) != slot) {
+        // 不在监听 fd 上等待，避免和当前轮次的线程一起被 epoll 唤醒后再抢走连接。
+        mqtt::runtime::current_runtime().wait(-1, 0, 1);
         continue;
       }
-      LOG_ERROR("Failed to accept connection");
-      break;
-    }
-    if (MQ_ISNULL(client)) {
-      continue;
-    }
-    if (workers > 1) {
-      server->accept_turn_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Create client-specific allocator with a memory limit
-    std::string client_id =
-        make_client_allocator_id(client->get_peer_addr(), client->get_peer_port());
-    MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
-    MQTTAllocator* client_allocator = root->create_child(
-        client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, server->memory_config_.client_max_size);
-    if (MQ_ISNULL(client_allocator)) {
-      LOG_ERROR("Failed to create client allocator {}", client_id);
-      if (MQ_NOT_NULL(client)) {
-        client->~MQTTSocket();  // Call destructor explicitly
-        root->deallocate(client, sizeof(MQTTSocket));
+      // 检查连接数限制
+      if (!server->can_accept_connection()) {
+        LOG_WARN("达到最大连接数限制 ({}), 等待连接释放", server->server_config_.max_connections);
+        // 等待一段时间后继续检查
+        mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
+        continue;
       }
-      continue;
-    }
 
-    // 增加连接计数
-    server->add_connection();
-
-    LOG_INFO("Accepted new connection from {}:{}", client->get_peer_addr(),
-             client->get_peer_port());
-
-    // Create client context using client's allocator
-    void* ctx_mem = client_allocator->allocate(sizeof(ClientContext));
-    if (MQ_ISNULL(ctx_mem)) {
-      LOG_ERROR("Failed to allocate client context");
-      root->remove_child(client_id);
-      server->remove_connection();  // 减少连接计数
-      if (MQ_NOT_NULL(client)) {
-        client->~MQTTSocket();  // Call destructor explicitly
-        root->deallocate(client, sizeof(MQTTSocket));
+      mqtt::runtime::current_runtime().wait_readable(server->server_socket_->get_fd(), 1000);
+      // Check if socket is still valid
+      if (!server->server_socket_->is_connected()) {
+        LOG_WARN("Server socket disconnected");
+        ret = MQ_ERR_SOCKET;
+        break;
       }
-      continue;
-    }
-
-    // Initialize client context using placement new
-    ClientContext* ctx = new (ctx_mem) ClientContext();
-    ctx->server = server;
-    ctx->client = client;
-    ctx->client_id = client_id;
-    ctx->client_ip = client->get_peer_addr();
-    ctx->client_port = client->get_peer_port();
-    ctx->trace_id = generate_session_trace_id(ctx->client_ip, ctx->client_port);
-    ctx->allocator = client_allocator;
-
-    mqtt::runtime::TaskHandle client_task =
-        mqtt::runtime::current_runtime().spawn(client_routine, ctx);
-    if (!client_task.is_valid()) {
-      LOG_ERROR("Failed to create client task for {}:{}", ctx->client_ip, ctx->client_port);
-      if (MQ_NOT_NULL(client)) {
-        client->close();
-        client->~MQTTSocket();
-        root->deallocate(client, sizeof(MQTTSocket));
+      ret = server->server_socket_->accept(client);
+      if (MQ_FAIL(ret)) {
+        if (ret == MQ_ERR_SOCKET_ACCEPT_WOULDBLOCK) {
+          ret = MQ_SUCCESS;
+          continue;
+        }
+        LOG_ERROR("Failed to accept connection");
+        break;
       }
-      server->remove_connection();
-      ClientContext::destroy(ctx);
-      continue;
-    }
+      if (MQ_ISNULL(client)) {
+        continue;
+      }
+      if (workers > 1) {
+        server->accept_turn_.fetch_add(1, std::memory_order_relaxed);
+      }
 
-    release_finished_client_tasks();
-    thread_client_tasks().push_back(std::move(client_task));
+      // Create client-specific allocator with a memory limit
+      std::string client_id =
+          make_client_allocator_id(client->get_peer_addr(), client->get_peer_port());
+      MQTTAllocator* root = MQ_MEM_MANAGER.get_root_allocator();
+      MQTTAllocator* client_allocator = root->create_child(
+          client_id.c_str(), MQTTMemoryTag::MEM_TAG_CLIENT, server->memory_config_.client_max_size);
+      if (MQ_ISNULL(client_allocator)) {
+        LOG_ERROR("Failed to create client allocator {}", client_id);
+        if (MQ_NOT_NULL(client)) {
+          client->~MQTTSocket();  // Call destructor explicitly
+          root->deallocate(client, sizeof(MQTTSocket));
+        }
+        continue;
+      }
+
+      // 增加连接计数
+      server->add_connection();
+
+      LOG_INFO("Accepted new connection from {}:{}", client->get_peer_addr(),
+               client->get_peer_port());
+
+      // Create client context using client's allocator
+      void* ctx_mem = client_allocator->allocate(sizeof(ClientContext));
+      if (MQ_ISNULL(ctx_mem)) {
+        LOG_ERROR("Failed to allocate client context");
+        root->remove_child(client_id);
+        server->remove_connection();  // 减少连接计数
+        if (MQ_NOT_NULL(client)) {
+          client->~MQTTSocket();  // Call destructor explicitly
+          root->deallocate(client, sizeof(MQTTSocket));
+        }
+        continue;
+      }
+
+      // Initialize client context using placement new
+      ClientContext* ctx = new (ctx_mem) ClientContext();
+      ctx->server = server;
+      ctx->client = client;
+      ctx->client_id = client_id;
+      ctx->client_ip = client->get_peer_addr();
+      ctx->client_port = client->get_peer_port();
+      ctx->trace_id = generate_session_trace_id(ctx->client_ip, ctx->client_port);
+      ctx->allocator = client_allocator;
+
+      mqtt::runtime::TaskHandle client_task =
+          mqtt::runtime::current_runtime().spawn(client_routine, ctx);
+      if (!client_task.is_valid()) {
+        LOG_ERROR("Failed to create client task for {}:{}", ctx->client_ip, ctx->client_port);
+        if (MQ_NOT_NULL(client)) {
+          client->close();
+          client->~MQTTSocket();
+          root->deallocate(client, sizeof(MQTTSocket));
+        }
+        server->remove_connection();
+        ClientContext::destroy(ctx);
+        continue;
+      }
+
+      release_finished_client_tasks();
+      thread_client_tasks().push_back(std::move(client_task));
+    }
   }
-
   return NULL;
 }
 

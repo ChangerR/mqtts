@@ -37,38 +37,40 @@ bool RedisConnection::is_connected() const
 
 int RedisConnection::ping()
 {
+  int ret = 0;
   if (!is_connected()) {
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "PING");
+    if (!reply) {
+      LOG_ERROR("Redis PING failed: connection error");
+      ret = MQ_ERR_CONNECT;
+    } else {
+      bool success = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
+      freeReplyObject(reply);
+      ret = success ? MQ_SUCCESS : MQ_ERR_CONNECT;
+    }
   }
-
-  redisReply* reply = (redisReply*)redisCommand(ctx_, "PING");
-  if (!reply) {
-    LOG_ERROR("Redis PING failed: connection error");
-    return MQ_ERR_CONNECT;
-  }
-
-  bool success = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
-
-  freeReplyObject(reply);
-  return success ? MQ_SUCCESS : MQ_ERR_CONNECT;
+  return ret;
 }
 
 int RedisConnection::select_database(int db)
 {
+  int ret = 0;
   if (!is_connected()) {
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    redisReply* reply = (redisReply*)redisCommand(ctx_, "SELECT %d", db);
+    if (!reply) {
+      LOG_ERROR("Redis SELECT failed: connection error");
+      ret = MQ_ERR_CONNECT;
+    } else {
+      bool success = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "OK") == 0);
+      freeReplyObject(reply);
+      ret = success ? MQ_SUCCESS : MQ_ERR_DATABASE;
+    }
   }
-
-  redisReply* reply = (redisReply*)redisCommand(ctx_, "SELECT %d", db);
-  if (!reply) {
-    LOG_ERROR("Redis SELECT failed: connection error");
-    return MQ_ERR_CONNECT;
-  }
-
-  bool success = (reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "OK") == 0);
-
-  freeReplyObject(reply);
-  return success ? MQ_SUCCESS : MQ_ERR_DATABASE;
+  return ret;
 }
 
 //==============================================================================
@@ -127,22 +129,16 @@ int RedisConnectionPool::initialize()
 void RedisConnectionPool::cleanup()
 {
   std::unique_lock<std::mutex> lock(pool_mutex_);
-
-  if (!initialized_) {
-    return;
+  if (initialized_) {
+    LOG_INFO("Cleaning up Redis connection pool");
+    // 清空可用连接队列
+    while (!available_.empty()) {
+      available_.pop();
+    }
+    // 关闭所有连接
+    pool_.clear();
+    initialized_ = false;
   }
-
-  LOG_INFO("Cleaning up Redis connection pool");
-
-  // 清空可用连接队列
-  while (!available_.empty()) {
-    available_.pop();
-  }
-
-  // 关闭所有连接
-  pool_.clear();
-
-  initialized_ = false;
 }
 
 std::shared_ptr<RedisConnection> RedisConnectionPool::acquire_connection()
@@ -188,17 +184,13 @@ std::shared_ptr<RedisConnection> RedisConnectionPool::acquire_connection()
 
 void RedisConnectionPool::release_connection(std::shared_ptr<RedisConnection> conn)
 {
-  if (!conn) {
-    return;
+  if (conn) {
+    std::unique_lock<std::mutex> lock(pool_mutex_);
+    conn->set_busy(false);
+    conn->update_last_used();
+    available_.push(conn);
+    pool_cv_.notify_one();
   }
-
-  std::unique_lock<std::mutex> lock(pool_mutex_);
-
-  conn->set_busy(false);
-  conn->update_last_used();
-
-  available_.push(conn);
-  pool_cv_.notify_one();
 }
 
 size_t RedisConnectionPool::get_active_connections() const
@@ -209,39 +201,38 @@ size_t RedisConnectionPool::get_active_connections() const
 
 bool RedisConnectionPool::test_connection()
 {
+  bool ret = false;
   auto conn = acquire_connection();
   if (!conn) {
-    return false;
+    ret = false;
+  } else {
+    bool healthy = conn->ping() == MQ_SUCCESS;
+    release_connection(conn);
+    ret = healthy;
   }
-
-  bool healthy = conn->ping() == MQ_SUCCESS;
-  release_connection(conn);
-
-  return healthy;
+  return ret;
 }
 
 redisContext* RedisConnectionPool::create_connection()
 {
+  redisContext* ret = NULL;
   struct timeval timeout = {config_.connect_timeout_ms / 1000,
                             (config_.connect_timeout_ms % 1000) * 1000};
-
   redisContext* ctx = redisConnectWithTimeout(config_.host.c_str(), config_.port, timeout);
   if (!ctx) {
     LOG_ERROR("Failed to allocate Redis context");
-    return nullptr;
-  }
-
-  if (ctx->err) {
+    ret = nullptr;
+  } else if (ctx->err) {
     LOG_ERROR("Failed to connect to Redis {}:{}: {}", config_.host, config_.port, ctx->errstr);
     redisFree(ctx);
-    return nullptr;
+    ret = nullptr;
+  } else {
+    // 设置命令超时
+    timeout = {config_.command_timeout_ms / 1000, (config_.command_timeout_ms % 1000) * 1000};
+    redisSetTimeout(ctx, timeout);
+    ret = ctx;
   }
-
-  // 设置命令超时
-  timeout = {config_.command_timeout_ms / 1000, (config_.command_timeout_ms % 1000) * 1000};
-  redisSetTimeout(ctx, timeout);
-
-  return ctx;
+  return ret;
 }
 
 int RedisConnectionPool::configure_connection(redisContext* ctx)
@@ -450,196 +441,182 @@ int RedisAuthProvider::add_user(const MQTTString& username, const MQTTString& pa
 
 int RedisAuthProvider::remove_user(const MQTTString& username)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string user_key = make_user_key(username);
+    std::string permissions_key = make_permissions_key(username);
+    // 使用Redis事务
+    redisReply* reply = execute_command(conn, "MULTI");
+    if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      free_redis_reply(reply);
+      // 删除用户信息和权限
+      reply = execute_command(conn, "DEL %s %s", user_key.c_str(), permissions_key.c_str());
+      if (check_redis_reply(reply, "DEL") != MQ_SUCCESS) {
+        free_redis_reply(reply);
+        execute_command(conn, "DISCARD");
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+      } else {
+        free_redis_reply(reply);
+        // 执行事务
+        reply = execute_command(conn, "EXEC");
+        if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
+          free_redis_reply(reply);
+          connection_pool_->release_connection(conn);
+          ret = MQ_ERR_DATABASE;
+        } else {
+          free_redis_reply(reply);
+          connection_pool_->release_connection(conn);
+          // 清除本地缓存
+          remove_from_local_cache(username);
+          LOG_INFO("User '{}' removed from Redis successfully", from_mqtt_string(username));
+          ret = MQ_SUCCESS;
+        }
+      }
+    }
   }
-
-  std::string user_key = make_user_key(username);
-  std::string permissions_key = make_permissions_key(username);
-
-  // 使用Redis事务
-  redisReply* reply = execute_command(conn, "MULTI");
-  if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 删除用户信息和权限
-  reply = execute_command(conn, "DEL %s %s", user_key.c_str(), permissions_key.c_str());
-  if (check_redis_reply(reply, "DEL") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    execute_command(conn, "DISCARD");
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 执行事务
-  reply = execute_command(conn, "EXEC");
-  if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  connection_pool_->release_connection(conn);
-
-  // 清除本地缓存
-  remove_from_local_cache(username);
-
-  LOG_INFO("User '{}' removed from Redis successfully", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int RedisAuthProvider::update_user_password(const MQTTString& username,
                                             const MQTTString& new_password)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string password_hash = hash_password(from_mqtt_string(new_password));
+    std::string user_key = make_user_key(username);
+    redisReply* reply =
+        execute_command(conn, "HMSET %s password_hash %s updated_at %d", user_key.c_str(),
+                        password_hash.c_str(), static_cast<int>(time(nullptr)));
+    int result = check_redis_reply(reply, "HMSET");
+    free_redis_reply(reply);
+    connection_pool_->release_connection(conn);
+    if (result == MQ_SUCCESS) {
+      // 清除本地缓存
+      remove_from_local_cache(username);
+      LOG_INFO("Password updated for user '{}'", from_mqtt_string(username));
+    }
+    ret = result;
   }
-
-  std::string password_hash = hash_password(from_mqtt_string(new_password));
-  std::string user_key = make_user_key(username);
-
-  redisReply* reply =
-      execute_command(conn, "HMSET %s password_hash %s updated_at %d", user_key.c_str(),
-                      password_hash.c_str(), static_cast<int>(time(nullptr)));
-
-  int result = check_redis_reply(reply, "HMSET");
-  free_redis_reply(reply);
-  connection_pool_->release_connection(conn);
-
-  if (result == MQ_SUCCESS) {
-    // 清除本地缓存
-    remove_from_local_cache(username);
-    LOG_INFO("Password updated for user '{}'", from_mqtt_string(username));
-  }
-
-  return result;
+  return ret;
 }
 
 int RedisAuthProvider::add_topic_permission(const MQTTString& username,
                                             const MQTTString& topic_pattern, Permission permission,
                                             int ttl_seconds)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
-  }
-
-  std::string permissions_key = make_permissions_key(username);
-  std::string permission_value =
-      from_mqtt_string(topic_pattern) + ":" + std::to_string(static_cast<int>(permission));
-
-  redisReply* reply =
-      execute_command(conn, "SADD %s %s", permissions_key.c_str(), permission_value.c_str());
-
-  int result = check_redis_reply(reply, "SADD");
-  free_redis_reply(reply);
-
-  // 设置TTL
-  if (result == MQ_SUCCESS && ttl_seconds > 0) {
-    reply = execute_command(conn, "EXPIRE %s %d", permissions_key.c_str(), ttl_seconds);
-    int ttl_result = check_redis_reply(reply, "EXPIRE");
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string permissions_key = make_permissions_key(username);
+    std::string permission_value =
+        from_mqtt_string(topic_pattern) + ":" + std::to_string(static_cast<int>(permission));
+    redisReply* reply =
+        execute_command(conn, "SADD %s %s", permissions_key.c_str(), permission_value.c_str());
+    int result = check_redis_reply(reply, "SADD");
     free_redis_reply(reply);
-    if (ttl_result != MQ_SUCCESS) {
-      LOG_WARN("Failed to set TTL for permissions key: {}", permissions_key);
+    // 设置TTL
+    if (result == MQ_SUCCESS && ttl_seconds > 0) {
+      reply = execute_command(conn, "EXPIRE %s %d", permissions_key.c_str(), ttl_seconds);
+      int ttl_result = check_redis_reply(reply, "EXPIRE");
+      free_redis_reply(reply);
+      if (ttl_result != MQ_SUCCESS) {
+        LOG_WARN("Failed to set TTL for permissions key: {}", permissions_key);
+      }
     }
+    connection_pool_->release_connection(conn);
+    if (result == MQ_SUCCESS) {
+      // 清除本地缓存
+      remove_from_local_cache(username);
+      LOG_INFO("Topic permission added for user '{}': {} -> {}", from_mqtt_string(username),
+               from_mqtt_string(topic_pattern), static_cast<int>(permission));
+    }
+    ret = result;
   }
-
-  connection_pool_->release_connection(conn);
-
-  if (result == MQ_SUCCESS) {
-    // 清除本地缓存
-    remove_from_local_cache(username);
-    LOG_INFO("Topic permission added for user '{}': {} -> {}", from_mqtt_string(username),
-             from_mqtt_string(topic_pattern), static_cast<int>(permission));
-  }
-
-  return result;
+  return ret;
 }
 
 int RedisAuthProvider::remove_topic_permission(const MQTTString& username,
                                                const MQTTString& topic_pattern)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
-  }
-
-  std::string permissions_key = make_permissions_key(username);
-
-  // 需要找到匹配的权限条目并删除
-  redisReply* reply = execute_command(conn, "SMEMBERS %s", permissions_key.c_str());
-  if (check_redis_reply(reply, "SMEMBERS") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  std::string topic_pattern_str = from_mqtt_string(topic_pattern);
-  std::vector<std::string> to_remove;
-
-  for (size_t i = 0; i < reply->elements; ++i) {
-    std::string member = reply->element[i]->str;
-    if (member.substr(0, member.find(':')) == topic_pattern_str) {
-      to_remove.push_back(member);
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string permissions_key = make_permissions_key(username);
+    // 需要找到匹配的权限条目并删除
+    redisReply* reply = execute_command(conn, "SMEMBERS %s", permissions_key.c_str());
+    if (check_redis_reply(reply, "SMEMBERS") != MQ_SUCCESS) {
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      std::string topic_pattern_str = from_mqtt_string(topic_pattern);
+      std::vector<std::string> to_remove;
+      for (size_t i = 0; i < reply->elements; ++i) {
+        std::string member = reply->element[i]->str;
+        if (member.substr(0, member.find(':')) == topic_pattern_str) {
+          to_remove.push_back(member);
+        }
+      }
+      free_redis_reply(reply);
+      // 删除匹配的权限
+      for (const auto& member : to_remove) {
+        reply = execute_command(conn, "SREM %s %s", permissions_key.c_str(), member.c_str());
+        if (check_redis_reply(reply, "SREM") != MQ_SUCCESS) {
+          LOG_WARN("Failed to remove permission: {}", member);
+        }
+        free_redis_reply(reply);
+      }
+      connection_pool_->release_connection(conn);
+      // 清除本地缓存
+      remove_from_local_cache(username);
+      LOG_INFO("Topic permission removed for user '{}': {}", from_mqtt_string(username),
+               from_mqtt_string(topic_pattern));
+      ret = MQ_SUCCESS;
     }
   }
-
-  free_redis_reply(reply);
-
-  // 删除匹配的权限
-  for (const auto& member : to_remove) {
-    reply = execute_command(conn, "SREM %s %s", permissions_key.c_str(), member.c_str());
-    if (check_redis_reply(reply, "SREM") != MQ_SUCCESS) {
-      LOG_WARN("Failed to remove permission: {}", member);
-    }
-    free_redis_reply(reply);
-  }
-
-  connection_pool_->release_connection(conn);
-
-  // 清除本地缓存
-  remove_from_local_cache(username);
-
-  LOG_INFO("Topic permission removed for user '{}': {}", from_mqtt_string(username),
-           from_mqtt_string(topic_pattern));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int RedisAuthProvider::clear_user_permissions(const MQTTString& username)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string permissions_key = make_permissions_key(username);
+    redisReply* reply = execute_command(conn, "DEL %s", permissions_key.c_str());
+    int result = check_redis_reply(reply, "DEL");
+    free_redis_reply(reply);
+    connection_pool_->release_connection(conn);
+    if (result == MQ_SUCCESS) {
+      // 清除本地缓存
+      remove_from_local_cache(username);
+      LOG_INFO("All permissions cleared for user '{}'", from_mqtt_string(username));
+    }
+    ret = result;
   }
-
-  std::string permissions_key = make_permissions_key(username);
-
-  redisReply* reply = execute_command(conn, "DEL %s", permissions_key.c_str());
-  int result = check_redis_reply(reply, "DEL");
-  free_redis_reply(reply);
-
-  connection_pool_->release_connection(conn);
-
-  if (result == MQ_SUCCESS) {
-    // 清除本地缓存
-    remove_from_local_cache(username);
-    LOG_INFO("All permissions cleared for user '{}'", from_mqtt_string(username));
-  }
-
-  return result;
+  return ret;
 }
 
 int RedisAuthProvider::get_user_permissions(const MQTTString& username,
@@ -842,96 +819,90 @@ AuthResult RedisAuthProvider::check_topic_access_internal(const MQTTString& user
 int RedisAuthProvider::load_user_from_redis(const MQTTString& username,
                                             UserCache::UserInfo& user_info)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string user_key = make_user_key(username);
+    redisReply* reply =
+        execute_command(conn, "HMGET %s password_hash is_super_user", user_key.c_str());
+    if (check_redis_reply(reply, "HMGET") != MQ_SUCCESS) {
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else if (reply->elements < 2 || reply->element[0]->type == REDIS_REPLY_NIL ||
+               reply->element[1]->type == REDIS_REPLY_NIL) {
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_NOT_FOUND_V2;
+    } else {
+      user_info.password_hash = reply->element[0]->str;
+      user_info.is_super_user = (std::atoi(reply->element[1]->str) != 0);
+      user_info.expire_time =
+          std::chrono::steady_clock::now() + std::chrono::seconds(config_.cache_ttl_seconds);
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_SUCCESS;
+    }
   }
-
-  std::string user_key = make_user_key(username);
-
-  redisReply* reply =
-      execute_command(conn, "HMGET %s password_hash is_super_user", user_key.c_str());
-  if (check_redis_reply(reply, "HMGET") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  if (reply->elements < 2 || reply->element[0]->type == REDIS_REPLY_NIL ||
-      reply->element[1]->type == REDIS_REPLY_NIL) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_NOT_FOUND_V2;
-  }
-
-  user_info.password_hash = reply->element[0]->str;
-  user_info.is_super_user = (std::atoi(reply->element[1]->str) != 0);
-  user_info.expire_time =
-      std::chrono::steady_clock::now() + std::chrono::seconds(config_.cache_ttl_seconds);
-
-  free_redis_reply(reply);
-  connection_pool_->release_connection(conn);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int RedisAuthProvider::load_user_permissions_from_redis(const MQTTString& username,
                                                         std::vector<TopicPermission>& permissions)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
-  }
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string permissions_key = make_permissions_key(username);
+    redisReply* reply = execute_command(conn, "SMEMBERS %s", permissions_key.c_str());
+    if (check_redis_reply(reply, "SMEMBERS") != MQ_SUCCESS) {
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      permissions.clear();
+      for (size_t i = 0; i < reply->elements; ++i) {
+        std::string member = reply->element[i]->str;
+        size_t colon_pos = member.rfind(':');
+        if (colon_pos != std::string::npos) {
+          std::string topic_pattern = member.substr(0, colon_pos);
+          int perm_value = std::atoi(member.substr(colon_pos + 1).c_str());
 
-  std::string permissions_key = make_permissions_key(username);
-
-  redisReply* reply = execute_command(conn, "SMEMBERS %s", permissions_key.c_str());
-  if (check_redis_reply(reply, "SMEMBERS") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  permissions.clear();
-
-  for (size_t i = 0; i < reply->elements; ++i) {
-    std::string member = reply->element[i]->str;
-    size_t colon_pos = member.rfind(':');
-    if (colon_pos != std::string::npos) {
-      std::string topic_pattern = member.substr(0, colon_pos);
-      int perm_value = std::atoi(member.substr(colon_pos + 1).c_str());
-
-      TopicPermission perm(allocator_);
-      perm.topic_pattern = to_mqtt_string(topic_pattern, allocator_);
-      perm.permission = static_cast<Permission>(perm_value);
-      permissions.push_back(std::move(perm));
+          TopicPermission perm(allocator_);
+          perm.topic_pattern = to_mqtt_string(topic_pattern, allocator_);
+          perm.permission = static_cast<Permission>(perm_value);
+          permissions.push_back(std::move(perm));
+        }
+      }
+      free_redis_reply(reply);
+      connection_pool_->release_connection(conn);
+      ret = MQ_SUCCESS;
     }
   }
-
-  free_redis_reply(reply);
-  connection_pool_->release_connection(conn);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 bool RedisAuthProvider::get_from_local_cache(const MQTTString& username,
                                              UserCache::UserInfo& user_info)
 {
+  bool ret = false;
   mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(local_cache_.mutex);
-
   auto it = local_cache_.users.find(from_mqtt_string(username));
   if (it == local_cache_.users.end()) {
-    return false;
+    ret = false;
+  } else if (std::chrono::steady_clock::now() > it->second.expire_time) {
+    ret = false;
+  } else {
+    user_info = it->second;
+    ret = true;
   }
-
-  if (std::chrono::steady_clock::now() > it->second.expire_time) {
-    return false;
-  }
-
-  user_info = it->second;
-  return true;
+  return ret;
 }
 
 void RedisAuthProvider::put_to_local_cache(const MQTTString& username,
@@ -1035,17 +1006,17 @@ redisReply* RedisAuthProvider::execute_command(std::shared_ptr<RedisConnection> 
 
 int RedisAuthProvider::check_redis_reply(redisReply* reply, const char* operation)
 {
+  int ret = 0;
   if (!reply) {
     LOG_ERROR("Redis {} failed: connection error", operation);
-    return MQ_ERR_CONNECT;
-  }
-
-  if (reply->type == REDIS_REPLY_ERROR) {
+    ret = MQ_ERR_CONNECT;
+  } else if (reply->type == REDIS_REPLY_ERROR) {
     LOG_ERROR("Redis {} failed: {}", operation, reply->str);
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    ret = MQ_SUCCESS;
   }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void RedisAuthProvider::free_redis_reply(redisReply* reply)

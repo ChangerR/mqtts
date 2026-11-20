@@ -15,30 +15,39 @@ struct PacketIdSet {
 
   bool test(uint16_t id) const
   {
+    bool ret = false;
     if (id == 0) {
-      return false;
+      ret = false;
+    } else {
+      ret = (word[id >> 6] >> (id & 63)) & 1ull;
     }
-    return (word[id >> 6] >> (id & 63)) & 1ull;
+    return ret;
   }
 
   bool add(uint16_t id)
   {
+    bool ret = false;
     if (id == 0 || test(id)) {
-      return false;
+      ret = false;
+    } else {
+      word[id >> 6] |= 1ull << (id & 63);
+      ++count;
+      ret = true;
     }
-    word[id >> 6] |= 1ull << (id & 63);
-    ++count;
-    return true;
+    return ret;
   }
 
   bool erase(uint16_t id)
   {
+    bool ret = false;
     if (!test(id)) {
-      return false;
+      ret = false;
+    } else {
+      word[id >> 6] &= ~(1ull << (id & 63));
+      --count;
+      ret = true;
     }
-    word[id >> 6] &= ~(1ull << (id & 63));
-    --count;
-    return true;
+    return ret;
   }
 };
 

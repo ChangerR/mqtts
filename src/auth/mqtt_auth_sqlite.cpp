@@ -77,58 +77,46 @@ int SQLiteConnectionPool::initialize()
 void SQLiteConnectionPool::cleanup()
 {
   std::unique_lock<std::mutex> lock(pool_mutex_);
-
-  if (!initialized_) {
-    return;
+  if (initialized_) {
+    LOG_INFO("Cleaning up SQLite connection pool");
+    // 清空可用连接队列
+    while (!available_.empty()) {
+      available_.pop();
+    }
+    // 关闭所有连接
+    pool_.clear();
+    initialized_ = false;
   }
-
-  LOG_INFO("Cleaning up SQLite connection pool");
-
-  // 清空可用连接队列
-  while (!available_.empty()) {
-    available_.pop();
-  }
-
-  // 关闭所有连接
-  pool_.clear();
-
-  initialized_ = false;
 }
 
 std::shared_ptr<SQLiteConnection> SQLiteConnectionPool::acquire_connection()
 {
+  std::shared_ptr<SQLiteConnection> ret{};
   std::unique_lock<std::mutex> lock(pool_mutex_);
-
   if (!initialized_) {
     LOG_ERROR("Connection pool not initialized");
-    return nullptr;
+    ret = nullptr;
+  } else {
+    // 等待可用连接
+    pool_cv_.wait(lock, [this] { return !available_.empty(); });
+    auto conn = available_.front();
+    available_.pop();
+    conn->set_busy(true);
+    conn->update_last_used();
+    ret = std::move(conn);
   }
-
-  // 等待可用连接
-  pool_cv_.wait(lock, [this] { return !available_.empty(); });
-
-  auto conn = available_.front();
-  available_.pop();
-
-  conn->set_busy(true);
-  conn->update_last_used();
-
-  return conn;
+  return ret;
 }
 
 void SQLiteConnectionPool::release_connection(std::shared_ptr<SQLiteConnection> conn)
 {
-  if (!conn) {
-    return;
+  if (conn) {
+    std::unique_lock<std::mutex> lock(pool_mutex_);
+    conn->set_busy(false);
+    conn->update_last_used();
+    available_.push(conn);
+    pool_cv_.notify_one();
   }
-
-  std::unique_lock<std::mutex> lock(pool_mutex_);
-
-  conn->set_busy(false);
-  conn->update_last_used();
-
-  available_.push(conn);
-  pool_cv_.notify_one();
 }
 
 size_t SQLiteConnectionPool::get_active_connections() const
@@ -146,11 +134,12 @@ int SQLiteConnectionPool::create_connection(sqlite3** db)
       sqlite3_close(*db);
       *db = nullptr;
     }
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    configure_connection(*db);
+    ret = MQ_SUCCESS;
   }
-
-  configure_connection(*db);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void SQLiteConnectionPool::configure_connection(sqlite3* db)
@@ -346,250 +335,238 @@ bool SQLiteAuthProvider::is_healthy() const
 int SQLiteAuthProvider::add_user(const MQTTString& username, const MQTTString& password,
                                  bool is_super_user)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    std::string password_hash = hash_password(from_mqtt_string(password));
+    const char* sql =
+        "INSERT INTO users (username, password_hash, is_super_user, created_at) VALUES (?, ?, ?, "
+        "datetime('now'))";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_int(stmt, 3, is_super_user ? 1 : 0);
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to insert user: {}", sqlite3_errmsg(conn->get_db()));
+        ret = MQ_ERR_DATABASE;
+      } else {
+        LOG_INFO("User '{}' added successfully", from_mqtt_string(username));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  std::string password_hash = hash_password(from_mqtt_string(password));
-
-  const char* sql =
-      "INSERT INTO users (username, password_hash, is_super_user, created_at) VALUES (?, ?, ?, "
-      "datetime('now'))";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_int(stmt, 3, is_super_user ? 1 : 0);
-
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to insert user: {}", sqlite3_errmsg(conn->get_db()));
-    return MQ_ERR_DATABASE;
-  }
-
-  LOG_INFO("User '{}' added successfully", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::remove_user(const MQTTString& username)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    // 开始事务
+    sqlite3_exec(conn->get_db(), "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
+    // 删除用户的主题权限
+    const char* delete_perms_sql = "DELETE FROM topic_permissions WHERE username = ?";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), delete_perms_sql, -1, &stmt, nullptr);
+    if (ret == SQLITE_OK) {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+    }
+    // 删除用户
+    const char* delete_user_sql = "DELETE FROM users WHERE username = ?";
+    ret = sqlite3_prepare_v2(conn->get_db(), delete_user_sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      sqlite3_exec(conn->get_db(), "ROLLBACK", nullptr, nullptr, nullptr);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to delete user: {}", sqlite3_errmsg(conn->get_db()));
+        sqlite3_exec(conn->get_db(), "ROLLBACK", nullptr, nullptr, nullptr);
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+      } else {
+        // 提交事务
+        sqlite3_exec(conn->get_db(), "COMMIT", nullptr, nullptr, nullptr);
+        connection_pool_->release_connection(conn);
+        LOG_INFO("User '{}' removed successfully", from_mqtt_string(username));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  // 开始事务
-  sqlite3_exec(conn->get_db(), "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
-
-  // 删除用户的主题权限
-  const char* delete_perms_sql = "DELETE FROM topic_permissions WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), delete_perms_sql, -1, &stmt, nullptr);
-  if (ret == SQLITE_OK) {
-    sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-  }
-
-  // 删除用户
-  const char* delete_user_sql = "DELETE FROM users WHERE username = ?";
-  ret = sqlite3_prepare_v2(conn->get_db(), delete_user_sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    sqlite3_exec(conn->get_db(), "ROLLBACK", nullptr, nullptr, nullptr);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to delete user: {}", sqlite3_errmsg(conn->get_db()));
-    sqlite3_exec(conn->get_db(), "ROLLBACK", nullptr, nullptr, nullptr);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  // 提交事务
-  sqlite3_exec(conn->get_db(), "COMMIT", nullptr, nullptr, nullptr);
-  connection_pool_->release_connection(conn);
-
-  LOG_INFO("User '{}' removed successfully", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::update_user_password(const MQTTString& username,
                                              const MQTTString& new_password)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    std::string password_hash = hash_password(from_mqtt_string(new_password));
+    const char* sql =
+        "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE username = ?";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, password_hash.c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_text(stmt, 2, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to update user password: {}", sqlite3_errmsg(conn->get_db()));
+        ret = MQ_ERR_DATABASE;
+      } else {
+        LOG_INFO("Password updated for user '{}'", from_mqtt_string(username));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  std::string password_hash = hash_password(from_mqtt_string(new_password));
-
-  const char* sql =
-      "UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, password_hash.c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_text(stmt, 2, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to update user password: {}", sqlite3_errmsg(conn->get_db()));
-    return MQ_ERR_DATABASE;
-  }
-
-  LOG_INFO("Password updated for user '{}'", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::add_topic_permission(const MQTTString& username,
                                              const MQTTString& topic_pattern, Permission permission)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    const char* sql =
+        "INSERT OR REPLACE INTO topic_permissions (username, topic_pattern, permission, "
+        "created_at) "
+        "VALUES (?, ?, ?, datetime('now'))";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_text(stmt, 2, from_mqtt_string(topic_pattern).c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_int(stmt, 3, static_cast<int>(permission));
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to insert topic permission: {}", sqlite3_errmsg(conn->get_db()));
+        ret = MQ_ERR_DATABASE;
+      } else {
+        // 使缓存失效
+        std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+        topic_cache_.user_permissions.erase(from_mqtt_string(username));
+        LOG_INFO("Topic permission added for user '{}': {} -> {}", from_mqtt_string(username),
+                 from_mqtt_string(topic_pattern), static_cast<int>(permission));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  const char* sql =
-      "INSERT OR REPLACE INTO topic_permissions (username, topic_pattern, permission, created_at) "
-      "VALUES (?, ?, ?, datetime('now'))";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_text(stmt, 2, from_mqtt_string(topic_pattern).c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_int(stmt, 3, static_cast<int>(permission));
-
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to insert topic permission: {}", sqlite3_errmsg(conn->get_db()));
-    return MQ_ERR_DATABASE;
-  }
-
-  // 使缓存失效
-  std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
-  topic_cache_.user_permissions.erase(from_mqtt_string(username));
-
-  LOG_INFO("Topic permission added for user '{}': {} -> {}", from_mqtt_string(username),
-           from_mqtt_string(topic_pattern), static_cast<int>(permission));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::remove_topic_permission(const MQTTString& username,
                                                 const MQTTString& topic_pattern)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    const char* sql = "DELETE FROM topic_permissions WHERE username = ? AND topic_pattern = ?";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      sqlite3_bind_text(stmt, 2, from_mqtt_string(topic_pattern).c_str(), -1, SQLITE_STATIC);
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to delete topic permission: {}", sqlite3_errmsg(conn->get_db()));
+        ret = MQ_ERR_DATABASE;
+      } else {
+        // 使缓存失效
+        std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+        topic_cache_.user_permissions.erase(from_mqtt_string(username));
+        LOG_INFO("Topic permission removed for user '{}': {}", from_mqtt_string(username),
+                 from_mqtt_string(topic_pattern));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  const char* sql = "DELETE FROM topic_permissions WHERE username = ? AND topic_pattern = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-  sqlite3_bind_text(stmt, 2, from_mqtt_string(topic_pattern).c_str(), -1, SQLITE_STATIC);
-
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to delete topic permission: {}", sqlite3_errmsg(conn->get_db()));
-    return MQ_ERR_DATABASE;
-  }
-
-  // 使缓存失效
-  std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
-  topic_cache_.user_permissions.erase(from_mqtt_string(username));
-
-  LOG_INFO("Topic permission removed for user '{}': {}", from_mqtt_string(username),
-           from_mqtt_string(topic_pattern));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::clear_user_permissions(const MQTTString& username)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    const char* sql = "DELETE FROM topic_permissions WHERE username = ?";
+    sqlite3_stmt* stmt;
+    ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      ret = sqlite3_step(stmt);
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      if (ret != SQLITE_DONE) {
+        LOG_ERROR("Failed to clear user permissions: {}", sqlite3_errmsg(conn->get_db()));
+        ret = MQ_ERR_DATABASE;
+      } else {
+        // 使缓存失效
+        std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+        topic_cache_.user_permissions.erase(from_mqtt_string(username));
+        LOG_INFO("All permissions cleared for user '{}'", from_mqtt_string(username));
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  const char* sql = "DELETE FROM topic_permissions WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-
-  ret = sqlite3_step(stmt);
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  if (ret != SQLITE_DONE) {
-    LOG_ERROR("Failed to clear user permissions: {}", sqlite3_errmsg(conn->get_db()));
-    return MQ_ERR_DATABASE;
-  }
-
-  // 使缓存失效
-  std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
-  topic_cache_.user_permissions.erase(from_mqtt_string(username));
-
-  LOG_INFO("All permissions cleared for user '{}'", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::get_user_permissions(const MQTTString& username,
@@ -630,53 +607,52 @@ int SQLiteAuthProvider::get_user_permissions(const MQTTString& username,
 
 int SQLiteAuthProvider::create_tables()
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
+    ret = MQ_ERR_DATABASE;
+  } else {
+    const char* users_table = R"(
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                is_super_user INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT DEFAULT NULL
+            )
+        )";
+    const char* topic_permissions_table = R"(
+            CREATE TABLE IF NOT EXISTS topic_permissions (
+                username TEXT NOT NULL,
+                topic_pattern TEXT NOT NULL,
+                permission INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (username, topic_pattern),
+                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+            )
+        )";
+    char* err_msg = nullptr;
+    ret = sqlite3_exec(conn->get_db(), users_table, nullptr, nullptr, &err_msg);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to create users table: {}", err_msg);
+      sqlite3_free(err_msg);
+      connection_pool_->release_connection(conn);
+      ret = MQ_ERR_DATABASE;
+    } else {
+      ret = sqlite3_exec(conn->get_db(), topic_permissions_table, nullptr, nullptr, &err_msg);
+      if (ret != SQLITE_OK) {
+        LOG_ERROR("Failed to create topic_permissions table: {}", err_msg);
+        sqlite3_free(err_msg);
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+      } else {
+        connection_pool_->release_connection(conn);
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  const char* users_table = R"(
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            is_super_user INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT DEFAULT NULL
-        )
-    )";
-
-  const char* topic_permissions_table = R"(
-        CREATE TABLE IF NOT EXISTS topic_permissions (
-            username TEXT NOT NULL,
-            topic_pattern TEXT NOT NULL,
-            permission INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (username, topic_pattern),
-            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )
-    )";
-
-  char* err_msg = nullptr;
-
-  int ret = sqlite3_exec(conn->get_db(), users_table, nullptr, nullptr, &err_msg);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to create users table: {}", err_msg);
-    sqlite3_free(err_msg);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  ret = sqlite3_exec(conn->get_db(), topic_permissions_table, nullptr, nullptr, &err_msg);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to create topic_permissions table: {}", err_msg);
-    sqlite3_free(err_msg);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-
-  connection_pool_->release_connection(conn);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int SQLiteAuthProvider::create_indexes()
@@ -826,40 +802,33 @@ void SQLiteAuthProvider::update_topic_cache(const MQTTString& username)
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return;
+  } else {
+    const char* sql = "SELECT topic_pattern, permission FROM topic_permissions WHERE username = ?";
+    sqlite3_stmt* stmt;
+    int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+      std::vector<TopicPermission> permissions;
+      while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* topic_pattern = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        int permission = sqlite3_column_int(stmt, 1);
+
+        TopicPermission perm(allocator_);
+        perm.topic_pattern = MQTTString(topic_pattern, MQTTStrAllocator(allocator_));
+        perm.permission = static_cast<Permission>(permission);
+        permissions.push_back(std::move(perm));
+      }
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+      // 更新缓存
+      std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+      topic_cache_.user_permissions[from_mqtt_string(username)] = std::move(permissions);
+      topic_cache_.last_update = std::chrono::steady_clock::now();
+    }
   }
-
-  const char* sql = "SELECT topic_pattern, permission FROM topic_permissions WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-
-  std::vector<TopicPermission> permissions;
-
-  while (sqlite3_step(stmt) == SQLITE_ROW) {
-    const char* topic_pattern = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    int permission = sqlite3_column_int(stmt, 1);
-
-    TopicPermission perm(allocator_);
-    perm.topic_pattern = MQTTString(topic_pattern, MQTTStrAllocator(allocator_));
-    perm.permission = static_cast<Permission>(permission);
-    permissions.push_back(std::move(perm));
-  }
-
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  // 更新缓存
-  std::unique_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
-  topic_cache_.user_permissions[from_mqtt_string(username)] = std::move(permissions);
-  topic_cache_.last_update = std::chrono::steady_clock::now();
 }
 
 bool SQLiteAuthProvider::is_topic_cache_valid() const

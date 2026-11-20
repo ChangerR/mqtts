@@ -38,14 +38,18 @@ void writeBytes(VectorType& buffer, const MQTTVector<uint8_t>& data)
 template <typename VectorType>
 uint32_t readUint32(const VectorType& buffer, size_t& offset)
 {
-  if (offset + 4 > buffer.size())
-    return 0;
-  uint32_t value = (static_cast<uint32_t>(buffer[offset]) << 24) |
-                   (static_cast<uint32_t>(buffer[offset + 1]) << 16) |
-                   (static_cast<uint32_t>(buffer[offset + 2]) << 8) |
-                   static_cast<uint32_t>(buffer[offset + 3]);
-  offset += 4;
-  return value;
+  uint32_t ret = 0;
+  if (offset + 4 > buffer.size()) {
+    ret = 0;
+  } else {
+    uint32_t value = (static_cast<uint32_t>(buffer[offset]) << 24) |
+                     (static_cast<uint32_t>(buffer[offset + 1]) << 16) |
+                     (static_cast<uint32_t>(buffer[offset + 2]) << 8) |
+                     static_cast<uint32_t>(buffer[offset + 3]);
+    offset += 4;
+    ret = value;
+  }
+  return ret;
 }
 
 template <typename VectorType>

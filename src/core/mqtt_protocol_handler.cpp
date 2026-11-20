@@ -24,14 +24,16 @@ namespace {
 static bool is_supported_protocol_name_version(const MQTTString& protocol_name,
                                                uint8_t protocol_version)
 {
+  bool ret = false;
   const std::string name = from_mqtt_string(protocol_name);
   if (protocol_version == 3) {
-    return name == "MQIsdp";
+    ret = name == "MQIsdp";
+  } else if (protocol_version == 4 || protocol_version == 5) {
+    ret = name == "MQTT";
+  } else {
+    ret = false;
   }
-  if (protocol_version == 4 || protocol_version == 5) {
-    return name == "MQTT";
-  }
-  return false;
+  return ret;
 }
 }  // namespace
 
@@ -150,11 +152,10 @@ int MQTTProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip, 
 
 void MQTTProtocolHandler::arm_connection_watch()
 {
-  if (watch_.started()) {
-    return;
+  if (!(watch_.started())) {
+    const auto established = established_set_ ? established_ : ConnectionWatch::now();
+    watch_.start(established, effective_limits().connect_timeout_seconds);
   }
-  const auto established = established_set_ ? established_ : ConnectionWatch::now();
-  watch_.start(established, effective_limits().connect_timeout_seconds);
 }
 
 void MQTTProtocolHandler::signal_takeover_done()
@@ -169,16 +170,16 @@ void MQTTProtocolHandler::request_session_takeover(const std::shared_ptr<Session
 {
   if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
     gate->done.store(true, std::memory_order_release);
-    return;
-  }
-  takeover_gate_ = gate;
-  takeover_pending_.store(true, std::memory_order_release);
-  if (cleanup_finished_) {
-    signal_takeover_done();
-    return;
-  }
-  if (socket_ && socket_->get_fd() >= 0) {
-    ::shutdown(socket_->get_fd(), SHUT_RD);
+  } else {
+    takeover_gate_ = gate;
+    takeover_pending_.store(true, std::memory_order_release);
+    if (cleanup_finished_) {
+      signal_takeover_done();
+    } else {
+      if (socket_ && socket_->get_fd() >= 0) {
+        ::shutdown(socket_->get_fd(), SHUT_RD);
+      }
+    }
   }
 }
 
@@ -388,16 +389,15 @@ void MQTTProtocolHandler::release_grown_read_buffer()
 {
   // A parsed packet owns copies of everything it needs. Dropping a grown read
   // buffer keeps one large packet from being held twice while it is handled.
-  if (current_buffer_size_ <= INITIAL_BUFFER_SIZE || bytes_read_ != header_size_ + remaining_length_) {
-    return;
+  if (!(current_buffer_size_ <= INITIAL_BUFFER_SIZE ||
+        bytes_read_ != header_size_ + remaining_length_)) {
+    char* fresh = static_cast<char*>(allocator_->allocate(INITIAL_BUFFER_SIZE));
+    if (fresh) {
+      allocator_->deallocate(buffer_, current_buffer_size_);
+      buffer_ = fresh;
+      current_buffer_size_ = INITIAL_BUFFER_SIZE;
+    }
   }
-  char* fresh = static_cast<char*>(allocator_->allocate(INITIAL_BUFFER_SIZE));
-  if (!fresh) {
-    return;
-  }
-  allocator_->deallocate(buffer_, current_buffer_size_);
-  buffer_ = fresh;
-  current_buffer_size_ = INITIAL_BUFFER_SIZE;
 }
 
 int MQTTProtocolHandler::read_packet()
@@ -558,24 +558,28 @@ void MQTTProtocolHandler::release_inbound_qos2(uint16_t packet_id)
 
 int MQTTProtocolHandler::claim_outbound_packet_id(uint16_t id, void* arg)
 {
+  int ret = 0;
   auto* self = static_cast<MQTTProtocolHandler*>(arg);
-  if (!self->durable_epoch_ || !self->session_manager_ || !self->session_manager_->durable_store()) {
-    return 0;
+  if (!self->durable_epoch_ || !self->session_manager_ ||
+      !self->session_manager_->durable_store()) {
+    ret = 0;
+  } else {
+    const auto claim = self->session_manager_->durable_store()->claim_live_packet_id(
+        from_mqtt_string(self->client_id_), self->durable_epoch_, id);
+    switch (claim) {
+      case DurableStore::PacketIdClaim::Reserved:
+      case DurableStore::PacketIdClaim::Absent:
+        return 0;
+      case DurableStore::PacketIdClaim::InUse:
+        return 1;
+      case DurableStore::PacketIdClaim::Quota:
+        return 3;
+      case DurableStore::PacketIdClaim::Busy:
+        return 2;
+    }
+    ret = 2;
   }
-  const auto claim = self->session_manager_->durable_store()->claim_live_packet_id(
-      from_mqtt_string(self->client_id_), self->durable_epoch_, id);
-  switch (claim) {
-    case DurableStore::PacketIdClaim::Reserved:
-    case DurableStore::PacketIdClaim::Absent:
-      return 0;
-    case DurableStore::PacketIdClaim::InUse:
-      return 1;
-    case DurableStore::PacketIdClaim::Quota:
-      return 3;
-    case DurableStore::PacketIdClaim::Busy:
-      return 2;
-  }
-  return 2;
+  return ret;
 }
 
 ConnectionFlow::Allocation MQTTProtocolHandler::allocate_outbound_packet_id(uint8_t qos)
@@ -585,13 +589,12 @@ ConnectionFlow::Allocation MQTTProtocolHandler::allocate_outbound_packet_id(uint
 
 void MQTTProtocolHandler::release_outbound_packet_id(uint16_t packet_id)
 {
-  if (!flow_.outbound_holds(packet_id)) {
-    return;
-  }
-  flow_.release_outbound(packet_id);
-  if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
-    session_manager_->durable_store()->release_live_packet_id(from_mqtt_string(client_id_),
-                                                              durable_epoch_, packet_id);
+  if (!(!flow_.outbound_holds(packet_id))) {
+    flow_.release_outbound(packet_id);
+    if (durable_epoch_ && session_manager_ && session_manager_->durable_store()) {
+      session_manager_->durable_store()->release_live_packet_id(from_mqtt_string(client_id_),
+                                                                durable_epoch_, packet_id);
+    }
   }
 }
 
@@ -629,10 +632,13 @@ int MQTTProtocolHandler::transmit_parts(const uint8_t* head, size_t head_size,
 
 bool MQTTProtocolHandler::outbound_exceeds_client_maximum(size_t bytes) const
 {
+  bool ret = false;
   if (!version_negotiated_ || negotiated_protocol_version_ < 5) {
-    return false;
+    ret = false;
+  } else {
+    ret = flow_.outbound_too_large(bytes);
   }
-  return flow_.outbound_too_large(bytes);
+  return ret;
 }
 
 void MQTTProtocolHandler::omit_optional_outbound_properties(Properties& properties)
@@ -1218,43 +1224,45 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
 
 int MQTTProtocolHandler::handle_connack(const ConnAckPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received CONNACK but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
-  }
-
-  if (packet->reason_code != ReasonCode::Success) {
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else if (packet->reason_code != ReasonCode::Success) {
     LOG_ERROR("Connection refused with reason code: 0x{:02x}",
               static_cast<uint8_t>(packet->reason_code));
-    return MQ_ERR_CONNECT;
+    ret = MQ_ERR_CONNECT;
+  } else {
+    // 处理会话属性
+    session_properties_ = packet->properties;
+    session_expiry_interval_ = packet->properties.session_expiry_interval;
+    receive_maximum_ = packet->properties.receive_maximum;
+    maximum_packet_size_ = packet->properties.maximum_packet_size;
+    topic_alias_maximum_ = packet->properties.topic_alias_maximum;
+    request_response_information_ = packet->properties.request_response_information;
+    request_problem_information_ = packet->properties.request_problem_information;
+    ret = MQ_SUCCESS;
   }
-
-  // 处理会话属性
-  session_properties_ = packet->properties;
-  session_expiry_interval_ = packet->properties.session_expiry_interval;
-  receive_maximum_ = packet->properties.receive_maximum;
-  maximum_packet_size_ = packet->properties.maximum_packet_size;
-  topic_alias_maximum_ = packet->properties.topic_alias_maximum;
-  request_response_information_ = packet->properties.request_response_information;
-  request_problem_information_ = packet->properties.request_problem_information;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 InboundTopicAliases::Result MQTTProtocolHandler::apply_inbound_topic_alias(PublishPacket* packet)
 {
+  InboundTopicAliases::Result ret{};
   if (packet == nullptr) {
-    return InboundTopicAliases::Result::Invalid;
+    ret = InboundTopicAliases::Result::Invalid;
+  } else {
+    const InboundTopicAliases::Result result =
+        inbound_aliases_.apply(packet->properties.has_topic_alias, packet->properties.topic_alias,
+                               effective_limits().topic_alias_maximum, packet->topic_name);
+    if (result == InboundTopicAliases::Result::Unused ||
+        result == InboundTopicAliases::Result::Resolved) {
+      packet->properties.topic_alias = 0;
+      packet->properties.has_topic_alias = false;
+    }
+    ret = std::move(result);
   }
-  const InboundTopicAliases::Result result = inbound_aliases_.apply(
-      packet->properties.has_topic_alias, packet->properties.topic_alias,
-      effective_limits().topic_alias_maximum, packet->topic_name);
-  if (result == InboundTopicAliases::Result::Unused ||
-      result == InboundTopicAliases::Result::Resolved) {
-    packet->properties.topic_alias = 0;
-    packet->properties.has_topic_alias = false;
-  }
-  return result;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_publish(PublishPacket* packet)
@@ -1430,75 +1438,76 @@ int MQTTProtocolHandler::handle_puback(const PubAckPacket* packet)
 
 int MQTTProtocolHandler::handle_pubrec(const PubRecPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received PUBREC but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
-  }
-
-  if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubRec) ==
-      ConnectionFlow::AckDisposition::Unexpected) {
-    return fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
-  }
-  if (static_cast<uint8_t>(packet->reason_code) >= 0x80) {
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubRec) ==
+             ConnectionFlow::AckDisposition::Unexpected) {
+    ret = fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
+  } else if (static_cast<uint8_t>(packet->reason_code) >= 0x80) {
     LOG_WARN("PUBREC with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
     release_outbound_packet_id(packet->packet_id);
-    return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    flow_.mark_awaiting_pubcomp(packet->packet_id);
+    ret = send_pubrel(packet->packet_id, ReasonCode::Success);
   }
-
-  flow_.mark_awaiting_pubcomp(packet->packet_id);
-  return send_pubrel(packet->packet_id, ReasonCode::Success);
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_pubrel(const PubRelPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received PUBREL but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    if (packet->reason_code != ReasonCode::Success) {
+      LOG_WARN("PUBREL with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
+    }
+    release_inbound_qos2(packet->packet_id);
+    ret = send_pubcomp(packet->packet_id, ReasonCode::Success);
   }
-
-  if (packet->reason_code != ReasonCode::Success) {
-    LOG_WARN("PUBREL with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
-  }
-
-  release_inbound_qos2(packet->packet_id);
-  return send_pubcomp(packet->packet_id, ReasonCode::Success);
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_pubcomp(const PubCompPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received PUBCOMP but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubComp) ==
+             ConnectionFlow::AckDisposition::Unexpected) {
+    ret = fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
+  } else {
+    release_outbound_packet_id(packet->packet_id);
+    if (packet->reason_code != ReasonCode::Success) {
+      LOG_WARN("PUBCOMP with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
+    }
+    ret = MQ_SUCCESS;
   }
-
-  if (flow_.classify_outbound_ack(packet->packet_id, ConnectionFlow::AckKind::PubComp) ==
-      ConnectionFlow::AckDisposition::Unexpected) {
-    return fail_protocol(ReasonCode::ProtocolError, MQ_ERR_PACKET_TYPE);
-  }
-  release_outbound_packet_id(packet->packet_id);
-  if (packet->reason_code != ReasonCode::Success) {
-    LOG_WARN("PUBCOMP with reason code: 0x{:02x}", static_cast<uint8_t>(packet->reason_code));
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_suback(const SubAckPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received SUBACK but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
-  }
-
-  // 处理SUBACK响应
-  for (size_t i = 0; i < packet->reason_codes.size(); ++i) {
-    if (packet->reason_codes[i] != ReasonCode::Success) {
-      LOG_WARN("Subscription {} failed with reason code: 0x{:02x}", i,
-               static_cast<uint8_t>(packet->reason_codes[i]));
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    // 处理SUBACK响应
+    for (size_t i = 0; i < packet->reason_codes.size(); ++i) {
+      if (packet->reason_codes[i] != ReasonCode::Success) {
+        LOG_WARN("Subscription {} failed with reason code: 0x{:02x}", i,
+                 static_cast<uint8_t>(packet->reason_codes[i]));
+      }
     }
+    ret = MQ_SUCCESS;
   }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
@@ -1546,43 +1555,47 @@ int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
 
 int MQTTProtocolHandler::handle_unsuback(const UnsubAckPacket* packet)
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received UNSUBACK but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
-  }
-
-  // 处理UNSUBACK响应
-  for (size_t i = 0; i < packet->reason_codes.size(); ++i) {
-    if (packet->reason_codes[i] != ReasonCode::Success) {
-      LOG_WARN("Unsubscribe {} failed with reason code: 0x{:02x}", i,
-               static_cast<uint8_t>(packet->reason_codes[i]));
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    // 处理UNSUBACK响应
+    for (size_t i = 0; i < packet->reason_codes.size(); ++i) {
+      if (packet->reason_codes[i] != ReasonCode::Success) {
+        LOG_WARN("Unsubscribe {} failed with reason code: 0x{:02x}", i,
+                 static_cast<uint8_t>(packet->reason_codes[i]));
+      }
     }
+    ret = MQ_SUCCESS;
   }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_pingreq()
 {
+  int ret = 0;
   LOG_DEBUG("Processing PINGREQ from client {}:{}", client_ip_.c_str(), client_port_);
-
   if (!connected_) {
     LOG_ERROR("Received PINGREQ but client {}:{} not connected", client_ip_.c_str(), client_port_);
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    LOG_DEBUG("Sending PINGRESP to client {}:{}", client_ip_.c_str(), client_port_);
+    ret = send_pingresp();
   }
-
-  LOG_DEBUG("Sending PINGRESP to client {}:{}", client_ip_.c_str(), client_port_);
-  return send_pingresp();
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_pingresp()
 {
+  int ret = 0;
   if (!connected_) {
     LOG_ERROR("Received PINGRESP but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    ret = MQ_SUCCESS;
   }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
@@ -1627,28 +1640,28 @@ int MQTTProtocolHandler::handle_disconnect(const DisconnectPacket* packet)
 
 int MQTTProtocolHandler::handle_auth(const AuthPacket* packet)
 {
+  int ret = 0;
   if (negotiated_protocol_version_ < 5) {
     LOG_WARN("Received AUTH in MQTT 3.x session from client {}:{}", client_ip_.c_str(),
              client_port_);
     if (socket_) {
       socket_->close();
     }
-    return MQ_ERR_PACKET_TYPE;
-  }
-
-  if (!connected_) {
+    ret = MQ_ERR_PACKET_TYPE;
+  } else if (!connected_) {
     LOG_ERROR("Received AUTH but not connected");
-    return MQ_ERR_SESSION_NOT_CONNECTED;
+    ret = MQ_ERR_SESSION_NOT_CONNECTED;
+  } else {
+    // 处理认证
+    if (packet->reason_code != ReasonCode::Success) {
+      LOG_WARN("Authentication failed with reason code: 0x{:02x}",
+               static_cast<uint8_t>(packet->reason_code));
+      ret = MQ_ERR_CONNECT_CREDENTIALS;
+    } else {
+      ret = MQ_SUCCESS;
+    }
   }
-
-  // 处理认证
-  if (packet->reason_code != ReasonCode::Success) {
-    LOG_WARN("Authentication failed with reason code: 0x{:02x}",
-             static_cast<uint8_t>(packet->reason_code));
-    return MQ_ERR_CONNECT_CREDENTIALS;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTProtocolHandler::handle_subscribe(const SubscribePacket* packet)
@@ -2008,123 +2021,129 @@ int MQTTProtocolHandler::send_connack(ReasonCode reason_code, bool session_prese
 
 int MQTTProtocolHandler::send_pubrec(uint16_t packet_id, ReasonCode reason_code)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<PubRecPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::PUBREC;
+      packet->packet_id = packet_id;
+      packet->reason_code = reason_code;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_pubrec(static_cast<PubRecPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<PubRecPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::PUBREC;
-  packet->packet_id = packet_id;
-  packet->reason_code = reason_code;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_pubrec(static_cast<PubRecPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_pubrel(uint16_t packet_id, ReasonCode reason_code)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<PubRelPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::PUBREL;
+      packet->packet_id = packet_id;
+      packet->reason_code = reason_code;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_pubrel(static_cast<PubRelPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<PubRelPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::PUBREL;
-  packet->packet_id = packet_id;
-  packet->reason_code = reason_code;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_pubrel(static_cast<PubRelPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_pubcomp(uint16_t packet_id, ReasonCode reason_code)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<PubCompPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::PUBCOMP;
+      packet->packet_id = packet_id;
+      packet->reason_code = reason_code;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_pubcomp(static_cast<PubCompPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<PubCompPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::PUBCOMP;
-  packet->packet_id = packet_id;
-  packet->reason_code = reason_code;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_pubcomp(static_cast<PubCompPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_unsuback(uint16_t packet_id,
                                        const std::vector<ReasonCode>& reason_codes)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<UnsubAckPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::UNSUBACK;
+      packet->packet_id = packet_id;
+      for (const ReasonCode& code : reason_codes) {
+        packet->reason_codes.push_back(code);
+      }
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_unsuback(static_cast<UnsubAckPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<UnsubAckPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::UNSUBACK;
-  packet->packet_id = packet_id;
-  for (const ReasonCode& code : reason_codes) {
-    packet->reason_codes.push_back(code);
-  }
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_unsuback(static_cast<UnsubAckPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_disconnect(ReasonCode reason_code)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<DisconnectPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::DISCONNECT;
+      packet->reason_code = reason_code;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_disconnect(static_cast<DisconnectPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<DisconnectPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::DISCONNECT;
-  packet->reason_code = reason_code;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_disconnect(static_cast<DisconnectPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_auth(ReasonCode reason_code)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<AuthPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::AUTH;
+      packet->reason_code = reason_code;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_auth(static_cast<AuthPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<AuthPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::AUTH;
-  packet->reason_code = reason_code;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_auth(static_cast<AuthPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::add_subscription(const MQTTString& topic,
@@ -2212,24 +2231,25 @@ int MQTTProtocolHandler::get_subscriptions(MQTTVector<MQTTString>& subscriptions
 int MQTTProtocolHandler::send_suback(uint16_t packet_id,
                                      const std::vector<ReasonCode>& reason_codes)
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<SubAckPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::SUBACK;
+      packet->packet_id = packet_id;
+      for (const ReasonCode& code : reason_codes) {
+        packet->reason_codes.push_back(code);
+      }
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_suback(static_cast<SubAckPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<SubAckPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::SUBACK;
-  packet->packet_id = packet_id;
-  for (const ReasonCode& code : reason_codes) {
-    packet->reason_codes.push_back(code);
-  }
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_suback(static_cast<SubAckPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
@@ -2270,30 +2290,30 @@ int MQTTProtocolHandler::send_puback(uint16_t packet_id, ReasonCode reason_code)
 
 int MQTTProtocolHandler::send_pingresp()
 {
+  int ret = 0;
   if (!socket_) {
-    return MQ_ERR_SOCKET;
+    ret = MQ_ERR_SOCKET;
+  } else {
+    AllocatedPacket<PingRespPacket> packet(allocator_);
+    if (!packet) {
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      packet->type = PacketType::PINGRESP;
+      ret = send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
+        return parser_->serialize_pingresp(static_cast<PingRespPacket*>(raw), *buffer);
+      });
+    }
   }
-
-  AllocatedPacket<PingRespPacket> packet(allocator_);
-  if (!packet) {
-    return MQ_ERR_MEMORY_ALLOC;
-  }
-
-  packet->type = PacketType::PINGRESP;
-
-  return send_within_client_limit(packet.get(), [&](Packet* raw, MQTTBuffer* buffer) {
-    return parser_->serialize_pingresp(static_cast<PingRespPacket*>(raw), *buffer);
-  });
+  return ret;
 }
 
 void MQTTProtocolHandler::release_will_properties()
 {
-  if (!will_properties_) {
-    return;
+  if (will_properties_) {
+    will_properties_->~Properties();
+    allocator_->deallocate(will_properties_, sizeof(Properties));
+    will_properties_ = nullptr;
   }
-  will_properties_->~Properties();
-  allocator_->deallocate(will_properties_, sizeof(Properties));
-  will_properties_ = nullptr;
 }
 
 int MQTTProtocolHandler::remember_will(const ConnectPacket* packet)
@@ -2358,33 +2378,31 @@ WillBody MQTTProtocolHandler::snapshot_will() const
 
 void MQTTProtocolHandler::dispose_will()
 {
-  if (!will_present_ || will_settled_) {
-    return;
+  if (!(!will_present_ || will_settled_)) {
+    will_settled_ = true;
+    if (!(will_discard_ || !session_manager_ || client_id_.empty())) {
+      const WillBody body = snapshot_will();
+      const std::string client_id = from_mqtt_string(client_id_);
+      const bool persistent = session_manager_->durable_store() != nullptr;
+      const uint32_t delay =
+          effective_will_delay_seconds(persistent, body.delay_seconds, session_expiry_interval_);
+      // 立即遗嘱也只入队。授权在所属线程的发布协程里做，接管不用等那次远程授权。
+      std::unique_ptr<WillScheduler::Entry> entry(new WillScheduler::Entry());
+      entry->client_id = client_id;
+      entry->forward_id = client_id;
+      entry->due = delay == 0 ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+      entry->owner = std::this_thread::get_id();
+      entry->body = body;
+      if (current_auth_context_ && !copy_auth_context(*current_auth_context_, entry->auth)) {
+        LOG_WARN("Failed to copy auth context for delayed will of {}", client_id);
+        session_manager_->note_will_rejected();
+      } else {
+        session_manager_->will_scheduler().schedule(std::move(entry));
+        LOG_INFO("Scheduled will for {} in {} seconds", client_id, delay);
+      }
+    }
   }
-  will_settled_ = true;
-  if (will_discard_ || !session_manager_ || client_id_.empty()) {
-    return;
-  }
-  const WillBody body = snapshot_will();
-  const std::string client_id = from_mqtt_string(client_id_);
-  const bool persistent = session_manager_->durable_store() != nullptr;
-  const uint32_t delay =
-      effective_will_delay_seconds(persistent, body.delay_seconds, session_expiry_interval_);
-  // 立即遗嘱也只入队。授权在所属线程的发布协程里做，接管不用等那次远程授权。
-  std::unique_ptr<WillScheduler::Entry> entry(new WillScheduler::Entry());
-  entry->client_id = client_id;
-  entry->forward_id = client_id;
-  entry->due = delay == 0 ? std::chrono::steady_clock::now()
-                          : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
-  entry->owner = std::this_thread::get_id();
-  entry->body = body;
-  if (current_auth_context_ && !copy_auth_context(*current_auth_context_, entry->auth)) {
-    LOG_WARN("Failed to copy auth context for delayed will of {}", client_id);
-    session_manager_->note_will_rejected();
-    return;
-  }
-  session_manager_->will_scheduler().schedule(std::move(entry));
-  LOG_INFO("Scheduled will for {} in {} seconds", client_id, delay);
 }
 
 void MQTTProtocolHandler::cleanup_session_registration(const char* context)

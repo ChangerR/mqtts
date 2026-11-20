@@ -316,97 +316,120 @@ BufferResult MQTTBuffer::put_uint64_le(uint64_t value)
 
 bool MQTTBuffer::get_byte(uint8_t& value)
 {
+  bool ret = false;
   if (remaining() < 1) {
-    return false;
+    ret = false;
+  } else {
+    value = data_[read_pos_++];
+    ret = true;
   }
-  value = data_[read_pos_++];
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint16_be(uint16_t& value)
 {
+  bool ret = false;
   if (remaining() < 2) {
-    return false;
+    ret = false;
+  } else {
+    value =
+        static_cast<uint16_t>(data_[read_pos_]) << 8 | static_cast<uint16_t>(data_[read_pos_ + 1]);
+    read_pos_ += 2;
+    ret = true;
   }
-  value =
-      static_cast<uint16_t>(data_[read_pos_]) << 8 | static_cast<uint16_t>(data_[read_pos_ + 1]);
-  read_pos_ += 2;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint16_le(uint16_t& value)
 {
+  bool ret = false;
   if (remaining() < 2) {
-    return false;
+    ret = false;
+  } else {
+    value = static_cast<uint16_t>(data_[read_pos_]) |
+            (static_cast<uint16_t>(data_[read_pos_ + 1]) << 8);
+    read_pos_ += 2;
+    ret = true;
   }
-  value =
-      static_cast<uint16_t>(data_[read_pos_]) | (static_cast<uint16_t>(data_[read_pos_ + 1]) << 8);
-  read_pos_ += 2;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint32_be(uint32_t& value)
 {
+  bool ret = false;
   if (remaining() < 4) {
-    return false;
+    ret = false;
+  } else {
+    value = (static_cast<uint32_t>(data_[read_pos_]) << 24) |
+            (static_cast<uint32_t>(data_[read_pos_ + 1]) << 16) |
+            (static_cast<uint32_t>(data_[read_pos_ + 2]) << 8) |
+            static_cast<uint32_t>(data_[read_pos_ + 3]);
+    read_pos_ += 4;
+    ret = true;
   }
-  value = (static_cast<uint32_t>(data_[read_pos_]) << 24) |
-          (static_cast<uint32_t>(data_[read_pos_ + 1]) << 16) |
-          (static_cast<uint32_t>(data_[read_pos_ + 2]) << 8) |
-          static_cast<uint32_t>(data_[read_pos_ + 3]);
-  read_pos_ += 4;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint32_le(uint32_t& value)
 {
+  bool ret = false;
   if (remaining() < 4) {
-    return false;
+    ret = false;
+  } else {
+    value = static_cast<uint32_t>(data_[read_pos_]) |
+            (static_cast<uint32_t>(data_[read_pos_ + 1]) << 8) |
+            (static_cast<uint32_t>(data_[read_pos_ + 2]) << 16) |
+            (static_cast<uint32_t>(data_[read_pos_ + 3]) << 24);
+    read_pos_ += 4;
+    ret = true;
   }
-  value = static_cast<uint32_t>(data_[read_pos_]) |
-          (static_cast<uint32_t>(data_[read_pos_ + 1]) << 8) |
-          (static_cast<uint32_t>(data_[read_pos_ + 2]) << 16) |
-          (static_cast<uint32_t>(data_[read_pos_ + 3]) << 24);
-  read_pos_ += 4;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint64_be(uint64_t& value)
 {
+  bool ret = false;
   if (remaining() < 8) {
-    return false;
+    ret = false;
+  } else {
+    value = 0;
+    for (int i = 0; i < 8; ++i) {
+      value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
+    }
+    read_pos_ += 8;
+    ret = true;
   }
-  value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
-  }
-  read_pos_ += 8;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_uint64_le(uint64_t& value)
 {
+  bool ret = false;
   if (remaining() < 8) {
-    return false;
+    ret = false;
+  } else {
+    value = 0;
+    for (int i = 7; i >= 0; --i) {
+      value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
+    }
+    read_pos_ += 8;
+    ret = true;
   }
-  value = 0;
-  for (int i = 7; i >= 0; --i) {
-    value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
-  }
-  read_pos_ += 8;
-  return true;
+  return ret;
 }
 
 bool MQTTBuffer::get_string(size_t len, MQTTString& value)
 {
+  bool ret = false;
   if (remaining() < len) {
-    return false;
+    ret = false;
+  } else {
+    value.assign(reinterpret_cast<const char*>(data_ + read_pos_),
+                 reinterpret_cast<const char*>(data_ + read_pos_ + len));
+    read_pos_ += len;
+    ret = true;
   }
-
-  value.assign(reinterpret_cast<const char*>(data_ + read_pos_),
-               reinterpret_cast<const char*>(data_ + read_pos_ + len));
-  read_pos_ += len;
-  return true;
+  return ret;
 }
 
 MQTTString MQTTBuffer::serialize() const
@@ -421,35 +444,39 @@ MQTTString MQTTBuffer::serialize() const
 
 bool MQTTBuffer::deserialize(const MQTTString& input)
 {
+  bool ret = false;
   clear();
   if (input.empty()) {
-    return true;
+    ret = true;
+  } else {
+    ret = append(input.data(), input.size());
   }
-  return append(input.data(), input.size());
+  return ret;
 }
 
 uint8_t* MQTTBuffer::allocate_bytes(size_t bytes)
 {
+  uint8_t* ret = NULL;
   if (bytes == 0) {
-    return nullptr;
-  }
-  if (allocator_ == nullptr) {
+    ret = nullptr;
+  } else if (allocator_ == nullptr) {
     assert(false && "MQTTBuffer allocator must not be null");
-    return nullptr;
+    ret = nullptr;
+  } else {
+    ret = static_cast<uint8_t*>(allocator_->allocate(bytes));
   }
-  return static_cast<uint8_t*>(allocator_->allocate(bytes));
+  return ret;
 }
 
 void MQTTBuffer::free_bytes(uint8_t* ptr, size_t bytes)
 {
-  if (!ptr) {
-    return;
+  if (ptr) {
+    if (allocator_ == nullptr) {
+      assert(false && "MQTTBuffer allocator must not be null");
+    } else {
+      allocator_->deallocate(ptr, bytes);
+    }
   }
-  if (allocator_ == nullptr) {
-    assert(false && "MQTTBuffer allocator must not be null");
-    return;
-  }
-  allocator_->deallocate(ptr, bytes);
 }
 
 }  // namespace mqtt

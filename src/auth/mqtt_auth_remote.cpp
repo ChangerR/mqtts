@@ -41,45 +41,55 @@ uint64_t wall_ms()
 }
 size_t read_response(char* data, size_t size, size_t count, void* target)
 {
+  size_t ret = 0;
   auto& output = *static_cast<std::string*>(target);
-  if (size && count > (8192 - output.size()) / size)
-    return 0;
-  output.append(data, size * count);
-  return size * count;
+  if (size && count > (8192 - output.size()) / size) {
+    ret = 0;
+  } else {
+    output.append(data, size * count);
+    ret = size * count;
+  }
+  return ret;
 }
 bool valid_url(const std::string& url)
 {
+  bool ret = false;
   if (url.empty() ||
-      std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= 32 || c == 127; }))
-    return false;
-  CURLU* parsed = curl_url();
-  if (!parsed)
-    return false;
-  bool valid = curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK;
-  char* value = nullptr;
-  if (valid) {
-    valid = curl_url_get(parsed, CURLUPART_SCHEME, &value, 0) == CURLUE_OK &&
-            (std::string(value) == "http" || std::string(value) == "https");
-    curl_free(value);
-    value = nullptr;
+      std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= 32 || c == 127; })) {
+    ret = false;
+  } else {
+    CURLU* parsed = curl_url();
+    if (!parsed) {
+      ret = false;
+    } else {
+      bool valid = curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK;
+      char* value = nullptr;
+      if (valid) {
+        valid = curl_url_get(parsed, CURLUPART_SCHEME, &value, 0) == CURLUE_OK &&
+                (std::string(value) == "http" || std::string(value) == "https");
+        curl_free(value);
+        value = nullptr;
+      }
+      if (valid) {
+        valid = curl_url_get(parsed, CURLUPART_HOST, &value, 0) == CURLUE_OK && value && *value;
+        curl_free(value);
+        value = nullptr;
+      }
+      if (valid && curl_url_get(parsed, CURLUPART_PORT, &value, 0) == CURLUE_OK)
+        valid = std::string(value) != "0";
+      curl_free(value);
+      value = nullptr;
+      for (auto part : {CURLUPART_USER, CURLUPART_PASSWORD, CURLUPART_FRAGMENT}) {
+        if (curl_url_get(parsed, part, &value, 0) == CURLUE_OK)
+          valid = false;
+        curl_free(value);
+        value = nullptr;
+      }
+      curl_url_cleanup(parsed);
+      ret = valid;
+    }
   }
-  if (valid) {
-    valid = curl_url_get(parsed, CURLUPART_HOST, &value, 0) == CURLUE_OK && value && *value;
-    curl_free(value);
-    value = nullptr;
-  }
-  if (valid && curl_url_get(parsed, CURLUPART_PORT, &value, 0) == CURLUE_OK)
-    valid = std::string(value) != "0";
-  curl_free(value);
-  value = nullptr;
-  for (auto part : {CURLUPART_USER, CURLUPART_PASSWORD, CURLUPART_FRAGMENT}) {
-    if (curl_url_get(parsed, part, &value, 0) == CURLUE_OK)
-      valid = false;
-    curl_free(value);
-    value = nullptr;
-  }
-  curl_url_cleanup(parsed);
-  return valid;
+  return ret;
 }
 std::string digest(const void* bytes, size_t size)
 {
@@ -294,11 +304,13 @@ struct RemoteAuthProvider::Impl
   }
   std::function<bool()> fence(size_t scope, uint64_t captured_epoch, uint64_t captured_scope) const
   {
+    std::function<bool()> ret{};
     const auto global = epoch;
     const auto local = scope_epochs;
-    return [global, local, scope, captured_epoch, captured_scope] {
+    ret = [global, local, scope, captured_epoch, captured_scope] {
       return global->load() == captured_epoch && local->values[scope].load() == captured_scope;
     };
+    return ret;
   }
   std::shared_ptr<const std::string> revision = std::make_shared<const std::string>();
 
@@ -355,13 +367,17 @@ struct RemoteAuthProvider::Impl
   }
   bool circuit_admit()
   {
+    bool ret = false;
     std::lock_guard<std::mutex> lock(breaker_mutex);
-    if (consecutive_failures < 3)
-      return true;
-    if (monotonic_ms() < circuit_until || probe_running)
-      return false;
-    probe_running = true;
-    return true;
+    if (consecutive_failures < 3) {
+      ret = true;
+    } else if (monotonic_ms() < circuit_until || probe_running) {
+      ret = false;
+    } else {
+      probe_running = true;
+      ret = true;
+    }
+    return ret;
   }
   void circuit_result(bool healthy)
   {
@@ -580,17 +596,20 @@ struct RemoteAuthProvider::Impl
   }
   bool enqueue(const std::shared_ptr<Job>& job)
   {
+    bool ret = false;
     std::lock_guard<std::mutex> lock(queue_mutex);
     if (stopping || queue.size() >= queue_capacity ||
         job->body.size() > queue_byte_limit - queued_bytes ||
         (grpc_mode && job->url == "authorize" && job->body.size() + 32 > batch_bytes)) {
       ++stats.rejected;
-      return false;
+      ret = false;
+    } else {
+      queued_bytes += job->body.size();
+      queue.push_back(job);
+      work_ready.notify_all();
+      ret = true;
     }
-    queued_bytes += job->body.size();
-    queue.push_back(job);
-    work_ready.notify_all();
-    return true;
+    return ret;
   }
   void worker()
   {
@@ -650,25 +669,25 @@ struct RemoteAuthProvider::Impl
                       bool delta = false)
   {
     const auto before = std::atomic_load(&revision);
-    if (*before == value)
-      return;
-    if (delta && !before->empty()) {
-      // Fixed-size identity partitions bound memory without scanning cache
-      // shards. Hash collisions cause extra invalidation, never stale grants.
-      for (const auto& name : invalidated)
-        ++scope_epochs->values[scope_for(name)];
-      std::atomic_store(&revision, std::make_shared<const std::string>(value));
-      return;
-    }
-    std::atomic_store(&revision, std::make_shared<const std::string>(value));
-    ++*epoch;
-    for (auto& shard : shards) {
-      std::lock_guard<std::mutex> lock(shard.mutex);
-      stats.evictions += shard.entries.size();
-      shard.entries.clear();
-      shard.lru.clear();
-      // In-flight jobs retain their epoch; an older response cannot restore a
-      // revoked lease or authorize a waiter after invalidation is observed.
+    if (!(*before == value)) {
+      if (delta && !before->empty()) {
+        // Fixed-size identity partitions bound memory without scanning cache
+        // shards. Hash collisions cause extra invalidation, never stale grants.
+        for (const auto& name : invalidated)
+          ++scope_epochs->values[scope_for(name)];
+        std::atomic_store(&revision, std::make_shared<const std::string>(value));
+      } else {
+        std::atomic_store(&revision, std::make_shared<const std::string>(value));
+        ++*epoch;
+        for (auto& shard : shards) {
+          std::lock_guard<std::mutex> lock(shard.mutex);
+          stats.evictions += shard.entries.size();
+          shard.entries.clear();
+          shard.lru.clear();
+          // In-flight jobs retain their epoch; an older response cannot restore a
+          // revoked lease or authorize a waiter after invalidation is observed.
+        }
+      }
     }
   }
   void watch_version()

@@ -65,72 +65,78 @@ static int mqtt_packet_total_length(const uint8_t* data, size_t data_len, size_t
 static bool is_supported_protocol_name_version(const mqtt::MQTTString& protocol_name,
                                                uint8_t protocol_version)
 {
+  bool ret = false;
   const std::string name = mqtt::from_mqtt_string(protocol_name);
   if (protocol_version == 3) {
-    return name == "MQIsdp";
+    ret = name == "MQIsdp";
+  } else if (protocol_version == 4 || protocol_version == 5) {
+    ret = name == "MQTT";
+  } else {
+    ret = false;
   }
-  if (protocol_version == 4 || protocol_version == 5) {
-    return name == "MQTT";
-  }
-  return false;
+  return ret;
 }
 
 // Simple JSON parsing helpers
 static bool json_get_string(const std::string& json, const std::string& key, std::string& value)
 {
+  bool ret = false;
   std::string search_key = "\"" + key + "\"";
   size_t key_pos = json.find(search_key);
   if (key_pos == std::string::npos) {
-    return false;
+    ret = false;
+  } else {
+    // Find the colon
+    size_t colon_pos = json.find(':', key_pos);
+    if (colon_pos == std::string::npos) {
+      ret = false;
+    } else {
+      // Skip whitespace and find opening quote
+      size_t value_start = json.find('"', colon_pos);
+      if (value_start == std::string::npos) {
+        ret = false;
+      } else {
+        value_start++;
+        // Find closing quote
+        size_t value_end = json.find('"', value_start);
+        if (value_end == std::string::npos) {
+          ret = false;
+        } else {
+          value = json.substr(value_start, value_end - value_start);
+          ret = true;
+        }
+      }
+    }
   }
-
-  // Find the colon
-  size_t colon_pos = json.find(':', key_pos);
-  if (colon_pos == std::string::npos) {
-    return false;
-  }
-
-  // Skip whitespace and find opening quote
-  size_t value_start = json.find('"', colon_pos);
-  if (value_start == std::string::npos) {
-    return false;
-  }
-  value_start++;
-
-  // Find closing quote
-  size_t value_end = json.find('"', value_start);
-  if (value_end == std::string::npos) {
-    return false;
-  }
-
-  value = json.substr(value_start, value_end - value_start);
-  return true;
+  return ret;
 }
 
 static bool json_get_int(const std::string& json, const std::string& key, int& value)
 {
+  bool ret = false;
   std::string search_key = "\"" + key + "\"";
   size_t key_pos = json.find(search_key);
   if (key_pos == std::string::npos) {
-    return false;
+    ret = false;
+  } else {
+    // Find the colon
+    size_t colon_pos = json.find(':', key_pos);
+    if (colon_pos == std::string::npos) {
+      ret = false;
+    } else {
+      // Skip whitespace
+      size_t value_start = colon_pos + 1;
+      while (value_start < json.length() &&
+             (json[value_start] == ' ' || json[value_start] == '\t')) {
+        value_start++;
+      }
+      // Parse integer
+      char* end = nullptr;
+      value = std::strtol(json.c_str() + value_start, &end, 10);
+      ret = end != (json.c_str() + value_start);
+    }
   }
-
-  // Find the colon
-  size_t colon_pos = json.find(':', key_pos);
-  if (colon_pos == std::string::npos) {
-    return false;
-  }
-
-  // Skip whitespace
-  size_t value_start = colon_pos + 1;
-  while (value_start < json.length() && (json[value_start] == ' ' || json[value_start] == '\t')) {
-    value_start++;
-  }
-
-  // Parse integer
-  char* end = nullptr;
-  value = std::strtol(json.c_str() + value_start, &end, 10);
-  return end != (json.c_str() + value_start);
+  return ret;
 }
 
 static bool json_get_bool(const std::string& json, const std::string& key, bool& value)
@@ -167,50 +173,46 @@ static bool json_get_bool(const std::string& json, const std::string& key, bool&
 // Base64 encode/decode
 std::string WebSocketMQTTBridge::base64_encode(const std::vector<uint8_t>& data)
 {
+  std::string ret{};
   if (data.empty()) {
-    return "";
+    ret = "";
+  } else {
+    BIO* bio = BIO_new(BIO_s_mem());
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    bio = BIO_push(b64, bio);
+    BIO_write(bio, data.data(), data.size());
+    BIO_flush(bio);
+    BUF_MEM* buffer_ptr;
+    BIO_get_mem_ptr(bio, &buffer_ptr);
+    std::string result(buffer_ptr->data, buffer_ptr->length);
+    BIO_free_all(bio);
+    ret = std::move(result);
   }
-
-  BIO* bio = BIO_new(BIO_s_mem());
-  BIO* b64 = BIO_new(BIO_f_base64());
-  BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-  bio = BIO_push(b64, bio);
-
-  BIO_write(bio, data.data(), data.size());
-  BIO_flush(bio);
-
-  BUF_MEM* buffer_ptr;
-  BIO_get_mem_ptr(bio, &buffer_ptr);
-
-  std::string result(buffer_ptr->data, buffer_ptr->length);
-  BIO_free_all(bio);
-
-  return result;
+  return ret;
 }
 
 std::vector<uint8_t> WebSocketMQTTBridge::base64_decode(const std::string& encoded)
 {
+  std::vector<uint8_t> ret{};
   if (encoded.empty()) {
-    return {};
-  }
-
-  BIO* bio = BIO_new_mem_buf(encoded.c_str(), encoded.length());
-  BIO* b64 = BIO_new(BIO_f_base64());
-  BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-  bio = BIO_push(b64, bio);
-
-  std::vector<uint8_t> result(encoded.length());
-  int decoded_length = BIO_read(bio, result.data(), result.size());
-
-  BIO_free_all(bio);
-
-  if (decoded_length > 0) {
-    result.resize(decoded_length);
+    ret = {};
   } else {
-    result.clear();
+    BIO* bio = BIO_new_mem_buf(encoded.c_str(), encoded.length());
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    bio = BIO_push(b64, bio);
+    std::vector<uint8_t> result(encoded.length());
+    int decoded_length = BIO_read(bio, result.data(), result.size());
+    BIO_free_all(bio);
+    if (decoded_length > 0) {
+      result.resize(decoded_length);
+    } else {
+      result.clear();
+    }
+    ret = std::move(result);
   }
-
-  return result;
+  return ret;
 }
 
 // WebSocketMQTTBridge implementation
@@ -283,31 +285,34 @@ WebSocketMQTTBridge::~WebSocketMQTTBridge()
 
 int WebSocketMQTTBridge::init(mqtt::GlobalSessionManager* session_manager)
 {
+  int ret = 0;
   if (!session_manager) {
     LOG_ERROR("Session manager is null");
-    return MQ_ERR_INVALID_ARGS;
+    ret = MQ_ERR_INVALID_ARGS;
+  } else {
+    session_manager_ = session_manager;
+    LOG_INFO("WebSocket MQTT bridge initialized");
+    ret = MQ_SUCCESS;
   }
-
-  session_manager_ = session_manager;
-  LOG_INFO("WebSocket MQTT bridge initialized");
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketMQTTBridge::register_handler(const std::string& client_id,
                                           WebSocketProtocolHandler* handler)
 {
+  int ret = 0;
   if (!handler) {
     LOG_ERROR("Handler is null");
-    return MQ_ERR_INVALID_ARGS;
+    ret = MQ_ERR_INVALID_ARGS;
+  } else {
+    handlers_[client_id] = handler;
+    client_protocol_versions_.erase(client_id);
+    auth_contexts_.erase(client_id);
+    mqtt_client_ids_.erase(client_id);
+    LOG_INFO("Registered WebSocket handler for client {}", client_id);
+    ret = MQ_SUCCESS;
   }
-
-  handlers_[client_id] = handler;
-  client_protocol_versions_.erase(client_id);
-  auth_contexts_.erase(client_id);
-  mqtt_client_ids_.erase(client_id);
-  LOG_INFO("Registered WebSocket handler for client {}", client_id);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void WebSocketMQTTBridge::bind_session_handler(const std::string& client_id,
@@ -318,25 +323,31 @@ void WebSocketMQTTBridge::bind_session_handler(const std::string& client_id,
 
 uint8_t WebSocketMQTTBridge::mqtt_protocol_version(const std::string& client_id) const
 {
+  uint8_t ret = 0;
   auto found = client_protocol_versions_.find(client_id);
   if (found == client_protocol_versions_.end()) {
-    return 5;
+    ret = 5;
+  } else {
+    ret = found->second;
   }
-  return found->second;
+  return ret;
 }
 
 int WebSocketMQTTBridge::send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason)
 {
+  int ret = 0;
   // MQTT-3.14.0-1: nothing may precede a successful CONNACK, so an unknown version means silence.
   auto version = client_protocol_versions_.find(client_id);
   if (version == client_protocol_versions_.end() || version->second < 5 ||
       format_ != MessageFormat::MQTT_PACKET) {
-    return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    mqtt::DisconnectPacket packet(allocator_);
+    packet.type = mqtt::PacketType::DISCONNECT;
+    packet.reason_code = reason;
+    ret = send_serialized_mqtt_packet(client_id, packet);
   }
-  mqtt::DisconnectPacket packet(allocator_);
-  packet.type = mqtt::PacketType::DISCONNECT;
-  packet.reason_code = reason;
-  return send_serialized_mqtt_packet(client_id, packet);
+  return ret;
 }
 
 int WebSocketMQTTBridge::unregister_handler(const std::string& client_id)
@@ -740,30 +751,29 @@ int WebSocketMQTTBridge::parse_json_message(const std::string& json, std::string
                                             std::vector<uint8_t>& payload, uint8_t& qos,
                                             bool& retain)
 {
+  int ret = 0;
   // Parse JSON: {"topic": "test", "payload": "hello", "qos": 0, "retain": false}
   if (!json_get_string(json, "topic", topic)) {
     LOG_ERROR("Missing 'topic' field in JSON");
-    return MQ_ERR_PROTOCOL;
-  }
-
-  std::string payload_str;
-  if (json_get_string(json, "payload", payload_str)) {
-    // Try to decode as base64 first
-    payload = base64_decode(payload_str);
-    if (payload.empty() && !payload_str.empty()) {
-      // Not base64, use as plain text
-      payload.assign(payload_str.begin(), payload_str.end());
+    ret = MQ_ERR_PROTOCOL;
+  } else {
+    std::string payload_str;
+    if (json_get_string(json, "payload", payload_str)) {
+      // Try to decode as base64 first
+      payload = base64_decode(payload_str);
+      if (payload.empty() && !payload_str.empty()) {
+        // Not base64, use as plain text
+        payload.assign(payload_str.begin(), payload_str.end());
+      }
     }
+    int qos_int = 0;
+    if (json_get_int(json, "qos", qos_int)) {
+      qos = static_cast<uint8_t>(qos_int);
+    }
+    json_get_bool(json, "retain", retain);
+    ret = MQ_SUCCESS;
   }
-
-  int qos_int = 0;
-  if (json_get_int(json, "qos", qos_int)) {
-    qos = static_cast<uint8_t>(qos_int);
-  }
-
-  json_get_bool(json, "retain", retain);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 std::string WebSocketMQTTBridge::format_json_message(const std::string& topic,
@@ -781,30 +791,31 @@ std::string WebSocketMQTTBridge::format_json_message(const std::string& topic,
 int WebSocketMQTTBridge::parse_text_protocol(const std::string& text, std::string& topic,
                                              std::vector<uint8_t>& payload)
 {
+  int ret = 0;
   // Parse: "PUBLISH:topic:payload"
   size_t first_colon = text.find(':');
   if (first_colon == std::string::npos) {
     LOG_ERROR("Invalid text protocol format");
-    return MQ_ERR_PROTOCOL;
+    ret = MQ_ERR_PROTOCOL;
+  } else {
+    std::string command = text.substr(0, first_colon);
+    if (command != "PUBLISH") {
+      LOG_ERROR("Unsupported command: {}", command);
+      ret = MQ_ERR_PROTOCOL;
+    } else {
+      size_t second_colon = text.find(':', first_colon + 1);
+      if (second_colon == std::string::npos) {
+        LOG_ERROR("Invalid text protocol format");
+        ret = MQ_ERR_PROTOCOL;
+      } else {
+        topic = text.substr(first_colon + 1, second_colon - first_colon - 1);
+        std::string payload_str = text.substr(second_colon + 1);
+        payload.assign(payload_str.begin(), payload_str.end());
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  std::string command = text.substr(0, first_colon);
-  if (command != "PUBLISH") {
-    LOG_ERROR("Unsupported command: {}", command);
-    return MQ_ERR_PROTOCOL;
-  }
-
-  size_t second_colon = text.find(':', first_colon + 1);
-  if (second_colon == std::string::npos) {
-    LOG_ERROR("Invalid text protocol format");
-    return MQ_ERR_PROTOCOL;
-  }
-
-  topic = text.substr(first_colon + 1, second_colon - first_colon - 1);
-  std::string payload_str = text.substr(second_colon + 1);
-  payload.assign(payload_str.begin(), payload_str.end());
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 std::string WebSocketMQTTBridge::format_text_protocol(const std::string& topic,
@@ -820,14 +831,16 @@ std::string WebSocketMQTTBridge::format_text_protocol(const std::string& topic,
 int WebSocketMQTTBridge::parse_mqtt_packet(const uint8_t* data, size_t len, mqtt::Packet*& packet,
                                            uint8_t protocol_version_hint)
 {
+  int ret = 0;
   if (!allocator_) {
     LOG_ERROR("Allocator is null");
-    return MQ_ERR_MEMORY_ALLOC;
+    ret = MQ_ERR_MEMORY_ALLOC;
+  } else {
+    mqtt::MQTTParser parser(allocator_);
+    parser.set_protocol_version_hint(protocol_version_hint);
+    ret = parser.parse_packet(data, len, &packet);
   }
-
-  mqtt::MQTTParser parser(allocator_);
-  parser.set_protocol_version_hint(protocol_version_hint);
-  return parser.parse_packet(data, len, &packet);
+  return ret;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id,
@@ -907,74 +920,75 @@ int WebSocketMQTTBridge::subscribe_topic(const std::string& client_id,
                                          const mqtt::SubscriptionOptions& options,
                                          bool* already_present)
 {
-  if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ))
-    return MQ_ERR_CONNECT_NOT_AUTHORIZED;
-  if (!session_manager_) {
+  int ret = 0;
+  if (!topic_allowed(client_id, topic_filter, mqtt::auth::Permission::READ)) {
+    ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+  } else if (!session_manager_) {
     LOG_ERROR("Session manager not initialized");
-    return MQ_ERR_SESSION_MANAGER_NOT_READY;
-  }
-
-  LOG_INFO("Subscribing WebSocket client {} to topic {}, qos={}", client_id, topic_filter,
-           options.qos);
-
-  bool existed = false;
-  std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>& subs =
-      subscriptions_[client_id];
-  for (size_t i = 0; i < subs.size(); ++i) {
-    if (subs[i].topic_filter == topic_filter) {
-      existed = true;
-      break;
-    }
-  }
-  if (already_present) {
-    *already_present = existed;
-  }
-
-  mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
-  mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-  const int subscribed = session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, options);
-  if (subscribed != MQ_SUCCESS) {
-    return subscribed;
-  }
-  if (existed) {
+    ret = MQ_ERR_SESSION_MANAGER_NOT_READY;
+  } else {
+    LOG_INFO("Subscribing WebSocket client {} to topic {}, qos={}", client_id, topic_filter,
+             options.qos);
+    bool existed = false;
+    std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>& subs =
+        subscriptions_[client_id];
     for (size_t i = 0; i < subs.size(); ++i) {
       if (subs[i].topic_filter == topic_filter) {
-        subs[i].qos = options.qos;
+        existed = true;
+        break;
       }
     }
-  } else {
-    subs.push_back(SubscriptionInfo(topic_filter, options.qos));
-    stats_.active_subscriptions++;
+    if (already_present) {
+      *already_present = existed;
+    }
+    mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
+    mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
+    const int subscribed = session_manager_->subscribe_topic(mqtt_topic, mqtt_client_id, options);
+    if (subscribed != MQ_SUCCESS) {
+      ret = subscribed;
+    } else {
+      if (existed) {
+        for (size_t i = 0; i < subs.size(); ++i) {
+          if (subs[i].topic_filter == topic_filter) {
+            subs[i].qos = options.qos;
+          }
+        }
+      } else {
+        subs.push_back(SubscriptionInfo(topic_filter, options.qos));
+        stats_.active_subscriptions++;
+      }
+      ret = MQ_SUCCESS;
+    }
   }
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketMQTTBridge::unsubscribe_topic(const std::string& client_id,
                                            const std::string& topic_filter)
 {
+  int ret = 0;
   if (!session_manager_) {
     LOG_ERROR("Session manager not initialized");
-    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+    ret = MQ_ERR_SESSION_MANAGER_NOT_READY;
+  } else {
+    LOG_INFO("Unsubscribing WebSocket client {} from topic {}", client_id, topic_filter);
+    // Remove from subscription tracking
+    auto it = subscriptions_.find(client_id);
+    if (it != subscriptions_.end()) {
+      auto& subs = it->second;
+      subs.erase(std::remove_if(subs.begin(), subs.end(),
+                                [&topic_filter](const SubscriptionInfo& sub) {
+                                  return sub.topic_filter == topic_filter;
+                                }),
+                 subs.end());
+      stats_.active_subscriptions--;
+    }
+    // Unsubscribe via session manager
+    mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
+    mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
+    ret = session_manager_->unsubscribe_topic(mqtt_topic, mqtt_client_id);
   }
-
-  LOG_INFO("Unsubscribing WebSocket client {} from topic {}", client_id, topic_filter);
-
-  // Remove from subscription tracking
-  auto it = subscriptions_.find(client_id);
-  if (it != subscriptions_.end()) {
-    auto& subs = it->second;
-    subs.erase(std::remove_if(subs.begin(), subs.end(),
-                              [&topic_filter](const SubscriptionInfo& sub) {
-                                return sub.topic_filter == topic_filter;
-                              }),
-               subs.end());
-    stats_.active_subscriptions--;
-  }
-
-  // Unsubscribe via session manager
-  mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic_filter, allocator_);
-  mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-  return session_manager_->unsubscribe_topic(mqtt_topic, mqtt_client_id);
+  return ret;
 }
 
 int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std::string& topic,
@@ -1036,17 +1050,23 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
 bool WebSocketMQTTBridge::topic_allowed(const std::string& client_id, const std::string& topic,
                                         mqtt::auth::Permission permission)
 {
-  if (!auth_manager_)
-    return true;
-  const auto found = auth_contexts_.find(client_id);
-  if (found == auth_contexts_.end())
-    return false;
-  // Keep the context alive across coroutine-aware HTTP I/O.
-  const auto context = found->second;
-  mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
-  auth_manager_->check_topic_access(*context, mqtt::to_mqtt_string(topic, allocator_), permission,
-                                    result);
-  return result == mqtt::auth::AuthResult::SUCCESS;
+  bool ret = false;
+  if (!auth_manager_) {
+    ret = true;
+  } else {
+    const auto found = auth_contexts_.find(client_id);
+    if (found == auth_contexts_.end()) {
+      ret = false;
+    } else {
+      // Keep the context alive across coroutine-aware HTTP I/O.
+      const auto context = found->second;
+      mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+      auth_manager_->check_topic_access(*context, mqtt::to_mqtt_string(topic, allocator_),
+                                        permission, result);
+      ret = result == mqtt::auth::AuthResult::SUCCESS;
+    }
+  }
+  return ret;
 }
 
 // MQTT packet handlers (for binary protocol mode)
@@ -1205,105 +1225,104 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id,
 int WebSocketMQTTBridge::handle_mqtt_subscribe(const std::string& client_id,
                                                const mqtt::SubscribePacket* packet)
 {
+  int ret = 0;
   LOG_INFO("Received MQTT SUBSCRIBE from WebSocket client {}", client_id);
-
   if (packet->properties.subscription_identifier != 0) {
     (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::SubscriptionIdentifiersNotSupported);
     auto handler = handlers_.find(client_id);
     if (handler != handlers_.end())
       handler->second->close_connection();
-    return MQ_ERR_FLOW_CLOSED;
-  }
-
-  const uint8_t protocol = mqtt_protocol_version(client_id);
-  const auto suback_failure = [protocol](mqtt::ReasonCode code) {
-    return protocol >= 5 ? code : mqtt::ReasonCode::UnspecifiedError;
-  };
-
-  mqtt::SubAckPacket suback(allocator_);
-  suback.type = mqtt::PacketType::SUBACK;
-  suback.packet_id = packet->packet_id;
-  struct GrantedRetain
-  {
-    std::string topic;
-    mqtt::SubscriptionOptions options;
-    bool existed;
-    mqtt::RetainMatchResult matched;
-  };
-  std::vector<GrantedRetain> retained_grants;
-
-  auto session = session_handlers_.find(client_id);
-  mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
-  const uint8_t qos_cap = flow ? flow->granted_qos_limit() : effective_limits().max_qos;
-  for (const auto& sub : packet->subscriptions) {
-    mqtt::MQTTString topic = sub.topic_filter;
-    mqtt::SubscriptionOptions granted = sub.options;
-    const uint8_t requested_qos = granted.qos;
-    if (mqtt::is_shared_subscription_filter(topic)) {
-      suback.reason_codes.push_back(
-          suback_failure(mqtt::ReasonCode::SharedSubscriptionsNotSupported));
-      continue;
-    }
-    if (!effective_limits().wildcard_subscription_available &&
-        mqtt::topic_filter_has_wildcard(topic)) {
-      suback.reason_codes.push_back(
-          suback_failure(mqtt::ReasonCode::WildcardSubscriptionsNotSupported));
-      continue;
-    }
-    if (requested_qos > 2) {
-      suback.reason_codes.push_back(mqtt::ReasonCode::QoSNotSupported);
-      continue;
-    }
-    if (granted.qos > qos_cap) {
-      granted.qos = qos_cap;
-    }
-    bool existed = false;
-    mqtt::RetainMatchResult matched;
-    int sub_ret;
-    if (session_manager_) {
-      mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
-      sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
-      if (sub_ret == MQ_SUCCESS &&
-          mqtt::retain_handling_delivers(granted.retain_handling, existed)) {
-        matched = session_manager_->match_retained(mqtt::from_mqtt_string(topic));
+    ret = MQ_ERR_FLOW_CLOSED;
+  } else {
+    const uint8_t protocol = mqtt_protocol_version(client_id);
+    const auto suback_failure = [protocol](mqtt::ReasonCode code) {
+      return protocol >= 5 ? code : mqtt::ReasonCode::UnspecifiedError;
+    };
+    mqtt::SubAckPacket suback(allocator_);
+    suback.type = mqtt::PacketType::SUBACK;
+    suback.packet_id = packet->packet_id;
+    struct GrantedRetain
+    {
+      std::string topic;
+      mqtt::SubscriptionOptions options;
+      bool existed;
+      mqtt::RetainMatchResult matched;
+    };
+    std::vector<GrantedRetain> retained_grants;
+    auto session = session_handlers_.find(client_id);
+    mqtt::MQTTProtocolHandler* flow =
+        session == session_handlers_.end() ? nullptr : session->second;
+    const uint8_t qos_cap = flow ? flow->granted_qos_limit() : effective_limits().max_qos;
+    for (const auto& sub : packet->subscriptions) {
+      mqtt::MQTTString topic = sub.topic_filter;
+      mqtt::SubscriptionOptions granted = sub.options;
+      const uint8_t requested_qos = granted.qos;
+      if (mqtt::is_shared_subscription_filter(topic)) {
+        suback.reason_codes.push_back(
+            suback_failure(mqtt::ReasonCode::SharedSubscriptionsNotSupported));
+        continue;
       }
-    } else {
-      sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
-    }
-    if (sub_ret == MQ_SUCCESS) {
-      retained_grants.push_back(
-          GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed, std::move(matched)});
-      switch (granted.qos) {
-        case 0:
-          suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
-          break;
-        case 1:
-          suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS1);
-          break;
-        case 2:
-          suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS2);
-          break;
-        default:
-          suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
-          break;
+      if (!effective_limits().wildcard_subscription_available &&
+          mqtt::topic_filter_has_wildcard(topic)) {
+        suback.reason_codes.push_back(
+            suback_failure(mqtt::ReasonCode::WildcardSubscriptionsNotSupported));
+        continue;
       }
-    } else {
-      suback.reason_codes.push_back(sub_ret == MQ_ERR_CONNECT_NOT_AUTHORIZED
-                                        ? mqtt::ReasonCode::NotAuthorized
-                                        : mqtt::ReasonCode::UnspecifiedError);
+      if (requested_qos > 2) {
+        suback.reason_codes.push_back(mqtt::ReasonCode::QoSNotSupported);
+        continue;
+      }
+      if (granted.qos > qos_cap) {
+        granted.qos = qos_cap;
+      }
+      bool existed = false;
+      mqtt::RetainMatchResult matched;
+      int sub_ret;
+      if (session_manager_) {
+        mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
+        sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
+        if (sub_ret == MQ_SUCCESS &&
+            mqtt::retain_handling_delivers(granted.retain_handling, existed)) {
+          matched = session_manager_->match_retained(mqtt::from_mqtt_string(topic));
+        }
+      } else {
+        sub_ret = subscribe_topic(client_id, mqtt::from_mqtt_string(topic), granted, &existed);
+      }
+      if (sub_ret == MQ_SUCCESS) {
+        retained_grants.push_back(
+            GrantedRetain{mqtt::from_mqtt_string(topic), granted, existed, std::move(matched)});
+        switch (granted.qos) {
+          case 0:
+            suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS0);
+            break;
+          case 1:
+            suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS1);
+            break;
+          case 2:
+            suback.reason_codes.push_back(mqtt::ReasonCode::GrantedQoS2);
+            break;
+          default:
+            suback.reason_codes.push_back(mqtt::ReasonCode::UnspecifiedError);
+            break;
+        }
+      } else {
+        suback.reason_codes.push_back(sub_ret == MQ_ERR_CONNECT_NOT_AUTHORIZED
+                                          ? mqtt::ReasonCode::NotAuthorized
+                                          : mqtt::ReasonCode::UnspecifiedError);
+      }
     }
-  }
-
-  const int sent = send_serialized_mqtt_packet(client_id, suback);
-  if (sent == MQ_SUCCESS && session_manager_) {
-    mqtt::MQTTString subscriber = mqtt::to_mqtt_string(client_id, allocator_);
-    for (size_t i = 0; i < retained_grants.size(); ++i) {
-      GrantedRetain& grant = retained_grants[i];
-      (void)session_manager_->enqueue_retained_snapshot(subscriber, 0, grant.options, grant.existed,
-                                                        std::move(grant.matched));
+    const int sent = send_serialized_mqtt_packet(client_id, suback);
+    if (sent == MQ_SUCCESS && session_manager_) {
+      mqtt::MQTTString subscriber = mqtt::to_mqtt_string(client_id, allocator_);
+      for (size_t i = 0; i < retained_grants.size(); ++i) {
+        GrantedRetain& grant = retained_grants[i];
+        (void)session_manager_->enqueue_retained_snapshot(subscriber, 0, grant.options,
+                                                          grant.existed, std::move(grant.matched));
+      }
     }
+    ret = sent;
   }
-  return sent;
+  return ret;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id,
@@ -1462,35 +1481,33 @@ bool WebSocketMQTTBridge::remember_connection_will(const std::string& transport_
 void WebSocketMQTTBridge::dispose_will(const std::string& transport_id)
 {
   auto found = connection_wills_.find(transport_id);
-  if (found == connection_wills_.end() || found->second.settled) {
-    return;
+  if (!(found == connection_wills_.end() || found->second.settled)) {
+    ConnectionWill& will = found->second;
+    will.settled = true;
+    if (!(!will.present || will.discard || !session_manager_ || will.mqtt_client_id.empty())) {
+      const bool persistent = session_manager_->durable_store() != nullptr;
+      const uint32_t delay = mqtt::effective_will_delay_seconds(persistent, will.body.delay_seconds,
+                                                                will.session_expiry_seconds);
+      const mqtt::WillBody body = will.body;
+      const std::string mqtt_client_id = will.mqtt_client_id;
+      std::unique_ptr<mqtt::WillScheduler::Entry> entry(new mqtt::WillScheduler::Entry());
+      entry->client_id = mqtt_client_id;
+      entry->forward_id = transport_id;
+      entry->due = delay == 0 ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
+      entry->owner = std::this_thread::get_id();
+      entry->body = body;
+      const auto auth_found = auth_contexts_.find(transport_id);
+      if (auth_found != auth_contexts_.end() && auth_found->second &&
+          !mqtt::copy_auth_context(*auth_found->second, entry->auth)) {
+        LOG_WARN("Failed to copy auth context for delayed will of {}", mqtt_client_id);
+        session_manager_->note_will_rejected();
+      } else {
+        session_manager_->will_scheduler().schedule(std::move(entry));
+        LOG_INFO("Scheduled WebSocket will for {} in {} seconds", mqtt_client_id, delay);
+      }
+    }
   }
-  ConnectionWill& will = found->second;
-  will.settled = true;
-  if (!will.present || will.discard || !session_manager_ || will.mqtt_client_id.empty()) {
-    return;
-  }
-  const bool persistent = session_manager_->durable_store() != nullptr;
-  const uint32_t delay = mqtt::effective_will_delay_seconds(persistent, will.body.delay_seconds,
-                                                            will.session_expiry_seconds);
-  const mqtt::WillBody body = will.body;
-  const std::string mqtt_client_id = will.mqtt_client_id;
-  std::unique_ptr<mqtt::WillScheduler::Entry> entry(new mqtt::WillScheduler::Entry());
-  entry->client_id = mqtt_client_id;
-  entry->forward_id = transport_id;
-  entry->due = delay == 0 ? std::chrono::steady_clock::now()
-                          : std::chrono::steady_clock::now() + std::chrono::seconds(delay);
-  entry->owner = std::this_thread::get_id();
-  entry->body = body;
-  const auto auth_found = auth_contexts_.find(transport_id);
-  if (auth_found != auth_contexts_.end() && auth_found->second &&
-      !mqtt::copy_auth_context(*auth_found->second, entry->auth)) {
-    LOG_WARN("Failed to copy auth context for delayed will of {}", mqtt_client_id);
-    session_manager_->note_will_rejected();
-    return;
-  }
-  session_manager_->will_scheduler().schedule(std::move(entry));
-  LOG_INFO("Scheduled WebSocket will for {} in {} seconds", mqtt_client_id, delay);
 }
 
 int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id,
@@ -1668,80 +1685,77 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
 
 void WebSocketMQTTBridge::destroy_packet(mqtt::Packet* packet)
 {
-  if (!packet) {
-    return;
-  }
-
-  if (!allocator_) {
-    delete packet;
-    return;
-  }
-
-  switch (packet->type) {
-    case mqtt::PacketType::CONNECT:
-      reinterpret_cast<mqtt::ConnectPacket*>(packet)->~ConnectPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::ConnectPacket));
-      break;
-    case mqtt::PacketType::CONNACK:
-      reinterpret_cast<mqtt::ConnAckPacket*>(packet)->~ConnAckPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::ConnAckPacket));
-      break;
-    case mqtt::PacketType::PUBLISH:
-      reinterpret_cast<mqtt::PublishPacket*>(packet)->~PublishPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PublishPacket));
-      break;
-    case mqtt::PacketType::PUBACK:
-      reinterpret_cast<mqtt::PubAckPacket*>(packet)->~PubAckPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PubAckPacket));
-      break;
-    case mqtt::PacketType::PUBREC:
-      reinterpret_cast<mqtt::PubRecPacket*>(packet)->~PubRecPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PubRecPacket));
-      break;
-    case mqtt::PacketType::PUBREL:
-      reinterpret_cast<mqtt::PubRelPacket*>(packet)->~PubRelPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PubRelPacket));
-      break;
-    case mqtt::PacketType::PUBCOMP:
-      reinterpret_cast<mqtt::PubCompPacket*>(packet)->~PubCompPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PubCompPacket));
-      break;
-    case mqtt::PacketType::SUBSCRIBE:
-      reinterpret_cast<mqtt::SubscribePacket*>(packet)->~SubscribePacket();
-      allocator_->deallocate(packet, sizeof(mqtt::SubscribePacket));
-      break;
-    case mqtt::PacketType::SUBACK:
-      reinterpret_cast<mqtt::SubAckPacket*>(packet)->~SubAckPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::SubAckPacket));
-      break;
-    case mqtt::PacketType::UNSUBSCRIBE:
-      reinterpret_cast<mqtt::UnsubscribePacket*>(packet)->~UnsubscribePacket();
-      allocator_->deallocate(packet, sizeof(mqtt::UnsubscribePacket));
-      break;
-    case mqtt::PacketType::UNSUBACK:
-      reinterpret_cast<mqtt::UnsubAckPacket*>(packet)->~UnsubAckPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::UnsubAckPacket));
-      break;
-    case mqtt::PacketType::PINGREQ:
-      reinterpret_cast<mqtt::PingReqPacket*>(packet)->~PingReqPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PingReqPacket));
-      break;
-    case mqtt::PacketType::PINGRESP:
-      reinterpret_cast<mqtt::PingRespPacket*>(packet)->~PingRespPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::PingRespPacket));
-      break;
-    case mqtt::PacketType::DISCONNECT:
-      reinterpret_cast<mqtt::DisconnectPacket*>(packet)->~DisconnectPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::DisconnectPacket));
-      break;
-    case mqtt::PacketType::AUTH:
-      reinterpret_cast<mqtt::AuthPacket*>(packet)->~AuthPacket();
-      allocator_->deallocate(packet, sizeof(mqtt::AuthPacket));
-      break;
-    default:
-      packet->~Packet();
-      allocator_->deallocate(packet, sizeof(mqtt::Packet));
-      break;
+  if (packet) {
+    if (!allocator_) {
+      delete packet;
+    } else {
+      switch (packet->type) {
+        case mqtt::PacketType::CONNECT:
+          reinterpret_cast<mqtt::ConnectPacket*>(packet)->~ConnectPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::ConnectPacket));
+          break;
+        case mqtt::PacketType::CONNACK:
+          reinterpret_cast<mqtt::ConnAckPacket*>(packet)->~ConnAckPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::ConnAckPacket));
+          break;
+        case mqtt::PacketType::PUBLISH:
+          reinterpret_cast<mqtt::PublishPacket*>(packet)->~PublishPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PublishPacket));
+          break;
+        case mqtt::PacketType::PUBACK:
+          reinterpret_cast<mqtt::PubAckPacket*>(packet)->~PubAckPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PubAckPacket));
+          break;
+        case mqtt::PacketType::PUBREC:
+          reinterpret_cast<mqtt::PubRecPacket*>(packet)->~PubRecPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PubRecPacket));
+          break;
+        case mqtt::PacketType::PUBREL:
+          reinterpret_cast<mqtt::PubRelPacket*>(packet)->~PubRelPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PubRelPacket));
+          break;
+        case mqtt::PacketType::PUBCOMP:
+          reinterpret_cast<mqtt::PubCompPacket*>(packet)->~PubCompPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PubCompPacket));
+          break;
+        case mqtt::PacketType::SUBSCRIBE:
+          reinterpret_cast<mqtt::SubscribePacket*>(packet)->~SubscribePacket();
+          allocator_->deallocate(packet, sizeof(mqtt::SubscribePacket));
+          break;
+        case mqtt::PacketType::SUBACK:
+          reinterpret_cast<mqtt::SubAckPacket*>(packet)->~SubAckPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::SubAckPacket));
+          break;
+        case mqtt::PacketType::UNSUBSCRIBE:
+          reinterpret_cast<mqtt::UnsubscribePacket*>(packet)->~UnsubscribePacket();
+          allocator_->deallocate(packet, sizeof(mqtt::UnsubscribePacket));
+          break;
+        case mqtt::PacketType::UNSUBACK:
+          reinterpret_cast<mqtt::UnsubAckPacket*>(packet)->~UnsubAckPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::UnsubAckPacket));
+          break;
+        case mqtt::PacketType::PINGREQ:
+          reinterpret_cast<mqtt::PingReqPacket*>(packet)->~PingReqPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PingReqPacket));
+          break;
+        case mqtt::PacketType::PINGRESP:
+          reinterpret_cast<mqtt::PingRespPacket*>(packet)->~PingRespPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::PingRespPacket));
+          break;
+        case mqtt::PacketType::DISCONNECT:
+          reinterpret_cast<mqtt::DisconnectPacket*>(packet)->~DisconnectPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::DisconnectPacket));
+          break;
+        case mqtt::PacketType::AUTH:
+          reinterpret_cast<mqtt::AuthPacket*>(packet)->~AuthPacket();
+          allocator_->deallocate(packet, sizeof(mqtt::AuthPacket));
+          break;
+        default:
+          packet->~Packet();
+          allocator_->deallocate(packet, sizeof(mqtt::Packet));
+          break;
+      }
+    }
   }
 }
 

@@ -58,45 +58,43 @@ bool EventForwardingQueue::enqueue(std::shared_ptr<MQTTEvent> event)
 
 size_t EventForwardingQueue::enqueueBatch(const EventBatch& batch)
 {
+  size_t ret = 0;
   if (batch.empty() || stopped_.load()) {
-    return 0;
-  }
-
-  size_t enqueued_count = 0;
-  std::unique_lock<std::mutex> lock(mutex_);
-
-  for (const auto& event : batch.events) {
-    if (stopped_.load()) {
-      break;
-    }
-
-    // Check if queue is full
-    if (queue_.size() >= max_queue_size_) {
-      if (drop_policy_ == 0) {
-        // Drop oldest
-        if (!queue_.empty()) {
-          queue_.pop();
-          stats_.total_dropped.fetch_add(1);
-        }
-      } else {
-        // Drop newest (skip current event)
-        stats_.total_dropped.fetch_add(1);
-        continue;
+    ret = 0;
+  } else {
+    size_t enqueued_count = 0;
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (const auto& event : batch.events) {
+      if (stopped_.load()) {
+        break;
       }
+
+      // Check if queue is full
+      if (queue_.size() >= max_queue_size_) {
+        if (drop_policy_ == 0) {
+          // Drop oldest
+          if (!queue_.empty()) {
+            queue_.pop();
+            stats_.total_dropped.fetch_add(1);
+          }
+        } else {
+          // Drop newest (skip current event)
+          stats_.total_dropped.fetch_add(1);
+          continue;
+        }
+      }
+
+      queue_.push(std::make_shared<MQTTEvent>(event));
+      enqueued_count++;
     }
-
-    queue_.push(std::make_shared<MQTTEvent>(event));
-    enqueued_count++;
+    stats_.total_enqueued.fetch_add(enqueued_count);
+    stats_.current_queue_size.store(queue_.size());
+    updateMaxQueueSize();
+    lock.unlock();
+    condition_.notify_all();
+    ret = enqueued_count;
   }
-
-  stats_.total_enqueued.fetch_add(enqueued_count);
-  stats_.current_queue_size.store(queue_.size());
-  updateMaxQueueSize();
-
-  lock.unlock();
-  condition_.notify_all();
-
-  return enqueued_count;
+  return ret;
 }
 
 std::shared_ptr<MQTTEvent> EventForwardingQueue::dequeue(int timeout_ms)
@@ -165,18 +163,18 @@ size_t EventForwardingQueue::dequeueBatch(MQTTVector<std::shared_ptr<MQTTEvent>>
 
 std::shared_ptr<MQTTEvent> EventForwardingQueue::tryDequeue()
 {
+  std::shared_ptr<MQTTEvent> ret{};
   std::unique_lock<std::mutex> lock(mutex_);
-
   if (queue_.empty() || stopped_.load()) {
-    return nullptr;
+    ret = nullptr;
+  } else {
+    auto event = queue_.front();
+    queue_.pop();
+    stats_.total_dequeued.fetch_add(1);
+    stats_.current_queue_size.store(queue_.size());
+    ret = std::move(event);
   }
-
-  auto event = queue_.front();
-  queue_.pop();
-  stats_.total_dequeued.fetch_add(1);
-  stats_.current_queue_size.store(queue_.size());
-
-  return event;
+  return ret;
 }
 
 size_t EventForwardingQueue::size() const

@@ -97,6 +97,7 @@ std::string frame(uint64_t serial, const std::string& data)
 }  // namespace
 uint32_t checksum(const char* data, size_t size)
 {
+  uint32_t ret = 0;
   static const auto table = [] {
     std::vector<uint32_t> values(256);
     for (uint32_t i = 0; i < 256; ++i) {
@@ -110,7 +111,8 @@ uint32_t checksum(const char* data, size_t size)
   uint32_t c = 0xffffffffU;
   for (size_t i = 0; i < size; ++i)
     c = table[(c ^ uint8_t(data[i])) & 255] ^ (c >> 8);
-  return c ^ 0xffffffffU;
+  ret = c ^ 0xffffffffU;
+  return ret;
 }
 uint64_t topic_hash(const std::string& text)
 {
@@ -125,13 +127,13 @@ void ensure_directory(const std::string& path)
 {
   if (mkdir(path.c_str(), 0700) == 0) {
     sync_parent(path);
-    return;
+  } else {
+    struct stat st
+    {
+    };
+    check(errno == EEXIST && lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode),
+          "journal path must be a directory (legacy SQLite requires offline migration)");
   }
-  struct stat st
-  {
-  };
-  check(errno == EEXIST && lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode),
-        "journal path must be a directory (legacy SQLite requires offline migration)");
 }
 void atomic_file(const std::string& path, const std::string& data)
 {

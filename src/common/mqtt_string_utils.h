@@ -64,21 +64,22 @@ template <typename VectorType>
 int parse_binary_data_impl(const uint8_t* buffer, size_t length, VectorType& data,
                            size_t& bytes_read)
 {
+  int ret = 0;
   if (length < 2) {
-    return MQ_STRING_ERR_BUFFER_TOO_SHORT;
+    ret = MQ_STRING_ERR_BUFFER_TOO_SHORT;
+  } else {
+    // Parse data length (big-endian)
+    uint16_t data_length = (buffer[0] << 8) | buffer[1];
+    if (length < 2 + data_length) {
+      ret = MQ_STRING_ERR_BUFFER_TOO_SHORT;
+    } else {
+      // Assign data to vector
+      data.assign(buffer + 2, buffer + 2 + data_length);
+      bytes_read = 2 + data_length;
+      ret = MQ_STRING_SUCCESS;
+    }
   }
-
-  // Parse data length (big-endian)
-  uint16_t data_length = (buffer[0] << 8) | buffer[1];
-
-  if (length < 2 + data_length) {
-    return MQ_STRING_ERR_BUFFER_TOO_SHORT;
-  }
-
-  // Assign data to vector
-  data.assign(buffer + 2, buffer + 2 + data_length);
-  bytes_read = 2 + data_length;
-  return MQ_STRING_SUCCESS;
+  return ret;
 }
 
 // Template-based unified string serialization
@@ -121,27 +122,26 @@ int serialize_string_impl(const StringType& str, MQTTBuffer& buffer)
 template <typename VectorType>
 int serialize_binary_data_impl(const VectorType& data, MQTTBuffer& buffer)
 {
+  int ret = 0;
   // Check data length limit
   if (data.size() > MQTT_MAX_BINARY_LENGTH) {
-    return MQ_STRING_ERR_STRING_TOO_LONG;
+    ret = MQ_STRING_ERR_STRING_TOO_LONG;
+  } else {
+    // Serialize length (big-endian)
+    uint16_t length = static_cast<uint16_t>(data.size());
+    ret = buffer.push_back((length >> 8) & 0xFF);
+    if (!(ret != 0)) {
+      ret = buffer.push_back(length & 0xFF);
+      if (!(ret != 0)) {
+        // Serialize data
+        ret = buffer.append(data.data(), data.size());
+        if (!(ret != 0)) {
+          ret = MQ_STRING_SUCCESS;
+        }
+      }
+    }
   }
-
-  // Serialize length (big-endian)
-  uint16_t length = static_cast<uint16_t>(data.size());
-  int ret = buffer.push_back((length >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  ret = buffer.push_back(length & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // Serialize data
-  ret = buffer.append(data.data(), data.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_STRING_SUCCESS;
+  return ret;
 }
 
 // Convenience functions for specific types

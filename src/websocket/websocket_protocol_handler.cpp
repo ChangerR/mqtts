@@ -37,10 +37,12 @@ static std::string trim_ascii(const std::string& input)
 
 static std::string to_lower_ascii(const std::string& input)
 {
+  std::string ret{};
   std::string out = input;
   std::transform(out.begin(), out.end(), out.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return out;
+  ret = std::move(out);
+  return ret;
 }
 
 static bool is_supported_mqtt_subprotocol_token(const std::string& token)
@@ -137,39 +139,37 @@ WebSocketProtocolHandler::~WebSocketProtocolHandler()
 int WebSocketProtocolHandler::init(MQTTSocket* socket, const std::string& client_ip,
                                    int client_port)
 {
+  int ret = 0;
   if (!socket) {
     LOG_ERROR("Socket is null");
-    return MQ_ERR_INVALID_ARGS;
+    ret = MQ_ERR_INVALID_ARGS;
+  } else {
+    socket_ = socket;
+    client_ip_ = client_ip;
+    client_port_ = client_port;
+    // Generate default client ID if not set
+    if (client_id_.empty()) {
+      std::ostringstream oss;
+      oss << "ws_" << client_ip << "_" << client_port;
+      client_id_ = oss.str();
+    }
+    LOG_INFO("WebSocket handler initialized for {}:{}, client_id={}", client_ip_, client_port_,
+             client_id_);
+    ret = MQ_SUCCESS;
   }
-
-  socket_ = socket;
-  client_ip_ = client_ip;
-  client_port_ = client_port;
-
-  // Generate default client ID if not set
-  if (client_id_.empty()) {
-    std::ostringstream oss;
-    oss << "ws_" << client_ip << "_" << client_port;
-    client_id_ = oss.str();
-  }
-
-  LOG_INFO("WebSocket handler initialized for {}:{}, client_id={}", client_ip_, client_port_,
-           client_id_);
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void WebSocketProtocolHandler::arm_connection_watch()
 {
-  if (watch_.started()) {
-    return;
+  if (!(watch_.started())) {
+    const auto established = established_set_ ? established_ : mqtt::ConnectionWatch::now();
+    uint32_t timeout = 10;
+    if (bridge_) {
+      timeout = bridge_->effective_limits().connect_timeout_seconds;
+    }
+    watch_.start(established, timeout);
   }
-  const auto established = established_set_ ? established_ : mqtt::ConnectionWatch::now();
-  uint32_t timeout = 10;
-  if (bridge_) {
-    timeout = bridge_->effective_limits().connect_timeout_seconds;
-  }
-  watch_.start(established, timeout);
 }
 
 int64_t WebSocketProtocolHandler::read_deadline_ms() const
@@ -200,16 +200,16 @@ void WebSocketProtocolHandler::request_session_takeover(
 {
   if (gate && gate->phase.load(std::memory_order_acquire) == 2) {
     gate->done.store(true, std::memory_order_release);
-    return;
-  }
-  takeover_gate_ = gate;
-  takeover_pending_.store(true, std::memory_order_release);
-  if (takeover_finished_) {
-    signal_takeover_done();
-    return;
-  }
-  if (socket_ && socket_->get_fd() >= 0) {
-    ::shutdown(socket_->get_fd(), SHUT_RD);
+  } else {
+    takeover_gate_ = gate;
+    takeover_pending_.store(true, std::memory_order_release);
+    if (takeover_finished_) {
+      signal_takeover_done();
+    } else {
+      if (socket_ && socket_->get_fd() >= 0) {
+        ::shutdown(socket_->get_fd(), SHUT_RD);
+      }
+    }
   }
 }
 
@@ -217,22 +217,22 @@ void WebSocketProtocolHandler::finish_session_takeover()
 {
   if (takeover_finished_) {
     signal_takeover_done();
-    return;
+  } else {
+    takeover_finished_ = true;
+    if (bridge_ && bridge_->get_message_format() == MessageFormat::MQTT_PACKET &&
+        bridge_->mqtt_protocol_version(client_id_) >= 5) {
+      (void)bridge_->send_mqtt_disconnect(client_id_, mqtt::ReasonCode::SessionTakenOver);
+    }
+    if (bridge_ && bridge_->get_session_manager()) {
+      bridge_->get_session_manager()->note_session_takeover();
+    }
+    if (bridge_) {
+      bridge_->unregister_handler(client_id_);
+    }
+    state_ = WebSocketState::CLOSED;
+    signal_takeover_done();
+    LOG_INFO("WebSocket session {} taken over", client_id_);
   }
-  takeover_finished_ = true;
-  if (bridge_ && bridge_->get_message_format() == MessageFormat::MQTT_PACKET &&
-      bridge_->mqtt_protocol_version(client_id_) >= 5) {
-    (void)bridge_->send_mqtt_disconnect(client_id_, mqtt::ReasonCode::SessionTakenOver);
-  }
-  if (bridge_ && bridge_->get_session_manager()) {
-    bridge_->get_session_manager()->note_session_takeover();
-  }
-  if (bridge_) {
-    bridge_->unregister_handler(client_id_);
-  }
-  state_ = WebSocketState::CLOSED;
-  signal_takeover_done();
-  LOG_INFO("WebSocket session {} taken over", client_id_);
 }
 
 int WebSocketProtocolHandler::process()
@@ -465,53 +465,55 @@ int WebSocketProtocolHandler::read_handshake_request(std::string& request)
 int WebSocketProtocolHandler::parse_handshake_request(const std::string& request,
                                                       std::string& ws_key)
 {
+  int ret = 0;
   selected_subprotocol_.clear();
-
   http::HttpParser parser(allocator_, http::HttpParserType::REQUEST);
   size_t consumed = 0;
   http::HttpParseStatus status = parser.execute(request.data(), request.size(), consumed);
   if (status != http::HttpParseStatus::OK || !parser.message_complete()) {
     LOG_ERROR("Failed to parse HTTP request with parser status {}", static_cast<int>(status));
-    return MQ_ERR_WS_HANDSHAKE;
+    ret = MQ_ERR_WS_HANDSHAKE;
+  } else {
+    const http::HttpRequest& http_request = parser.request();
+    if (http_request.method != mqtt::to_mqtt_string("GET", allocator_)) {
+      LOG_ERROR("WebSocket handshake requires GET, got {}",
+                mqtt::from_mqtt_string(http_request.method));
+      ret = MQ_ERR_WS_HANDSHAKE;
+    } else {
+      const mqtt::MQTTString ws_key_mqtt =
+          http_request.get_header(mqtt::to_mqtt_string("sec-websocket-key", allocator_));
+      ws_key.assign(ws_key_mqtt.data(), ws_key_mqtt.size());
+      if (ws_key_mqtt.empty()) {
+        LOG_ERROR("Sec-WebSocket-Key header not found or empty");
+        ret = MQ_ERR_WS_HANDSHAKE;
+      } else {
+        const mqtt::MQTTString upgrade = http::to_lower_ascii(
+            http_request.get_header(mqtt::to_mqtt_string("upgrade", allocator_)), allocator_);
+        const mqtt::MQTTString connection = http::to_lower_ascii(
+            http_request.get_header(mqtt::to_mqtt_string("connection", allocator_)), allocator_);
+        if (upgrade != mqtt::to_mqtt_string("websocket", allocator_) ||
+            connection.find("upgrade") == mqtt::MQTTString::npos) {
+          LOG_ERROR("Invalid websocket upgrade headers, upgrade='{}', connection='{}'",
+                    mqtt::from_mqtt_string(upgrade), mqtt::from_mqtt_string(connection));
+          ret = MQ_ERR_WS_HANDSHAKE;
+        } else {
+          const mqtt::MQTTString offered_subprotocols_mqtt =
+              http_request.get_header(mqtt::to_mqtt_string("sec-websocket-protocol", allocator_));
+          if (!offered_subprotocols_mqtt.empty()) {
+            const std::string offered_subprotocols =
+                mqtt::from_mqtt_string(offered_subprotocols_mqtt);
+            (void)select_supported_subprotocol(offered_subprotocols, selected_subprotocol_);
+            LOG_DEBUG(
+                "Client offered subprotocols: '{}', selected: '{}'", offered_subprotocols,
+                selected_subprotocol_.empty() ? std::string("<none>") : selected_subprotocol_);
+          }
+          LOG_DEBUG("Extracted WebSocket key: {}", ws_key);
+          ret = MQ_SUCCESS;
+        }
+      }
+    }
   }
-
-  const http::HttpRequest& http_request = parser.request();
-  if (http_request.method != mqtt::to_mqtt_string("GET", allocator_)) {
-    LOG_ERROR("WebSocket handshake requires GET, got {}",
-              mqtt::from_mqtt_string(http_request.method));
-    return MQ_ERR_WS_HANDSHAKE;
-  }
-
-  const mqtt::MQTTString ws_key_mqtt =
-      http_request.get_header(mqtt::to_mqtt_string("sec-websocket-key", allocator_));
-  ws_key.assign(ws_key_mqtt.data(), ws_key_mqtt.size());
-  if (ws_key_mqtt.empty()) {
-    LOG_ERROR("Sec-WebSocket-Key header not found or empty");
-    return MQ_ERR_WS_HANDSHAKE;
-  }
-
-  const mqtt::MQTTString upgrade = http::to_lower_ascii(
-      http_request.get_header(mqtt::to_mqtt_string("upgrade", allocator_)), allocator_);
-  const mqtt::MQTTString connection = http::to_lower_ascii(
-      http_request.get_header(mqtt::to_mqtt_string("connection", allocator_)), allocator_);
-  if (upgrade != mqtt::to_mqtt_string("websocket", allocator_) ||
-      connection.find("upgrade") == mqtt::MQTTString::npos) {
-    LOG_ERROR("Invalid websocket upgrade headers, upgrade='{}', connection='{}'",
-              mqtt::from_mqtt_string(upgrade), mqtt::from_mqtt_string(connection));
-    return MQ_ERR_WS_HANDSHAKE;
-  }
-
-  const mqtt::MQTTString offered_subprotocols_mqtt =
-      http_request.get_header(mqtt::to_mqtt_string("sec-websocket-protocol", allocator_));
-  if (!offered_subprotocols_mqtt.empty()) {
-    const std::string offered_subprotocols = mqtt::from_mqtt_string(offered_subprotocols_mqtt);
-    (void)select_supported_subprotocol(offered_subprotocols, selected_subprotocol_);
-    LOG_DEBUG("Client offered subprotocols: '{}', selected: '{}'", offered_subprotocols,
-              selected_subprotocol_.empty() ? std::string("<none>") : selected_subprotocol_);
-  }
-
-  LOG_DEBUG("Extracted WebSocket key: {}", ws_key);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 std::string WebSocketProtocolHandler::compute_accept_key(const std::string& ws_key)
@@ -572,14 +574,16 @@ void WebSocketProtocolHandler::compact_read_buffer()
 
 bool WebSocketProtocolHandler::streams_mqtt_payload(const WebSocketFrame& header) const
 {
+  bool ret = false;
   if (!bridge_ || bridge_->get_message_format() != MessageFormat::MQTT_PACKET) {
-    return false;
+    ret = false;
+  } else if (header.opcode == WebSocketOpcode::BINARY) {
+    ret = true;
+  } else {
+    ret = header.opcode == WebSocketOpcode::CONTINUATION &&
+          !(is_fragmenting_ && fragmented_opcode_ == WebSocketOpcode::TEXT);
   }
-  if (header.opcode == WebSocketOpcode::BINARY) {
-    return true;
-  }
-  return header.opcode == WebSocketOpcode::CONTINUATION &&
-         !(is_fragmenting_ && fragmented_opcode_ == WebSocketOpcode::TEXT);
+  return ret;
 }
 
 int WebSocketProtocolHandler::begin_streamed_frame(const WebSocketFrame& header, size_t header_len)
@@ -704,22 +708,27 @@ int WebSocketProtocolHandler::read_frame(WebSocketFrame& frame)
 
 int WebSocketProtocolHandler::reject_oversized_mqtt_fragment(size_t incoming)
 {
+  int ret = 0;
   if (!bridge_) {
-    return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    const size_t limit = bridge_->effective_limits().max_packet_size;
+    if (limit == 0) {
+      ret = MQ_SUCCESS;
+    } else {
+      const size_t have = is_fragmenting_ ? fragmented_payload_.size() : 0;
+      if (incoming > limit || have > limit - incoming) {
+        is_fragmenting_ = false;
+        fragmented_payload_.clear();
+        LOG_WARN("WebSocket client {} accumulated {} bytes, above MQTT max packet size {}",
+                 client_id_, have + incoming, limit);
+        ret = MQ_ERR_PACKET_TOO_LARGE;
+      } else {
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-  const size_t limit = bridge_->effective_limits().max_packet_size;
-  if (limit == 0) {
-    return MQ_SUCCESS;
-  }
-  const size_t have = is_fragmenting_ ? fragmented_payload_.size() : 0;
-  if (incoming > limit || have > limit - incoming) {
-    is_fragmenting_ = false;
-    fragmented_payload_.clear();
-    LOG_WARN("WebSocket client {} accumulated {} bytes, above MQTT max packet size {}", client_id_,
-             have + incoming, limit);
-    return MQ_ERR_PACKET_TOO_LARGE;
-  }
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame)
@@ -789,64 +798,69 @@ int WebSocketProtocolHandler::handle_frame(const WebSocketFrame& frame)
 
 int WebSocketProtocolHandler::handle_text_frame(const WebSocketFrame& frame)
 {
+  int ret = 0;
   stats_.text_frames++;
-
   // Check for fragmentation
   if (!frame.fin) {
     if (is_fragmenting_) {
       LOG_ERROR("Already fragmenting a message");
-      return MQ_ERR_WS_FRAGMENTATION;
+      ret = MQ_ERR_WS_FRAGMENTATION;
+    } else {
+      const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
+      if (capped != MQ_SUCCESS) {
+        ret = capped;
+      } else {
+        is_fragmenting_ = true;
+        fragmented_opcode_ = frame.opcode;
+        fragmented_payload_.assign(frame.payload.begin(), frame.payload.end());
+        ret = MQ_SUCCESS;
+      }
     }
-    const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
-    if (capped != MQ_SUCCESS) {
-      return capped;
+  } else {
+    // Convert to string
+    std::string text(frame.payload.begin(), frame.payload.end());
+    LOG_DEBUG("Received text message from {}: {}", client_id_, text);
+    // Forward to bridge if available
+    if (bridge_) {
+      ret = bridge_->handle_websocket_text(client_id_, text);
+    } else {
+      ret = MQ_SUCCESS;
     }
-    is_fragmenting_ = true;
-    fragmented_opcode_ = frame.opcode;
-    fragmented_payload_.assign(frame.payload.begin(), frame.payload.end());
-    return MQ_SUCCESS;
   }
-
-  // Convert to string
-  std::string text(frame.payload.begin(), frame.payload.end());
-  LOG_DEBUG("Received text message from {}: {}", client_id_, text);
-
-  // Forward to bridge if available
-  if (bridge_) {
-    return bridge_->handle_websocket_text(client_id_, text);
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketProtocolHandler::handle_binary_frame(const WebSocketFrame& frame)
 {
+  int ret = 0;
   stats_.binary_frames++;
-
   // Check for fragmentation
   if (!frame.fin) {
     if (is_fragmenting_) {
       LOG_ERROR("Already fragmenting a message");
-      return MQ_ERR_WS_FRAGMENTATION;
+      ret = MQ_ERR_WS_FRAGMENTATION;
+    } else {
+      const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
+      if (capped != MQ_SUCCESS) {
+        ret = capped;
+      } else {
+        is_fragmenting_ = true;
+        fragmented_opcode_ = frame.opcode;
+        fragmented_payload_.assign(frame.payload.begin(), frame.payload.end());
+        ret = MQ_SUCCESS;
+      }
     }
-    const int capped = reject_oversized_mqtt_fragment(frame.payload.size());
-    if (capped != MQ_SUCCESS) {
-      return capped;
+  } else {
+    LOG_DEBUG("Received binary message from {}: {} bytes", client_id_, frame.payload.size());
+    // Forward to bridge if available
+    if (bridge_) {
+      ret =
+          bridge_->handle_websocket_binary(client_id_, frame.payload.data(), frame.payload.size());
+    } else {
+      ret = MQ_SUCCESS;
     }
-    is_fragmenting_ = true;
-    fragmented_opcode_ = frame.opcode;
-    fragmented_payload_.assign(frame.payload.begin(), frame.payload.end());
-    return MQ_SUCCESS;
   }
-
-  LOG_DEBUG("Received binary message from {}: {} bytes", client_id_, frame.payload.size());
-
-  // Forward to bridge if available
-  if (bridge_) {
-    return bridge_->handle_websocket_binary(client_id_, frame.payload.data(), frame.payload.size());
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketProtocolHandler::handle_close_frame(const WebSocketFrame& frame)
@@ -1012,13 +1026,15 @@ bool WebSocketProtocolHandler::should_send_ping() const
 
 bool WebSocketProtocolHandler::is_pong_timeout() const
 {
+  bool ret = false;
   if (!waiting_for_pong_) {
-    return false;
+    ret = false;
+  } else {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ping_sent_);
+    ret = elapsed.count() >= pong_timeout_ms_;
   }
-
-  auto now = std::chrono::steady_clock::now();
-  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ping_sent_);
-  return elapsed.count() >= pong_timeout_ms_;
+  return ret;
 }
 
 void WebSocketProtocolHandler::close_connection()

@@ -170,37 +170,38 @@ class WebSocketMQTTClient
 
   bool connect()
   {
+    bool ret = false;
     // Create socket
     sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd_ < 0) {
       std::cerr << "Failed to create socket" << std::endl;
-      return false;
+      ret = false;
+    } else {
+      // Connect to server
+      struct sockaddr_in server_addr;
+      memset(&server_addr, 0, sizeof(server_addr));
+      server_addr.sin_family = AF_INET;
+      server_addr.sin_port = htons(port_);
+      inet_pton(AF_INET, host_.c_str(), &server_addr.sin_addr);
+      if (::connect(sockfd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "Failed to connect to server" << std::endl;
+        close(sockfd_);
+        sockfd_ = -1;
+        ret = false;
+      } else {
+        // Perform WebSocket handshake
+        if (!perform_handshake()) {
+          close(sockfd_);
+          sockfd_ = -1;
+          ret = false;
+        } else {
+          connected_ = true;
+          std::cout << "Connected to WebSocket MQTT server at " << host_ << ":" << port_ << std::endl;
+          ret = true;
+        }
+      }
     }
-
-    // Connect to server
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port_);
-    inet_pton(AF_INET, host_.c_str(), &server_addr.sin_addr);
-
-    if (::connect(sockfd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-      std::cerr << "Failed to connect to server" << std::endl;
-      close(sockfd_);
-      sockfd_ = -1;
-      return false;
-    }
-
-    // Perform WebSocket handshake
-    if (!perform_handshake()) {
-      close(sockfd_);
-      sockfd_ = -1;
-      return false;
-    }
-
-    connected_ = true;
-    std::cout << "Connected to WebSocket MQTT server at " << host_ << ":" << port_ << std::endl;
-    return true;
+    return ret;
   }
 
   void disconnect()
@@ -218,61 +219,61 @@ class WebSocketMQTTClient
 
   bool publish(const std::string& topic, const std::string& payload, int qos = 0)
   {
+    bool ret = false;
     if (!connected_) {
       std::cerr << "Not connected" << std::endl;
-      return false;
+      ret = false;
+    } else {
+      // Create JSON message
+      std::string json = "{\"topic\":\"" + topic +
+                         "\","
+                         "\"payload\":\"" +
+                         payload +
+                         "\","
+                         "\"qos\":" +
+                         std::to_string(qos) +
+                         ","
+                         "\"retain\":false}";
+      // Send as WebSocket TEXT frame
+      std::vector<uint8_t> frame = create_websocket_frame(0x01, json);
+      ssize_t sent = send(sockfd_, frame.data(), frame.size(), 0);
+      if (sent < 0) {
+        std::cerr << "Failed to send message" << std::endl;
+        ret = false;
+      } else {
+        std::cout << "Published to topic '" << topic << "': " << payload << std::endl;
+        ret = true;
+      }
     }
-
-    // Create JSON message
-    std::string json = "{\"topic\":\"" + topic +
-                       "\","
-                       "\"payload\":\"" +
-                       payload +
-                       "\","
-                       "\"qos\":" +
-                       std::to_string(qos) +
-                       ","
-                       "\"retain\":false}";
-
-    // Send as WebSocket TEXT frame
-    std::vector<uint8_t> frame = create_websocket_frame(0x01, json);
-    ssize_t sent = send(sockfd_, frame.data(), frame.size(), 0);
-
-    if (sent < 0) {
-      std::cerr << "Failed to send message" << std::endl;
-      return false;
-    }
-
-    std::cout << "Published to topic '" << topic << "': " << payload << std::endl;
-    return true;
+    return ret;
   }
 
   bool subscribe(const std::string& topic, int qos = 0)
   {
+    bool ret = false;
     if (!connected_) {
       std::cerr << "Not connected" << std::endl;
-      return false;
+      ret = false;
+    } else {
+      // Create JSON subscribe message
+      std::string json =
+          "{\"type\":\"subscribe\","
+          "\"topic\":\"" +
+          topic +
+          "\","
+          "\"qos\":" +
+          std::to_string(qos) + "}";
+      std::vector<uint8_t> frame = create_websocket_frame(0x01, json);
+      ssize_t sent = send(sockfd_, frame.data(), frame.size(), 0);
+      if (sent < 0) {
+        std::cerr << "Failed to send subscribe" << std::endl;
+        ret = false;
+      } else {
+        std::cout << "Subscribed to topic: " << topic << std::endl;
+        ret = true;
+      }
     }
-
-    // Create JSON subscribe message
-    std::string json =
-        "{\"type\":\"subscribe\","
-        "\"topic\":\"" +
-        topic +
-        "\","
-        "\"qos\":" +
-        std::to_string(qos) + "}";
-
-    std::vector<uint8_t> frame = create_websocket_frame(0x01, json);
-    ssize_t sent = send(sockfd_, frame.data(), frame.size(), 0);
-
-    if (sent < 0) {
-      std::cerr << "Failed to send subscribe" << std::endl;
-      return false;
-    }
-
-    std::cout << "Subscribed to topic: " << topic << std::endl;
-    return true;
+    return ret;
   }
 
   bool receive_message(std::string& topic, std::string& payload, int timeout_ms = 5000)
@@ -334,12 +335,14 @@ class WebSocketMQTTClient
 
   bool send_ping()
   {
+    bool ret = false;
     if (!connected_) {
-      return false;
+      ret = false;
+    } else {
+      std::vector<uint8_t> ping = create_websocket_frame(0x09, "ping");
+      ret = send(sockfd_, ping.data(), ping.size(), 0) > 0;
     }
-
-    std::vector<uint8_t> ping = create_websocket_frame(0x09, "ping");
-    return send(sockfd_, ping.data(), ping.size(), 0) > 0;
+    return ret;
   }
 
  private:
@@ -362,9 +365,9 @@ class WebSocketMQTTClient
 
   bool perform_handshake()
   {
+    bool ret = false;
     // Generate WebSocket key
     std::string ws_key = generate_websocket_key();
-
     // Build handshake request
     std::string handshake =
         "GET / HTTP/1.1\r\n"
@@ -378,74 +381,70 @@ class WebSocketMQTTClient
         "\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n";
-
     // Send handshake
     if (send(sockfd_, handshake.c_str(), handshake.size(), 0) < 0) {
       std::cerr << "Failed to send handshake" << std::endl;
-      return false;
-    }
+      ret = false;
+    } else {
+      // Receive handshake response
+      char buffer[4096];
+      ssize_t n = recv(sockfd_, buffer, sizeof(buffer) - 1, 0);
+      if (n <= 0) {
+        std::cerr << "Failed to receive handshake response" << std::endl;
+        ret = false;
+      } else {
+        buffer[n] = '\0';
+        std::string response(buffer);
+        // Verify response
+        if (response.find("HTTP/1.1 101") == std::string::npos) {
+          std::cerr << "Handshake failed: " << response << std::endl;
+          ret = false;
+        } else {
+          // Only scan the header section: anything after it is already frame data.
+          size_t headers_end = response.find("\r\n\r\n");
+          if (headers_end == std::string::npos) {
+            std::cerr << "Incomplete handshake response" << std::endl;
+            ret = false;
+          } else {
+            // Header names are case insensitive, but the accept key itself is base64
+            // and must match exactly.
+            std::string expected_accept = compute_accept_key(ws_key);
+            bool found_accept = false;
+            bool found_upgrade = false;
+            bool found_connection = false;
+            std::istringstream response_stream(response.substr(0, headers_end));
+            std::string line;
+            while (std::getline(response_stream, line)) {
+              size_t separator = line.find(':');
+              if (separator == std::string::npos) {
+                continue;
+              }
 
-    // Receive handshake response
-    char buffer[4096];
-    ssize_t n = recv(sockfd_, buffer, sizeof(buffer) - 1, 0);
-    if (n <= 0) {
-      std::cerr << "Failed to receive handshake response" << std::endl;
-      return false;
-    }
-
-    buffer[n] = '\0';
-    std::string response(buffer);
-
-    // Verify response
-    if (response.find("HTTP/1.1 101") == std::string::npos) {
-      std::cerr << "Handshake failed: " << response << std::endl;
-      return false;
-    }
-
-    // Only scan the header section: anything after it is already frame data.
-    size_t headers_end = response.find("\r\n\r\n");
-    if (headers_end == std::string::npos) {
-      std::cerr << "Incomplete handshake response" << std::endl;
-      return false;
-    }
-
-    // Header names are case insensitive, but the accept key itself is base64
-    // and must match exactly.
-    std::string expected_accept = compute_accept_key(ws_key);
-    bool found_accept = false;
-    bool found_upgrade = false;
-    bool found_connection = false;
-    std::istringstream response_stream(response.substr(0, headers_end));
-    std::string line;
-    while (std::getline(response_stream, line)) {
-      size_t separator = line.find(':');
-      if (separator == std::string::npos) {
-        continue;
+              std::string name = lowercase(line.substr(0, separator));
+              std::string value = trim_header_value(line.substr(separator + 1));
+              if (name == "sec-websocket-accept") {
+                found_accept = (value == expected_accept);
+              } else if (name == "upgrade") {
+                found_upgrade = (lowercase(value) == "websocket");
+              } else if (name == "connection") {
+                found_connection = (lowercase(value).find("upgrade") != std::string::npos);
+              }
+            }
+            if (!found_accept) {
+              std::cerr << "Invalid accept key in handshake response" << std::endl;
+              ret = false;
+            } else if (!found_upgrade || !found_connection) {
+              std::cerr << "Missing Upgrade/Connection headers in handshake response" << std::endl;
+              ret = false;
+            } else {
+              std::cout << "WebSocket handshake successful" << std::endl;
+              ret = true;
+            }
+          }
+        }
       }
-
-      std::string name = lowercase(line.substr(0, separator));
-      std::string value = trim_header_value(line.substr(separator + 1));
-      if (name == "sec-websocket-accept") {
-        found_accept = (value == expected_accept);
-      } else if (name == "upgrade") {
-        found_upgrade = (lowercase(value) == "websocket");
-      } else if (name == "connection") {
-        found_connection = (lowercase(value).find("upgrade") != std::string::npos);
-      }
     }
-
-    if (!found_accept) {
-      std::cerr << "Invalid accept key in handshake response" << std::endl;
-      return false;
-    }
-
-    if (!found_upgrade || !found_connection) {
-      std::cerr << "Missing Upgrade/Connection headers in handshake response" << std::endl;
-      return false;
-    }
-
-    std::cout << "WebSocket handshake successful" << std::endl;
-    return true;
+    return ret;
   }
 
   std::string host_;
@@ -459,31 +458,27 @@ class WebSocketMQTTClient
 void test_publish_subscribe(WebSocketMQTTClient& client)
 {
   std::cout << "\n=== Test 1: Publish/Subscribe ===" << std::endl;
-
   // Subscribe to a topic
   if (!client.subscribe("test/topic", 0)) {
     std::cerr << "Subscribe failed" << std::endl;
-    return;
-  }
-
-  sleep(1);
-
-  // Publish a message
-  if (!client.publish("test/topic", "Hello WebSocket MQTT!", 0)) {
-    std::cerr << "Publish failed" << std::endl;
-    return;
-  }
-
-  // Wait for message
-  std::string topic, payload;
-  if (client.receive_message(topic, payload, 5000)) {
-    if (topic == "test/topic" && payload == "Hello WebSocket MQTT!") {
-      std::cout << "✓ Publish/Subscribe test PASSED" << std::endl;
-    } else {
-      std::cout << "✗ Publish/Subscribe test FAILED (wrong data)" << std::endl;
-    }
   } else {
-    std::cout << "✗ Publish/Subscribe test FAILED (no message received)" << std::endl;
+    sleep(1);
+    // Publish a message
+    if (!client.publish("test/topic", "Hello WebSocket MQTT!", 0)) {
+      std::cerr << "Publish failed" << std::endl;
+    } else {
+      // Wait for message
+      std::string topic, payload;
+      if (client.receive_message(topic, payload, 5000)) {
+        if (topic == "test/topic" && payload == "Hello WebSocket MQTT!") {
+          std::cout << "✓ Publish/Subscribe test PASSED" << std::endl;
+        } else {
+          std::cout << "✗ Publish/Subscribe test FAILED (wrong data)" << std::endl;
+        }
+      } else {
+        std::cout << "✗ Publish/Subscribe test FAILED (no message received)" << std::endl;
+      }
+    }
   }
 }
 
@@ -587,8 +582,10 @@ void test_wildcard_topics(WebSocketMQTTClient& client)
 
 int main(int argc, char* argv[])
 {
+  int ret = 0;
   std::string host = "localhost";
-  int port = 1883;  // MQTT port with WebSocket auto-detection
+  int port = 1883;
+  // MQTT port with WebSocket auto-detection
 
   if (argc > 1) {
     host = argv[1];
@@ -596,29 +593,25 @@ int main(int argc, char* argv[])
   if (argc > 2) {
     port = std::atoi(argv[2]);
   }
-
   std::cout << "WebSocket MQTT Integration Test" << std::endl;
   std::cout << "=================================" << std::endl;
   std::cout << "Server: " << host << ":" << port << std::endl;
-
   WebSocketMQTTClient client(host, port);
-
   if (!client.connect()) {
     std::cerr << "Failed to connect to server" << std::endl;
     std::cerr << "\nPlease ensure the WebSocket MQTT server is running:" << std::endl;
     std::cerr << "  ./mqtts mqtts.yaml" << std::endl;
-    return 1;
+    ret = 1;
+  } else {
+    // Run tests
+    test_publish_subscribe(client);
+    test_multiple_messages(client);
+    test_ping_pong(client);
+    test_qos_levels(client);
+    test_wildcard_topics(client);
+    std::cout << "\n=== All Tests Complete ===" << std::endl;
+    client.disconnect();
+    ret = 0;
   }
-
-  // Run tests
-  test_publish_subscribe(client);
-  test_multiple_messages(client);
-  test_ping_pong(client);
-  test_qos_levels(client);
-  test_wildcard_topics(client);
-
-  std::cout << "\n=== All Tests Complete ===" << std::endl;
-
-  client.disconnect();
-  return 0;
+  return ret;
 }

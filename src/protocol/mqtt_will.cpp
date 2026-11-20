@@ -29,23 +29,22 @@ void* run_will_fire(void* arg)
 {
   std::unique_ptr<WillFire> fire(static_cast<WillFire*>(arg));
   runtime::current_runtime().enable_async_syscalls();
-  if (!fire || !fire->entry || !fire->sessions) {
-    return nullptr;
-  }
-  WillScheduler::Entry* entry = fire->entry.get();
-  const std::string client_id = entry->client_id;
-  const uint64_t generation = entry->generation;
-  GlobalSessionManager* sessions = fire->sessions;
-  const WillPublishOutcome outcome = publish_will(
-      sessions, fire->auth, entry->auth.context, entry->forward_id, entry->body,
-      [sessions, client_id, generation]() {
-        return sessions->will_scheduler().generation_matches(client_id, generation);
-      });
-  sessions->will_scheduler().complete(client_id, generation);
-  if (outcome == WillPublishOutcome::Published) {
-    sessions->note_will_published();
-  } else if (outcome == WillPublishOutcome::Rejected) {
-    sessions->note_will_rejected();
+  if (!(!fire || !fire->entry || !fire->sessions)) {
+    WillScheduler::Entry* entry = fire->entry.get();
+    const std::string client_id = entry->client_id;
+    const uint64_t generation = entry->generation;
+    GlobalSessionManager* sessions = fire->sessions;
+    const WillPublishOutcome outcome =
+        publish_will(sessions, fire->auth, entry->auth.context, entry->forward_id, entry->body,
+                     [sessions, client_id, generation]() {
+                       return sessions->will_scheduler().generation_matches(client_id, generation);
+                     });
+    sessions->will_scheduler().complete(client_id, generation);
+    if (outcome == WillPublishOutcome::Published) {
+      sessions->note_will_published();
+    } else if (outcome == WillPublishOutcome::Rejected) {
+      sessions->note_will_rejected();
+    }
   }
   return nullptr;
 }
@@ -55,10 +54,13 @@ void* run_will_fire(void* arg)
 uint32_t effective_will_delay_seconds(bool persistent, uint32_t will_delay_seconds,
                                      uint32_t session_expiry_seconds)
 {
+  uint32_t ret = 0;
   if (!persistent) {
-    return 0;
+    ret = 0;
+  } else {
+    ret = std::min(will_delay_seconds, session_expiry_seconds);
   }
-  return std::min(will_delay_seconds, session_expiry_seconds);
+  return ret;
 }
 
 WillConnectDecision validate_will_connect(uint8_t will_qos, bool will_retain, const std::string& topic,
@@ -266,24 +268,23 @@ WillPublishOutcome publish_will(GlobalSessionManager* sessions, auth::AuthManage
 
 void WillScheduler::schedule(std::unique_ptr<Entry> entry)
 {
-  if (!entry || entry->client_id.empty()) {
-    return;
+  if (!(!entry || entry->client_id.empty())) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // 新连接的遗嘱单独编号。已经到期、等待发布的上一代不能被这次插入清掉。
+    ClientGenerations& state = generations_[entry->client_id];
+    uint64_t generation = ++state.next;
+    if (generation == 0) {
+      generation = ++state.next;
+    }
+    entry->generation = generation;
+    state.live.insert(generation);
+    const std::thread::id owner = entry->owner;
+    const std::chrono::steady_clock::time_point due = entry->due;
+    Queued queued;
+    queued.owner = owner;
+    queued.position = queues_[owner].emplace(due, std::move(entry));
+    state.queued.push_back(queued);
   }
-  std::lock_guard<std::mutex> lock(mutex_);
-  // 新连接的遗嘱单独编号。已经到期、等待发布的上一代不能被这次插入清掉。
-  ClientGenerations& state = generations_[entry->client_id];
-  uint64_t generation = ++state.next;
-  if (generation == 0) {
-    generation = ++state.next;
-  }
-  entry->generation = generation;
-  state.live.insert(generation);
-  const std::thread::id owner = entry->owner;
-  const std::chrono::steady_clock::time_point due = entry->due;
-  Queued queued;
-  queued.owner = owner;
-  queued.position = queues_[owner].emplace(due, std::move(entry));
-  state.queued.push_back(queued);
 }
 
 void WillScheduler::forget_queued(ClientGenerations& state, const Entry* entry)
@@ -302,69 +303,65 @@ void WillScheduler::suppress_pending(const std::string& client_id,
 {
   const std::unordered_map<std::string, ClientGenerations>::iterator state =
       generations_.find(client_id);
-  if (state == generations_.end()) {
-    return;
-  }
-  std::vector<Queued>& queued = state->second.queued;
-  for (size_t i = 0; i < queued.size();) {
-    Entry* entry = queued[i].position->second.get();
-    if (entry->due > now) {
-      state->second.live.erase(entry->generation);
-      DueQueue& queue = queues_[queued[i].owner];
-      queue.erase(queued[i].position);
-      if (queue.empty()) {
-        queues_.erase(queued[i].owner);
+  if (!(state == generations_.end())) {
+    std::vector<Queued>& queued = state->second.queued;
+    for (size_t i = 0; i < queued.size();) {
+      Entry* entry = queued[i].position->second.get();
+      if (entry->due > now) {
+        state->second.live.erase(entry->generation);
+        DueQueue& queue = queues_[queued[i].owner];
+        queue.erase(queued[i].position);
+        if (queue.empty()) {
+          queues_.erase(queued[i].owner);
+        }
+        queued[i] = queued.back();
+        queued.pop_back();
+        continue;
       }
-      queued[i] = queued.back();
-      queued.pop_back();
-      continue;
+      ++i;
     }
-    ++i;
+    drop_client_if_idle(client_id);
   }
-  drop_client_if_idle(client_id);
 }
 
 void WillScheduler::drop_client_if_idle(const std::string& client_id)
 {
-  const std::unordered_map<std::string, ClientGenerations>::iterator state = generations_.find(client_id);
-  if (state == generations_.end()) {
-    return;
-  }
-  if (state->second.queued.empty() && state->second.live.empty() &&
-      state->second.inflight.empty()) {
-    generations_.erase(state);
+  const std::unordered_map<std::string, ClientGenerations>::iterator state =
+      generations_.find(client_id);
+  if (!(state == generations_.end())) {
+    if (state->second.queued.empty() && state->second.live.empty() &&
+        state->second.inflight.empty()) {
+      generations_.erase(state);
+    }
   }
 }
 
 void WillScheduler::cancel(const std::string& client_id)
 {
-  if (client_id.empty()) {
-    return;
+  if (!(client_id.empty())) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    suppress_pending(client_id, std::chrono::steady_clock::now());
   }
-  std::lock_guard<std::mutex> lock(mutex_);
-  suppress_pending(client_id, std::chrono::steady_clock::now());
 }
 
 void WillScheduler::expire_now(const std::string& client_id)
 {
-  if (client_id.empty()) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(mutex_);
-  const std::unordered_map<std::string, ClientGenerations>::iterator state =
-      generations_.find(client_id);
-  if (state == generations_.end()) {
-    return;
-  }
-  const std::chrono::steady_clock::time_point immediately =
-      std::chrono::steady_clock::time_point::min();
-  for (size_t i = 0; i < state->second.queued.size(); ++i) {
-    Queued& queued = state->second.queued[i];
-    DueQueue& queue = queues_[queued.owner];
-    std::unique_ptr<Entry> entry = std::move(queued.position->second);
-    queue.erase(queued.position);
-    entry->due = immediately;
-    queued.position = queue.emplace(immediately, std::move(entry));
+  if (!(client_id.empty())) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::unordered_map<std::string, ClientGenerations>::iterator state =
+        generations_.find(client_id);
+    if (!(state == generations_.end())) {
+      const std::chrono::steady_clock::time_point immediately =
+          std::chrono::steady_clock::time_point::min();
+      for (size_t i = 0; i < state->second.queued.size(); ++i) {
+        Queued& queued = state->second.queued[i];
+        DueQueue& queue = queues_[queued.owner];
+        std::unique_ptr<Entry> entry = std::move(queued.position->second);
+        queue.erase(queued.position);
+        entry->due = immediately;
+        queued.position = queue.emplace(immediately, std::move(entry));
+      }
+    }
   }
 }
 
@@ -380,60 +377,62 @@ void WillScheduler::observe_connect(const std::string& client_id, bool clean_sta
 
 void WillScheduler::complete(const std::string& client_id, uint64_t generation)
 {
-  if (client_id.empty()) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(mutex_);
-  const std::unordered_map<std::string, ClientGenerations>::iterator state = generations_.find(client_id);
-  if (state == generations_.end()) {
-    return;
-  }
-  state->second.inflight.erase(generation);
-  bool queued = false;
-  for (size_t i = 0; i < state->second.queued.size(); ++i) {
-    if (state->second.queued[i].position->second->generation == generation) {
-      queued = true;
-      break;
+  if (!(client_id.empty())) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::unordered_map<std::string, ClientGenerations>::iterator state =
+        generations_.find(client_id);
+    if (!(state == generations_.end())) {
+      state->second.inflight.erase(generation);
+      bool queued = false;
+      for (size_t i = 0; i < state->second.queued.size(); ++i) {
+        if (state->second.queued[i].position->second->generation == generation) {
+          queued = true;
+          break;
+        }
+      }
+      if (!queued) {
+        state->second.live.erase(generation);
+      }
+      drop_client_if_idle(client_id);
     }
   }
-  if (!queued) {
-    state->second.live.erase(generation);
-  }
-  drop_client_if_idle(client_id);
 }
 
 std::vector<std::unique_ptr<WillScheduler::Entry>> WillScheduler::take_due(
     std::thread::id owner, std::chrono::steady_clock::time_point now, bool flush_all)
 {
+  std::vector<std::unique_ptr<WillScheduler::Entry>> ret{};
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::unique_ptr<Entry>> due;
   const std::unordered_map<std::thread::id, DueQueue>::iterator found = queues_.find(owner);
   if (found == queues_.end()) {
-    return due;
-  }
-  DueQueue& queue = found->second;
-  while (!queue.empty() && (flush_all || queue.begin()->first <= now)) {
-    const std::unordered_map<std::string, ClientGenerations>::iterator state =
-        generations_.find(queue.begin()->second->client_id);
-    if (state != generations_.end()) {
-      forget_queued(state->second, queue.begin()->second.get());
+    ret = std::move(due);
+  } else {
+    DueQueue& queue = found->second;
+    while (!queue.empty() && (flush_all || queue.begin()->first <= now)) {
+      const std::unordered_map<std::string, ClientGenerations>::iterator state =
+          generations_.find(queue.begin()->second->client_id);
+      if (state != generations_.end()) {
+        forget_queued(state->second, queue.begin()->second.get());
+      }
+      std::unique_ptr<Entry> entry = std::move(queue.begin()->second);
+      queue.erase(queue.begin());
+      if (state == generations_.end()) {
+        continue;
+      }
+      if (state->second.live.find(entry->generation) == state->second.live.end()) {
+        drop_client_if_idle(entry->client_id);
+        continue;
+      }
+      state->second.inflight.insert(entry->generation);
+      due.push_back(std::move(entry));
     }
-    std::unique_ptr<Entry> entry = std::move(queue.begin()->second);
-    queue.erase(queue.begin());
-    if (state == generations_.end()) {
-      continue;
+    if (queue.empty()) {
+      queues_.erase(found);
     }
-    if (state->second.live.find(entry->generation) == state->second.live.end()) {
-      drop_client_if_idle(entry->client_id);
-      continue;
-    }
-    state->second.inflight.insert(entry->generation);
-    due.push_back(std::move(entry));
+    ret = std::move(due);
   }
-  if (queue.empty()) {
-    queues_.erase(found);
-  }
-  return due;
+  return ret;
 }
 
 bool WillScheduler::generation_matches(const std::string& client_id, uint64_t generation) const
@@ -448,27 +447,26 @@ bool WillScheduler::generation_matches(const std::string& client_id, uint64_t ge
 void launch_due_wills(GlobalSessionManager* sessions, auth::AuthManager* auth, std::thread::id owner,
                       bool flush_all)
 {
-  if (!sessions) {
-    return;
-  }
-  std::vector<std::unique_ptr<WillScheduler::Entry>> due =
-      sessions->will_scheduler().take_due(owner, std::chrono::steady_clock::now(), flush_all);
-  for (size_t i = 0; i < due.size(); ++i) {
-    WillFire* fire = new WillFire();
-    fire->sessions = sessions;
-    fire->auth = auth;
-    fire->entry = std::move(due[i]);
-    runtime::TaskHandle handle =
-        runtime::current_runtime().spawn(run_will_fire, fire, 128 * 1024);
-    if (!handle.is_valid()) {
-      const std::string client_id = fire->entry->client_id;
-      const uint64_t generation = fire->entry->generation;
-      delete fire;
-      sessions->will_scheduler().complete(client_id, generation);
-      sessions->note_will_rejected();
-      continue;
+  if (sessions) {
+    std::vector<std::unique_ptr<WillScheduler::Entry>> due =
+        sessions->will_scheduler().take_due(owner, std::chrono::steady_clock::now(), flush_all);
+    for (size_t i = 0; i < due.size(); ++i) {
+      WillFire* fire = new WillFire();
+      fire->sessions = sessions;
+      fire->auth = auth;
+      fire->entry = std::move(due[i]);
+      runtime::TaskHandle handle =
+          runtime::current_runtime().spawn(run_will_fire, fire, 128 * 1024);
+      if (!handle.is_valid()) {
+        const std::string client_id = fire->entry->client_id;
+        const uint64_t generation = fire->entry->generation;
+        delete fire;
+        sessions->will_scheduler().complete(client_id, generation);
+        sessions->note_will_rejected();
+        continue;
+      }
+      handle.release();
     }
-    handle.release();
   }
 }
 

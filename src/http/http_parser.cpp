@@ -156,20 +156,18 @@ int HttpParser::on_message_complete(llhttp_t* parser)
 
 int HttpParser::append_url(const char* at, size_t length)
 {
-  if (type_ != HttpParserType::REQUEST) {
-    return 0;
+  if (!(type_ != HttpParserType::REQUEST)) {
+    request_.url.append(at, length);
+    request_.path = request_.url;
   }
-  request_.url.append(at, length);
-  request_.path = request_.url;
   return 0;
 }
 
 int HttpParser::append_status(const char* at, size_t length)
 {
-  if (type_ != HttpParserType::RESPONSE) {
-    return 0;
+  if (!(type_ != HttpParserType::RESPONSE)) {
+    response_.reason.append(at, length);
   }
-  response_.reason.append(at, length);
   return 0;
 }
 
@@ -195,22 +193,18 @@ int HttpParser::append_header_value(const char* at, size_t length)
 
 int HttpParser::commit_pending_header()
 {
-  if (pending_header_field_.empty()) {
-    return 0;
+  if (!(pending_header_field_.empty())) {
+    mqtt::MQTTString key = to_lower_ascii(pending_header_field_, allocator_);
+    mqtt::MQTTString value = pending_header_value_;
+    if (type_ == HttpParserType::REQUEST) {
+      request_.set_header(key, value);
+    } else {
+      response_.set_header(key, value);
+    }
+    pending_header_field_.clear();
+    pending_header_value_.clear();
+    parsing_header_value_ = false;
   }
-
-  mqtt::MQTTString key = to_lower_ascii(pending_header_field_, allocator_);
-  mqtt::MQTTString value = pending_header_value_;
-
-  if (type_ == HttpParserType::REQUEST) {
-    request_.set_header(key, value);
-  } else {
-    response_.set_header(key, value);
-  }
-
-  pending_header_field_.clear();
-  pending_header_value_.clear();
-  parsing_header_value_ = false;
   return 0;
 }
 
@@ -236,14 +230,12 @@ int HttpParser::headers_complete()
 
 int HttpParser::append_body(const char* at, size_t length)
 {
-  if (length == 0) {
-    return 0;
-  }
-
-  if (type_ == HttpParserType::REQUEST) {
-    (void)request_.body.append(at, length);
-  } else {
-    (void)response_.body.append(at, length);
+  if (!(length == 0)) {
+    if (type_ == HttpParserType::REQUEST) {
+      (void)request_.body.append(at, length);
+    } else {
+      (void)response_.body.append(at, length);
+    }
   }
   return 0;
 }

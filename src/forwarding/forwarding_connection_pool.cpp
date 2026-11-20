@@ -127,37 +127,34 @@ void ForwardingConnectionPool::release(const std::string& host,
                                        bool               is_pooled,
                                        bool               has_error)
 {
-  if (socket == NULL) {
-    return;
-  }
-
-  if (!is_pooled || has_error) {
-    destroy_socket_internal(socket);
-    socket = NULL;
-    if (is_pooled) {
-      // 归还占位
-      const std::string key  = host + ":" + std::to_string(port);
-      RemotePool*       pool = get_pool(key);
-      if (pool != NULL) {
+  if (!(socket == NULL)) {
+    if (!is_pooled || has_error) {
+      destroy_socket_internal(socket);
+      socket = NULL;
+      if (is_pooled) {
+        // 归还占位
+        const std::string key = host + ":" + std::to_string(port);
+        RemotePool* pool = get_pool(key);
+        if (pool != NULL) {
+          std::lock_guard<std::mutex> lk(pool->mutex);
+          pool->in_use_count--;
+        }
+      }
+    } else {
+      // 健康连接归还到 idle 队列
+      const std::string key = host + ":" + std::to_string(port);
+      RemotePool* pool = get_or_create_pool(key);
+      {
         std::lock_guard<std::mutex> lk(pool->mutex);
         pool->in_use_count--;
+        PooledConn conn;
+        conn.socket = socket;
+        conn.last_used_ms = now_ms();
+        pool->idle.push_back(conn);
       }
+      socket = NULL;
     }
-    return;
   }
-
-  // 健康连接归还到 idle 队列
-  const std::string key  = host + ":" + std::to_string(port);
-  RemotePool*       pool = get_or_create_pool(key);
-  {
-    std::lock_guard<std::mutex> lk(pool->mutex);
-    pool->in_use_count--;
-    PooledConn conn;
-    conn.socket       = socket;
-    conn.last_used_ms = now_ms();
-    pool->idle.push_back(conn);
-  }
-  socket = NULL;
 }
 
 // ---------------------------------------------------------------------------

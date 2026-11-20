@@ -47,19 +47,18 @@ class RedisAuthTest
   {
     if (!check_redis_availability()) {
       std::cout << "Redis server not available, skipping Redis tests" << std::endl;
-      return;
+    } else {
+      test_initialization();
+      test_user_management();
+      test_authentication();
+      test_topic_permissions();
+      test_super_user();
+      test_local_cache();
+      test_performance();
+      test_concurrent_access();
+      test_error_handling();
+      test_redis_operations();
     }
-
-    test_initialization();
-    test_user_management();
-    test_authentication();
-    test_topic_permissions();
-    test_super_user();
-    test_local_cache();
-    test_performance();
-    test_concurrent_access();
-    test_error_handling();
-    test_redis_operations();
   }
 
  private:

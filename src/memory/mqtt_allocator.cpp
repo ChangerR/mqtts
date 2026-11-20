@@ -41,68 +41,75 @@ void MQTTMemoryManager::sub_tag_usage(MQTTMemoryTag tag, size_t size)
 
 size_t MQTTMemoryManager::get_tag_usage(MQTTMemoryTag tag)
 {
+  size_t ret = 0;
   size_t index = static_cast<size_t>(tag);
   if (index < tag_usage_vector_.size()) {
-    return tag_usage_vector_[index]->load();
+    ret = tag_usage_vector_[index]->load();
+  } else {
+    ret = 0;
   }
-  return 0;
+  return ret;
 }
 
 void* MQTTAllocator::allocate(size_t size)
 {
+  void* ret = NULL;
   // Check memory limit
   if (limit_ > 0 && usage_ + size > limit_) {
     LOG_WARN(
         "Memory allocation failed: limit exceeded for id {} tag {} (limit: {}, used: {}, "
         "requested: {})",
         id_.c_str(), get_memory_tag_str(tag_), limit_, usage_.load(), size);
-    return nullptr;
-  }
-  // Allocate memory using tcmalloc
-  void* ptr = tc_malloc(size);
-  if (ptr) {
-    usage_ += size;
-    
-    // Safely access the memory manager
-    try {
-      MQTTMemoryManager::get_instance().add_tag_usage(tag_, size);
-    } catch (...) {
-      // Ignore errors during shutdown
+    ret = nullptr;
+  } else {
+    // Allocate memory using tcmalloc
+    void* ptr = tc_malloc(size);
+    if (ptr) {
+      usage_ += size;
+
+      // Safely access the memory manager
+      try {
+        MQTTMemoryManager::get_instance().add_tag_usage(tag_, size);
+      } catch (...) {
+        // Ignore errors during shutdown
+      }
+
+      LOG_DEBUG("Allocated {} bytes for id {} tag {} (used: {}/{})", size, id_.c_str(),
+                get_memory_tag_str(tag_), usage_.load(), limit_);
     }
-    
-    LOG_DEBUG("Allocated {} bytes for id {} tag {} (used: {}/{})", size, id_.c_str(),
-              get_memory_tag_str(tag_), usage_.load(), limit_);
+    ret = ptr;
   }
-  return ptr;
+  return ret;
 }
 
 void MQTTAllocator::deallocate(void* ptr, size_t size)
 {
-  if (!ptr)
-    return;
-
-  tc_free(ptr);
-  usage_ -= size;
-  
-  // Safely access the memory manager
-  try {
-    MQTTMemoryManager::get_instance().sub_tag_usage(tag_, size);
-  } catch (...) {
-    // Ignore errors during shutdown
+  if (ptr) {
+    tc_free(ptr);
+    usage_ -= size;
+    // Safely access the memory manager
+    try {
+      MQTTMemoryManager::get_instance().sub_tag_usage(tag_, size);
+    } catch (...) {
+      // Ignore errors during shutdown
+    }
+    LOG_DEBUG("Freed {} bytes from id {} tag {} (used: {}/{})", size, id_.c_str(),
+              get_memory_tag_str(tag_), usage_.load(), limit_);
   }
-  
-  LOG_DEBUG("Freed {} bytes from id {} tag {} (used: {}/{})", size, id_.c_str(),
-            get_memory_tag_str(tag_), usage_.load(), limit_);
 }
 
 MQTTAllocator* MQTTAllocator::create_child(const std::string& child_id, MQTTMemoryTag tag,
                                            size_t limit)
 {
-  if (children_.count(child_id))
-    return nullptr;
-  MQTTAllocator* child = new MQTTAllocator(child_id, tag, limit, this);
-  children_[child_id] = child;
-  return child;
+  MQTTAllocator* ret = NULL;
+  if (children_.count(child_id)) {
+    ret = nullptr;
+  } else {
+    MQTTAllocator* child = new MQTTAllocator(child_id, tag, limit, this);
+    children_[child_id] = child;
+    ret = child;
+  }
+  return ret;
 }
 
 void MQTTAllocator::remove_child(const std::string& child_id)

@@ -28,32 +28,36 @@ class SimpleJSONParser
 
   static int extract_int_value(const std::string& json, const std::string& key)
   {
+    int ret = 0;
     std::string search_key = "\"" + key + "\":";
     size_t start = json.find(search_key);
     if (start == std::string::npos) {
-      return -1;
+      ret = -1;
+    } else {
+      start += search_key.length();
+      size_t end = json.find_first_of(",}", start);
+      if (end == std::string::npos) {
+        ret = -1;
+      } else {
+        std::string value_str = json.substr(start, end - start);
+        ret = std::stoi(value_str);
+      }
     }
-
-    start += search_key.length();
-    size_t end = json.find_first_of(",}", start);
-    if (end == std::string::npos) {
-      return -1;
-    }
-
-    std::string value_str = json.substr(start, end - start);
-    return std::stoi(value_str);
+    return ret;
   }
 
   static bool extract_bool_value(const std::string& json, const std::string& key)
   {
+    bool ret = false;
     std::string search_key = "\"" + key + "\":";
     size_t start = json.find(search_key);
     if (start == std::string::npos) {
-      return false;
+      ret = false;
+    } else {
+      start += search_key.length();
+      ret = json.substr(start, 4) == "true";
     }
-
-    start += search_key.length();
-    return json.substr(start, 4) == "true";
+    return ret;
   }
 };
 
@@ -179,40 +183,41 @@ class SimpleMQTTBridge
 
   int parse_json_publish(const std::string& json, PublishMessage& msg)
   {
+    int ret = 0;
     if (json.find("\"type\":\"publish\"") == std::string::npos) {
-      return -1;
+      ret = -1;
+    } else {
+      msg.topic = SimpleJSONParser::extract_string_value(json, "topic");
+      if (msg.topic.empty()) {
+        ret = -1;
+      } else {
+        std::string payload_b64 = SimpleJSONParser::extract_string_value(json, "payload");
+        if (!payload_b64.empty()) {
+          msg.payload = SimpleBase64::decode(payload_b64);
+        }
+        msg.qos = static_cast<uint8_t>(SimpleJSONParser::extract_int_value(json, "qos"));
+        msg.retain = SimpleJSONParser::extract_bool_value(json, "retain");
+        ret = 0;
+      }
     }
-
-    msg.topic = SimpleJSONParser::extract_string_value(json, "topic");
-    if (msg.topic.empty()) {
-      return -1;
-    }
-
-    std::string payload_b64 = SimpleJSONParser::extract_string_value(json, "payload");
-    if (!payload_b64.empty()) {
-      msg.payload = SimpleBase64::decode(payload_b64);
-    }
-
-    msg.qos = static_cast<uint8_t>(SimpleJSONParser::extract_int_value(json, "qos"));
-    msg.retain = SimpleJSONParser::extract_bool_value(json, "retain");
-
-    return 0;
+    return ret;
   }
 
   int parse_json_subscribe(const std::string& json, SubscribeMessage& msg)
   {
+    int ret = 0;
     if (json.find("\"type\":\"subscribe\"") == std::string::npos) {
-      return -1;
+      ret = -1;
+    } else {
+      msg.topic_filter = SimpleJSONParser::extract_string_value(json, "topic_filter");
+      if (msg.topic_filter.empty()) {
+        ret = -1;
+      } else {
+        msg.qos = static_cast<uint8_t>(SimpleJSONParser::extract_int_value(json, "qos"));
+        ret = 0;
+      }
     }
-
-    msg.topic_filter = SimpleJSONParser::extract_string_value(json, "topic_filter");
-    if (msg.topic_filter.empty()) {
-      return -1;
-    }
-
-    msg.qos = static_cast<uint8_t>(SimpleJSONParser::extract_int_value(json, "qos"));
-
-    return 0;
+    return ret;
   }
 
   std::string generate_json_publish(const PublishMessage& msg)
@@ -246,50 +251,44 @@ class SimpleMQTTBridge
 
   int parse_text_publish(const std::string& text, PublishMessage& msg)
   {
+    int ret = 0;
     std::istringstream iss(text);
     std::string command;
     std::string qos_str, retain_str;
-
     if (!(iss >> command >> msg.topic >> qos_str >> retain_str)) {
-      return -1;
+      ret = -1;
+    } else if (command != "PUB") {
+      ret = -1;
+    } else {
+      msg.qos = static_cast<uint8_t>(std::stoi(qos_str));
+      msg.retain = (std::stoi(retain_str) != 0);
+      // Read the rest as payload
+      std::string payload_str;
+      std::getline(iss, payload_str);
+      if (!payload_str.empty() && payload_str[0] == ' ') {
+        payload_str = payload_str.substr(1);  // Remove leading space
+      }
+      msg.payload = std::vector<uint8_t>(payload_str.begin(), payload_str.end());
+      ret = 0;
     }
-
-    if (command != "PUB") {
-      return -1;
-    }
-
-    msg.qos = static_cast<uint8_t>(std::stoi(qos_str));
-    msg.retain = (std::stoi(retain_str) != 0);
-
-    // Read the rest as payload
-    std::string payload_str;
-    std::getline(iss, payload_str);
-    if (!payload_str.empty() && payload_str[0] == ' ') {
-      payload_str = payload_str.substr(1);  // Remove leading space
-    }
-
-    msg.payload = std::vector<uint8_t>(payload_str.begin(), payload_str.end());
-
-    return 0;
+    return ret;
   }
 
   int parse_text_subscribe(const std::string& text, SubscribeMessage& msg)
   {
+    int ret = 0;
     std::istringstream iss(text);
     std::string command;
     std::string qos_str;
-
     if (!(iss >> command >> msg.topic_filter >> qos_str)) {
-      return -1;
+      ret = -1;
+    } else if (command != "SUB") {
+      ret = -1;
+    } else {
+      msg.qos = static_cast<uint8_t>(std::stoi(qos_str));
+      ret = 0;
     }
-
-    if (command != "SUB") {
-      return -1;
-    }
-
-    msg.qos = static_cast<uint8_t>(std::stoi(qos_str));
-
-    return 0;
+    return ret;
   }
 };
 

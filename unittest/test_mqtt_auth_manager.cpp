@@ -169,21 +169,22 @@ class MockAuthProvider : public IAuthProvider
 
   bool match_topic_pattern(const std::string& topic, const std::string& pattern)
   {
-    if (pattern == "#")
-      return true;
-    if (pattern.find('+') == std::string::npos && pattern.find('#') == std::string::npos) {
-      return topic == pattern;
+    bool ret = false;
+    if (pattern == "#") {
+      ret = true;
+    } else if (pattern.find('+') == std::string::npos && pattern.find('#') == std::string::npos) {
+      ret = topic == pattern;
+    } else {
+      // 简单的通配符匹配
+      if (pattern == "test/+") {
+        ret = topic.substr(0, 5) == "test/" && topic.find('/', 5) == std::string::npos;
+      } else if (pattern == "home/#") {
+        ret = topic.substr(0, 5) == "home/";
+      } else {
+        ret = false;
+      }
     }
-
-    // 简单的通配符匹配
-    if (pattern == "test/+") {
-      return topic.substr(0, 5) == "test/" && topic.find('/', 5) == std::string::npos;
-    }
-    if (pattern == "home/#") {
-      return topic.substr(0, 5) == "home/";
-    }
-
-    return false;
+    return ret;
   }
 };
 

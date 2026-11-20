@@ -111,32 +111,34 @@ bool has_control_characters(const uint8_t* data, size_t length)
 // Validate MQTT string according to MQTT v5.0 specification
 int validate_mqtt_string(const uint8_t* data, size_t length)
 {
+  int ret = 0;
   // Check for null pointer
   if (!data && length > 0) {
-    return MQ_STRING_ERR_INVALID_LENGTH;
+    ret = MQ_STRING_ERR_INVALID_LENGTH;
+  } else {
+    // Check length limit
+    if (length > MQTT_MAX_STRING_LENGTH) {
+      ret = MQ_STRING_ERR_STRING_TOO_LONG;
+    } else {
+      // Empty string is valid
+      if (length == 0) {
+        ret = MQ_STRING_SUCCESS;
+      } else {
+        // Validate UTF-8 encoding
+        if (!is_valid_utf8(data, length)) {
+          ret = MQ_STRING_ERR_INVALID_UTF8;
+        } else {
+          // Check for control characters
+          if (has_control_characters(data, length)) {
+            ret = MQ_STRING_ERR_INVALID_CONTROL_CHARS;
+          } else {
+            ret = MQ_STRING_SUCCESS;
+          }
+        }
+      }
+    }
   }
-
-  // Check length limit
-  if (length > MQTT_MAX_STRING_LENGTH) {
-    return MQ_STRING_ERR_STRING_TOO_LONG;
-  }
-
-  // Empty string is valid
-  if (length == 0) {
-    return MQ_STRING_SUCCESS;
-  }
-
-  // Validate UTF-8 encoding
-  if (!is_valid_utf8(data, length)) {
-    return MQ_STRING_ERR_INVALID_UTF8;
-  }
-
-  // Check for control characters
-  if (has_control_characters(data, length)) {
-    return MQ_STRING_ERR_INVALID_CONTROL_CHARS;
-  }
-
-  return MQ_STRING_SUCCESS;
+  return ret;
 }
 
 }  // namespace mqtt

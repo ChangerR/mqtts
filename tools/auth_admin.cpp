@@ -326,64 +326,61 @@ class AuthAdmin
     auto provider = get_current_provider();
     if (!provider) {
       std::cerr << "No provider initialized" << std::endl;
-      return;
+    } else {
+      AuthStats stats = provider->get_stats();
+      std::cout << "Authentication Statistics (" << provider->get_provider_name()
+                << "):" << std::endl;
+      std::cout << "  Total login attempts: " << stats.total_login_attempts << std::endl;
+      std::cout << "  Successful logins: " << stats.successful_logins << std::endl;
+      std::cout << "  Failed logins: " << stats.failed_logins << std::endl;
+      std::cout << "  Total topic checks: " << stats.total_topic_checks << std::endl;
+      std::cout << "  Topic access granted: " << stats.topic_access_granted << std::endl;
+      std::cout << "  Topic access denied: " << stats.topic_access_denied << std::endl;
+      std::cout << "  Cache hits: " << stats.cache_hits << std::endl;
+      std::cout << "  Cache misses: " << stats.cache_misses << std::endl;
+      std::cout << "  Provider healthy: " << (provider->is_healthy() ? "Yes" : "No") << std::endl;
     }
-
-    AuthStats stats = provider->get_stats();
-
-    std::cout << "Authentication Statistics (" << provider->get_provider_name()
-              << "):" << std::endl;
-    std::cout << "  Total login attempts: " << stats.total_login_attempts << std::endl;
-    std::cout << "  Successful logins: " << stats.successful_logins << std::endl;
-    std::cout << "  Failed logins: " << stats.failed_logins << std::endl;
-    std::cout << "  Total topic checks: " << stats.total_topic_checks << std::endl;
-    std::cout << "  Topic access granted: " << stats.topic_access_granted << std::endl;
-    std::cout << "  Topic access denied: " << stats.topic_access_denied << std::endl;
-    std::cout << "  Cache hits: " << stats.cache_hits << std::endl;
-    std::cout << "  Cache misses: " << stats.cache_misses << std::endl;
-    std::cout << "  Provider healthy: " << (provider->is_healthy() ? "Yes" : "No") << std::endl;
   }
 
   int test_authentication(const std::string& username, const std::string& password)
   {
+    int ret = 0;
     auto provider = get_current_provider();
     if (!provider) {
       std::cerr << "No provider initialized" << std::endl;
-      return -1;
+      ret = -1;
+    } else {
+      MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+      MQTTString mqtt_password = to_mqtt_string(password, allocator_);
+      MQTTString client_id = to_mqtt_string("test_client", allocator_);
+      MQTTString client_ip = to_mqtt_string("127.0.0.1", allocator_);
+      UserInfo user_info(allocator_);
+      AuthResult result = provider->authenticate_user(mqtt_username, mqtt_password, client_id,
+                                                      client_ip, 1883, user_info);
+      std::cout << "Authentication test for user '" << username << "': ";
+      switch (result) {
+        case AuthResult::SUCCESS:
+          std::cout << "SUCCESS" << std::endl;
+          std::cout << "  User info:" << std::endl;
+          std::cout << "    Username: " << from_mqtt_string(user_info.username) << std::endl;
+          std::cout << "    Super user: " << (user_info.is_super_user ? "Yes" : "No") << std::endl;
+          break;
+        case AuthResult::INVALID_CREDENTIALS:
+          std::cout << "FAILED - Invalid credentials" << std::endl;
+          break;
+        case AuthResult::USER_NOT_FOUND:
+          std::cout << "FAILED - User not found" << std::endl;
+          break;
+        case AuthResult::ACCESS_DENIED:
+          std::cout << "FAILED - Access denied" << std::endl;
+          break;
+        default:
+          std::cout << "FAILED - Internal error" << std::endl;
+          break;
+      }
+      ret = result == AuthResult::SUCCESS ? 0 : -1;
     }
-
-    MQTTString mqtt_username = to_mqtt_string(username, allocator_);
-    MQTTString mqtt_password = to_mqtt_string(password, allocator_);
-    MQTTString client_id = to_mqtt_string("test_client", allocator_);
-    MQTTString client_ip = to_mqtt_string("127.0.0.1", allocator_);
-
-    UserInfo user_info(allocator_);
-    AuthResult result = provider->authenticate_user(mqtt_username, mqtt_password, client_id,
-                                                    client_ip, 1883, user_info);
-
-    std::cout << "Authentication test for user '" << username << "': ";
-    switch (result) {
-      case AuthResult::SUCCESS:
-        std::cout << "SUCCESS" << std::endl;
-        std::cout << "  User info:" << std::endl;
-        std::cout << "    Username: " << from_mqtt_string(user_info.username) << std::endl;
-        std::cout << "    Super user: " << (user_info.is_super_user ? "Yes" : "No") << std::endl;
-        break;
-      case AuthResult::INVALID_CREDENTIALS:
-        std::cout << "FAILED - Invalid credentials" << std::endl;
-        break;
-      case AuthResult::USER_NOT_FOUND:
-        std::cout << "FAILED - User not found" << std::endl;
-        break;
-      case AuthResult::ACCESS_DENIED:
-        std::cout << "FAILED - Access denied" << std::endl;
-        break;
-      default:
-        std::cout << "FAILED - Internal error" << std::endl;
-        break;
-    }
-
-    return result == AuthResult::SUCCESS ? 0 : -1;
+    return ret;
   }
 
   int test_topic_permission(const std::string& username, const std::string& topic,

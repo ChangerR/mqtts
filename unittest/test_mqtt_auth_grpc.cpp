@@ -18,35 +18,55 @@ public:
   std::atomic<bool> delta{false};
   std::atomic<int> ttl{100}, age{600};
   grpc::Status GetRevision(grpc::ServerContext*, const pb::RevisionRequest* req, pb::RevisionResponse* out) override {
-    if (mode == 3) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "offline");
-    const int current = version;
-    out->set_revision(std::to_string(current));
-    if (delta && (req->known_revision() == std::to_string(current) || req->known_revision() == std::to_string(current - 1))) {
-      out->set_is_delta(true);
-      if (req->known_revision() != out->revision()) out->add_invalidated_usernames("fixture");
+    grpc::Status ret{};
+    if (mode == 3) {
+      ret = grpc::Status(grpc::StatusCode::UNAVAILABLE, "offline");
+    } else {
+      const int current = version;
+      out->set_revision(std::to_string(current));
+      if (delta && (req->known_revision() == std::to_string(current) ||
+                    req->known_revision() == std::to_string(current - 1))) {
+        out->set_is_delta(true);
+        if (req->known_revision() != out->revision())
+          out->add_invalidated_usernames("fixture");
+      }
+      ret = grpc::Status::OK;
     }
-    return grpc::Status::OK;
+    return ret;
   }
   grpc::Status BatchAuthorize(grpc::ServerContext* context, const pb::BatchAuthorizeRequest* req, pb::BatchAuthorizeResponse* out) override {
+    grpc::Status ret{};
     ++calls;
     auto headers = context->client_metadata().find("authorization");
     assert(headers != context->client_metadata().end());
-    assert(std::string(headers->second.data(), headers->second.size()) == "Bearer " + std::string(40, 'q'));
-    assert(req->requests_size() <= 32); largest = std::max(largest.load(), req->requests_size());
+    assert(std::string(headers->second.data(), headers->second.size()) ==
+           "Bearer " + std::string(40, 'q'));
+    assert(req->requests_size() <= 32);
+    largest = std::max(largest.load(), req->requests_size());
     const int revision = version, current_mode = mode;
-    if (delay) std::this_thread::sleep_for(milliseconds(delay.load()));
-    if (current_mode == 3) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "offline");
-    for (int i = req->requests_size() - 1; i >= 0; --i) {
-      const auto& request = req->requests(i);
-      auto* result = out->add_results();
-      result->set_request_id(current_mode == 1 ? 999999 : request.request_id());
-      auto* decision = result->mutable_decision();
-      decision->set_outcome(request.topic().find("denied") != std::string::npos || current_mode == 2 || (current_mode == 4 && request.username() == "fixture") ? pb::DENY : pb::ALLOW);
-      decision->set_cache_revision(std::to_string(revision));
-      decision->set_cache_ttl_ms(ttl); decision->set_cache_max_age_ms(age);
-      decision->set_expires_at_ms(wall() + age);
+    if (delay)
+      std::this_thread::sleep_for(milliseconds(delay.load()));
+    if (current_mode == 3) {
+      ret = grpc::Status(grpc::StatusCode::UNAVAILABLE, "offline");
+    } else {
+      for (int i = req->requests_size() - 1; i >= 0; --i) {
+        const auto& request = req->requests(i);
+        auto* result = out->add_results();
+        result->set_request_id(current_mode == 1 ? 999999 : request.request_id());
+        auto* decision = result->mutable_decision();
+        decision->set_outcome(request.topic().find("denied") != std::string::npos ||
+                                      current_mode == 2 ||
+                                      (current_mode == 4 && request.username() == "fixture")
+                                  ? pb::DENY
+                                  : pb::ALLOW);
+        decision->set_cache_revision(std::to_string(revision));
+        decision->set_cache_ttl_ms(ttl);
+        decision->set_cache_max_age_ms(age);
+        decision->set_expires_at_ms(wall() + age);
+      }
+      ret = grpc::Status::OK;
     }
-    return grpc::Status::OK;
+    return ret;
   }
 };
 

@@ -23,12 +23,15 @@ struct SessionTakeoverGate
 
   bool cancel()
   {
+    bool ret = false;
     int expected = 0;
     if (!phase.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
-      return false;
+      ret = false;
+    } else {
+      done.store(true, std::memory_order_release);
+      ret = true;
     }
-    done.store(true, std::memory_order_release);
-    return true;
+    return ret;
   }
 };
 

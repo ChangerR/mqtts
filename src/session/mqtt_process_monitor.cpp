@@ -57,17 +57,13 @@ int ProcessMonitor::start()
 
 void ProcessMonitor::stop()
 {
-  if (!running_.load()) {
-    return;
+  if (!(!running_.load())) {
+    running_.store(false);
+    if (monitor_thread_ && monitor_thread_->joinable()) {
+      monitor_thread_->join();
+    }
+    LOG_INFO("Process monitor stopped");
   }
-
-  running_.store(false);
-
-  if (monitor_thread_ && monitor_thread_->joinable()) {
-    monitor_thread_->join();
-  }
-
-  LOG_INFO("Process monitor stopped");
 }
 
 void ProcessMonitor::monitor_loop()
@@ -132,45 +128,37 @@ void ProcessMonitor::collect_memory_stats(ProcessStats& stats)
 
 void ProcessMonitor::collect_connection_stats(ProcessStats& stats)
 {
-  if (!session_manager_) {
-    return;
-  }
-
-  // 获取线程数量
-  stats.total_threads = session_manager_->get_thread_count();
-
-  // 获取总连接数和活跃连接数
-  size_t total_handlers = 0;
-  size_t active_handlers = 0;
-
-  int result = session_manager_->get_total_handler_count(total_handlers);
-  if (result == MQ_SUCCESS) {
-    stats.total_connections = total_handlers;
-    stats.active_connections = total_handlers;  // 假设所有连接都是活跃的
-  }
-
-  // 获取待处理消息数
-  size_t pending_count = 0;
-  result = session_manager_->get_total_pending_message_count(pending_count);
-  if (result == MQ_SUCCESS) {
-    stats.pending_messages = pending_count;
+  if (session_manager_) {
+    // 获取线程数量
+    stats.total_threads = session_manager_->get_thread_count();
+    // 获取总连接数和活跃连接数
+    size_t total_handlers = 0;
+    size_t active_handlers = 0;
+    int result = session_manager_->get_total_handler_count(total_handlers);
+    if (result == MQ_SUCCESS) {
+      stats.total_connections = total_handlers;
+      stats.active_connections = total_handlers;  // 假设所有连接都是活跃的
+    }
+    // 获取待处理消息数
+    size_t pending_count = 0;
+    result = session_manager_->get_total_pending_message_count(pending_count);
+    if (result == MQ_SUCCESS) {
+      stats.pending_messages = pending_count;
+    }
   }
 }
 
 void ProcessMonitor::collect_topic_stats(ProcessStats& stats)
 {
-  if (!session_manager_) {
-    return;
-  }
-
-  // 获取topic tree统计信息
-  size_t subscriber_count = 0;
-  size_t node_count = 0;
-
-  int result = session_manager_->get_topic_tree_stats(subscriber_count, node_count);
-  if (result == MQ_SUCCESS) {
-    stats.total_subscribers = subscriber_count;
-    stats.total_topic_nodes = node_count;
+  if (session_manager_) {
+    // 获取topic tree统计信息
+    size_t subscriber_count = 0;
+    size_t node_count = 0;
+    int result = session_manager_->get_topic_tree_stats(subscriber_count, node_count);
+    if (result == MQ_SUCCESS) {
+      stats.total_subscribers = subscriber_count;
+      stats.total_topic_nodes = node_count;
+    }
   }
 }
 
@@ -180,14 +168,12 @@ void ProcessMonitor::print_status_once()
   int result = get_process_stats(stats);
   if (result != MQ_SUCCESS) {
     LOG_ERROR("Failed to get process stats: {}", result);
-    return;
-  }
-
-  print_process_stats(stats);
-
-  // 如果配置了JSON输出文件，同时写入JSON格式
-  if (!json_output_file_.empty()) {
-    write_json_stats_to_file(stats);
+  } else {
+    print_process_stats(stats);
+    // 如果配置了JSON输出文件，同时写入JSON格式
+    if (!json_output_file_.empty()) {
+      write_json_stats_to_file(stats);
+    }
   }
 }
 

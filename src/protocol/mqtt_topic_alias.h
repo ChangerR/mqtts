@@ -97,14 +97,13 @@ class InboundTopicAliases
 
   void reset()
   {
-    if (entries_ == nullptr) {
-      return;
+    if (!(entries_ == nullptr)) {
+      entries_->~Map();
+      if (allocator_ != nullptr) {
+        allocator_->deallocate(entries_, sizeof(Map));
+      }
+      entries_ = nullptr;
     }
-    entries_->~Map();
-    if (allocator_ != nullptr) {
-      allocator_->deallocate(entries_, sizeof(Map));
-    }
-    entries_ = nullptr;
   }
 
   MQTTAllocator* allocator_;

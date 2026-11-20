@@ -120,25 +120,23 @@ int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int prior
 
 int AuthManager::remove_provider(const std::string& provider_name)
 {
+  int ret = 0;
   LOG_INFO("Removing auth provider: {}", provider_name);
-
   std::unique_lock<std::mutex> lock(providers_mutex_);
-
   auto it = std::find_if(providers_.begin(), providers_.end(),
                          [&provider_name](const ProviderEntry& entry) {
                            return std::string(entry.provider->get_provider_name()) == provider_name;
                          });
-
   if (it == providers_.end()) {
     LOG_WARN("Auth provider '{}' not found", provider_name);
-    return MQ_ERR_NOT_FOUND_V2;
+    ret = MQ_ERR_NOT_FOUND_V2;
+  } else {
+    it->provider->cleanup();
+    providers_.erase(it);
+    LOG_INFO("Successfully removed auth provider: {}", provider_name);
+    ret = MQ_SUCCESS;
   }
-
-  it->provider->cleanup();
-  providers_.erase(it);
-
-  LOG_INFO("Successfully removed auth provider: {}", provider_name);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 AuthResult AuthManager::authenticate_user(const MQTTString& username, const MQTTString& password,
@@ -498,64 +496,57 @@ std::string AuthManager::make_cache_key(const MQTTString& username,
 bool AuthManager::get_from_cache(const std::string& key, AuthResult& result,
                                  UserInfo& user_info) const
 {
+  bool ret = false;
   std::unique_lock<std::mutex> lock(cache_mutex_);
-
   auto it = auth_cache_.find(key);
   if (it == auth_cache_.end()) {
-    return false;
+    ret = false;
+  } else {
+    const CacheEntry& entry = it->second;
+    if (std::chrono::steady_clock::now() > entry.expire_time) {
+      ret = false;
+    } else {
+      result = entry.result;
+      // 复制用户信息
+      user_info.username = entry.user_info.username;
+      user_info.client_id = entry.user_info.client_id;
+      user_info.client_ip = entry.user_info.client_ip;
+      user_info.client_port = entry.user_info.client_port;
+      user_info.is_super_user = entry.user_info.is_super_user;
+      ret = true;
+    }
   }
-
-  const CacheEntry& entry = it->second;
-  if (std::chrono::steady_clock::now() > entry.expire_time) {
-    return false;
-  }
-
-  result = entry.result;
-  // 复制用户信息
-  user_info.username = entry.user_info.username;
-  user_info.client_id = entry.user_info.client_id;
-  user_info.client_ip = entry.user_info.client_ip;
-  user_info.client_port = entry.user_info.client_port;
-  user_info.is_super_user = entry.user_info.is_super_user;
-
-  return true;
+  return ret;
 }
 
 void AuthManager::put_to_cache(const std::string& key, AuthResult result, const UserInfo& user_info)
 {
-  if (!cache_enabled_) {
-    return;
+  if (cache_enabled_) {
+    std::unique_lock<std::mutex> lock(cache_mutex_);
+    CacheEntry entry(allocator_);
+    entry.result = result;
+    entry.user_info.username = user_info.username;
+    entry.user_info.client_id = user_info.client_id;
+    entry.user_info.client_ip = user_info.client_ip;
+    entry.user_info.client_port = user_info.client_port;
+    entry.user_info.is_super_user = user_info.is_super_user;
+    entry.expire_time = std::chrono::steady_clock::now() + std::chrono::seconds(cache_ttl_seconds_);
+    auth_cache_.emplace(key, std::move(entry));
   }
-
-  std::unique_lock<std::mutex> lock(cache_mutex_);
-
-  CacheEntry entry(allocator_);
-  entry.result = result;
-  entry.user_info.username = user_info.username;
-  entry.user_info.client_id = user_info.client_id;
-  entry.user_info.client_ip = user_info.client_ip;
-  entry.user_info.client_port = user_info.client_port;
-  entry.user_info.is_super_user = user_info.is_super_user;
-  entry.expire_time = std::chrono::steady_clock::now() + std::chrono::seconds(cache_ttl_seconds_);
-
-  auth_cache_.emplace(key, std::move(entry));
 }
 
 void AuthManager::cleanup_expired_cache()
 {
-  if (!cache_enabled_) {
-    return;
-  }
-
-  std::unique_lock<std::mutex> lock(cache_mutex_);
-
-  auto now = std::chrono::steady_clock::now();
-  auto it = auth_cache_.begin();
-  while (it != auth_cache_.end()) {
-    if (now > it->second.expire_time) {
-      it = auth_cache_.erase(it);
-    } else {
-      ++it;
+  if (cache_enabled_) {
+    std::unique_lock<std::mutex> lock(cache_mutex_);
+    auto now = std::chrono::steady_clock::now();
+    auto it = auth_cache_.begin();
+    while (it != auth_cache_.end()) {
+      if (now > it->second.expire_time) {
+        it = auth_cache_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 }

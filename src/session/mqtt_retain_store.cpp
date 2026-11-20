@@ -26,16 +26,15 @@ RetainStore::~RetainStore()
 
 void RetainStore::destroy_node(Node* node)
 {
-  if (!node) {
-    return;
+  if (node) {
+    for (std::unordered_map<std::string, Node*>::iterator it = node->children.begin();
+         it != node->children.end(); ++it) {
+      destroy_node(it->second);
+    }
+    node->children.clear();
+    node->content.reset();
+    delete node;
   }
-  for (std::unordered_map<std::string, Node*>::iterator it = node->children.begin();
-       it != node->children.end(); ++it) {
-    destroy_node(it->second);
-  }
-  node->children.clear();
-  node->content.reset();
-  delete node;
 }
 
 std::vector<std::string> RetainStore::split(const std::string& topic)
@@ -56,10 +55,13 @@ std::vector<std::string> RetainStore::split(const std::string& topic)
 
 std::string RetainStore::join_topic(const std::string& parent, const std::string& segment, bool at_root)
 {
+  std::string ret{};
   if (at_root) {
-    return segment;
+    ret = std::move(segment);
+  } else {
+    ret = parent + "/" + segment;
   }
-  return parent + "/" + segment;
+  return ret;
 }
 
 RetainStore::Node* RetainStore::descend(Node* node, const std::vector<std::string>& segments, bool create)
@@ -102,41 +104,49 @@ void RetainStore::account_removed(size_t bytes)
 bool RetainStore::erase_at(Node* node, const std::string& topic, const std::vector<std::string>& segments,
                            size_t index, size_t& bytes)
 {
+  bool ret = false;
   if (index == segments.size()) {
     if (!node->has_message) {
-      return false;
+      ret = false;
+    } else {
+      unindex(node, topic);
+      bytes = node->payload_bytes;
+      node->content.reset();
+      node->has_message = false;
+      node->has_expiry = false;
+      node->payload_bytes = 0;
+      ret = true;
     }
-    unindex(node, topic);
-    bytes = node->payload_bytes;
-    node->content.reset();
-    node->has_message = false;
-    node->has_expiry = false;
-    node->payload_bytes = 0;
-    return true;
+  } else {
+    std::unordered_map<std::string, Node*>::iterator found = node->children.find(segments[index]);
+    if (found == node->children.end()) {
+      ret = false;
+    } else {
+      size_t removed = 0;
+      const bool erased = erase_at(found->second, topic, segments, index + 1, removed);
+      if (erased && found->second->children.empty() && !found->second->has_message) {
+        delete found->second;
+        node->children.erase(found);
+      }
+      bytes = removed;
+      ret = erased;
+    }
   }
-  std::unordered_map<std::string, Node*>::iterator found = node->children.find(segments[index]);
-  if (found == node->children.end()) {
-    return false;
-  }
-  size_t removed = 0;
-  const bool erased = erase_at(found->second, topic, segments, index + 1, removed);
-  if (erased && found->second->children.empty() && !found->second->has_message) {
-    delete found->second;
-    node->children.erase(found);
-  }
-  bytes = removed;
-  return erased;
+  return ret;
 }
 
 const char* RetainStore::warn_locked(const char* reason)
 {
+  const char* ret = NULL;
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
   if (warned_ && now - last_warn_ < std::chrono::seconds(1)) {
-    return nullptr;
+    ret = nullptr;
+  } else {
+    warned_ = true;
+    last_warn_ = now;
+    ret = reason;
   }
-  warned_ = true;
-  last_warn_ = now;
-  return reason;
+  return ret;
 }
 
 bool RetainStore::peek(const std::string& topic, RetainedCopy& out,
@@ -331,35 +341,32 @@ void RetainStore::offer(MatchPick& pick, RetainedCopy copy) const
 {
   if (pick.limit == 0) {
     pick.truncated = true;
-    return;
-  }
-  if (pick.best.size() < pick.limit) {
+  } else if (pick.best.size() < pick.limit) {
     pick.best.push(std::move(copy));
-    return;
+  } else {
+    if (copy.topic < pick.best.top().topic) {
+      pick.best.pop();
+      pick.best.push(std::move(copy));
+    }
+    pick.truncated = true;
   }
-  if (copy.topic < pick.best.top().topic) {
-    pick.best.pop();
-    pick.best.push(std::move(copy));
-  }
-  pick.truncated = true;
 }
 
 void RetainStore::consider(Node* node, const std::string& topic, std::chrono::steady_clock::time_point now,
                            MatchPick& pick, std::vector<std::string>& expired) const
 {
-  if (!node || !node->has_message || topic.empty()) {
-    return;
+  if (!(!node || !node->has_message || topic.empty())) {
+    if (node->has_expiry && now >= node->expires_at) {
+      expired.push_back(topic);
+    } else {
+      RetainedCopy copy;
+      copy.topic = topic;
+      copy.content = node->content;
+      copy.has_expiry = node->has_expiry;
+      copy.expires_at = node->expires_at;
+      offer(pick, std::move(copy));
+    }
   }
-  if (node->has_expiry && now >= node->expires_at) {
-    expired.push_back(topic);
-    return;
-  }
-  RetainedCopy copy;
-  copy.topic = topic;
-  copy.content = node->content;
-  copy.has_expiry = node->has_expiry;
-  copy.expires_at = node->expires_at;
-  offer(pick, std::move(copy));
 }
 
 void RetainStore::collect(Node* node, const std::string& topic, bool at_root,
@@ -380,37 +387,33 @@ void RetainStore::walk(Node* node, const std::string& topic, const std::vector<s
                        size_t index, bool root_level, std::chrono::steady_clock::time_point now,
                        MatchPick& pick, std::vector<std::string>& expired) const
 {
-  if (!node) {
-    return;
-  }
-  if (index == filter.size()) {
-    consider(node, topic, now, pick, expired);
-    return;
-  }
-  const std::string& segment = filter[index];
-  if (segment == "#") {
-    if (index + 1 != filter.size()) {
-      return;
-    }
-    collect(node, topic, root_level, now, pick, expired);
-    return;
-  }
-  if (segment == "+") {
-    for (std::unordered_map<std::string, Node*>::const_iterator it = node->children.begin();
-         it != node->children.end(); ++it) {
-      if (root_level && !it->first.empty() && it->first[0] == '$') {
-        continue;
+  if (node) {
+    if (index == filter.size()) {
+      consider(node, topic, now, pick, expired);
+    } else {
+      const std::string& segment = filter[index];
+      if (segment == "#") {
+        if (!(index + 1 != filter.size())) {
+          collect(node, topic, root_level, now, pick, expired);
+        }
+      } else if (segment == "+") {
+        for (std::unordered_map<std::string, Node*>::const_iterator it = node->children.begin();
+             it != node->children.end(); ++it) {
+          if (root_level && !it->first.empty() && it->first[0] == '$') {
+            continue;
+          }
+          walk(it->second, join_topic(topic, it->first, root_level), filter, index + 1, false, now,
+               pick, expired);
+        }
+      } else {
+        std::unordered_map<std::string, Node*>::const_iterator found = node->children.find(segment);
+        if (!(found == node->children.end())) {
+          walk(found->second, join_topic(topic, segment, root_level), filter, index + 1, false, now,
+               pick, expired);
+        }
       }
-      walk(it->second, join_topic(topic, it->first, root_level), filter, index + 1, false, now, pick,
-           expired);
     }
-    return;
   }
-  std::unordered_map<std::string, Node*>::const_iterator found = node->children.find(segment);
-  if (found == node->children.end()) {
-    return;
-  }
-  walk(found->second, join_topic(topic, segment, root_level), filter, index + 1, false, now, pick, expired);
 }
 
 void RetainStore::reclaim_expired(std::chrono::steady_clock::time_point now, int64_t& message_delta,
@@ -434,22 +437,21 @@ void RetainStore::purge(const std::vector<std::string>& topics, std::chrono::ste
 {
   message_delta = 0;
   byte_delta = 0;
-  if (topics.empty()) {
-    return;
-  }
-  WriteLockGuard lock(mutex_);
-  for (size_t i = 0; i < topics.size(); ++i) {
-    Node* node = descend(&root_, split(topics[i]), false);
-    if (!node || !node->has_message || !node->has_expiry || now < node->expires_at) {
-      continue;
+  if (!(topics.empty())) {
+    WriteLockGuard lock(mutex_);
+    for (size_t i = 0; i < topics.size(); ++i) {
+      Node* node = descend(&root_, split(topics[i]), false);
+      if (!node || !node->has_message || !node->has_expiry || now < node->expires_at) {
+        continue;
+      }
+      size_t bytes = 0;
+      if (!erase_at(&root_, topics[i], split(topics[i]), 0, bytes)) {
+        continue;
+      }
+      account_removed(bytes);
+      --message_delta;
+      byte_delta -= static_cast<int64_t>(bytes);
     }
-    size_t bytes = 0;
-    if (!erase_at(&root_, topics[i], split(topics[i]), 0, bytes)) {
-      continue;
-    }
-    account_removed(bytes);
-    --message_delta;
-    byte_delta -= static_cast<int64_t>(bytes);
   }
 }
 
