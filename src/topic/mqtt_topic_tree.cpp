@@ -222,13 +222,24 @@ int IntermediateNode::clone(IntermediateNode*& cloned_node) const
     return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
   }
 
-  cloned_node = new (memory) IntermediateNode(allocator_);
-  int ret = safe_copy_containers(cloned_node);
-  if (MQ_FAIL(ret)) {
-    destroy_intermediate_node(cloned_node);
-    cloned_node = nullptr;
+  try {
+    cloned_node = new (memory) IntermediateNode(allocator_);
+    int ret = safe_copy_containers(cloned_node);
+    if (MQ_FAIL(ret)) {
+      destroy_intermediate_node(cloned_node);
+      cloned_node = nullptr;
+    }
+    return ret;
+  } catch (const std::bad_alloc&) {
+    if (cloned_node) {
+      destroy_intermediate_node(cloned_node);
+      cloned_node = nullptr;
+    } else {
+      allocator_->deallocate(memory, sizeof(IntermediateNode));
+    }
+    LOG_ERROR("Failed to allocate memory while cloning IntermediateNode");
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
   }
-  return ret;
 }
 
 int IntermediateNode::add_child(const MQTTString& level, const TopicTreeNodePtr& child)
@@ -237,15 +248,19 @@ int IntermediateNode::add_child(const MQTTString& level, const TopicTreeNodePtr&
     return MQ_ERR_PARAM_V2;
   }
 
-  MQTTString owned_level = clone_to_tree_string(level, allocator_);
-  auto it = children_.find(owned_level);
-  if (it != children_.end()) {
-    it->second = child;
-    return MQ_SUCCESS;
-  }
+  try {
+    MQTTString owned_level = clone_to_tree_string(level, allocator_);
+    auto it = children_.find(owned_level);
+    if (it != children_.end()) {
+      it->second = child;
+      return MQ_SUCCESS;
+    }
 
-  auto result = children_.insert(std::make_pair(std::move(owned_level), child));
-  return result.second ? MQ_SUCCESS : MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+    auto result = children_.insert(std::make_pair(std::move(owned_level), child));
+    return result.second ? MQ_SUCCESS : MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  } catch (const std::bad_alloc&) {
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  }
 }
 
 int IntermediateNode::remove_child(const MQTTString& level)
@@ -264,14 +279,18 @@ int IntermediateNode::add_subscriber(const SubscriberInfo& subscriber)
     return MQ_ERR_TOPIC_TREE_INVALID_CLIENT;
   }
 
-  SubscriberInfo owned_subscriber = copy_subscriber(subscriber, allocator_);
-  auto existing = subscribers_.find(owned_subscriber);
-  if (existing != subscribers_.end()) {
-    subscribers_.erase(existing);
-  }
+  try {
+    SubscriberInfo owned_subscriber = copy_subscriber(subscriber, allocator_);
+    auto existing = subscribers_.find(owned_subscriber);
+    if (existing != subscribers_.end()) {
+      subscribers_.erase(existing);
+    }
 
-  auto result = subscribers_.insert(owned_subscriber);
-  return result.second ? MQ_SUCCESS : MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+    auto result = subscribers_.insert(owned_subscriber);
+    return result.second ? MQ_SUCCESS : MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  } catch (const std::bad_alloc&) {
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  }
 }
 
 int IntermediateNode::remove_subscriber(const MQTTString& client_id)
@@ -353,14 +372,21 @@ int TopicTreeNode::init()
     return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
   }
 
-  IntermediateNode* node = new (memory) IntermediateNode(allocator_);
-  intermediate_node_.store(node, std::memory_order_release);
-  return MQ_SUCCESS;
+  try {
+    IntermediateNode* node = new (memory) IntermediateNode(allocator_);
+    intermediate_node_.store(node, std::memory_order_release);
+    return MQ_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    allocator_->deallocate(memory, sizeof(IntermediateNode));
+    LOG_ERROR("Failed to allocate memory while constructing IntermediateNode");
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  }
 }
 
 IntermediateNode* TopicTreeNode::get_intermediate_node() const
 {
-  IntermediateNode* node = intermediate_node_.load(std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock(intermediate_mutex_);
+  IntermediateNode* node = intermediate_node_.load(std::memory_order_relaxed);
   intrusive_ptr_add_ref(node);
   return node;
 }
@@ -368,13 +394,16 @@ IntermediateNode* TopicTreeNode::get_intermediate_node() const
 bool TopicTreeNode::compare_and_swap_intermediate_node(IntermediateNode* expected,
                                                        IntermediateNode* desired)
 {
-  bool success =
-      intermediate_node_.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
-                                                 std::memory_order_acquire);
-  if (success) {
-    intrusive_ptr_release(expected);
+  {
+    std::lock_guard<std::mutex> lock(intermediate_mutex_);
+    IntermediateNode* current = intermediate_node_.load(std::memory_order_relaxed);
+    if (current != expected) {
+      return false;
+    }
+    intermediate_node_.store(desired, std::memory_order_release);
   }
-  return success;
+  intrusive_ptr_release(expected);
+  return true;
 }
 
 int TopicTreeNode::get_child(const MQTTString& level, TopicTreeNodePtr& child) const
@@ -737,58 +766,68 @@ int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTStr
 int ConcurrentTopicTree::subscribe(const MQTTString& topic_filter, const MQTTString& client_id,
                                    const SubscriptionOptions& options)
 {
-  if (!is_initialized()) {
-    return MQ_ERR_TOPIC_TREE;
-  }
+  try {
+    if (!is_initialized()) {
+      return MQ_ERR_TOPIC_TREE;
+    }
 
-  if (client_id.empty()) {
-    return MQ_ERR_PARAM_V2;
-  }
+    if (client_id.empty()) {
+      return MQ_ERR_PARAM_V2;
+    }
 
-  int ret = validate_topic_filter(topic_filter);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
+    int ret = validate_topic_filter(topic_filter);
+    if (MQ_FAIL(ret)) {
+      return ret;
+    }
 
-  TopicTreeLevelVector levels = make_level_vector(allocator_);
-  ret = split_topic_levels(topic_filter, levels);
-  if (MQ_FAIL(ret) || levels.empty()) {
-    return MQ_ERR_PARAM_V2;
-  }
+    TopicTreeLevelVector levels = make_level_vector(allocator_);
+    ret = split_topic_levels(topic_filter, levels);
+    if (MQ_FAIL(ret) || levels.empty()) {
+      return MQ_ERR_PARAM_V2;
+    }
 
-  TopicTreeNodePtr target_node;
-  ret = get_or_create_node(levels, true, target_node);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
+    TopicTreeNodePtr target_node;
+    ret = get_or_create_node(levels, true, target_node);
+    if (MQ_FAIL(ret)) {
+      return ret;
+    }
 
-  SubscriberInfo subscriber(client_id, options, allocator_);
-  return add_subscriber_to_node(target_node, subscriber);
+    SubscriberInfo subscriber(client_id, options, allocator_);
+    return add_subscriber_to_node(target_node, subscriber);
+  } catch (const std::bad_alloc&) {
+    LOG_ERROR("Topic tree subscribe failed with std::bad_alloc");
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  }
 }
 
 int ConcurrentTopicTree::unsubscribe(const MQTTString& topic_filter, const MQTTString& client_id)
 {
-  if (!is_initialized()) {
-    return MQ_ERR_TOPIC_TREE;
-  }
+  try {
+    if (!is_initialized()) {
+      return MQ_ERR_TOPIC_TREE;
+    }
 
-  if (topic_filter.empty() || client_id.empty()) {
-    return MQ_ERR_PARAM_V2;
-  }
+    if (topic_filter.empty() || client_id.empty()) {
+      return MQ_ERR_PARAM_V2;
+    }
 
-  TopicTreeLevelVector levels = make_level_vector(allocator_);
-  int ret = split_topic_levels(topic_filter, levels);
-  if (MQ_FAIL(ret) || levels.empty()) {
-    return MQ_ERR_PARAM_V2;
-  }
+    TopicTreeLevelVector levels = make_level_vector(allocator_);
+    int ret = split_topic_levels(topic_filter, levels);
+    if (MQ_FAIL(ret) || levels.empty()) {
+      return MQ_ERR_PARAM_V2;
+    }
 
-  TopicTreeNodePtr target_node;
-  ret = get_or_create_node(levels, false, target_node);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
+    TopicTreeNodePtr target_node;
+    ret = get_or_create_node(levels, false, target_node);
+    if (MQ_FAIL(ret)) {
+      return ret;
+    }
 
-  return remove_subscriber_from_node(target_node, client_id);
+    return remove_subscriber_from_node(target_node, client_id);
+  } catch (const std::bad_alloc&) {
+    LOG_ERROR("Topic tree unsubscribe failed with std::bad_alloc");
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
+  }
 }
 
 int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node,
@@ -875,39 +914,44 @@ int ConcurrentTopicTree::find_subscribers_recursive(const TopicTreeNodePtr& node
 
 int ConcurrentTopicTree::find_subscribers(const MQTTString& topic, TopicMatchResult& result) const
 {
-  if (!is_initialized()) {
-    return MQ_ERR_TOPIC_TREE;
+  try {
+    if (!is_initialized()) {
+      return MQ_ERR_TOPIC_TREE;
+    }
+
+    if (topic.empty()) {
+      return MQ_ERR_PARAM_V2;
+    }
+
+    result.subscribers.clear();
+    result.total_count = 0;
+
+    TopicTreeLevelVector levels = make_level_vector(allocator_);
+    int ret = split_topic_levels(topic, levels);
+    if (MQ_FAIL(ret)) {
+      return ret;
+    }
+
+    ret = find_subscribers_recursive(root_, levels, 0, result);
+    if (MQ_FAIL(ret)) {
+      return ret;
+    }
+
+    if (!result.subscribers.empty()) {
+      std::sort(result.subscribers.begin(), result.subscribers.end(),
+                [](const SubscriberInfo& a, const SubscriberInfo& b) {
+                  return from_mqtt_string(a.client_id) < from_mqtt_string(b.client_id);
+                });
+      result.subscribers.erase(std::unique(result.subscribers.begin(), result.subscribers.end()),
+                               result.subscribers.end());
+      result.total_count = result.subscribers.size();
+    }
+
+    return MQ_SUCCESS;
+  } catch (const std::bad_alloc&) {
+    LOG_ERROR("Topic tree find_subscribers failed with std::bad_alloc");
+    return MQ_ERR_TOPIC_TREE_MEMORY_ALLOC;
   }
-
-  if (topic.empty()) {
-    return MQ_ERR_PARAM_V2;
-  }
-
-  result.subscribers.clear();
-  result.total_count = 0;
-
-  TopicTreeLevelVector levels = make_level_vector(allocator_);
-  int ret = split_topic_levels(topic, levels);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  ret = find_subscribers_recursive(root_, levels, 0, result);
-  if (MQ_FAIL(ret)) {
-    return ret;
-  }
-
-  if (!result.subscribers.empty()) {
-    std::sort(result.subscribers.begin(), result.subscribers.end(),
-              [](const SubscriberInfo& a, const SubscriberInfo& b) {
-                return from_mqtt_string(a.client_id) < from_mqtt_string(b.client_id);
-              });
-    result.subscribers.erase(std::unique(result.subscribers.begin(), result.subscribers.end()),
-                             result.subscribers.end());
-    result.total_count = result.subscribers.size();
-  }
-
-  return MQ_SUCCESS;
 }
 
 int ConcurrentTopicTree::unsubscribe_all(const MQTTString& client_id)

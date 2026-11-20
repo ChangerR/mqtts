@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -397,14 +398,16 @@ TEST_F(TopicTreeTest, UnsubscribeAll)
 
 TEST_F(TopicTreeTest, EphemeralAllocatorInputSurvives)
 {
-  MQTTAllocator* input_allocator = create_standalone_allocator("ephemeral_input");
-  ASSERT_NE(input_allocator, nullptr);
+  {
+    std::unique_ptr<MQTTAllocator> input_allocator(
+        create_standalone_allocator("ephemeral_input"));
+    ASSERT_NE(input_allocator, nullptr);
 
-  MQTTString topic = to_mqtt_string("ephemeral/topic", input_allocator);
-  MQTTString client_id = to_mqtt_string("ephemeral_client", input_allocator);
+    MQTTString topic = to_mqtt_string("ephemeral/topic", input_allocator.get());
+    MQTTString client_id = to_mqtt_string("ephemeral_client", input_allocator.get());
 
-  EXPECT_EQ(tree->subscribe(topic, client_id, 1), MQ_SUCCESS);
-  delete input_allocator;
+    EXPECT_EQ(tree->subscribe(topic, client_id, 1), MQ_SUCCESS);
+  }
 
   TopicMatchResult result(tree_allocator);
   EXPECT_EQ(tree->find_subscribers(create_mqtt_string("ephemeral/topic"), result), MQ_SUCCESS);

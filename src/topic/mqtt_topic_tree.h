@@ -149,6 +149,9 @@ class TopicTreeNode
   MQTTAllocator* allocator_;
   std::atomic<IntermediateNode*> intermediate_node_;
   std::atomic<int> ref_count_;
+  // Serializes load+add_ref against CAS+release so a reader cannot resurrect
+  // an IntermediateNode that another thread has already destroyed.
+  mutable std::mutex intermediate_mutex_;
 
   IntermediateNode* get_intermediate_node() const;
   bool compare_and_swap_intermediate_node(IntermediateNode* expected, IntermediateNode* desired);
