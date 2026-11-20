@@ -1134,11 +1134,16 @@ int MQTTProtocolHandler::handle_connect(const ConnectPacket* packet)
         restored.no_local = sub.second.no_local;
         restored.retain_as_published = sub.second.retain_as_published;
         restored.retain_handling = sub.second.retain_handling;
-        if (add_subscription(filter, restored) != MQ_SUCCESS ||
-            session_manager_->subscribe_topic_with_router(filter, client_id_, restored) != MQ_SUCCESS)
-          throw std::runtime_error("persistent subscription restore failed");
+        if (MQ_FAIL(add_subscription(filter, restored)) ||
+            MQ_FAIL(session_manager_->subscribe_topic_with_router(filter, client_id_, restored))) {
+          ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+          break;
+        }
       }
     } catch (const std::exception&) {
+      ret = MQ_ERR_CONNECT_SERVER_UNAVAILABLE;
+    }
+    if (MQ_FAIL(ret)) {
       session_manager_->durable_store()->disconnect(from_mqtt_string(client_id_), durable_epoch_);
       durable_epoch_ = 0;
       session_manager_->unsubscribe_all_topics(client_id_);
@@ -1521,7 +1526,7 @@ int MQTTProtocolHandler::handle_unsubscribe(const UnsubscribePacket* packet)
     // 从全局session manager的topic tree中移除订阅（包括路由器）
     if (session_manager_) {
       int ret = session_manager_->unsubscribe_topic_with_router(topic, client_id_);
-      if (ret != MQ_SUCCESS) {
+      if (MQ_FAIL(ret)) {
         LOG_WARN("Failed to unregister subscription with session manager for client {}:{}, topic: {}, error: {}", 
                  client_ip_.c_str(), client_port_, from_mqtt_string(topic), ret);
       } else {
@@ -2748,7 +2753,7 @@ void MQTTProtocolHandler::pump_durable()
         const uint64_t payload_bytes = packet->payload.size();
         int ret = encoder.serialize_publish(packet, output);
         packets[i].reset();
-        if (ret != MQ_SUCCESS) {
+        if (MQ_FAIL(ret)) {
           if (!discard(DurableStore::DiscardReason::Malformed).ok)
             break;
           continue;

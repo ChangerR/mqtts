@@ -39,10 +39,13 @@ class InboundTopicAliases
     try {
       if (!topic.empty()) {
         MQTTString stored(topic.data(), topic.size(), MQTTStrAllocator(allocator_));
-        Map& table = ensure();
-        const auto found = table.find(alias);
-        if (found == table.end()) {
-          table.emplace(alias, std::move(stored));
+        Map* table = ensure();
+        if (MQ_ISNULL(table)) {
+          return Result::Quota;
+        }
+        const auto found = table->find(alias);
+        if (found == table->end()) {
+          table->emplace(alias, std::move(stored));
         } else {
           found->second.assign(stored.data(), stored.size());
         }
@@ -65,27 +68,31 @@ class InboundTopicAliases
  private:
   using Map = MQTTMap<uint16_t, MQTTString>;
 
-  Map& ensure()
+  Map* ensure()
   {
     if (entries_ != nullptr) {
-      return *entries_;
+      return entries_;
     }
     if (allocator_ == nullptr) {
-      throw std::bad_alloc();
+      return NULL;
     }
     void* memory = allocator_->allocate(sizeof(Map));
     if (memory == nullptr) {
-      throw std::bad_alloc();
+      return NULL;
     }
     try {
       entries_ =
           new (memory) Map(MQTTSTLAllocator<std::pair<const uint16_t, MQTTString>>(allocator_));
+    } catch (const std::bad_alloc&) {
+      allocator_->deallocate(memory, sizeof(Map));
+      entries_ = NULL;
+      return NULL;
     } catch (...) {
       allocator_->deallocate(memory, sizeof(Map));
-      entries_ = nullptr;
+      entries_ = NULL;
       throw;
     }
-    return *entries_;
+    return entries_;
   }
 
   void reset()

@@ -3,7 +3,8 @@
 
 #include "mqtt_buffer.h"
 
-static void test_endian_rw() {
+static void test_endian_rw()
+{
   MQTTAllocator allocator("test_buffer", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
   mqtt::MQTTBuffer buffer(&allocator);
 
@@ -28,7 +29,8 @@ static void test_endian_rw() {
   assert(buffer.get_uint64_le(v64) && v64 == 0x1112131415161718ULL);
 }
 
-static void test_string_and_serialize() {
+static void test_string_and_serialize()
+{
   MQTTAllocator allocator("test_buffer_str", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
   mqtt::MQTTBuffer buffer(&allocator);
 
@@ -46,7 +48,8 @@ static void test_string_and_serialize() {
   assert(out == mqtt::to_mqtt_string("hello", &allocator));
 }
 
-static void test_text_and_decimal_append() {
+static void test_text_and_decimal_append()
+{
   MQTTAllocator allocator("test_buffer_text", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
   mqtt::MQTTBuffer buffer(&allocator);
 
@@ -63,7 +66,8 @@ static void test_text_and_decimal_append() {
   assert(buffer.serialize() == mqtt::to_mqtt_string("-12345", &allocator));
 }
 
-static void test_serialize_empty_buffer() {
+static void test_serialize_empty_buffer()
+{
   MQTTAllocator allocator("test_buffer_empty", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
   mqtt::MQTTBuffer buffer(&allocator);
 
@@ -71,7 +75,8 @@ static void test_serialize_empty_buffer() {
   assert(serialized.empty());
 }
 
-static void test_resize_and_tail_write() {
+static void test_resize_and_tail_write()
+{
   MQTTAllocator allocator("test_buffer_resize", MQTTMemoryTag::MEM_TAG_CLIENT, 0);
   mqtt::MQTTBuffer buffer(&allocator);
 
@@ -86,7 +91,8 @@ static void test_resize_and_tail_write() {
   assert(buffer.size() == 8);
 }
 
-int main() {
+int main()
+{
   std::cout << "Running MQTTBuffer tests..." << std::endl;
   test_endian_rw();
   test_string_and_serialize();

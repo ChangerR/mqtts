@@ -41,7 +41,7 @@ int run_mqtt_server(const mqtt::Config& config)
   LOG_INFO("Starting MQTT server on {}:{}", config.server.bind_address, config.server.port);
 
   int ret = server.start();
-  if (ret != MQ_SUCCESS) {
+  if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to start MQTT server, error code: {}", ret);
     return 1;
   }
