@@ -269,6 +269,8 @@ static inline const char* mqtt_error_string(int error_code)
       return "Resource not found";
     case MQ_ERR_TIMEOUT_V2:
       return "Operation timeout";
+    case MQ_ERR_QUEUE_FULL:
+      return "Message queue is full";
     case MQ_ERR_AUTH:
       return "Authentication failed";
     case MQ_ERR_DATABASE:

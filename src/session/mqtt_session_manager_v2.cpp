@@ -1723,11 +1723,11 @@ int GlobalSessionManager::forward_publish(const MQTTString& target_client_id,
     LOG_WARN("Target client not found: {}", from_mqtt_string(target_client_id));
     ret = MQ_ERR_NOT_FOUND_V2;
   } else {
-    // 将消息加入目标线程的队列
     PendingMessage message(packet, target_client_id, sender_client_id);
-    thread_manager->enqueue_message(message);
-    LOG_DEBUG("Message forwarded to client: {}", from_mqtt_string(target_client_id));
-    ret = MQ_SUCCESS;
+    ret = thread_manager->enqueue_message(message);
+    if (ret == MQ_SUCCESS) {
+      LOG_DEBUG("Message forwarded to client: {}", from_mqtt_string(target_client_id));
+    }
   }
   return ret;
 }
@@ -1786,17 +1786,25 @@ int GlobalSessionManager::batch_forward_publish(const std::vector<MQTTString>& t
       }
     }
     int forwarded_count = 0;
-    // 批量转发到每个线程
+    bool queue_full = false;
     for (const auto& group : manager_groups) {
       ThreadLocalSessionManager* manager = group.first;
       const std::vector<MQTTString>& client_ids = group.second;
-
-      manager->enqueue_shared_messages(content, client_ids);
-      forwarded_count += client_ids.size();
+      const int enqueue_ret = manager->enqueue_shared_messages(content, client_ids);
+      if (enqueue_ret == MQ_SUCCESS) {
+        forwarded_count += static_cast<int>(client_ids.size());
+      } else if (enqueue_ret == MQ_ERR_QUEUE_FULL) {
+        queue_full = true;
+      } else {
+        ret = enqueue_ret;
+        break;
+      }
     }
-    LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", forwarded_count,
-              manager_groups.size());
-    ret = forwarded_count;
+    if (ret == 0) {
+      LOG_DEBUG("Batch forwarded shared message to {} clients across {} threads", forwarded_count,
+                manager_groups.size());
+      ret = queue_full ? MQ_ERR_QUEUE_FULL : forwarded_count;
+    }
   }
   return ret;
 }
@@ -2083,6 +2091,7 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   if (planned.empty())
     return int(persisted_count);
   int forwarded_count = int(persisted_count);
+  bool queue_full = false;
   try {
     // Previously every recipient copied the payload using the publisher's
     // 1-MiB allocator. A single 4-KiB publish to 500 recipients could exhaust
@@ -2110,8 +2119,14 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
           outbound = found->second;
         }
       }
-      if (forward_publish_shared(delivery.client_id, outbound) == MQ_SUCCESS)
+      const int enqueue_ret = forward_publish_shared(delivery.client_id, outbound);
+      if (enqueue_ret == MQ_SUCCESS) {
         ++forwarded_count;
+      } else if (enqueue_ret == MQ_ERR_QUEUE_FULL) {
+        // Keep delivering to other subscribers; the publisher must not get a
+        // success ACK for a publish we could not accept for every recipient.
+        queue_full = true;
+      }
     }
   } catch (const std::bad_alloc&) {
     LOG_WARN("Insufficient memory while queuing PUBLISH fanout");
@@ -2121,6 +2136,8 @@ int GlobalSessionManager::forward_publish_by_topic(const MQTTString& topic,
   LOG_DEBUG("Forwarded PUBLISH message to {} subscribers for topic: {}", forwarded_count,
             from_mqtt_string(topic));
 
+  if (queue_full)
+    return MQ_ERR_QUEUE_FULL;
   return forwarded_count;
 }
 
@@ -2166,9 +2183,19 @@ int GlobalSessionManager::forward_publish_by_topic_shared(const MQTTString& topi
         }
       }
     }
+    bool queue_full = false;
     for (const auto& group : groups) {
-      forwarded_count += batch_forward_publish(group.second, shaped[group.first]);
+      const int batch_ret = batch_forward_publish(group.second, shaped[group.first]);
+      if (batch_ret == MQ_ERR_QUEUE_FULL) {
+        queue_full = true;
+      } else if (batch_ret < 0) {
+        return batch_ret;
+      } else {
+        forwarded_count += batch_ret;
+      }
     }
+    if (queue_full)
+      return MQ_ERR_QUEUE_FULL;
   } catch (const std::bad_alloc&) {
     LOG_WARN("Insufficient memory while queuing shared PUBLISH fanout");
     return MQ_ERR_MEMORY_ALLOC;
@@ -2987,11 +3014,15 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
   bool router_enabled = false;
   bool strict_cluster_mode = false;
 
-  delivered_count = forward_publish_by_topic(topic, packet, sender_client_id);
+  const int local_delivered = forward_publish_by_topic(topic, packet, sender_client_id);
+  // Keep a local queue-full (or other negative) error off the recipient
+  // counter. Adding remote_delivered_count to MQ_ERR_QUEUE_FULL would either
+  // disconnect the publisher or, with enough remotes, Success-ACK a drop.
+  delivered_count = local_delivered < 0 ? 0 : local_delivered;
   router_enabled = (router_client_.get() != NULL);
   strict_cluster_mode = cluster_config_.cluster_enabled;
   if (!router_enabled) {
-    ret = delivered_count;
+    ret = local_delivered;
   } else {
     request.topic = topic;
     request.qos = packet.qos;
@@ -3006,7 +3037,7 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
     }
     ret = router_client_->route_publish(request, targets);
     if (MQ_ERR_ROUTER_ROUTE_EMPTY == ret) {
-      ret = delivered_count;
+      ret = local_delivered;
     } else if (MQ_SUCCESS == ret) {
       for (size_t i = 0; MQ_SUCCESS == ret && i < targets.size(); ++i) {
         int remote_delivered_count = 0;
@@ -3046,7 +3077,7 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
         }
       }
       if (MQ_SUCCESS == ret) {
-        ret = delivered_count;
+        ret = local_delivered < 0 ? local_delivered : delivered_count;
       }
     }
   }
