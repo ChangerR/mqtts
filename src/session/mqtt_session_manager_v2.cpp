@@ -3014,11 +3014,15 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
   bool router_enabled = false;
   bool strict_cluster_mode = false;
 
-  delivered_count = forward_publish_by_topic(topic, packet, sender_client_id);
+  const int local_delivered = forward_publish_by_topic(topic, packet, sender_client_id);
+  // Keep a local queue-full (or other negative) error off the recipient
+  // counter. Adding remote_delivered_count to MQ_ERR_QUEUE_FULL would either
+  // disconnect the publisher or, with enough remotes, Success-ACK a drop.
+  delivered_count = local_delivered < 0 ? 0 : local_delivered;
   router_enabled = (router_client_.get() != NULL);
   strict_cluster_mode = cluster_config_.cluster_enabled;
   if (!router_enabled) {
-    ret = delivered_count;
+    ret = local_delivered;
   } else {
     request.topic = topic;
     request.qos = packet.qos;
@@ -3033,7 +3037,7 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
     }
     ret = router_client_->route_publish(request, targets);
     if (MQ_ERR_ROUTER_ROUTE_EMPTY == ret) {
-      ret = delivered_count;
+      ret = local_delivered;
     } else if (MQ_SUCCESS == ret) {
       for (size_t i = 0; MQ_SUCCESS == ret && i < targets.size(); ++i) {
         int remote_delivered_count = 0;
@@ -3073,7 +3077,7 @@ int GlobalSessionManager::forward_publish_cluster(const MQTTString& topic,
         }
       }
       if (MQ_SUCCESS == ret) {
-        ret = delivered_count;
+        ret = local_delivered < 0 ? local_delivered : delivered_count;
       }
     }
   }

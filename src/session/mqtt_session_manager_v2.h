@@ -663,7 +663,8 @@ class GlobalSessionManager
    * @param topic 主题
    * @param packet 发布包
    * @param sender_client_id 发送者客户端ID
-   * @return 转发的目标数量，或 MQ_ERR_QUEUE_FULL / 其他负错误码
+   * @return 转发的目标数量，或 MQ_ERR_QUEUE_FULL / 其他负错误码。
+   *         本地 pending 队列满时即使远程投递成功也返回 MQ_ERR_QUEUE_FULL。
    */
   int forward_publish_via_router(const MQTTString& topic, const PublishPacket& packet,
                                 const MQTTString& sender_client_id);

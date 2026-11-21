@@ -1386,19 +1386,20 @@ int MQTTProtocolHandler::handle_publish(PublishPacket* packet)
       } else if (forward_ret == MQ_ERR_QUEUE_FULL) {
         // Live pending queue overflow. QoS 0 may drop. QoS 1/2 must not look like
         // success: MQTT 5 gets QuotaExceeded; MQTT 3.x has no reason code so the
-        // positive ACK is withheld and the client retries.
+        // positive ACK is withheld and the client retries. Release the inbound
+        // QoS 2 reservation in both cases so a later retry is not treated as a
+        // duplicate Success PUBREC.
         LOG_WARN("Live delivery queue full for topic: {}", from_mqtt_string(packet->topic_name));
+        if (qos2_tracked) {
+          release_inbound_qos2(packet->packet_id);
+          qos2_tracked = false;
+        }
         if (0 == packet->qos)
           return MQ_SUCCESS;
         if (negotiated_protocol_version_ >= 5 && 1 == packet->qos)
           return send_puback(packet->packet_id, ReasonCode::QuotaExceeded);
-        if (negotiated_protocol_version_ >= 5 && 2 == packet->qos) {
-          if (qos2_tracked) {
-            release_inbound_qos2(packet->packet_id);
-            qos2_tracked = false;
-          }
+        if (negotiated_protocol_version_ >= 5 && 2 == packet->qos)
           return send_pubrec(packet->packet_id, ReasonCode::QuotaExceeded);
-        }
         return MQ_SUCCESS;
       } else {
         LOG_WARN("Failed to forward PUBLISH message to subscribers for topic: {}, error: {}",
