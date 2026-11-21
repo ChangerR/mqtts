@@ -1043,6 +1043,9 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
     stats_.mqtt_messages_sent++;
     return MQ_SUCCESS;  // Session manager returns the recipient count.
   }
+  // QoS 0 is at-most-once: a full live queue is a drop, not a connection error.
+  if (ret == MQ_ERR_QUEUE_FULL && qos == 0)
+    return MQ_SUCCESS;
 
   return ret;
 }
@@ -1409,11 +1412,17 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
   int ret =
       publish_message(client_id, topic, payload, packet->qos, packet->retain, packet->properties);
   const auto protocol = client_protocol_versions_.find(client_id);
-  const bool negative_ack = protocol != client_protocol_versions_.end() && protocol->second >= 5 &&
-                            (packet->qos == 1 || packet->qos == 2) &&
+  const uint8_t protocol_version =
+      protocol != client_protocol_versions_.end() ? protocol->second : 0;
+  const bool quota_nack = ret == MQ_ERR_PUBLISH_QUOTA || ret == MQ_ERR_QUEUE_FULL;
+  const bool negative_ack = protocol_version >= 5 && (packet->qos == 1 || packet->qos == 2) &&
                             (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ||
-                             ret == MQ_ERR_AUTH_UNAVAILABLE || ret == MQ_ERR_PUBLISH_QUOTA);
-  if (ret != MQ_SUCCESS && !negative_ack) {
+                             ret == MQ_ERR_AUTH_UNAVAILABLE || quota_nack);
+  // MQTT 3.x has no PUBACK reason code. Withhold the success ACK on a full
+  // live queue so the client retries instead of treating a drop as delivery.
+  const bool withhold_ack =
+      protocol_version < 5 && (packet->qos == 1 || packet->qos == 2) && ret == MQ_ERR_QUEUE_FULL;
+  if (ret != MQ_SUCCESS && !negative_ack && !withhold_ack) {
     if (qos2_tracked && flow)
       flow->release_inbound_qos2(packet->packet_id);
     auto handler = handlers_.find(client_id);
@@ -1424,6 +1433,8 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
   if (ret != MQ_SUCCESS && qos2_tracked && flow) {
     flow->release_inbound_qos2(packet->packet_id);
   }
+  if (withhold_ack)
+    return MQ_SUCCESS;
 
   if (packet->qos == 1) {
     mqtt::PubAckPacket puback(allocator_);
@@ -1432,7 +1443,7 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     puback.reason_code =
         ret == MQ_SUCCESS
             ? mqtt::ReasonCode::Success
-            : (ret == MQ_ERR_PUBLISH_QUOTA
+            : (quota_nack
                    ? mqtt::ReasonCode::QuotaExceeded
                    : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized
                                                            : mqtt::ReasonCode::UnspecifiedError));
@@ -1443,10 +1454,13 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     mqtt::PubRecPacket pubrec(allocator_);
     pubrec.type = mqtt::PacketType::PUBREC;
     pubrec.packet_id = packet->packet_id;
-    pubrec.reason_code = ret == MQ_SUCCESS ? mqtt::ReasonCode::Success
-                                           : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED
-                                                  ? mqtt::ReasonCode::NotAuthorized
-                                                  : mqtt::ReasonCode::UnspecifiedError);
+    pubrec.reason_code =
+        ret == MQ_SUCCESS
+            ? mqtt::ReasonCode::Success
+            : (quota_nack
+                   ? mqtt::ReasonCode::QuotaExceeded
+                   : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized
+                                                           : mqtt::ReasonCode::UnspecifiedError));
     return send_serialized_mqtt_packet(client_id, pubrec);
   }
 
