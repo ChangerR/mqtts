@@ -309,16 +309,16 @@ int MQTTSocket::send_parts(const uint8_t* head, int head_len, const uint8_t* bod
 
 int MQTTSocket::send(const mqtt::MQTTBuffer& buffer)
 {
+  int ret = 0;
   if (buffer.empty()) {
-    return MQ_SUCCESS;
-  }
-
-  if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ret = MQ_SUCCESS;
+  } else if (buffer.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
     LOG_ERROR("Buffer too large to send: {} bytes", buffer.size());
-    return MQ_ERR_INVALID_ARGS;
+    ret = MQ_ERR_INVALID_ARGS;
+  } else {
+    ret = send(buffer.data(), static_cast<int>(buffer.size()));
   }
-
-  return send(buffer.data(), static_cast<int>(buffer.size()));
+  return ret;
 }
 
 int MQTTSocket::recv(char* buf, int& len)
@@ -430,28 +430,30 @@ int MQTTSocket::recv(mqtt::MQTTBuffer& buffer, int& len)
 
 bool MQTTSocket::is_websocket_upgrade_request(int timeout_ms)
 {
+  bool ret = false;
   if (!connected_) {
-    return false;
+    ret = false;
+  } else {
+    char peek_buffer[16] = {0};
+    int fd = get_fd();
+    if (fd < 0) {
+      ret = false;
+    } else {
+      int poll_ret = mqtt::runtime::current_runtime().wait_readable(fd, timeout_ms);
+      if (poll_ret <= 0) {
+        ret = false;
+      } else {
+        ssize_t bytes = ::recv(fd, peek_buffer, sizeof(peek_buffer), MSG_PEEK | MSG_NOSIGNAL);
+        if (bytes < 4) {
+          ret = false;
+        } else {
+          ret = (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' &&
+                 peek_buffer[3] == ' ');
+        }
+      }
+    }
   }
-
-  char peek_buffer[16] = {0};
-  int fd = get_fd();
-  if (fd < 0) {
-    return false;
-  }
-
-  int poll_ret = mqtt::runtime::current_runtime().wait_readable(fd, timeout_ms);
-  if (poll_ret <= 0) {
-    return false;
-  }
-
-  ssize_t bytes = ::recv(fd, peek_buffer, sizeof(peek_buffer), MSG_PEEK | MSG_NOSIGNAL);
-  if (bytes < 4) {
-    return false;
-  }
-
-  return (peek_buffer[0] == 'G' && peek_buffer[1] == 'E' && peek_buffer[2] == 'T' &&
-          peek_buffer[3] == ' ');
+  return ret;
 }
 
 int MQTTSocket::close()
@@ -565,38 +567,42 @@ int MQTTSocket::get_peer_port() const
 
 bool MQTTSocket::set_peer_endpoint(const struct sockaddr* addr, socklen_t len)
 {
+  bool ret = false;
   peer_addr_.clear();
   peer_port_ = 0;
   if (!addr || len < static_cast<socklen_t>(sizeof(struct sockaddr_in))) {
     LOG_WARN("Unsupported socket peer address");
-    return false;
-  }
-  if (addr->sa_family != AF_INET) {
+    ret = false;
+  } else if (addr->sa_family != AF_INET) {
     LOG_WARN("Unsupported socket peer address");
-    return false;
+    ret = false;
+  } else {
+    const struct sockaddr_in* in = reinterpret_cast<const struct sockaddr_in*>(addr);
+    char address[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &in->sin_addr, address, sizeof(address))) {
+      LOG_WARN("Failed to format socket peer address - {}", strerror(errno));
+      ret = false;
+    } else {
+      peer_addr_ = address;
+      peer_port_ = ntohs(in->sin_port);
+      ret = true;
+    }
   }
-
-  const struct sockaddr_in* in = reinterpret_cast<const struct sockaddr_in*>(addr);
-  char address[INET_ADDRSTRLEN];
-  if (!inet_ntop(AF_INET, &in->sin_addr, address, sizeof(address))) {
-    LOG_WARN("Failed to format socket peer address - {}", strerror(errno));
-    return false;
-  }
-  peer_addr_ = address;
-  peer_port_ = ntohs(in->sin_port);
-  return true;
+  return ret;
 }
 
 bool MQTTSocket::update_peer_info()
 {
+  bool ret = false;
   struct sockaddr_in addr = {};
   socklen_t len = sizeof(addr);
-
   if (getpeername(fd_, (struct sockaddr*)&addr, &len) != 0) {
     LOG_WARN("Failed to get socket peer endpoint - {}", strerror(errno));
-    return false;
+    ret = false;
+  } else {
+    ret = set_peer_endpoint(reinterpret_cast<struct sockaddr*>(&addr), len);
   }
-  return set_peer_endpoint(reinterpret_cast<struct sockaddr*>(&addr), len);
+  return ret;
 }
 
 int MQTTSocket::check_socket_error()

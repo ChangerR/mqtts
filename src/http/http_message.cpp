@@ -5,12 +5,14 @@
 
 namespace http {
 
-mqtt::MQTTString to_lower_ascii(const mqtt::MQTTString& value, MQTTAllocator* allocator) {
+mqtt::MQTTString to_lower_ascii(const mqtt::MQTTString& value, MQTTAllocator* allocator)
+{
+  mqtt::MQTTString ret{};
   mqtt::MQTTString lower(value, mqtt::MQTTStrAllocator(allocator));
-  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
-  return lower;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  ret = std::move(lower);
+  return ret;
 }
 
 HttpRequest::HttpRequest(MQTTAllocator* in_allocator)
@@ -20,10 +22,14 @@ HttpRequest::HttpRequest(MQTTAllocator* in_allocator)
       path(mqtt::MQTTStrAllocator(in_allocator)),
       version(mqtt::MQTTStrAllocator(in_allocator)),
       headers(0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
-              mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator)),
-      body(in_allocator) {}
+              mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(
+                  in_allocator)),
+      body(in_allocator)
+{
+}
 
-void HttpRequest::reset() {
+void HttpRequest::reset()
+{
   method.clear();
   url.clear();
   path.clear();
@@ -32,21 +38,27 @@ void HttpRequest::reset() {
   body.clear();
 }
 
-bool HttpRequest::has_header(const mqtt::MQTTString& key) const {
+bool HttpRequest::has_header(const mqtt::MQTTString& key) const
+{
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   return headers.find(key_lower) != headers.end();
 }
 
-mqtt::MQTTString HttpRequest::get_header(const mqtt::MQTTString& key) const {
+mqtt::MQTTString HttpRequest::get_header(const mqtt::MQTTString& key) const
+{
+  mqtt::MQTTString ret{};
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   HeaderMap::const_iterator iter = headers.find(key_lower);
   if (iter == headers.end()) {
-    return mqtt::MQTTString(mqtt::MQTTStrAllocator(allocator));
+    ret = mqtt::MQTTString(mqtt::MQTTStrAllocator(allocator));
+  } else {
+    ret = iter->second;
   }
-  return iter->second;
+  return ret;
 }
 
-void HttpRequest::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value) {
+void HttpRequest::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value)
+{
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   headers[key_lower] = value;
 }
@@ -57,14 +69,18 @@ HttpResponse::HttpResponse(MQTTAllocator* in_allocator)
       reason(mqtt::MQTTStrAllocator(in_allocator)),
       version("HTTP/1.1", mqtt::MQTTStrAllocator(in_allocator)),
       headers(0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
-              mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator)),
+              mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(
+                  in_allocator)),
       body(in_allocator),
-      header_names_(0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
-                    mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator)) {
+      header_names_(
+          0, std::hash<mqtt::MQTTString>(), std::equal_to<mqtt::MQTTString>(),
+          mqtt::MQTTSTLAllocator<std::pair<const mqtt::MQTTString, mqtt::MQTTString>>(in_allocator))
+{
   reason.assign("OK");
 }
 
-void HttpResponse::reset() {
+void HttpResponse::reset()
+{
   status_code = 200;
   reason.assign("OK");
   version.assign("HTTP/1.1");
@@ -73,7 +89,8 @@ void HttpResponse::reset() {
   body.clear();
 }
 
-void HttpResponse::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value) {
+void HttpResponse::set_header(const mqtt::MQTTString& key, const mqtt::MQTTString& value)
+{
   mqtt::MQTTString key_lower = to_lower_ascii(key, allocator);
   headers[key_lower] = value;
   // Header names are case insensitive on the wire, but clients that compare them
@@ -81,7 +98,8 @@ void HttpResponse::set_header(const mqtt::MQTTString& key, const mqtt::MQTTStrin
   header_names_[key_lower] = key;
 }
 
-mqtt::MQTTString HttpResponse::serialize() const {
+mqtt::MQTTString HttpResponse::serialize() const
+{
   mqtt::MQTTBuffer buffer(allocator);
 
   size_t estimated_size = version.size() + reason.size() + body.size() + 32;

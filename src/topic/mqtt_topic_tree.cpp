@@ -27,24 +27,20 @@ TopicTreeLevelVector make_level_vector(MQTTAllocator* allocator)
 
 void destroy_intermediate_node(IntermediateNode* node)
 {
-  if (MQ_ISNULL(node)) {
-    return;
+  if (!(MQ_ISNULL(node))) {
+    MQTTAllocator* allocator = node->get_allocator();
+    node->~IntermediateNode();
+    allocator->deallocate(node, sizeof(IntermediateNode));
   }
-
-  MQTTAllocator* allocator = node->get_allocator();
-  node->~IntermediateNode();
-  allocator->deallocate(node, sizeof(IntermediateNode));
 }
 
 void destroy_topic_tree_node(TopicTreeNode* node)
 {
-  if (MQ_ISNULL(node)) {
-    return;
+  if (!(MQ_ISNULL(node))) {
+    MQTTAllocator* allocator = node->get_allocator();
+    node->~TopicTreeNode();
+    allocator->deallocate(node, sizeof(TopicTreeNode));
   }
-
-  MQTTAllocator* allocator = node->get_allocator();
-  node->~TopicTreeNode();
-  allocator->deallocate(node, sizeof(TopicTreeNode));
 }
 
 int create_initialized_node(MQTTAllocator* allocator, TopicTreeNodePtr& node_ptr)
@@ -187,26 +183,26 @@ IntermediateNode::~IntermediateNode() {}
 
 int IntermediateNode::safe_copy_containers(IntermediateNode* dest) const
 {
+  int ret = 0;
   if (MQ_ISNULL(dest)) {
-    return MQ_ERR_PARAM_V2;
-  }
-
-  for (const auto& child_pair : children_) {
-    auto insert_result = dest->children_.insert(child_pair);
-    if (!insert_result.second) {
-      insert_result.first->second = child_pair.second;
+    ret = MQ_ERR_PARAM_V2;
+  } else {
+    for (const auto& child_pair : children_) {
+      auto insert_result = dest->children_.insert(child_pair);
+      if (!insert_result.second) {
+        insert_result.first->second = child_pair.second;
+      }
     }
-  }
-
-  for (const auto& subscriber : subscribers_) {
-    auto insert_result = dest->subscribers_.insert(subscriber);
-    if (!insert_result.second) {
-      dest->subscribers_.erase(insert_result.first);
-      dest->subscribers_.insert(subscriber);
+    for (const auto& subscriber : subscribers_) {
+      auto insert_result = dest->subscribers_.insert(subscriber);
+      if (!insert_result.second) {
+        dest->subscribers_.erase(insert_result.first);
+        dest->subscribers_.insert(subscriber);
+      }
     }
+    ret = MQ_SUCCESS;
   }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int IntermediateNode::clone(IntermediateNode*& cloned_node) const
@@ -265,12 +261,15 @@ int IntermediateNode::add_child(const MQTTString& level, const TopicTreeNodePtr&
 
 int IntermediateNode::remove_child(const MQTTString& level)
 {
+  int ret = 0;
   auto it = children_.find(level);
   if (it == children_.end()) {
-    return MQ_ERR_NOT_FOUND_V2;
+    ret = MQ_ERR_NOT_FOUND_V2;
+  } else {
+    children_.erase(it);
+    ret = MQ_SUCCESS;
   }
-  children_.erase(it);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int IntermediateNode::add_subscriber(const SubscriberInfo& subscriber)
@@ -295,30 +294,34 @@ int IntermediateNode::add_subscriber(const SubscriberInfo& subscriber)
 
 int IntermediateNode::remove_subscriber(const MQTTString& client_id)
 {
+  int ret = 0;
   if (client_id.empty()) {
-    return MQ_ERR_TOPIC_TREE_INVALID_CLIENT;
+    ret = MQ_ERR_TOPIC_TREE_INVALID_CLIENT;
+  } else {
+    SubscriberInfo lookup(client_id, 0, allocator_);
+    auto it = subscribers_.find(lookup);
+    if (it == subscribers_.end()) {
+      ret = MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND;
+    } else {
+      subscribers_.erase(it);
+      ret = MQ_SUCCESS;
+    }
   }
-
-  SubscriberInfo lookup(client_id, 0, allocator_);
-  auto it = subscribers_.find(lookup);
-  if (it == subscribers_.end()) {
-    return MQ_ERR_TOPIC_TREE_SUBSCRIBER_NOT_FOUND;
-  }
-
-  subscribers_.erase(it);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int IntermediateNode::get_child(const MQTTString& level, TopicTreeNodePtr& child) const
 {
+  int ret = 0;
   auto it = children_.find(level);
   if (it == children_.end()) {
     child = TopicTreeNodePtr();
-    return MQ_ERR_NOT_FOUND_V2;
+    ret = MQ_ERR_NOT_FOUND_V2;
+  } else {
+    child = it->second;
+    ret = MQ_SUCCESS;
   }
-
-  child = it->second;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int IntermediateNode::get_children(const TopicTreeChildrenMap*& children) const
@@ -539,33 +542,30 @@ ConcurrentTopicTree::~ConcurrentTopicTree() {}
 
 int ConcurrentTopicTree::split_topic_levels(const MQTTString& topic, TopicTreeLevelVector& levels) const
 {
+  int ret = 0;
   levels.clear();
   if (topic.empty()) {
-    return MQ_ERR_TOPIC_TREE_INVALID_TOPIC;
-  }
-
-  if (topic.size() > 65535) {
-    return MQ_ERR_TOPIC_TREE_INVALID_TOPIC;
-  }
-
-  size_t estimated_levels = std::count(topic.begin(), topic.end(), '/') + 1;
-  if (estimated_levels > 0 && estimated_levels <= 1000) {
-    levels.reserve(estimated_levels);
-  }
-
-  auto start = topic.begin();
-  for (auto it = topic.begin(); it != topic.end(); ++it) {
-    if (*it == '/') {
-      levels.emplace_back(start, it, MQTTStrAllocator(allocator_));
-      start = it + 1;
+    ret = MQ_ERR_TOPIC_TREE_INVALID_TOPIC;
+  } else if (topic.size() > 65535) {
+    ret = MQ_ERR_TOPIC_TREE_INVALID_TOPIC;
+  } else {
+    size_t estimated_levels = std::count(topic.begin(), topic.end(), '/') + 1;
+    if (estimated_levels > 0 && estimated_levels <= 1000) {
+      levels.reserve(estimated_levels);
     }
+    auto start = topic.begin();
+    for (auto it = topic.begin(); it != topic.end(); ++it) {
+      if (*it == '/') {
+        levels.emplace_back(start, it, MQTTStrAllocator(allocator_));
+        start = it + 1;
+      }
+    }
+    if (start != topic.end()) {
+      levels.emplace_back(start, topic.end(), MQTTStrAllocator(allocator_));
+    }
+    ret = MQ_SUCCESS;
   }
-
-  if (start != topic.end()) {
-    levels.emplace_back(start, topic.end(), MQTTStrAllocator(allocator_));
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int ConcurrentTopicTree::get_or_create_node(const TopicTreeLevelVector& levels,
@@ -956,24 +956,25 @@ int ConcurrentTopicTree::find_subscribers(const MQTTString& topic, TopicMatchRes
 
 int ConcurrentTopicTree::unsubscribe_all(const MQTTString& client_id)
 {
+  int ret = 0;
   if (client_id.empty()) {
-    return 0;
-  }
-
-  TopicTreeLevelVector subscriptions = make_level_vector(allocator_);
-  int ret = get_client_subscriptions(client_id, subscriptions);
-  if (MQ_FAIL(ret)) {
-    return 0;
-  }
-
-  int unsubscribed_count = 0;
-  for (const auto& subscription : subscriptions) {
-    if (unsubscribe(subscription, client_id) == MQ_SUCCESS) {
-      ++unsubscribed_count;
+    ret = 0;
+  } else {
+    TopicTreeLevelVector subscriptions = make_level_vector(allocator_);
+    ret = get_client_subscriptions(client_id, subscriptions);
+    if (MQ_FAIL(ret)) {
+      ret = 0;
+    } else {
+      int unsubscribed_count = 0;
+      for (const auto& subscription : subscriptions) {
+        if (unsubscribe(subscription, client_id) == MQ_SUCCESS) {
+          ++unsubscribed_count;
+        }
+      }
+      ret = unsubscribed_count;
     }
   }
-
-  return unsubscribed_count;
+  return ret;
 }
 
 int ConcurrentTopicTree::collect_client_subscriptions(const TopicTreeNodePtr& node,
@@ -1016,12 +1017,14 @@ int ConcurrentTopicTree::collect_client_subscriptions(const TopicTreeNodePtr& no
 int ConcurrentTopicTree::get_client_subscriptions(const MQTTString& client_id,
                                                   TopicTreeLevelVector& subscriptions) const
 {
+  int ret = 0;
   subscriptions.clear();
   if (!is_initialized()) {
-    return MQ_ERR_TOPIC_TREE;
+    ret = MQ_ERR_TOPIC_TREE;
+  } else {
+    ret = collect_client_subscriptions(root_, empty_path_, client_id, subscriptions);
   }
-
-  return collect_client_subscriptions(root_, empty_path_, client_id, subscriptions);
+  return ret;
 }
 
 int ConcurrentTopicTree::get_total_subscribers(size_t& total_count) const

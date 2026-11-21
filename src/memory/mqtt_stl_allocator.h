@@ -67,17 +67,14 @@ class MQTTSTLAllocator
 
   void deallocate(pointer p, size_type n)
   {
-    if (!p || n == 0) {
-      return;
-    }
-    
-    MQTTAllocator* alloc = get_effective_allocator();
-    
-    if (alloc) {
-      alloc->deallocate(p, n * sizeof(T));
-    } else {
-      // Fallback to standard free if our custom allocator is not available
-      std::free(p);
+    if (!(!p || n == 0)) {
+      MQTTAllocator* alloc = get_effective_allocator();
+      if (alloc) {
+        alloc->deallocate(p, n * sizeof(T));
+      } else {
+        // Fallback to standard free if our custom allocator is not available
+        std::free(p);
+      }
     }
   }
 

@@ -38,25 +38,26 @@ class ConnectionWatch
   // 绝对时间，单位毫秒（steady_clock）。没有截止时间时返回 -1。
   int64_t recv_deadline_ms(DeadlineKind* kind = nullptr) const
   {
+    int64_t ret = 0;
     if (kind) {
       *kind = DeadlineKind::None;
     }
     if (!started_ || suppressed_) {
-      return -1;
-    }
-    if (!connect_complete_) {
+      ret = -1;
+    } else if (!connect_complete_) {
       if (kind) {
         *kind = DeadlineKind::Connect;
       }
-      return epoch_ms(established_) + static_cast<int64_t>(connect_timeout_seconds_) * 1000;
+      ret = epoch_ms(established_) + static_cast<int64_t>(connect_timeout_seconds_) * 1000;
+    } else if (keep_alive_seconds_ == 0) {
+      ret = -1;
+    } else {
+      if (kind) {
+        *kind = DeadlineKind::KeepAlive;
+      }
+      ret = epoch_ms(last_packet_) + static_cast<int64_t>(keep_alive_seconds_) * 1500;
     }
-    if (keep_alive_seconds_ == 0) {
-      return -1;
-    }
-    if (kind) {
-      *kind = DeadlineKind::KeepAlive;
-    }
-    return epoch_ms(last_packet_) + static_cast<int64_t>(keep_alive_seconds_) * 1500;
+    return ret;
   }
 
   static int64_t epoch_ms(std::chrono::steady_clock::time_point when)
@@ -80,11 +81,14 @@ class ConnectionWatch
 inline uint16_t negotiated_keep_alive_seconds(uint16_t client_keep_alive, uint16_t keep_alive_max,
                                              uint8_t protocol_version)
 {
+  uint16_t ret = 0;
   if (protocol_version >= 5 && keep_alive_max > 0 &&
       (client_keep_alive == 0 || client_keep_alive > keep_alive_max)) {
-    return keep_alive_max;
+    ret = keep_alive_max;
+  } else {
+    ret = client_keep_alive;
   }
-  return client_keep_alive;
+  return ret;
 }
 
 }  // namespace mqtt

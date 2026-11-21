@@ -159,22 +159,25 @@ int Logger::configure(const mqtt::LogConfig& config)
 
 spdlog::level::level_enum Logger::string_to_level(const std::string& level_str)
 {
-  if (level_str == "trace")
-    return spdlog::level::trace;
-  if (level_str == "debug")
-    return spdlog::level::debug;
-  if (level_str == "info")
-    return spdlog::level::info;
-  if (level_str == "warn" || level_str == "warning")
-    return spdlog::level::warn;
-  if (level_str == "error")
-    return spdlog::level::err;
-  if (level_str == "critical")
-    return spdlog::level::critical;
-  if (level_str == "off")
-    return spdlog::level::off;
-
-  // 默认返回info级别
-  std::cerr << "未知的日志级别: " << level_str << "，使用默认级别info" << std::endl;
-  return spdlog::level::info;
+  spdlog::level::level_enum ret{};
+  if (level_str == "trace") {
+    ret = spdlog::level::trace;
+  } else if (level_str == "debug") {
+    ret = spdlog::level::debug;
+  } else if (level_str == "info") {
+    ret = spdlog::level::info;
+  } else if (level_str == "warn" || level_str == "warning") {
+    ret = spdlog::level::warn;
+  } else if (level_str == "error") {
+    ret = spdlog::level::err;
+  } else if (level_str == "critical") {
+    ret = spdlog::level::critical;
+  } else if (level_str == "off") {
+    ret = spdlog::level::off;
+  } else {
+    // 默认返回info级别
+    std::cerr << "未知的日志级别: " << level_str << "，使用默认级别info" << std::endl;
+    ret = spdlog::level::info;
+  }
+  return ret;
 }

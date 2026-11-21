@@ -9,7 +9,8 @@
 namespace mqtt {
 
 MQTTBuffer::MQTTBuffer(MQTTAllocator* allocator, size_t initial_capacity)
-    : allocator_(allocator), data_(nullptr), size_(0), capacity_(0), read_pos_(0) {
+    : allocator_(allocator), data_(nullptr), size_(0), capacity_(0), read_pos_(0)
+{
   assert(allocator_ != nullptr && "MQTTBuffer requires a non-null MQTTAllocator");
   if (initial_capacity > 0) {
     (void)reserve(initial_capacity);
@@ -17,14 +18,20 @@ MQTTBuffer::MQTTBuffer(MQTTAllocator* allocator, size_t initial_capacity)
 }
 
 MQTTBuffer::MQTTBuffer(const MQTTBuffer& other)
-    : allocator_(other.allocator_), data_(nullptr), size_(0), capacity_(0), read_pos_(other.read_pos_) {
+    : allocator_(other.allocator_),
+      data_(nullptr),
+      size_(0),
+      capacity_(0),
+      read_pos_(other.read_pos_)
+{
   if (other.size_ > 0 && reserve(other.size_)) {
     std::memcpy(data_, other.data_, other.size_);
     size_ = other.size_;
   }
 }
 
-MQTTBuffer& MQTTBuffer::operator=(const MQTTBuffer& other) {
+MQTTBuffer& MQTTBuffer::operator=(const MQTTBuffer& other)
+{
   if (this == &other) {
     return *this;
   }
@@ -50,14 +57,16 @@ MQTTBuffer::MQTTBuffer(MQTTBuffer&& other) noexcept
       data_(other.data_),
       size_(other.size_),
       capacity_(other.capacity_),
-      read_pos_(other.read_pos_) {
+      read_pos_(other.read_pos_)
+{
   other.data_ = nullptr;
   other.size_ = 0;
   other.capacity_ = 0;
   other.read_pos_ = 0;
 }
 
-MQTTBuffer& MQTTBuffer::operator=(MQTTBuffer&& other) noexcept {
+MQTTBuffer& MQTTBuffer::operator=(MQTTBuffer&& other) noexcept
+{
   if (this == &other) {
     return *this;
   }
@@ -80,19 +89,22 @@ MQTTBuffer& MQTTBuffer::operator=(MQTTBuffer&& other) noexcept {
   return *this;
 }
 
-MQTTBuffer::~MQTTBuffer() {
+MQTTBuffer::~MQTTBuffer()
+{
   if (data_) {
     free_bytes(data_, capacity_);
     data_ = nullptr;
   }
 }
 
-void MQTTBuffer::clear() {
+void MQTTBuffer::clear()
+{
   size_ = 0;
   read_pos_ = 0;
 }
 
-BufferResult MQTTBuffer::resize(size_t new_size) {
+BufferResult MQTTBuffer::resize(size_t new_size)
+{
   if (new_size > capacity_ && !reserve(new_size)) {
     return BufferResult(MQ_ERR_MEMORY_ALLOC);
   }
@@ -104,11 +116,13 @@ BufferResult MQTTBuffer::resize(size_t new_size) {
   return BufferResult(MQ_SUCCESS);
 }
 
-void MQTTBuffer::reset_read_pos() {
+void MQTTBuffer::reset_read_pos()
+{
   read_pos_ = 0;
 }
 
-BufferResult MQTTBuffer::reserve(size_t capacity) {
+BufferResult MQTTBuffer::reserve(size_t capacity)
+{
   if (capacity <= capacity_) {
     return BufferResult(MQ_SUCCESS);
   }
@@ -130,7 +144,8 @@ BufferResult MQTTBuffer::reserve(size_t capacity) {
   return BufferResult(MQ_SUCCESS);
 }
 
-BufferResult MQTTBuffer::ensure_capacity(size_t needed) {
+BufferResult MQTTBuffer::ensure_capacity(size_t needed)
+{
   if (needed <= capacity_) {
     return BufferResult(MQ_SUCCESS);
   }
@@ -142,7 +157,8 @@ BufferResult MQTTBuffer::ensure_capacity(size_t needed) {
   return reserve(new_capacity);
 }
 
-BufferResult MQTTBuffer::append(const void* data, size_t len) {
+BufferResult MQTTBuffer::append(const void* data, size_t len)
+{
   if (len == 0) {
     return BufferResult(MQ_SUCCESS);
   }
@@ -160,34 +176,41 @@ BufferResult MQTTBuffer::append(const void* data, size_t len) {
   return BufferResult(MQ_SUCCESS);
 }
 
-BufferResult MQTTBuffer::append(const uint8_t* data, size_t len) {
+BufferResult MQTTBuffer::append(const uint8_t* data, size_t len)
+{
   return append(static_cast<const void*>(data), len);
 }
 
-BufferResult MQTTBuffer::append(const char* data, size_t len) {
+BufferResult MQTTBuffer::append(const char* data, size_t len)
+{
   return append(static_cast<const void*>(data), len);
 }
 
-BufferResult MQTTBuffer::append_byte(uint8_t value) {
+BufferResult MQTTBuffer::append_byte(uint8_t value)
+{
   return append(&value, sizeof(value));
 }
 
-BufferResult MQTTBuffer::push_back(uint8_t value) {
+BufferResult MQTTBuffer::push_back(uint8_t value)
+{
   return append_byte(value);
 }
 
-BufferResult MQTTBuffer::append_string(const MQTTString& value) {
+BufferResult MQTTBuffer::append_string(const MQTTString& value)
+{
   return append(value.data(), value.size());
 }
 
-BufferResult MQTTBuffer::append_cstr(const char* value) {
+BufferResult MQTTBuffer::append_cstr(const char* value)
+{
   if (value == nullptr) {
     return BufferResult(MQ_ERR_INVALID_ARGS);
   }
   return append(value, std::strlen(value));
 }
 
-BufferResult MQTTBuffer::append_decimal_uint(uint64_t value) {
+BufferResult MQTTBuffer::append_decimal_uint(uint64_t value)
+{
   char digits[32];
   size_t index = sizeof(digits);
 
@@ -199,7 +222,8 @@ BufferResult MQTTBuffer::append_decimal_uint(uint64_t value) {
   return append(digits + index, sizeof(digits) - index);
 }
 
-BufferResult MQTTBuffer::append_decimal_int(int64_t value) {
+BufferResult MQTTBuffer::append_decimal_int(int64_t value)
+{
   uint64_t abs_value = 0;
   if (value < 0) {
     if (!append_byte(static_cast<uint8_t>('-'))) {
@@ -214,7 +238,8 @@ BufferResult MQTTBuffer::append_decimal_int(int64_t value) {
   return append_decimal_uint(abs_value);
 }
 
-BufferResult MQTTBuffer::insert(size_t pos, uint8_t value) {
+BufferResult MQTTBuffer::insert(size_t pos, uint8_t value)
+{
   if (pos > size_) {
     return BufferResult(MQ_ERR_INVALID_ARGS);
   }
@@ -231,7 +256,8 @@ BufferResult MQTTBuffer::insert(size_t pos, uint8_t value) {
   return BufferResult(MQ_SUCCESS);
 }
 
-void MQTTBuffer::set_size(size_t new_size) {
+void MQTTBuffer::set_size(size_t new_size)
+{
   if (new_size <= capacity_) {
     size_ = new_size;
     if (read_pos_ > size_) {
@@ -240,29 +266,38 @@ void MQTTBuffer::set_size(size_t new_size) {
   }
 }
 
-BufferResult MQTTBuffer::put_uint16_be(uint16_t value) {
-  uint8_t bytes[2] = {static_cast<uint8_t>((value >> 8) & 0xFF), static_cast<uint8_t>(value & 0xFF)};
+BufferResult MQTTBuffer::put_uint16_be(uint16_t value)
+{
+  uint8_t bytes[2] = {static_cast<uint8_t>((value >> 8) & 0xFF),
+                      static_cast<uint8_t>(value & 0xFF)};
   return append(bytes, sizeof(bytes));
 }
 
-BufferResult MQTTBuffer::put_uint16_le(uint16_t value) {
-  uint8_t bytes[2] = {static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF)};
+BufferResult MQTTBuffer::put_uint16_le(uint16_t value)
+{
+  uint8_t bytes[2] = {static_cast<uint8_t>(value & 0xFF),
+                      static_cast<uint8_t>((value >> 8) & 0xFF)};
   return append(bytes, sizeof(bytes));
 }
 
-BufferResult MQTTBuffer::put_uint32_be(uint32_t value) {
-  uint8_t bytes[4] = {static_cast<uint8_t>((value >> 24) & 0xFF), static_cast<uint8_t>((value >> 16) & 0xFF),
-                      static_cast<uint8_t>((value >> 8) & 0xFF), static_cast<uint8_t>(value & 0xFF)};
+BufferResult MQTTBuffer::put_uint32_be(uint32_t value)
+{
+  uint8_t bytes[4] = {
+      static_cast<uint8_t>((value >> 24) & 0xFF), static_cast<uint8_t>((value >> 16) & 0xFF),
+      static_cast<uint8_t>((value >> 8) & 0xFF), static_cast<uint8_t>(value & 0xFF)};
   return append(bytes, sizeof(bytes));
 }
 
-BufferResult MQTTBuffer::put_uint32_le(uint32_t value) {
+BufferResult MQTTBuffer::put_uint32_le(uint32_t value)
+{
   uint8_t bytes[4] = {static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF),
-                      static_cast<uint8_t>((value >> 16) & 0xFF), static_cast<uint8_t>((value >> 24) & 0xFF)};
+                      static_cast<uint8_t>((value >> 16) & 0xFF),
+                      static_cast<uint8_t>((value >> 24) & 0xFF)};
   return append(bytes, sizeof(bytes));
 }
 
-BufferResult MQTTBuffer::put_uint64_be(uint64_t value) {
+BufferResult MQTTBuffer::put_uint64_be(uint64_t value)
+{
   uint8_t bytes[8];
   for (int i = 0; i < 8; ++i) {
     bytes[i] = static_cast<uint8_t>((value >> (56 - (i * 8))) & 0xFF);
@@ -270,7 +305,8 @@ BufferResult MQTTBuffer::put_uint64_be(uint64_t value) {
   return append(bytes, sizeof(bytes));
 }
 
-BufferResult MQTTBuffer::put_uint64_le(uint64_t value) {
+BufferResult MQTTBuffer::put_uint64_le(uint64_t value)
+{
   uint8_t bytes[8];
   for (int i = 0; i < 8; ++i) {
     bytes[i] = static_cast<uint8_t>((value >> (i * 8)) & 0xFF);
@@ -278,88 +314,126 @@ BufferResult MQTTBuffer::put_uint64_le(uint64_t value) {
   return append(bytes, sizeof(bytes));
 }
 
-bool MQTTBuffer::get_byte(uint8_t& value) {
+bool MQTTBuffer::get_byte(uint8_t& value)
+{
+  bool ret = false;
   if (remaining() < 1) {
-    return false;
+    ret = false;
+  } else {
+    value = data_[read_pos_++];
+    ret = true;
   }
-  value = data_[read_pos_++];
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint16_be(uint16_t& value) {
+bool MQTTBuffer::get_uint16_be(uint16_t& value)
+{
+  bool ret = false;
   if (remaining() < 2) {
-    return false;
+    ret = false;
+  } else {
+    value =
+        static_cast<uint16_t>(data_[read_pos_]) << 8 | static_cast<uint16_t>(data_[read_pos_ + 1]);
+    read_pos_ += 2;
+    ret = true;
   }
-  value = static_cast<uint16_t>(data_[read_pos_]) << 8 | static_cast<uint16_t>(data_[read_pos_ + 1]);
-  read_pos_ += 2;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint16_le(uint16_t& value) {
+bool MQTTBuffer::get_uint16_le(uint16_t& value)
+{
+  bool ret = false;
   if (remaining() < 2) {
-    return false;
+    ret = false;
+  } else {
+    value = static_cast<uint16_t>(data_[read_pos_]) |
+            (static_cast<uint16_t>(data_[read_pos_ + 1]) << 8);
+    read_pos_ += 2;
+    ret = true;
   }
-  value = static_cast<uint16_t>(data_[read_pos_]) | (static_cast<uint16_t>(data_[read_pos_ + 1]) << 8);
-  read_pos_ += 2;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint32_be(uint32_t& value) {
+bool MQTTBuffer::get_uint32_be(uint32_t& value)
+{
+  bool ret = false;
   if (remaining() < 4) {
-    return false;
+    ret = false;
+  } else {
+    value = (static_cast<uint32_t>(data_[read_pos_]) << 24) |
+            (static_cast<uint32_t>(data_[read_pos_ + 1]) << 16) |
+            (static_cast<uint32_t>(data_[read_pos_ + 2]) << 8) |
+            static_cast<uint32_t>(data_[read_pos_ + 3]);
+    read_pos_ += 4;
+    ret = true;
   }
-  value = (static_cast<uint32_t>(data_[read_pos_]) << 24) | (static_cast<uint32_t>(data_[read_pos_ + 1]) << 16) |
-          (static_cast<uint32_t>(data_[read_pos_ + 2]) << 8) | static_cast<uint32_t>(data_[read_pos_ + 3]);
-  read_pos_ += 4;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint32_le(uint32_t& value) {
+bool MQTTBuffer::get_uint32_le(uint32_t& value)
+{
+  bool ret = false;
   if (remaining() < 4) {
-    return false;
+    ret = false;
+  } else {
+    value = static_cast<uint32_t>(data_[read_pos_]) |
+            (static_cast<uint32_t>(data_[read_pos_ + 1]) << 8) |
+            (static_cast<uint32_t>(data_[read_pos_ + 2]) << 16) |
+            (static_cast<uint32_t>(data_[read_pos_ + 3]) << 24);
+    read_pos_ += 4;
+    ret = true;
   }
-  value = static_cast<uint32_t>(data_[read_pos_]) | (static_cast<uint32_t>(data_[read_pos_ + 1]) << 8) |
-          (static_cast<uint32_t>(data_[read_pos_ + 2]) << 16) | (static_cast<uint32_t>(data_[read_pos_ + 3]) << 24);
-  read_pos_ += 4;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint64_be(uint64_t& value) {
+bool MQTTBuffer::get_uint64_be(uint64_t& value)
+{
+  bool ret = false;
   if (remaining() < 8) {
-    return false;
+    ret = false;
+  } else {
+    value = 0;
+    for (int i = 0; i < 8; ++i) {
+      value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
+    }
+    read_pos_ += 8;
+    ret = true;
   }
-  value = 0;
-  for (int i = 0; i < 8; ++i) {
-    value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
-  }
-  read_pos_ += 8;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_uint64_le(uint64_t& value) {
+bool MQTTBuffer::get_uint64_le(uint64_t& value)
+{
+  bool ret = false;
   if (remaining() < 8) {
-    return false;
+    ret = false;
+  } else {
+    value = 0;
+    for (int i = 7; i >= 0; --i) {
+      value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
+    }
+    read_pos_ += 8;
+    ret = true;
   }
-  value = 0;
-  for (int i = 7; i >= 0; --i) {
-    value = (value << 8) | static_cast<uint64_t>(data_[read_pos_ + i]);
-  }
-  read_pos_ += 8;
-  return true;
+  return ret;
 }
 
-bool MQTTBuffer::get_string(size_t len, MQTTString& value) {
+bool MQTTBuffer::get_string(size_t len, MQTTString& value)
+{
+  bool ret = false;
   if (remaining() < len) {
-    return false;
+    ret = false;
+  } else {
+    value.assign(reinterpret_cast<const char*>(data_ + read_pos_),
+                 reinterpret_cast<const char*>(data_ + read_pos_ + len));
+    read_pos_ += len;
+    ret = true;
   }
-
-  value.assign(reinterpret_cast<const char*>(data_ + read_pos_),
-               reinterpret_cast<const char*>(data_ + read_pos_ + len));
-  read_pos_ += len;
-  return true;
+  return ret;
 }
 
-MQTTString MQTTBuffer::serialize() const {
+MQTTString MQTTBuffer::serialize() const
+{
   if (size_ == 0) {
     return MQTTString(MQTTStrAllocator(allocator_));
   }
@@ -368,34 +442,41 @@ MQTTString MQTTBuffer::serialize() const {
   return MQTTString(reinterpret_cast<const char*>(data_), size_, MQTTStrAllocator(allocator_));
 }
 
-bool MQTTBuffer::deserialize(const MQTTString& input) {
+bool MQTTBuffer::deserialize(const MQTTString& input)
+{
+  bool ret = false;
   clear();
   if (input.empty()) {
-    return true;
+    ret = true;
+  } else {
+    ret = append(input.data(), input.size());
   }
-  return append(input.data(), input.size());
+  return ret;
 }
 
-uint8_t* MQTTBuffer::allocate_bytes(size_t bytes) {
+uint8_t* MQTTBuffer::allocate_bytes(size_t bytes)
+{
+  uint8_t* ret = NULL;
   if (bytes == 0) {
-    return nullptr;
-  }
-  if (allocator_ == nullptr) {
+    ret = nullptr;
+  } else if (allocator_ == nullptr) {
     assert(false && "MQTTBuffer allocator must not be null");
-    return nullptr;
+    ret = nullptr;
+  } else {
+    ret = static_cast<uint8_t*>(allocator_->allocate(bytes));
   }
-  return static_cast<uint8_t*>(allocator_->allocate(bytes));
+  return ret;
 }
 
-void MQTTBuffer::free_bytes(uint8_t* ptr, size_t bytes) {
-  if (!ptr) {
-    return;
+void MQTTBuffer::free_bytes(uint8_t* ptr, size_t bytes)
+{
+  if (ptr) {
+    if (allocator_ == nullptr) {
+      assert(false && "MQTTBuffer allocator must not be null");
+    } else {
+      allocator_->deallocate(ptr, bytes);
+    }
   }
-  if (allocator_ == nullptr) {
-    assert(false && "MQTTBuffer allocator must not be null");
-    return;
-  }
-  allocator_->deallocate(ptr, bytes);
 }
 
 }  // namespace mqtt

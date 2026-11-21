@@ -136,12 +136,15 @@ struct EventLoopContext
 
 int eventloop_trampoline(void* arg)
 {
+  int ret = 0;
   EventLoopContext* ctx = static_cast<EventLoopContext*>(arg);
   reap_finished_tasks();
   if (!ctx->callback) {
-    return 0;
+    ret = 0;
+  } else {
+    ret = ctx->callback(ctx->arg);
   }
-  return ctx->callback(ctx->arg);
+  return ret;
 }
 
 struct JoinContext
@@ -188,13 +191,15 @@ struct ConditionState
 // wrong thread. Such wakeups are dropped instead.
 bool can_wake_waiter(const std::atomic<void*>& waiter_env)
 {
+  bool ret = false;
   void* env = co_get_curr_thread_env();
   if (!env) {
-    return false;
+    ret = false;
+  } else {
+    void* waiter = waiter_env.load();
+    ret = !waiter || waiter == env;
   }
-
-  void* waiter = waiter_env.load();
-  return !waiter || waiter == env;
+  return ret;
 }
 
 }  // namespace
@@ -227,29 +232,23 @@ void TaskHandle::release()
 {
   TaskState* state = as_state(task_);
   task_ = nullptr;
-  if (!state) {
-    return;
-  }
-
-  if (!is_owner_thread(state)) {
-    // Freeing the coroutine from here could race with its owning thread, so the
-    // task is abandoned. It is reclaimed by the task itself if that thread is
-    // still pumping an event loop, and leaked otherwise.
-    int expected = kTaskRunning;
-    state->lifecycle.compare_exchange_strong(expected, kTaskDetached);
-    return;
-  }
-
-  reap_finished_tasks();
-
-  int expected = kTaskRunning;
-  if (state->lifecycle.compare_exchange_strong(expected, kTaskDetached)) {
-    return;
-  }
-
-  if (expected == kTaskFinished &&
-      state->lifecycle.compare_exchange_strong(expected, kTaskReaped)) {
-    destroy_task_state(state);
+  if (state) {
+    if (!is_owner_thread(state)) {
+      // Freeing the coroutine from here could race with its owning thread, so the
+      // task is abandoned. It is reclaimed by the task itself if that thread is
+      // still pumping an event loop, and leaked otherwise.
+      int expected = kTaskRunning;
+      state->lifecycle.compare_exchange_strong(expected, kTaskDetached);
+    } else {
+      reap_finished_tasks();
+      int expected = kTaskRunning;
+      if (!(state->lifecycle.compare_exchange_strong(expected, kTaskDetached))) {
+        if (expected == kTaskFinished &&
+            state->lifecycle.compare_exchange_strong(expected, kTaskReaped)) {
+          destroy_task_state(state);
+        }
+      }
+    }
   }
 }
 
@@ -261,37 +260,32 @@ bool TaskHandle::is_finished() const
 
 int TaskHandle::join(int timeout_ms)
 {
+  int ret = 0;
   TaskState* state = as_state(task_);
   if (!state || state->lifecycle.load() != kTaskRunning) {
-    return 0;
-  }
-
-  if (!is_owner_thread(state)) {
+    ret = 0;
+  } else if (!is_owner_thread(state)) {
     errno = EPERM;
-    return -1;
-  }
-
-  if (is_coroutine_context()) {
+    ret = -1;
+  } else if (is_coroutine_context()) {
     // A nested event loop would starve the outer loop's callback, so waiting for
     // another task from inside a coroutine is rejected instead.
     errno = EPERM;
-    return -1;
-  }
-
-  if (timeout_ms == 0) {
+    ret = -1;
+  } else if (timeout_ms == 0) {
     errno = EBUSY;
-    return -1;
+    ret = -1;
+  } else {
+    JoinContext ctx = {state, timeout_ms, std::chrono::steady_clock::now()};
+    co_eventloop(co_get_epoll_ct(), join_eventloop_callback, &ctx);
+    if (state->lifecycle.load() == kTaskRunning) {
+      errno = ETIMEDOUT;
+      ret = -1;
+    } else {
+      ret = 0;
+    }
   }
-
-  JoinContext ctx = {state, timeout_ms, std::chrono::steady_clock::now()};
-  co_eventloop(co_get_epoll_ct(), join_eventloop_callback, &ctx);
-
-  if (state->lifecycle.load() == kTaskRunning) {
-    errno = ETIMEDOUT;
-    return -1;
-  }
-
-  return 0;
+  return ret;
 }
 
 CoroutineMutex::CoroutineMutex() : impl_(nullptr)
@@ -320,31 +314,24 @@ CoroutineMutex::~CoroutineMutex()
 void CoroutineMutex::lock()
 {
   MutexState* state = static_cast<MutexState*>(impl_);
-  if (!state) {
-    return;
+  if (state) {
+    // Each unlock() hands the mutex to exactly one queued waiter, so the count of
+    // holders plus waiters is enough to decide whether this caller has to queue.
+    if (state->hold_count.fetch_add(1) > 0 && is_coroutine_context()) {
+      state->waiter_env.store(co_get_curr_thread_env());
+      co_cond_timedwait(state->cond, -1);
+    }
   }
-
-  // Each unlock() hands the mutex to exactly one queued waiter, so the count of
-  // holders plus waiters is enough to decide whether this caller has to queue.
-  if (state->hold_count.fetch_add(1) > 0 && is_coroutine_context()) {
-    state->waiter_env.store(co_get_curr_thread_env());
-    co_cond_timedwait(state->cond, -1);
-  }
-
-  // Outside a coroutine there is nothing to yield to, so a contended lock is
-  // taken without waiting rather than corrupting libco's call stack.
 }
 
 void CoroutineMutex::unlock()
 {
   MutexState* state = static_cast<MutexState*>(impl_);
-  if (!state) {
-    return;
-  }
-
-  state->hold_count.fetch_sub(1);
-  if (can_wake_waiter(state->waiter_env)) {
-    co_cond_signal(state->cond);
+  if (state) {
+    state->hold_count.fetch_sub(1);
+    if (can_wake_waiter(state->waiter_env)) {
+      co_cond_signal(state->cond);
+    }
   }
 }
 
@@ -405,26 +392,27 @@ CoroutineCondition& CoroutineCondition::operator=(CoroutineCondition&& other) no
 
 int CoroutineCondition::wait(int timeout_ms)
 {
+  int ret = 0;
   ConditionState* state = static_cast<ConditionState*>(impl_);
   if (!state) {
     errno = EINVAL;
-    return -1;
-  }
-
-  if (!is_coroutine_context()) {
+    ret = -1;
+  } else if (!is_coroutine_context()) {
     // There is no coroutine to suspend here. A bounded wait still honours its
     // timeout by sleeping, which matches what libco reports for a timed out
     // wait; an unbounded one would never be woken up.
     if (timeout_ms > 0) {
       poll_without_hook(nullptr, 0, timeout_ms);
-      return 0;
+      ret = 0;
+    } else {
+      errno = EPERM;
+      ret = -1;
     }
-    errno = EPERM;
-    return -1;
+  } else {
+    state->waiter_env.store(co_get_curr_thread_env());
+    ret = co_cond_timedwait(state->cond, timeout_ms);
   }
-
-  state->waiter_env.store(co_get_curr_thread_env());
-  return co_cond_timedwait(state->cond, timeout_ms);
+  return ret;
 }
 
 bool CoroutineCondition::can_wake() const
@@ -513,18 +501,19 @@ int Runtime::reap_tasks()
 
 int Runtime::wait(int fd, short events, int timeout_ms)
 {
+  int ret = 0;
   struct pollfd pf;
   std::memset(&pf, 0, sizeof(pf));
   pf.fd = fd;
   pf.events = events;
-
   // libco's co_poll() dereferences a null poll function for a zero timeout and
   // cannot suspend outside a coroutine, so both cases go through a real poll().
   if (timeout_ms == 0 || !is_coroutine_context()) {
-    return poll_without_hook(&pf, 1, timeout_ms);
+    ret = poll_without_hook(&pf, 1, timeout_ms);
+  } else {
+    ret = co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
   }
-
-  return co_poll(co_get_epoll_ct(), &pf, 1, timeout_ms);
+  return ret;
 }
 
 int Runtime::wait_readable(int fd, int timeout_ms)
@@ -544,46 +533,54 @@ int Runtime::accept(int fd, struct sockaddr* addr, socklen_t* len)
 
 int Runtime::create_task_local_key(TaskLocalKey* key)
 {
+  int ret = 0;
   if (!key) {
     errno = EINVAL;
-    return -1;
+    ret = -1;
+  } else {
+    pthread_key_t native_key = 0;
+    ret = pthread_key_create(&native_key, nullptr);
+    if (ret != 0) {
+      errno = ret;
+      ret = -1;
+    } else {
+      // libco indexes a fixed-size per-coroutine array with the raw key value and
+      // never validates it, so a key beyond that array is unusable here.
+      if (native_key >= kMaxTaskLocalKeys) {
+        pthread_key_delete(native_key);
+        errno = EINVAL;
+        ret = -1;
+      } else {
+        key->slot_ = static_cast<unsigned int>(native_key);
+        key->valid_ = true;
+        ret = 0;
+      }
+    }
   }
-
-  pthread_key_t native_key = 0;
-  int ret = pthread_key_create(&native_key, nullptr);
-  if (ret != 0) {
-    errno = ret;
-    return -1;
-  }
-
-  // libco indexes a fixed-size per-coroutine array with the raw key value and
-  // never validates it, so a key beyond that array is unusable here.
-  if (native_key >= kMaxTaskLocalKeys) {
-    pthread_key_delete(native_key);
-    errno = EINVAL;
-    return -1;
-  }
-
-  key->slot_ = static_cast<unsigned int>(native_key);
-  key->valid_ = true;
-  return 0;
+  return ret;
 }
 
 void* Runtime::get_task_local(const TaskLocalKey& key)
 {
+  void* ret = NULL;
   if (!key.is_valid()) {
-    return nullptr;
+    ret = nullptr;
+  } else {
+    ret = co_getspecific(static_cast<pthread_key_t>(key.slot_));
   }
-  return co_getspecific(static_cast<pthread_key_t>(key.slot_));
+  return ret;
 }
 
 int Runtime::set_task_local(const TaskLocalKey& key, const void* value)
 {
+  int ret = 0;
   if (!key.is_valid()) {
     errno = EINVAL;
-    return -1;
+    ret = -1;
+  } else {
+    ret = co_setspecific(static_cast<pthread_key_t>(key.slot_), value);
   }
-  return co_setspecific(static_cast<pthread_key_t>(key.slot_), value);
+  return ret;
 }
 
 Runtime& current_runtime()

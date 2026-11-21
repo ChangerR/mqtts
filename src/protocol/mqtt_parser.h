@@ -76,20 +76,23 @@ class MQTTParser
   template <typename T, typename... Args>
   T* begin_packet(Args&&... args)
   {
+    T* ret = NULL;
     void* memory = allocator_->allocate(sizeof(T));
     if (!memory) {
-      return nullptr;
+      ret = nullptr;
+    } else {
+      T* packet = nullptr;
+      try {
+        packet = new (memory) T(std::forward<Args>(args)...);
+      } catch (...) {
+        allocator_->deallocate(memory, sizeof(T));
+        throw;
+      }
+      building_ = packet;
+      building_size_ = sizeof(T);
+      ret = packet;
     }
-    T* packet = nullptr;
-    try {
-      packet = new (memory) T(std::forward<Args>(args)...);
-    } catch (...) {
-      allocator_->deallocate(memory, sizeof(T));
-      throw;
-    }
-    building_ = packet;
-    building_size_ = sizeof(T);
-    return packet;
+    return ret;
   }
 
   // Helper functions for parsing

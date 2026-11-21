@@ -18,13 +18,15 @@ namespace mqtt {
 // Retain Handling: 0 总是下发，1 仅新订阅下发，2 不下发。
 inline bool retain_handling_delivers(uint8_t retain_handling, bool subscription_existed)
 {
+  bool ret = false;
   if (retain_handling >= 2) {
-    return false;
+    ret = false;
+  } else if (retain_handling == 1 && subscription_existed) {
+    ret = false;
+  } else {
+    ret = true;
   }
-  if (retain_handling == 1 && subscription_existed) {
-    return false;
-  }
-  return true;
+  return ret;
 }
 
 struct RetainWriteResult

@@ -78,7 +78,6 @@ int SendWorkerPool::start()
 void SendWorkerPool::shutdown_workers()
 {
   should_stop_.store(true);
-
   // 协程条件变量和协程栈都只能由创建它们的线程操作：从其他线程唤醒会把Worker协程
   // 调度到错误的线程上，释放协程栈则会与归属线程竞争。因此跨线程停止时只设置停止
   // 标志并放弃句柄，由归属线程的事件循环收尾。
@@ -88,20 +87,18 @@ void SendWorkerPool::shutdown_workers()
       workers_[i]->worker_task.release();
     }
     LOG_WARN("SendWorkerPool stopped from a foreign thread; worker tasks were detached");
-    return;
-  }
-
-  // 通知所有Worker停止
-  for (size_t i = 0; i < worker_count_; ++i) {
-    workers_[i]->task_available.broadcast();
-  }
-
-  // 等待所有Worker协程结束
-  for (size_t i = 0; i < worker_count_; ++i) {
-    if (workers_[i]->worker_task.is_valid() && workers_[i]->worker_task.join(1000) != 0) {
-      LOG_WARN("Worker {} did not stop before timeout; detaching task", i);
+  } else {
+    // 通知所有Worker停止
+    for (size_t i = 0; i < worker_count_; ++i) {
+      workers_[i]->task_available.broadcast();
     }
-    workers_[i]->worker_task.release();
+    // 等待所有Worker协程结束
+    for (size_t i = 0; i < worker_count_; ++i) {
+      if (workers_[i]->worker_task.is_valid() && workers_[i]->worker_task.join(1000) != 0) {
+        LOG_WARN("Worker {} did not stop before timeout; detaching task", i);
+      }
+      workers_[i]->worker_task.release();
+    }
   }
 }
 
@@ -114,25 +111,20 @@ void SendWorkerPool::stop()
       break;
     }
   }
-
-  if (!running_.load() && !has_worker_tasks) {
-    return;
-  }
-
-  shutdown_workers();
-
-  // 清空所有队列
-  for (size_t i = 0; i < worker_count_; ++i) {
-    CoroLockGuard lock(&workers_[i]->queue_mutex);  // 使用协程锁
-    while (!workers_[i]->task_queue.empty()) {
-      workers_[i]->task_queue.pop();
+  if (!(!running_.load() && !has_worker_tasks)) {
+    shutdown_workers();
+    // 清空所有队列
+    for (size_t i = 0; i < worker_count_; ++i) {
+      CoroLockGuard lock(&workers_[i]->queue_mutex);  // 使用协程锁
+      while (!workers_[i]->task_queue.empty()) {
+        workers_[i]->task_queue.pop();
+      }
+      workers_[i]->pending_count = 0;
+      workers_[i]->client_order.clear();
     }
-    workers_[i]->pending_count = 0;
-    workers_[i]->client_order.clear();
+    running_.store(false);
+    LOG_INFO("SendWorkerPool stopped");
   }
-
-  running_.store(false);
-  LOG_INFO("SendWorkerPool stopped");
 }
 
 int SendWorkerPool::submit_task(const WorkerSendTask& task)
@@ -168,12 +160,15 @@ int SendWorkerPool::submit_task(const WorkerSendTask& task)
 
 size_t SendWorkerPool::free_capacity_for(const MQTTString& client_id) const
 {
+  size_t ret = 0;
   if (!running_.load() || workers_.empty()) {
-    return 0;
+    ret = 0;
+  } else {
+    const size_t worker_id = select_worker(client_id);
+    const size_t pending = workers_[worker_id]->pending_count.load();
+    ret = pending >= max_queue_size_ ? 0 : max_queue_size_ - pending;
   }
-  const size_t worker_id = select_worker(client_id);
-  const size_t pending = workers_[worker_id]->pending_count.load();
-  return pending >= max_queue_size_ ? 0 : max_queue_size_ - pending;
+  return ret;
 }
 
 SendWorkerPool::Statistics SendWorkerPool::get_statistics() const

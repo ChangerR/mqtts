@@ -5,12 +5,12 @@
 #include <unordered_map>
 #include <vector>
 #include "mqtt_allocator.h"
-#include "mqtt_define.h"
+#include "mqtt_auth_interface.h"
 #include "mqtt_config.h"
+#include "mqtt_define.h"
 #include "mqtt_packet.h"
 #include "mqtt_session_manager_v2.h"
 #include "mqtt_stl_allocator.h"
-#include "mqtt_auth_interface.h"
 
 namespace websocket {
 
@@ -19,185 +19,197 @@ class WebSocketProtocolHandler;
 
 // Message format for WebSocket-MQTT bridge
 enum class MessageFormat {
-    JSON,           // {"topic": "...", "payload": "...", "qos": 0}
-    MQTT_PACKET,    // Direct MQTT packet binary format
-    TEXT_PROTOCOL   // Simple text: "PUBLISH:topic:payload"
+  JSON,          // {"topic": "...", "payload": "...", "qos": 0}
+  MQTT_PACKET,   // Direct MQTT packet binary format
+  TEXT_PROTOCOL  // Simple text: "PUBLISH:topic:payload"
 };
 
 // Bridge statistics
-struct BridgeStatistics {
-    std::atomic<uint64_t> ws_messages_received{0};
-    std::atomic<uint64_t> ws_messages_sent{0};
-    std::atomic<uint64_t> mqtt_messages_received{0};
-    std::atomic<uint64_t> mqtt_messages_sent{0};
-    std::atomic<uint64_t> translation_errors{0};
-    std::atomic<uint64_t> active_subscriptions{0};
+struct BridgeStatistics
+{
+  std::atomic<uint64_t> ws_messages_received{0};
+  std::atomic<uint64_t> ws_messages_sent{0};
+  std::atomic<uint64_t> mqtt_messages_received{0};
+  std::atomic<uint64_t> mqtt_messages_sent{0};
+  std::atomic<uint64_t> translation_errors{0};
+  std::atomic<uint64_t> active_subscriptions{0};
 
-    void reset() {
-        ws_messages_received = 0;
-        ws_messages_sent = 0;
-        mqtt_messages_received = 0;
-        mqtt_messages_sent = 0;
-        translation_errors = 0;
-        active_subscriptions = 0;
-    }
+  void reset()
+  {
+    ws_messages_received = 0;
+    ws_messages_sent = 0;
+    mqtt_messages_received = 0;
+    mqtt_messages_sent = 0;
+    translation_errors = 0;
+    active_subscriptions = 0;
+  }
 };
 
 // Subscription info
-struct SubscriptionInfo {
-    std::string topic_filter;
-    uint8_t qos;
+struct SubscriptionInfo
+{
+  std::string topic_filter;
+  uint8_t qos;
 
-    SubscriptionInfo(const std::string& topic = "", uint8_t q = 0)
-        : topic_filter(topic), qos(q) {}
+  SubscriptionInfo(const std::string& topic = "", uint8_t q = 0) : topic_filter(topic), qos(q) {}
 };
 
 // WebSocket MQTT Bridge
-class WebSocketMQTTBridge {
-public:
-    explicit WebSocketMQTTBridge(MQTTAllocator* allocator, MessageFormat format = MessageFormat::JSON);
-    ~WebSocketMQTTBridge();
+class WebSocketMQTTBridge
+{
+ public:
+  explicit WebSocketMQTTBridge(MQTTAllocator* allocator,
+                               MessageFormat format = MessageFormat::JSON);
+  ~WebSocketMQTTBridge();
 
-    // Initialize with session manager
-    int init(mqtt::GlobalSessionManager* session_manager);
+  // Initialize with session manager
+  int init(mqtt::GlobalSessionManager* session_manager);
 
-    // Register/unregister WebSocket handlers
-    int register_handler(const std::string& client_id, WebSocketProtocolHandler* handler);
-    int unregister_handler(const std::string& client_id);
-    WebSocketProtocolHandler* get_handler(const std::string& client_id) const;
-    void bind_session_handler(const std::string& client_id, mqtt::MQTTProtocolHandler* handler);
-    int send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason);
-    uint8_t mqtt_protocol_version(const std::string& client_id) const;
+  // Register/unregister WebSocket handlers
+  int register_handler(const std::string& client_id, WebSocketProtocolHandler* handler);
+  int unregister_handler(const std::string& client_id);
+  WebSocketProtocolHandler* get_handler(const std::string& client_id) const;
+  void bind_session_handler(const std::string& client_id, mqtt::MQTTProtocolHandler* handler);
+  int send_mqtt_disconnect(const std::string& client_id, mqtt::ReasonCode reason);
+  uint8_t mqtt_protocol_version(const std::string& client_id) const;
 
-    // Handle incoming WebSocket messages
-    int handle_websocket_text(const std::string& client_id, const std::string& message);
-    int handle_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data);
-    // MQTT 子协议：WS 帧只是字节流，可以分多次喂入；按 MQTT 报文边界切分，单个报文受 max_packet_size 约束。
-    int handle_websocket_binary(const std::string& client_id, const uint8_t* data, size_t len);
+  // Handle incoming WebSocket messages
+  int handle_websocket_text(const std::string& client_id, const std::string& message);
+  int handle_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data);
+  // MQTT 子协议：WS 帧只是字节流，可以分多次喂入；按 MQTT 报文边界切分，单个报文受 max_packet_size
+  // 约束。
+  int handle_websocket_binary(const std::string& client_id, const uint8_t* data, size_t len);
 
-    // Handle incoming MQTT messages (from session manager)
-    int handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet);
-    // mqtt 二进制子协议的出站改走协议处理器，但仍要先做原来的投递授权复查。
-    bool outbound_read_allowed(const std::string& client_id, const std::string& topic) {
-        return topic_allowed(client_id, topic, mqtt::auth::Permission::READ);
-    }
+  // Handle incoming MQTT messages (from session manager)
+  int handle_mqtt_publish(const std::string& client_id, const mqtt::PublishPacket& packet);
+  // mqtt 二进制子协议的出站改走协议处理器，但仍要先做原来的投递授权复查。
+  bool outbound_read_allowed(const std::string& client_id, const std::string& topic)
+  {
+    return topic_allowed(client_id, topic, mqtt::auth::Permission::READ);
+  }
 
-    // Topic subscription management
-    int subscribe_topic(const std::string& client_id, const std::string& topic_filter, uint8_t qos = 0);
-    int subscribe_topic(const std::string& client_id, const std::string& topic_filter,
-                        const mqtt::SubscriptionOptions& options, bool* already_present = nullptr);
-    int unsubscribe_topic(const std::string& client_id, const std::string& topic_filter);
+  // Topic subscription management
+  int subscribe_topic(const std::string& client_id, const std::string& topic_filter,
+                      uint8_t qos = 0);
+  int subscribe_topic(const std::string& client_id, const std::string& topic_filter,
+                      const mqtt::SubscriptionOptions& options, bool* already_present = nullptr);
+  int unsubscribe_topic(const std::string& client_id, const std::string& topic_filter);
 
-    // Publish MQTT message
-    int publish_message(const std::string& client_id, const std::string& topic,
-                       const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false, const mqtt::Properties& properties = mqtt::Properties());
+  // Publish MQTT message
+  int publish_message(const std::string& client_id, const std::string& topic,
+                      const std::vector<uint8_t>& payload, uint8_t qos = 0, bool retain = false,
+                      const mqtt::Properties& properties = mqtt::Properties());
 
-    // Configuration
-    void set_message_format(MessageFormat format) { format_ = format; }
-    MessageFormat get_message_format() const { return format_; }
-    void set_protocol_limits(const mqtt::ProtocolLimits* limits) {
-        protocol_limits_ = limits;
-        if (limits) allow_mqtt3x_ = limits->allow_mqtt3x;
-    }
-    const mqtt::ProtocolLimits& effective_limits() const;
-    bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
-    void set_auth_manager(mqtt::auth::AuthManager* manager) { auth_manager_ = manager; }
+  // Configuration
+  void set_message_format(MessageFormat format) { format_ = format; }
+  MessageFormat get_message_format() const { return format_; }
+  void set_protocol_limits(const mqtt::ProtocolLimits* limits)
+  {
+    protocol_limits_ = limits;
+    if (limits)
+      allow_mqtt3x_ = limits->allow_mqtt3x;
+  }
+  const mqtt::ProtocolLimits& effective_limits() const;
+  bool is_mqtt3x_allowed() const { return allow_mqtt3x_; }
+  void set_auth_manager(mqtt::auth::AuthManager* manager) { auth_manager_ = manager; }
 
-    // Statistics
-    BridgeStatistics& get_statistics() { return stats_; }
-    const BridgeStatistics& get_statistics() const { return stats_; }
+  // Statistics
+  BridgeStatistics& get_statistics() { return stats_; }
+  const BridgeStatistics& get_statistics() const { return stats_; }
 
-    // Session manager
-    mqtt::GlobalSessionManager* get_session_manager() const { return session_manager_; }
+  // Session manager
+  mqtt::GlobalSessionManager* get_session_manager() const { return session_manager_; }
 
-private:
-    // JSON message parsing/formatting
-    int parse_json_message(const std::string& json, std::string& topic,
-                          std::vector<uint8_t>& payload, uint8_t& qos, bool& retain);
-    std::string format_json_message(const std::string& topic, const std::vector<uint8_t>& payload,
-                                   uint8_t qos, bool retain);
+ private:
+  // JSON message parsing/formatting
+  int parse_json_message(const std::string& json, std::string& topic, std::vector<uint8_t>& payload,
+                         uint8_t& qos, bool& retain);
+  std::string format_json_message(const std::string& topic, const std::vector<uint8_t>& payload,
+                                  uint8_t qos, bool retain);
 
-    // Text protocol parsing/formatting
-    int parse_text_protocol(const std::string& text, std::string& topic,
-                           std::vector<uint8_t>& payload);
-    std::string format_text_protocol(const std::string& topic, const std::vector<uint8_t>& payload);
+  // Text protocol parsing/formatting
+  int parse_text_protocol(const std::string& text, std::string& topic,
+                          std::vector<uint8_t>& payload);
+  std::string format_text_protocol(const std::string& topic, const std::vector<uint8_t>& payload);
 
-    // Binary MQTT packet handling
-    int parse_mqtt_packet(const uint8_t* data, size_t len, mqtt::Packet*& packet,
-                          uint8_t protocol_version_hint);
-    int handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet);
-    int handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet);
-    int handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet);
-    int handle_mqtt_publish_packet(const std::string& client_id, mqtt::PublishPacket* packet);
-    int handle_mqtt_pingreq(const std::string& client_id);
-    int handle_mqtt_disconnect(const std::string& client_id, const mqtt::DisconnectPacket* packet);
-    void dispose_will(const std::string& transport_id);
-    bool remember_connection_will(const std::string& transport_id, const std::string& mqtt_client_id,
-                                  const mqtt::ConnectPacket* packet);
-    int send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet);
-    void destroy_packet(mqtt::Packet* packet);
-    bool topic_allowed(const std::string& client_id, const std::string& topic, mqtt::auth::Permission permission);
-    void fill_connack(mqtt::ConnAckPacket& connack, const mqtt::ConnectPacket* packet);
+  // Binary MQTT packet handling
+  int parse_mqtt_packet(const uint8_t* data, size_t len, mqtt::Packet*& packet,
+                        uint8_t protocol_version_hint);
+  int handle_mqtt_connect(const std::string& client_id, const mqtt::ConnectPacket* packet);
+  int handle_mqtt_subscribe(const std::string& client_id, const mqtt::SubscribePacket* packet);
+  int handle_mqtt_unsubscribe(const std::string& client_id, const mqtt::UnsubscribePacket* packet);
+  int handle_mqtt_publish_packet(const std::string& client_id, mqtt::PublishPacket* packet);
+  int handle_mqtt_pingreq(const std::string& client_id);
+  int handle_mqtt_disconnect(const std::string& client_id, const mqtt::DisconnectPacket* packet);
+  void dispose_will(const std::string& transport_id);
+  bool remember_connection_will(const std::string& transport_id, const std::string& mqtt_client_id,
+                                const mqtt::ConnectPacket* packet);
+  int send_serialized_mqtt_packet(const std::string& client_id, mqtt::Packet& packet);
+  void destroy_packet(mqtt::Packet* packet);
+  bool topic_allowed(const std::string& client_id, const std::string& topic,
+                     mqtt::auth::Permission permission);
+  void fill_connack(mqtt::ConnAckPacket& connack, const mqtt::ConnectPacket* packet);
 
-    // Send response to WebSocket client
-    int send_to_websocket(const std::string& client_id, const std::string& text);
-    int send_to_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data);
+  // Send response to WebSocket client
+  int send_to_websocket(const std::string& client_id, const std::string& text);
+  int send_to_websocket_binary(const std::string& client_id, const std::vector<uint8_t>& data);
 
-    // Base64 encode/decode for binary payloads in JSON
-    static std::string base64_encode(const std::vector<uint8_t>& data);
-    static std::vector<uint8_t> base64_decode(const std::string& encoded);
+  // Base64 encode/decode for binary payloads in JSON
+  static std::string base64_encode(const std::vector<uint8_t>& data);
+  static std::vector<uint8_t> base64_decode(const std::string& encoded);
 
-    MQTTAllocator* allocator_;
-    MessageFormat format_;
-    mqtt::GlobalSessionManager* session_manager_;
+  MQTTAllocator* allocator_;
+  MessageFormat format_;
+  mqtt::GlobalSessionManager* session_manager_;
 
-    // Handler registry
-    using HandlerMap = std::unordered_map<std::string, WebSocketProtocolHandler*,
-                                          std::hash<std::string>,
-                                          std::equal_to<std::string>,
-                                          mqtt::mqtt_stl_allocator<std::pair<const std::string, WebSocketProtocolHandler*>>>;
-    HandlerMap handlers_;
+  // Handler registry
+  using HandlerMap = std::unordered_map<
+      std::string, WebSocketProtocolHandler*, std::hash<std::string>, std::equal_to<std::string>,
+      mqtt::mqtt_stl_allocator<std::pair<const std::string, WebSocketProtocolHandler*>>>;
+  HandlerMap handlers_;
 
-    // Subscription tracking
-    using SubscriptionMap = std::unordered_map<std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>,
-                                               std::hash<std::string>,
-                                               std::equal_to<std::string>,
-                                               mqtt::mqtt_stl_allocator<std::pair<const std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>>;
-    SubscriptionMap subscriptions_;
+  // Subscription tracking
+  using SubscriptionMap = std::unordered_map<
+      std::string, std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>,
+      std::hash<std::string>, std::equal_to<std::string>,
+      mqtt::mqtt_stl_allocator<
+          std::pair<const std::string,
+                    std::vector<SubscriptionInfo, mqtt::mqtt_stl_allocator<SubscriptionInfo>>>>>;
+  SubscriptionMap subscriptions_;
 
-    // 重组缓冲不走每连接分配器。解析器还要再拷一份载荷，两份都算进 client_max_size 会让
-    // 一条低于 max_packet_size 的 PUBLISH 直接 bad_alloc。这里按报文上限预留，用完即释放。
-    using BinaryBuffer = std::vector<uint8_t>;
-    using BinaryBufferMap = std::unordered_map<std::string, BinaryBuffer,
-                                               std::hash<std::string>,
-                                               std::equal_to<std::string>,
-                                               mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>>;
-    BinaryBufferMap pending_binary_buffers_;
-    using ProtocolVersionMap = std::unordered_map<std::string, uint8_t,
-                                                  std::hash<std::string>,
-                                                  std::equal_to<std::string>,
-                                                  mqtt::mqtt_stl_allocator<std::pair<const std::string, uint8_t>>>;
-    ProtocolVersionMap client_protocol_versions_;
-    std::unordered_map<std::string, mqtt::MQTTProtocolHandler*> session_handlers_;
-    std::unordered_map<std::string, std::string> mqtt_client_ids_;
+  // 重组缓冲不走每连接分配器。解析器还要再拷一份载荷，两份都算进 client_max_size 会让
+  // 一条低于 max_packet_size 的 PUBLISH 直接 bad_alloc。这里按报文上限预留，用完即释放。
+  using BinaryBuffer = std::vector<uint8_t>;
+  using BinaryBufferMap =
+      std::unordered_map<std::string, BinaryBuffer, std::hash<std::string>,
+                         std::equal_to<std::string>,
+                         mqtt::mqtt_stl_allocator<std::pair<const std::string, BinaryBuffer>>>;
+  BinaryBufferMap pending_binary_buffers_;
+  using ProtocolVersionMap =
+      std::unordered_map<std::string, uint8_t, std::hash<std::string>, std::equal_to<std::string>,
+                         mqtt::mqtt_stl_allocator<std::pair<const std::string, uint8_t>>>;
+  ProtocolVersionMap client_protocol_versions_;
+  std::unordered_map<std::string, mqtt::MQTTProtocolHandler*> session_handlers_;
+  std::unordered_map<std::string, std::string> mqtt_client_ids_;
 
-    // Statistics
-    BridgeStatistics stats_;
-    bool allow_mqtt3x_ = true;
-    const mqtt::ProtocolLimits* protocol_limits_ = nullptr;
-    mqtt::auth::AuthManager* auth_manager_ = nullptr;
-    std::unordered_map<std::string, std::shared_ptr<mqtt::auth::ClientAuthContext>> auth_contexts_;
+  // Statistics
+  BridgeStatistics stats_;
+  bool allow_mqtt3x_ = true;
+  const mqtt::ProtocolLimits* protocol_limits_ = nullptr;
+  mqtt::auth::AuthManager* auth_manager_ = nullptr;
+  std::unordered_map<std::string, std::shared_ptr<mqtt::auth::ClientAuthContext>> auth_contexts_;
 
-    // 遗嘱挂在桥上，不放进适配器。适配器析构也会走会话清理，不能再发一次。
-    struct ConnectionWill {
-        bool present = false;
-        bool settled = false;
-        bool discard = false;
-        uint32_t session_expiry_seconds = 0;
-        std::string mqtt_client_id;
-        mqtt::WillBody body;
-    };
-    std::unordered_map<std::string, ConnectionWill> connection_wills_;
+  // 遗嘱挂在桥上，不放进适配器。适配器析构也会走会话清理，不能再发一次。
+  struct ConnectionWill
+  {
+    bool present = false;
+    bool settled = false;
+    bool discard = false;
+    uint32_t session_expiry_seconds = 0;
+    std::string mqtt_client_id;
+    mqtt::WillBody body;
+  };
+  std::unordered_map<std::string, ConnectionWill> connection_wills_;
 };
 
 }  // namespace websocket

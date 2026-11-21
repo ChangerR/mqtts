@@ -1731,11 +1731,12 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffe
 int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffer)
 {
   int ret = serialize_publish_header(packet->topic_name, packet->qos, packet->retain, packet->dup,
-                                     packet->packet_id, packet->properties,
-                                     packet->payload.size(), buffer);
-  if (ret != 0)
-    return ret;
-  return buffer.append(packet->payload.data(), packet->payload.size());
+                                     packet->packet_id, packet->properties, packet->payload.size(),
+                                     buffer);
+  if (!(ret != 0)) {
+    ret = buffer.append(packet->payload.data(), packet->payload.size());
+  }
+  return ret;
 }
 
 int MQTTParser::serialize_publish_header(const MQTTString& topic, uint8_t qos, bool retain,
@@ -2239,24 +2240,28 @@ int MQTTParser::serialize_pingreq(const PingReqPacket* packet, MQTTBuffer& buffe
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PINGREQ));
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(0x00);  // 剩余长度为0
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  if (!(ret != 0)) {
+    ret = buffer.push_back(0x00);
+    // 剩余长度为0
+    if (!(ret != 0)) {
+      ret = MQ_SUCCESS;
+    }
+  }
+  return ret;
 }
 
 int MQTTParser::serialize_pingresp(const PingRespPacket* packet, MQTTBuffer& buffer)
 {
   buffer.clear();
   int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PINGRESP));
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(0x00);  // 剩余长度为0
-  if (ret != 0)
-    return ret;
-  return MQ_SUCCESS;
+  if (!(ret != 0)) {
+    ret = buffer.push_back(0x00);
+    // 剩余长度为0
+    if (!(ret != 0)) {
+      ret = MQ_SUCCESS;
+    }
+  }
+  return ret;
 }
 
 int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTBuffer& buffer)

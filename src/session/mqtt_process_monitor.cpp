@@ -1,454 +1,452 @@
 #include "mqtt_process_monitor.h"
-#include <iomanip>
-#include <sstream>
-#include <ctime>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include "logger.h"
 #include "mqtt_memory_tags.h"
 
 namespace mqtt {
 
 ProcessMonitor::ProcessMonitor(GlobalSessionManager* session_manager, int interval_seconds)
-    : session_manager_(session_manager), 
+    : session_manager_(session_manager),
       interval_seconds_(interval_seconds),
       verbose_output_(false),
       json_output_file_(""),
       running_(false),
       start_time_(std::chrono::steady_clock::now())
 {
-    if (interval_seconds_ <= 0) {
-        interval_seconds_ = 5;  // 默认5秒
-    }
+  if (interval_seconds_ <= 0) {
+    interval_seconds_ = 5;  // 默认5秒
+  }
 }
 
 ProcessMonitor::~ProcessMonitor()
 {
-    stop();
+  stop();
 }
 
 int ProcessMonitor::start()
 {
-    if (running_.load()) {
-        LOG_WARN("Process monitor is already running");
-        return MQ_SUCCESS;
-    }
-    
-    if (!session_manager_) {
-        LOG_ERROR("Session manager is null, cannot start process monitor");
-        return MQ_ERR_INVALID_ARGS;
-    }
-    
-    running_.store(true);
-    start_time_ = std::chrono::steady_clock::now();
-    
-    try {
-        monitor_thread_.reset(new std::thread(&ProcessMonitor::monitor_loop, this));
-        LOG_INFO("Process monitor started with {}s interval", interval_seconds_);
-    } catch (const std::exception& e) {
-        LOG_ERROR("Failed to start process monitor thread: {}", e.what());
-        running_.store(false);
-        return MQ_ERR_INTERNAL;
-    }
-    
+  if (running_.load()) {
+    LOG_WARN("Process monitor is already running");
     return MQ_SUCCESS;
+  }
+
+  if (!session_manager_) {
+    LOG_ERROR("Session manager is null, cannot start process monitor");
+    return MQ_ERR_INVALID_ARGS;
+  }
+
+  running_.store(true);
+  start_time_ = std::chrono::steady_clock::now();
+
+  try {
+    monitor_thread_.reset(new std::thread(&ProcessMonitor::monitor_loop, this));
+    LOG_INFO("Process monitor started with {}s interval", interval_seconds_);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Failed to start process monitor thread: {}", e.what());
+    running_.store(false);
+    return MQ_ERR_INTERNAL;
+  }
+
+  return MQ_SUCCESS;
 }
 
 void ProcessMonitor::stop()
 {
-    if (!running_.load()) {
-        return;
-    }
-    
+  if (!(!running_.load())) {
     running_.store(false);
-    
     if (monitor_thread_ && monitor_thread_->joinable()) {
-        monitor_thread_->join();
+      monitor_thread_->join();
     }
-    
     LOG_INFO("Process monitor stopped");
+  }
 }
 
 void ProcessMonitor::monitor_loop()
 {
-    LOG_INFO("Process monitor thread started");
-    
-    while (running_.load()) {
-        try {
-            print_status_once();
-        } catch (const std::exception& e) {
-            LOG_ERROR("Error in process monitor loop: {}", e.what());
-        }
-        
-        // 使用更精确的睡眠控制
-        for (int i = 0; i < interval_seconds_ * 10 && running_.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+  LOG_INFO("Process monitor thread started");
+
+  while (running_.load()) {
+    try {
+      print_status_once();
+    } catch (const std::exception& e) {
+      LOG_ERROR("Error in process monitor loop: {}", e.what());
     }
-    
-    LOG_INFO("Process monitor thread stopped");
+
+    // 使用更精确的睡眠控制
+    for (int i = 0; i < interval_seconds_ * 10 && running_.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
+  LOG_INFO("Process monitor thread stopped");
 }
 
 int ProcessMonitor::get_process_stats(ProcessStats& stats)
 {
-    // 重置统计信息
-    stats = ProcessStats();
-    
-    // 设置时间戳和运行时间
-    stats.timestamp = std::chrono::steady_clock::now();
-    stats.uptime = std::chrono::duration_cast<std::chrono::seconds>(
-        stats.timestamp - start_time_);
-    
-    // 收集各种统计信息
-    collect_memory_stats(stats);
-    collect_connection_stats(stats);
-    collect_topic_stats(stats);
-    
-    if (session_manager_) {
-        session_manager_->collect_protocol_counters(stats.protocol);
-    }
-    stats.messages_sent = static_cast<size_t>(stats.protocol.publish_sent);
-    stats.messages_received = static_cast<size_t>(stats.protocol.publish_received);
-    stats.bytes_sent = static_cast<size_t>(stats.protocol.bytes_sent);
-    stats.bytes_received = static_cast<size_t>(stats.protocol.bytes_received);
-    
-    return MQ_SUCCESS;
+  // 重置统计信息
+  stats = ProcessStats();
+
+  // 设置时间戳和运行时间
+  stats.timestamp = std::chrono::steady_clock::now();
+  stats.uptime = std::chrono::duration_cast<std::chrono::seconds>(stats.timestamp - start_time_);
+
+  // 收集各种统计信息
+  collect_memory_stats(stats);
+  collect_connection_stats(stats);
+  collect_topic_stats(stats);
+
+  if (session_manager_) {
+    session_manager_->collect_protocol_counters(stats.protocol);
+  }
+  stats.messages_sent = static_cast<size_t>(stats.protocol.publish_sent);
+  stats.messages_received = static_cast<size_t>(stats.protocol.publish_received);
+  stats.bytes_sent = static_cast<size_t>(stats.protocol.bytes_sent);
+  stats.bytes_received = static_cast<size_t>(stats.protocol.bytes_received);
+
+  return MQ_SUCCESS;
 }
 
 void ProcessMonitor::collect_memory_stats(ProcessStats& stats)
 {
-    auto& memory_manager = MQTTMemoryManager::get_instance();
-    
-    // 收集各标签的内存使用情况
-    for (int i = 0; i < static_cast<int>(MQTTMemoryTag::MEM_TAG_COUNT); ++i) {
-        MQTTMemoryTag tag = static_cast<MQTTMemoryTag>(i);
-        std::string tag_name = get_memory_tag_str(tag);
-        
-        size_t tag_memory = memory_manager.get_tag_memory_usage(tag);
-        stats.memory_by_tag[tag_name] = tag_memory;
-        stats.total_memory_used += tag_memory;
-    }
+  auto& memory_manager = MQTTMemoryManager::get_instance();
+
+  // 收集各标签的内存使用情况
+  for (int i = 0; i < static_cast<int>(MQTTMemoryTag::MEM_TAG_COUNT); ++i) {
+    MQTTMemoryTag tag = static_cast<MQTTMemoryTag>(i);
+    std::string tag_name = get_memory_tag_str(tag);
+
+    size_t tag_memory = memory_manager.get_tag_memory_usage(tag);
+    stats.memory_by_tag[tag_name] = tag_memory;
+    stats.total_memory_used += tag_memory;
+  }
 }
 
 void ProcessMonitor::collect_connection_stats(ProcessStats& stats)
 {
-    if (!session_manager_) {
-        return;
-    }
-    
+  if (session_manager_) {
     // 获取线程数量
     stats.total_threads = session_manager_->get_thread_count();
-    
     // 获取总连接数和活跃连接数
     size_t total_handlers = 0;
     size_t active_handlers = 0;
-    
     int result = session_manager_->get_total_handler_count(total_handlers);
     if (result == MQ_SUCCESS) {
-        stats.total_connections = total_handlers;
-        stats.active_connections = total_handlers;  // 假设所有连接都是活跃的
+      stats.total_connections = total_handlers;
+      stats.active_connections = total_handlers;  // 假设所有连接都是活跃的
     }
-    
     // 获取待处理消息数
     size_t pending_count = 0;
     result = session_manager_->get_total_pending_message_count(pending_count);
     if (result == MQ_SUCCESS) {
-        stats.pending_messages = pending_count;
+      stats.pending_messages = pending_count;
     }
+  }
 }
 
 void ProcessMonitor::collect_topic_stats(ProcessStats& stats)
 {
-    if (!session_manager_) {
-        return;
-    }
-    
+  if (session_manager_) {
     // 获取topic tree统计信息
     size_t subscriber_count = 0;
     size_t node_count = 0;
-    
     int result = session_manager_->get_topic_tree_stats(subscriber_count, node_count);
     if (result == MQ_SUCCESS) {
-        stats.total_subscribers = subscriber_count;
-        stats.total_topic_nodes = node_count;
+      stats.total_subscribers = subscriber_count;
+      stats.total_topic_nodes = node_count;
     }
+  }
 }
 
 void ProcessMonitor::print_status_once()
 {
-    ProcessStats stats;
-    int result = get_process_stats(stats);
-    if (result != MQ_SUCCESS) {
-        LOG_ERROR("Failed to get process stats: {}", result);
-        return;
-    }
-    
+  ProcessStats stats;
+  int result = get_process_stats(stats);
+  if (result != MQ_SUCCESS) {
+    LOG_ERROR("Failed to get process stats: {}", result);
+  } else {
     print_process_stats(stats);
-    
     // 如果配置了JSON输出文件，同时写入JSON格式
     if (!json_output_file_.empty()) {
-        write_json_stats_to_file(stats);
+      write_json_stats_to_file(stats);
     }
+  }
 }
 
 void ProcessMonitor::print_process_stats(const ProcessStats& stats)
 {
-    std::stringstream ss;
-    
-    // 时间信息
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    
-    ss << "\n" << std::string(80, '=') << "\n";
-    ss << "MQTT Server Process Status - " << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
-    ss << " (Uptime: " << format_duration(stats.uptime) << ")\n";
-    ss << std::string(80, '=') << "\n";
-    
-    // 连接统计
-    ss << "CONNECTION STATS:\n";
-    ss << "  Total Connections: " << stats.total_connections << "\n";
-    ss << "  Active Connections: " << stats.active_connections << "\n";
-    ss << "  Worker Threads: " << stats.total_threads << "\n";
-    ss << "  Pending Messages: " << stats.pending_messages << "\n";
-    ss << "\n";
-    
-    // Topic统计
-    ss << "TOPIC STATS:\n";
-    ss << "  Total Subscribers: " << stats.total_subscribers << "\n";
-    ss << "  Topic Tree Nodes: " << stats.total_topic_nodes << "\n";
-    ss << "\n";
-    
-    // 内存统计
-    ss << "MEMORY STATS:\n";
-    ss << "  Total Used: " << format_bytes(stats.total_memory_used) << "\n";
-    
-    if (verbose_output_) {
-        ss << "  Memory by Tag:\n";
-        for (const auto& pair : stats.memory_by_tag) {
-            if (pair.second > 0) {
-                ss << "    " << std::left << std::setw(20) << pair.first << ": " 
-                   << format_bytes(pair.second) << "\n";
-            }
-        }
+  std::stringstream ss;
+
+  // 时间信息
+  auto now = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(now);
+
+  ss << "\n" << std::string(80, '=') << "\n";
+  ss << "MQTT Server Process Status - "
+     << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+  ss << " (Uptime: " << format_duration(stats.uptime) << ")\n";
+  ss << std::string(80, '=') << "\n";
+
+  // 连接统计
+  ss << "CONNECTION STATS:\n";
+  ss << "  Total Connections: " << stats.total_connections << "\n";
+  ss << "  Active Connections: " << stats.active_connections << "\n";
+  ss << "  Worker Threads: " << stats.total_threads << "\n";
+  ss << "  Pending Messages: " << stats.pending_messages << "\n";
+  ss << "\n";
+
+  // Topic统计
+  ss << "TOPIC STATS:\n";
+  ss << "  Total Subscribers: " << stats.total_subscribers << "\n";
+  ss << "  Topic Tree Nodes: " << stats.total_topic_nodes << "\n";
+  ss << "\n";
+
+  // 内存统计
+  ss << "MEMORY STATS:\n";
+  ss << "  Total Used: " << format_bytes(stats.total_memory_used) << "\n";
+
+  if (verbose_output_) {
+    ss << "  Memory by Tag:\n";
+    for (const auto& pair : stats.memory_by_tag) {
+      if (pair.second > 0) {
+        ss << "    " << std::left << std::setw(20) << pair.first << ": "
+           << format_bytes(pair.second) << "\n";
+      }
     }
-    ss << "\n";
-    
-    // 吞吐量统计
-    ss << "THROUGHPUT STATS:\n";
-    ss << "  Messages Sent: " << stats.messages_sent << "\n";
-    ss << "  Messages Received: " << stats.messages_received << "\n";
-    ss << "  Bytes Sent: " << format_bytes(stats.bytes_sent) << "\n";
-    ss << "  Bytes Received: " << format_bytes(stats.bytes_received) << "\n";
-    
-    // 计算平均吞吐量
-    if (stats.uptime.count() > 0) {
-        double msg_per_sec = static_cast<double>(stats.messages_sent + stats.messages_received) / stats.uptime.count();
-        double bytes_per_sec = static_cast<double>(stats.bytes_sent + stats.bytes_received) / stats.uptime.count();
-        ss << "  Average Throughput: " << std::fixed << std::setprecision(2) 
-           << msg_per_sec << " msg/s, " << format_bytes(static_cast<size_t>(bytes_per_sec)) << "/s\n";
-    }
-    
-    // 系统资源信息
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        ss << "\nSYSTEM RESOURCE STATS:\n";
-        ss << "  Max RSS: " << format_bytes(usage.ru_maxrss * 1024) << "\n";
-        ss << "  User CPU Time: " << usage.ru_utime.tv_sec << "." << std::setfill('0') << std::setw(6) << usage.ru_utime.tv_usec << "s\n";
-        ss << "  System CPU Time: " << usage.ru_stime.tv_sec << "." << std::setfill('0') << std::setw(6) << usage.ru_stime.tv_usec << "s\n";
-    }
-    
-    ss << std::string(80, '=') << "\n";
-    
-    LOG_INFO(
-        "protocol counters: publish_received={} publish_received_bytes={} publish_sent={} "
-        "publish_sent_bytes={} bytes_received={} bytes_sent={} keepalive_timeouts={} "
-        "connect_timeouts={} session_takeovers={} malformed_packet_disconnects={} "
-        "outbound_packet_size_drops={} inflight_window_delays={} wills_published={} "
-        "wills_rejected={} retained_messages={} retained_bytes={} retained_not_stored={} "
-        "retained_delivery_truncated={}",
-        stats.protocol.publish_received, stats.protocol.publish_received_bytes,
-        stats.protocol.publish_sent, stats.protocol.publish_sent_bytes,
-        stats.protocol.bytes_received, stats.protocol.bytes_sent,
-        stats.protocol.keepalive_timeouts, stats.protocol.connect_timeouts,
-        stats.protocol.session_takeovers, stats.protocol.malformed_packet_disconnects,
-        stats.protocol.outbound_packet_size_drops, stats.protocol.inflight_window_delays,
-        stats.protocol.wills_published, stats.protocol.wills_rejected,
-        stats.protocol.retained_messages, stats.protocol.retained_bytes,
-        stats.protocol.retained_not_stored, stats.protocol.retained_delivery_truncated);
+  }
+  ss << "\n";
+
+  // 吞吐量统计
+  ss << "THROUGHPUT STATS:\n";
+  ss << "  Messages Sent: " << stats.messages_sent << "\n";
+  ss << "  Messages Received: " << stats.messages_received << "\n";
+  ss << "  Bytes Sent: " << format_bytes(stats.bytes_sent) << "\n";
+  ss << "  Bytes Received: " << format_bytes(stats.bytes_received) << "\n";
+
+  // 计算平均吞吐量
+  if (stats.uptime.count() > 0) {
+    double msg_per_sec =
+        static_cast<double>(stats.messages_sent + stats.messages_received) / stats.uptime.count();
+    double bytes_per_sec =
+        static_cast<double>(stats.bytes_sent + stats.bytes_received) / stats.uptime.count();
+    ss << "  Average Throughput: " << std::fixed << std::setprecision(2) << msg_per_sec
+       << " msg/s, " << format_bytes(static_cast<size_t>(bytes_per_sec)) << "/s\n";
+  }
+
+  // 系统资源信息
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    ss << "\nSYSTEM RESOURCE STATS:\n";
+    ss << "  Max RSS: " << format_bytes(usage.ru_maxrss * 1024) << "\n";
+    ss << "  User CPU Time: " << usage.ru_utime.tv_sec << "." << std::setfill('0') << std::setw(6)
+       << usage.ru_utime.tv_usec << "s\n";
+    ss << "  System CPU Time: " << usage.ru_stime.tv_sec << "." << std::setfill('0') << std::setw(6)
+       << usage.ru_stime.tv_usec << "s\n";
+  }
+
+  ss << std::string(80, '=') << "\n";
+
+  LOG_INFO(
+      "protocol counters: publish_received={} publish_received_bytes={} publish_sent={} "
+      "publish_sent_bytes={} bytes_received={} bytes_sent={} keepalive_timeouts={} "
+      "connect_timeouts={} session_takeovers={} malformed_packet_disconnects={} "
+      "outbound_packet_size_drops={} inflight_window_delays={} wills_published={} "
+      "wills_rejected={} retained_messages={} retained_bytes={} retained_not_stored={} "
+      "retained_delivery_truncated={}",
+      stats.protocol.publish_received, stats.protocol.publish_received_bytes,
+      stats.protocol.publish_sent, stats.protocol.publish_sent_bytes, stats.protocol.bytes_received,
+      stats.protocol.bytes_sent, stats.protocol.keepalive_timeouts, stats.protocol.connect_timeouts,
+      stats.protocol.session_takeovers, stats.protocol.malformed_packet_disconnects,
+      stats.protocol.outbound_packet_size_drops, stats.protocol.inflight_window_delays,
+      stats.protocol.wills_published, stats.protocol.wills_rejected,
+      stats.protocol.retained_messages, stats.protocol.retained_bytes,
+      stats.protocol.retained_not_stored, stats.protocol.retained_delivery_truncated);
 }
 
 std::string ProcessMonitor::format_bytes(size_t bytes)
 {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-    int unit_index = 0;
-    double size = static_cast<double>(bytes);
-    
-    while (size >= 1024.0 && unit_index < 4) {
-        size /= 1024.0;
-        unit_index++;
-    }
-    
-    std::stringstream ss;
-    ss << std::fixed << std::setprecision(2) << size << " " << units[unit_index];
-    return ss.str();
+  const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+  int unit_index = 0;
+  double size = static_cast<double>(bytes);
+
+  while (size >= 1024.0 && unit_index < 4) {
+    size /= 1024.0;
+    unit_index++;
+  }
+
+  std::stringstream ss;
+  ss << std::fixed << std::setprecision(2) << size << " " << units[unit_index];
+  return ss.str();
 }
 
 std::string ProcessMonitor::format_duration(std::chrono::seconds seconds)
 {
-    auto total_seconds = seconds.count();
-    auto hours = total_seconds / 3600;
-    auto minutes = (total_seconds % 3600) / 60;
-    auto secs = total_seconds % 60;
-    
-    std::stringstream ss;
-    ss << std::setfill('0') << std::setw(2) << hours << ":"
-       << std::setw(2) << minutes << ":"
-       << std::setw(2) << secs;
-    return ss.str();
+  auto total_seconds = seconds.count();
+  auto hours = total_seconds / 3600;
+  auto minutes = (total_seconds % 3600) / 60;
+  auto secs = total_seconds % 60;
+
+  std::stringstream ss;
+  ss << std::setfill('0') << std::setw(2) << hours << ":" << std::setw(2) << minutes << ":"
+     << std::setw(2) << secs;
+  return ss.str();
 }
 
 void ProcessMonitor::set_interval(int interval_seconds)
 {
-    if (interval_seconds > 0) {
-        interval_seconds_ = interval_seconds;
-        LOG_INFO("Process monitor interval changed to {}s", interval_seconds_);
-    }
+  if (interval_seconds > 0) {
+    interval_seconds_ = interval_seconds;
+    LOG_INFO("Process monitor interval changed to {}s", interval_seconds_);
+  }
 }
 
 void ProcessMonitor::set_verbose_output(bool enabled)
 {
-    verbose_output_ = enabled;
-    LOG_INFO("Process monitor verbose output {}", enabled ? "enabled" : "disabled");
+  verbose_output_ = enabled;
+  LOG_INFO("Process monitor verbose output {}", enabled ? "enabled" : "disabled");
 }
 
 void ProcessMonitor::set_json_output_file(const std::string& json_file_path)
 {
-    json_output_file_ = json_file_path;
-    LOG_INFO("Process monitor JSON output file set to: {}", json_file_path);
+  json_output_file_ = json_file_path;
+  LOG_INFO("Process monitor JSON output file set to: {}", json_file_path);
 }
 
 std::string ProcessMonitor::generate_json_stats(const ProcessStats& stats)
 {
-    std::stringstream json;
-    
-    // 获取当前时间戳
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()).count();
-    
-    json << "{\n";
-    json << "  \"timestamp\": " << timestamp_ms << ",\n";
-    json << "  \"timestamp_iso\": \"" << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ") << "\",\n";
-    json << "  \"uptime_seconds\": " << stats.uptime.count() << ",\n";
-    
-    // 连接统计
-    json << "  \"connections\": {\n";
-    json << "    \"total\": " << stats.total_connections << ",\n";
-    json << "    \"active\": " << stats.active_connections << ",\n";
-    json << "    \"threads\": " << stats.total_threads << ",\n";
-    json << "    \"pending_messages\": " << stats.pending_messages << "\n";
-    json << "  },\n";
-    
-    // Topic统计
-    json << "  \"topics\": {\n";
-    json << "    \"subscribers\": " << stats.total_subscribers << ",\n";
-    json << "    \"nodes\": " << stats.total_topic_nodes << "\n";
-    json << "  },\n";
-    
-    // 内存统计
-    json << "  \"memory\": {\n";
-    json << "    \"total_bytes\": " << stats.total_memory_used << ",\n";
-    json << "    \"by_tag\": {\n";
-    bool first_tag = true;
-    for (const auto& pair : stats.memory_by_tag) {
-        if (!first_tag) json << ",\n";
-        json << "      \"" << pair.first << "\": " << pair.second;
-        first_tag = false;
-    }
-    json << "\n    }\n";
-    json << "  },\n";
-    
-    // 吞吐量统计
-    json << "  \"throughput\": {\n";
-    json << "    \"messages_sent\": " << stats.messages_sent << ",\n";
-    json << "    \"messages_received\": " << stats.messages_received << ",\n";
-    json << "    \"bytes_sent\": " << stats.bytes_sent << ",\n";
-    json << "    \"bytes_received\": " << stats.bytes_received;
-    
-    // 计算平均吞吐量
-    if (stats.uptime.count() > 0) {
-        double msg_per_sec = static_cast<double>(stats.messages_sent + stats.messages_received) / stats.uptime.count();
-        double bytes_per_sec = static_cast<double>(stats.bytes_sent + stats.bytes_received) / stats.uptime.count();
-        json << ",\n";
-        json << "    \"avg_messages_per_sec\": " << std::fixed << std::setprecision(2) << msg_per_sec << ",\n";
-        json << "    \"avg_bytes_per_sec\": " << std::fixed << std::setprecision(2) << bytes_per_sec;
-    }
-    json << "\n  },\n";
-    json << "  \"protocol\": {\n";
-    json << "    \"publish_received\": " << stats.protocol.publish_received << ",\n";
-    json << "    \"publish_received_bytes\": " << stats.protocol.publish_received_bytes << ",\n";
-    json << "    \"publish_sent\": " << stats.protocol.publish_sent << ",\n";
-    json << "    \"publish_sent_bytes\": " << stats.protocol.publish_sent_bytes << ",\n";
-    json << "    \"bytes_received\": " << stats.protocol.bytes_received << ",\n";
-    json << "    \"bytes_sent\": " << stats.protocol.bytes_sent << ",\n";
-    json << "    \"keepalive_timeouts\": " << stats.protocol.keepalive_timeouts << ",\n";
-    json << "    \"connect_timeouts\": " << stats.protocol.connect_timeouts << ",\n";
-    json << "    \"session_takeovers\": " << stats.protocol.session_takeovers << ",\n";
-    json << "    \"malformed_packet_disconnects\": " << stats.protocol.malformed_packet_disconnects << ",\n";
-    json << "    \"outbound_packet_size_drops\": " << stats.protocol.outbound_packet_size_drops << ",\n";
-    json << "    \"inflight_window_delays\": " << stats.protocol.inflight_window_delays << ",\n";
-    json << "    \"wills_published\": " << stats.protocol.wills_published << ",\n";
-    json << "    \"wills_rejected\": " << stats.protocol.wills_rejected << ",\n";
-    json << "    \"retained_messages\": " << stats.protocol.retained_messages << ",\n";
-    json << "    \"retained_bytes\": " << stats.protocol.retained_bytes << ",\n";
-    json << "    \"retained_not_stored\": " << stats.protocol.retained_not_stored << ",\n";
-    json << "    \"retained_delivery_truncated\": " << stats.protocol.retained_delivery_truncated << "\n";
-    json << "  },\n";
-    
-    // 事件转发统计
-    json << "  \"event_forwarding\": {\n";
-    json << "    \"forwarded\": " << stats.events_forwarded << ",\n";
-    json << "    \"dropped\": " << stats.events_dropped << ",\n";
-    json << "    \"queue_size\": " << stats.forwarding_queue_size << "\n";
-    json << "  },\n";
-    
-    // 系统资源统计
-    struct rusage usage;
-    json << "  \"system_resources\": {\n";
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        json << "    \"max_rss_bytes\": " << (usage.ru_maxrss * 1024) << ",\n";
-        json << "    \"user_cpu_time_seconds\": " << (usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0) << ",\n";
-        json << "    \"system_cpu_time_seconds\": " << (usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0) << "\n";
-    } else {
-        json << "    \"error\": \"Unable to get resource usage\"\n";
-    }
-    json << "  }\n";
-    
-    json << "}";
-    
-    return json.str();
+  std::stringstream json;
+
+  // 获取当前时间戳
+  auto now = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(now);
+  auto timestamp_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+  json << "{\n";
+  json << "  \"timestamp\": " << timestamp_ms << ",\n";
+  json << "  \"timestamp_iso\": \"" << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ")
+       << "\",\n";
+  json << "  \"uptime_seconds\": " << stats.uptime.count() << ",\n";
+
+  // 连接统计
+  json << "  \"connections\": {\n";
+  json << "    \"total\": " << stats.total_connections << ",\n";
+  json << "    \"active\": " << stats.active_connections << ",\n";
+  json << "    \"threads\": " << stats.total_threads << ",\n";
+  json << "    \"pending_messages\": " << stats.pending_messages << "\n";
+  json << "  },\n";
+
+  // Topic统计
+  json << "  \"topics\": {\n";
+  json << "    \"subscribers\": " << stats.total_subscribers << ",\n";
+  json << "    \"nodes\": " << stats.total_topic_nodes << "\n";
+  json << "  },\n";
+
+  // 内存统计
+  json << "  \"memory\": {\n";
+  json << "    \"total_bytes\": " << stats.total_memory_used << ",\n";
+  json << "    \"by_tag\": {\n";
+  bool first_tag = true;
+  for (const auto& pair : stats.memory_by_tag) {
+    if (!first_tag)
+      json << ",\n";
+    json << "      \"" << pair.first << "\": " << pair.second;
+    first_tag = false;
+  }
+  json << "\n    }\n";
+  json << "  },\n";
+
+  // 吞吐量统计
+  json << "  \"throughput\": {\n";
+  json << "    \"messages_sent\": " << stats.messages_sent << ",\n";
+  json << "    \"messages_received\": " << stats.messages_received << ",\n";
+  json << "    \"bytes_sent\": " << stats.bytes_sent << ",\n";
+  json << "    \"bytes_received\": " << stats.bytes_received;
+
+  // 计算平均吞吐量
+  if (stats.uptime.count() > 0) {
+    double msg_per_sec =
+        static_cast<double>(stats.messages_sent + stats.messages_received) / stats.uptime.count();
+    double bytes_per_sec =
+        static_cast<double>(stats.bytes_sent + stats.bytes_received) / stats.uptime.count();
+    json << ",\n";
+    json << "    \"avg_messages_per_sec\": " << std::fixed << std::setprecision(2) << msg_per_sec
+         << ",\n";
+    json << "    \"avg_bytes_per_sec\": " << std::fixed << std::setprecision(2) << bytes_per_sec;
+  }
+  json << "\n  },\n";
+  json << "  \"protocol\": {\n";
+  json << "    \"publish_received\": " << stats.protocol.publish_received << ",\n";
+  json << "    \"publish_received_bytes\": " << stats.protocol.publish_received_bytes << ",\n";
+  json << "    \"publish_sent\": " << stats.protocol.publish_sent << ",\n";
+  json << "    \"publish_sent_bytes\": " << stats.protocol.publish_sent_bytes << ",\n";
+  json << "    \"bytes_received\": " << stats.protocol.bytes_received << ",\n";
+  json << "    \"bytes_sent\": " << stats.protocol.bytes_sent << ",\n";
+  json << "    \"keepalive_timeouts\": " << stats.protocol.keepalive_timeouts << ",\n";
+  json << "    \"connect_timeouts\": " << stats.protocol.connect_timeouts << ",\n";
+  json << "    \"session_takeovers\": " << stats.protocol.session_takeovers << ",\n";
+  json << "    \"malformed_packet_disconnects\": " << stats.protocol.malformed_packet_disconnects
+       << ",\n";
+  json << "    \"outbound_packet_size_drops\": " << stats.protocol.outbound_packet_size_drops
+       << ",\n";
+  json << "    \"inflight_window_delays\": " << stats.protocol.inflight_window_delays << ",\n";
+  json << "    \"wills_published\": " << stats.protocol.wills_published << ",\n";
+  json << "    \"wills_rejected\": " << stats.protocol.wills_rejected << ",\n";
+  json << "    \"retained_messages\": " << stats.protocol.retained_messages << ",\n";
+  json << "    \"retained_bytes\": " << stats.protocol.retained_bytes << ",\n";
+  json << "    \"retained_not_stored\": " << stats.protocol.retained_not_stored << ",\n";
+  json << "    \"retained_delivery_truncated\": " << stats.protocol.retained_delivery_truncated
+       << "\n";
+  json << "  },\n";
+
+  // 事件转发统计
+  json << "  \"event_forwarding\": {\n";
+  json << "    \"forwarded\": " << stats.events_forwarded << ",\n";
+  json << "    \"dropped\": " << stats.events_dropped << ",\n";
+  json << "    \"queue_size\": " << stats.forwarding_queue_size << "\n";
+  json << "  },\n";
+
+  // 系统资源统计
+  struct rusage usage;
+  json << "  \"system_resources\": {\n";
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    json << "    \"max_rss_bytes\": " << (usage.ru_maxrss * 1024) << ",\n";
+    json << "    \"user_cpu_time_seconds\": "
+         << (usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0) << ",\n";
+    json << "    \"system_cpu_time_seconds\": "
+         << (usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0) << "\n";
+  } else {
+    json << "    \"error\": \"Unable to get resource usage\"\n";
+  }
+  json << "  }\n";
+
+  json << "}";
+
+  return json.str();
 }
 
 void ProcessMonitor::write_json_stats_to_file(const ProcessStats& stats)
 {
-    try {
-        std::string json_content = generate_json_stats(stats);
-        
-        std::ofstream file(json_output_file_);
-        if (!file.is_open()) {
-            LOG_ERROR("Failed to open JSON output file: {}", json_output_file_);
-            return;
-        }
-        
-        file << json_content << std::endl;
-        file.close();
-        
-        LOG_DEBUG("JSON stats written to file: {}", json_output_file_);
-    } catch (const std::exception& e) {
-        LOG_ERROR("Error writing JSON stats to file {}: {}", json_output_file_, e.what());
+  try {
+    std::string json_content = generate_json_stats(stats);
+
+    std::ofstream file(json_output_file_);
+    if (!file.is_open()) {
+      LOG_ERROR("Failed to open JSON output file: {}", json_output_file_);
+      return;
     }
+
+    file << json_content << std::endl;
+    file.close();
+
+    LOG_DEBUG("JSON stats written to file: {}", json_output_file_);
+  } catch (const std::exception& e) {
+    LOG_ERROR("Error writing JSON stats to file {}: {}", json_output_file_, e.what());
+  }
 }
 
-} // namespace mqtt
+}  // namespace mqtt

@@ -116,9 +116,9 @@ void DurableStore::Signal::wait(uint64_t observed, int timeout_ms)
   uint64_t value;
   while (::read(fd_, &value, sizeof(value)) > 0) {
   }
-  if (load() != observed)
-    return;
-  runtime::current_runtime().wait_readable(fd_, timeout_ms);
+  if (!(load() != observed)) {
+    runtime::current_runtime().wait_readable(fd_, timeout_ms);
+  }
 }
 int64_t DurableStore::now_ms()
 {
@@ -335,12 +335,16 @@ struct DurableStore::Impl
   }
   std::shared_ptr<Session> current(const std::string& client, uint64_t epoch)
   {
+    std::shared_ptr<Session> ret{};
     auto it = sessions.find(client);
-    if (it == sessions.end() || it->second->epoch != epoch || !it->second->online)
-      return {};
-    if (it->second->busy)
-      throw Deferred();
-    return it->second;
+    if (it == sessions.end() || it->second->epoch != epoch || !it->second->online) {
+      ret = {};
+    } else {
+      if (it->second->busy)
+        throw Deferred();
+      ret = it->second;
+    }
+    return ret;
   }
   void notify(const std::shared_ptr<Session>& s)
   {
@@ -555,23 +559,23 @@ struct DurableStore::Impl
         else
           schedule_session(s, now + 100);
       }
-      return;
-    }
-    for (auto it = sessions.begin(); it != sessions.end();) {
-      auto s = it->second;
-      ++it;
-      if (startup)
-        s->online = false;
-      if (!s->busy && !s->online && s->deadline <= now) {
-        erase_session(s);
-        continue;
-      }
-      for (auto entry = s->pending.begin(); entry != s->pending.end();) {
-        auto old = entry++;
-        if (!old->second.attempted && old->second.message->committed &&
-            old->second.message->expires > 0 && old->second.message->expires <= now) {
-          drop(s, old);
-          notify(s);
+    } else {
+      for (auto it = sessions.begin(); it != sessions.end();) {
+        auto s = it->second;
+        ++it;
+        if (startup)
+          s->online = false;
+        if (!s->busy && !s->online && s->deadline <= now) {
+          erase_session(s);
+          continue;
+        }
+        for (auto entry = s->pending.begin(); entry != s->pending.end();) {
+          auto old = entry++;
+          if (!old->second.attempted && old->second.message->committed &&
+              old->second.message->expires > 0 && old->second.message->expires <= now) {
+            drop(s, old);
+            notify(s);
+          }
         }
       }
     }
@@ -640,13 +644,13 @@ struct DurableStore::Impl
   std::vector<SubscriptionHit> match(const std::string& topic);
   void mark_overflow(const std::shared_ptr<Session>& s, int64_t sequence)
   {
-    if (s->overflow_sequence)
-      return;
-    s->overflow_sequence = sequence;
-    if (indexing)
-      ++isolated_sessions;
-    notify(s);
-    LOG_WARN("Persistent consumer isolated: client {}, first_gap_sequence {}", s->client, sequence);
+    if (!(s->overflow_sequence)) {
+      s->overflow_sequence = sequence;
+      if (indexing)
+        ++isolated_sessions;
+      notify(s);
+      LOG_WARN("Persistent consumer isolated: client {}, first_gap_sequence {}", s->client, sequence);
+    }
   }
   void replay_control(const std::string& data, bool acknowledgements);
   std::shared_ptr<Message> decode_message(const std::string& data, size_t partition,
@@ -914,12 +918,16 @@ void DurableStore::Impl::set_retained(const std::string& topic, RetainedItem ite
 std::shared_ptr<DurableStore::Impl::RetainedItem> DurableStore::Impl::take_retained(
     const std::string& topic)
 {
+  std::shared_ptr<DurableStore::Impl::RetainedItem> ret{};
   auto found = retained.find(topic);
-  if (found == retained.end())
-    return {};
-  auto previous = std::make_shared<RetainedItem>(found->second);
-  erase_retained(found);
-  return previous;
+  if (found == retained.end()) {
+    ret = {};
+  } else {
+    auto previous = std::make_shared<RetainedItem>(found->second);
+    erase_retained(found);
+    ret = std::move(previous);
+  }
+  return ret;
 }
 
 void DurableStore::Impl::restore_retained_item(const std::string& topic, uint64_t generation,
@@ -927,18 +935,18 @@ void DurableStore::Impl::restore_retained_item(const std::string& topic, uint64_
                                                const std::shared_ptr<RetainedItem>& previous)
 {
   auto epoch = retain_epoch.find(topic);
-  if (epoch == retain_epoch.end() || epoch->second != generation)
-    return;
-  auto found = retained.find(topic);
-  if (found != retained.end() && found->second.generation == generation)
-    erase_retained(found);
-  if (previous_epoch)
-    epoch->second = previous_epoch;
-  else
-    retain_epoch.erase(epoch);
-  if (previous && (previous->record->expires_ms == 0 ||
-                   previous->record->expires_ms > DurableStore::now_ms()))
-    set_retained(topic, *previous);
+  if (!(epoch == retain_epoch.end() || epoch->second != generation)) {
+    auto found = retained.find(topic);
+    if (found != retained.end() && found->second.generation == generation)
+      erase_retained(found);
+    if (previous_epoch)
+      epoch->second = previous_epoch;
+    else
+      retain_epoch.erase(epoch);
+    if (previous && (previous->record->expires_ms == 0 ||
+                     previous->record->expires_ms > DurableStore::now_ms()))
+      set_retained(topic, *previous);
+  }
 }
 
 void DurableStore::Impl::erase_expired_retained(int64_t now)
@@ -955,13 +963,14 @@ void DurableStore::Impl::erase_expired_retained(int64_t now)
 
 void DurableStore::await(Result& result)
 {
-  if (!result.commit)
-    return;
-  if (!result.commit->wait() && result.ok) {
-    result.ok = false;
-    result.error = result.commit->error.empty() ? "persistent commit failed" : result.commit->error;
+  if (result.commit) {
+    if (!result.commit->wait() && result.ok) {
+      result.ok = false;
+      result.error =
+          result.commit->error.empty() ? "persistent commit failed" : result.commit->error;
+    }
+    result.commit.reset();
   }
-  result.commit.reset();
 }
 
 DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_t qos,
@@ -976,113 +985,120 @@ DurableStore::Result DurableStore::put_retained(const std::string& topic, uint8_
                                                 int64_t expires_ms, bool wait,
                                                 const RetainedProperties& properties, bool no_spin)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
   if (!retain_topic_ok(topic) || payload.empty() || qos > 2 || expires_ms < 0) {
     Result r;
     r.error = "invalid retained message";
-    return r;
+    ret = std::move(r);
+  } else {
+    auto record = std::make_shared<journal::StoredRetain>();
+    record->topic = topic;
+    record->qos = qos;
+    record->expires_ms = expires_ms;
+    record->payload = payload;
+    record->sender = sender;
+    fill_retain_record(*record, properties);
+    const size_t width = retain_record_width(*record);
+    const bool expired = expires_ms > 0 && expires_ms <= now_ms();
+    Encoder e;
+    if (expired)
+      journal::write_retain_clear(e, topic);
+    else
+      journal::write_retain_set(e, *record);
+    ret = v.call(
+        [&](const std::shared_ptr<Result>& r) -> Ticket {
+          *r = success();
+          v.erase_expired_retained(now_ms());
+          if (!expired) {
+            auto current = v.retained.find(topic);
+            const size_t replaced = current == v.retained.end() ? 0 : current->second.width;
+            const size_t snapshot_bytes = journal_text_width("MQTTS-RETAIN-2") + 8 + 4 + 4 +
+                                          v.retain_bytes - replaced + width;
+            if (snapshot_bytes > v.retain_snapshot_limit)
+              throw journal::AdmissionFull("retain snapshot exceeds reserved disk budget");
+          }
+          const uint64_t generation = ++v.next_retain_generation;
+          auto previous_epoch_it = v.retain_epoch.find(topic);
+          const uint64_t previous_epoch =
+              previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
+          // The previous value stays authoritative until this record commits. Every
+          // failure below puts it back, so a refused replace never deletes it.
+          std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
+          v.retain_epoch[topic] = generation;
+          try {
+            Impl::RetainedItem item;
+            item.record = record;
+            item.generation = generation;
+            std::shared_ptr<bool> committed = item.committed;
+            if (!expired)
+              v.set_retained(topic, std::move(item));
+            return v.enqueue(
+                *v.retain_log, e.data,
+                [&v, topic, generation, previous_epoch, previous, committed](bool ok,
+                                                                             const Location&) {
+                  if (!ok) {
+                    v.restore_retained_item(topic, generation, previous_epoch, previous);
+                    return;
+                  }
+                  *committed = true;
+                  auto epoch = v.retain_epoch.find(topic);
+                  if (epoch != v.retain_epoch.end() && epoch->second == generation &&
+                      v.retained.find(topic) == v.retained.end())
+                    v.retain_epoch.erase(epoch);
+                },
+                true);
+          } catch (...) {
+            v.restore_retained_item(topic, generation, previous_epoch, previous);
+            throw;
+          }
+        },
+        wait, false, no_spin);
   }
-  auto record = std::make_shared<journal::StoredRetain>();
-  record->topic = topic;
-  record->qos = qos;
-  record->expires_ms = expires_ms;
-  record->payload = payload;
-  record->sender = sender;
-  fill_retain_record(*record, properties);
-  const size_t width = retain_record_width(*record);
-  const bool expired = expires_ms > 0 && expires_ms <= now_ms();
-  Encoder e;
-  if (expired)
-    journal::write_retain_clear(e, topic);
-  else
-    journal::write_retain_set(e, *record);
-  return v.call(
-      [&](const std::shared_ptr<Result>& r) -> Ticket {
-        *r = success();
-        v.erase_expired_retained(now_ms());
-        if (!expired) {
-          auto current = v.retained.find(topic);
-          const size_t replaced = current == v.retained.end() ? 0 : current->second.width;
-          const size_t snapshot_bytes = journal_text_width("MQTTS-RETAIN-2") + 8 + 4 + 4 +
-                                        v.retain_bytes - replaced + width;
-          if (snapshot_bytes > v.retain_snapshot_limit)
-            throw journal::AdmissionFull("retain snapshot exceeds reserved disk budget");
-        }
-        const uint64_t generation = ++v.next_retain_generation;
-        auto previous_epoch_it = v.retain_epoch.find(topic);
-        const uint64_t previous_epoch =
-            previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
-        // The previous value stays authoritative until this record commits. Every
-        // failure below puts it back, so a refused replace never deletes it.
-        std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
-        v.retain_epoch[topic] = generation;
-        try {
-          Impl::RetainedItem item;
-          item.record = record;
-          item.generation = generation;
-          std::shared_ptr<bool> committed = item.committed;
-          if (!expired)
-            v.set_retained(topic, std::move(item));
-          return v.enqueue(
-              *v.retain_log, e.data,
-              [&v, topic, generation, previous_epoch, previous, committed](bool ok, const Location&) {
-                if (!ok) {
-                  v.restore_retained_item(topic, generation, previous_epoch, previous);
-                  return;
-                }
-                *committed = true;
-                auto epoch = v.retain_epoch.find(topic);
-                if (epoch != v.retain_epoch.end() && epoch->second == generation &&
-                    v.retained.find(topic) == v.retained.end())
-                  v.retain_epoch.erase(epoch);
-              },
-              true);
-        } catch (...) {
-          v.restore_retained_item(topic, generation, previous_epoch, previous);
-          throw;
-        }
-      },
-      wait, false, no_spin);
+  return ret;
 }
 
 DurableStore::Result DurableStore::clear_retained(const std::string& topic, bool wait, bool no_spin)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
   if (!retain_topic_ok(topic)) {
     Result r;
     r.error = "invalid retained topic";
-    return r;
+    ret = std::move(r);
+  } else {
+    Encoder e;
+    journal::write_retain_clear(e, topic);
+    ret = v.call(
+        [&](const std::shared_ptr<Result>& r) -> Ticket {
+          *r = success();
+          const uint64_t generation = ++v.next_retain_generation;
+          auto previous_epoch_it = v.retain_epoch.find(topic);
+          const uint64_t previous_epoch =
+              previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
+          std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
+          v.retain_epoch[topic] = generation;
+          try {
+            return v.enqueue(
+                *v.retain_log, e.data,
+                [&v, topic, generation, previous_epoch, previous](bool ok, const Location&) {
+                  if (!ok) {
+                    v.restore_retained_item(topic, generation, previous_epoch, previous);
+                    return;
+                  }
+                  auto epoch = v.retain_epoch.find(topic);
+                  if (epoch != v.retain_epoch.end() && epoch->second == generation)
+                    v.retain_epoch.erase(epoch);
+                },
+                true);
+          } catch (...) {
+            v.restore_retained_item(topic, generation, previous_epoch, previous);
+            throw;
+          }
+        },
+        wait, false, no_spin);
   }
-  Encoder e;
-  journal::write_retain_clear(e, topic);
-  return v.call(
-      [&](const std::shared_ptr<Result>& r) -> Ticket {
-        *r = success();
-        const uint64_t generation = ++v.next_retain_generation;
-        auto previous_epoch_it = v.retain_epoch.find(topic);
-        const uint64_t previous_epoch =
-            previous_epoch_it == v.retain_epoch.end() ? 0 : previous_epoch_it->second;
-        std::shared_ptr<Impl::RetainedItem> previous = v.take_retained(topic);
-        v.retain_epoch[topic] = generation;
-        try {
-          return v.enqueue(
-              *v.retain_log, e.data,
-              [&v, topic, generation, previous_epoch, previous](bool ok, const Location&) {
-                if (!ok) {
-                  v.restore_retained_item(topic, generation, previous_epoch, previous);
-                  return;
-                }
-                auto epoch = v.retain_epoch.find(topic);
-                if (epoch != v.retain_epoch.end() && epoch->second == generation)
-                  v.retain_epoch.erase(epoch);
-              },
-              true);
-        } catch (...) {
-          v.restore_retained_item(topic, generation, previous_epoch, previous);
-          throw;
-        }
-      },
-      wait, false, no_spin);
+  return ret;
 }
 
 std::vector<DurableStore::RetainedMessage> DurableStore::retained_messages() const
@@ -1111,89 +1127,95 @@ std::vector<DurableStore::RetainedMessage> DurableStore::retained_messages() con
 DurableStore::Result DurableStore::enqueue_directed(const std::string& client, uint64_t epoch,
                                                    const std::string& wire, int64_t expires, bool wait)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
-    auto found = v.sessions.find(client);
-    if (found == v.sessions.end() || !found->second->online) {
-      *r = success();
-      return {};
-    }
-    auto s = found->second;
-    // A Clean Start takeover after the SUBSCRIBE must not inherit its retained replay.
-    if (s->epoch != epoch) {
-      *r = success();
-      r->stale = true;
-      return {};
-    }
-    if (s->busy)
-      throw Deferred();
-    *r = success();
-    if (expires > 0 && expires <= now_ms()) {
-      r->present = true;
-      return {};
-    }
-    if (wire.empty()) {
-      r->ok = false;
-      r->error = "empty directed publish";
-      return {};
-    }
-    if (s->overflow_sequence || s->pending.size() >= v.config.max_messages_per_session ||
-        wire.size() > v.config.max_bytes_per_session ||
-        s->bytes > v.config.max_bytes_per_session - wire.size())
-      throw journal::AdmissionFull("persistent client backlog exhausted");
-    v.check_metadata(0, v.pending + 1, wire.size());
-    if (v.pending >= v.config.max_messages || wire.size() > v.config.max_bytes ||
-        v.bytes > v.config.max_bytes - wire.size())
-      throw journal::AdmissionFull("persistent message capacity exhausted");
-    auto message = std::make_shared<Impl::Message>();
-    message->id = ++v.next_id;
-    message->expires = expires;
-    message->partition = journal::topic_hash(client) % v.messages.size();
-    message->wire = wire;
-    const uint16_t packet = s->pending.size() < 65535 ? v.available_packet(s) : 0;
-    Encoder e;
-    e.u8(MESSAGE);
-    e.u64(message->id);
-    e.u64(expires);
-    e.text(wire);
-    e.u32(1);
-    e.text(s->client);
-    e.u64(s->generation);
-    e.u32(packet);
-    auto ticket = v.enqueue(*v.messages[message->partition], std::move(e.data),
-                            [=, &v](bool ok, const Location& location) {
-                              if (!ok)
-                                return;
-                              message->location = location;
-                              message->committed = true;
-                              v.schedule_message(message);
-                              v.notify(s);
-                            },
-                            wait);
-    Impl::DeliveryState entry;
-    entry.message = message;
-    entry.packet = packet;
-    s->pending.emplace(message->id, entry);
-    v.reference(message, s);
-    if (entry.packet) {
-      s->packets[entry.packet] = message->id;
-      s->next_packet = uint16_t(entry.packet % 65535 + 1);
-    }
-    s->bytes += wire.size();
-    v.bytes += wire.size();
-    ++v.pending;
-    r->present = true;
-    r->accepted_targets = 1;
-    return ticket;
-  }, wait);
+  ret = v.call(
+      [&](const std::shared_ptr<Result>& r) -> Ticket {
+        auto found = v.sessions.find(client);
+        if (found == v.sessions.end() || !found->second->online) {
+          *r = success();
+          return {};
+        }
+        auto s = found->second;
+        // A Clean Start takeover after the SUBSCRIBE must not inherit its retained replay.
+        if (s->epoch != epoch) {
+          *r = success();
+          r->stale = true;
+          return {};
+        }
+        if (s->busy)
+          throw Deferred();
+        *r = success();
+        if (expires > 0 && expires <= now_ms()) {
+          r->present = true;
+          return {};
+        }
+        if (wire.empty()) {
+          r->ok = false;
+          r->error = "empty directed publish";
+          return {};
+        }
+        if (s->overflow_sequence || s->pending.size() >= v.config.max_messages_per_session ||
+            wire.size() > v.config.max_bytes_per_session ||
+            s->bytes > v.config.max_bytes_per_session - wire.size())
+          throw journal::AdmissionFull("persistent client backlog exhausted");
+        v.check_metadata(0, v.pending + 1, wire.size());
+        if (v.pending >= v.config.max_messages || wire.size() > v.config.max_bytes ||
+            v.bytes > v.config.max_bytes - wire.size())
+          throw journal::AdmissionFull("persistent message capacity exhausted");
+        auto message = std::make_shared<Impl::Message>();
+        message->id = ++v.next_id;
+        message->expires = expires;
+        message->partition = journal::topic_hash(client) % v.messages.size();
+        message->wire = wire;
+        const uint16_t packet = s->pending.size() < 65535 ? v.available_packet(s) : 0;
+        Encoder e;
+        e.u8(MESSAGE);
+        e.u64(message->id);
+        e.u64(expires);
+        e.text(wire);
+        e.u32(1);
+        e.text(s->client);
+        e.u64(s->generation);
+        e.u32(packet);
+        auto ticket = v.enqueue(
+            *v.messages[message->partition], std::move(e.data),
+            [=, &v](bool ok, const Location& location) {
+              if (!ok)
+                return;
+              message->location = location;
+              message->committed = true;
+              v.schedule_message(message);
+              v.notify(s);
+            },
+            wait);
+        Impl::DeliveryState entry;
+        entry.message = message;
+        entry.packet = packet;
+        s->pending.emplace(message->id, entry);
+        v.reference(message, s);
+        if (entry.packet) {
+          s->packets[entry.packet] = message->id;
+          s->next_packet = uint16_t(entry.packet % 65535 + 1);
+        }
+        s->bytes += wire.size();
+        v.bytes += wire.size();
+        ++v.pending;
+        r->present = true;
+        r->accepted_targets = 1;
+        return ticket;
+      },
+      wait);
+  return ret;
 }
 
 DurableStore::Result DurableStore::connect(const std::string& client, const std::string& owner,
                                            bool clean, uint32_t expiry)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
   expiry = std::min(expiry, v.config.max_session_expiry_seconds);
-  return v.call(
+  ret = v.call(
       [&](const std::shared_ptr<Result>& r) -> Ticket {
         auto it = v.sessions.find(client);
         std::shared_ptr<Impl::Session> old = it == v.sessions.end() ? nullptr : it->second;
@@ -1288,12 +1310,14 @@ DurableStore::Result DurableStore::connect(const std::string& client, const std:
         return ticket;
       },
       true, true);
+  return ret;
 }
 DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_t epoch,
                                               int64_t expiry_override)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+  ret = v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
     auto s = v.current(client, epoch);
     if (!s) {
       *r = stale();
@@ -1331,65 +1355,70 @@ DurableStore::Result DurableStore::disconnect(const std::string& client, uint64_
     s->busy = true;
     return ticket;
   });
+  return ret;
 }
 DurableStore::Result DurableStore::subscribe(const std::string& client, uint64_t epoch,
                                              const std::string& filter,
                                              const journal::StoredSubscription& subscription,
                                              bool wait, bool no_spin)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
-    auto s = v.current(client, epoch);
-    if (!s) {
-      *r = stale();
-      return {};
-    }
-    if (subscription.qos > 2 || subscription.retain_handling > 2)
-      throw std::runtime_error("invalid stored subscription options");
-    if (!s->subscriptions.count(filter) &&
-        s->subscriptions.size() >= v.config.max_subscriptions_per_session)
-      throw journal::AdmissionFull("persistent subscription limit");
-    if (s->overflow_sequence)
-      throw journal::AdmissionFull(
-          "isolated session requires explicit gap recovery and Clean Start");
-    if (!s->subscriptions.count(filter))
-      v.check_metadata(subscription_cost(filter), v.pending);
-    size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
-    const auto previous = s->subscriptions.find(filter);
-    const bool existed = previous != s->subscriptions.end();
-    const journal::StoredSubscription previous_sub =
-        existed ? previous->second : journal::StoredSubscription();
-    Encoder e;
-    e.u8(SUBSCRIBE);
-    e.text(client);
-    e.u64(s->generation);
-    journal::write_subscription_record(e, filter, subscription);
-    auto ticket =
-        v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
-          v.metadata_reserved -= reservation;
-          s->busy = false;
-          if (!ok)
-            return;
-          v.set_subscription(s, filter, subscription);
-        });
-    v.metadata_reserved += reservation;
-    s->busy = true;
-    // Admission is success even when the caller does not wait. The callback used to
-    // be the only place that set ok, so wait=false looked like a failed subscribe
-    // and the handler deleted a subscription the journal was about to commit.
-    *r = success();
-    r->present = existed;
-    if (existed)
-      r->subscriptions.emplace_back(filter, previous_sub);
-    return ticket;
-  },
-                                                     wait, false, no_spin);
+  ret = v.call(
+      [&](const std::shared_ptr<Result>& r) -> Ticket {
+        auto s = v.current(client, epoch);
+        if (!s) {
+          *r = stale();
+          return {};
+        }
+        if (subscription.qos > 2 || subscription.retain_handling > 2)
+          throw std::runtime_error("invalid stored subscription options");
+        if (!s->subscriptions.count(filter) &&
+            s->subscriptions.size() >= v.config.max_subscriptions_per_session)
+          throw journal::AdmissionFull("persistent subscription limit");
+        if (s->overflow_sequence)
+          throw journal::AdmissionFull(
+              "isolated session requires explicit gap recovery and Clean Start");
+        if (!s->subscriptions.count(filter))
+          v.check_metadata(subscription_cost(filter), v.pending);
+        size_t reservation = s->subscriptions.count(filter) ? 0 : subscription_cost(filter);
+        const auto previous = s->subscriptions.find(filter);
+        const bool existed = previous != s->subscriptions.end();
+        const journal::StoredSubscription previous_sub =
+            existed ? previous->second : journal::StoredSubscription();
+        Encoder e;
+        e.u8(SUBSCRIBE);
+        e.text(client);
+        e.u64(s->generation);
+        journal::write_subscription_record(e, filter, subscription);
+        auto ticket =
+            v.enqueue(v.state_log(client), std::move(e.data), [=, &v](bool ok, const Location&) {
+              v.metadata_reserved -= reservation;
+              s->busy = false;
+              if (!ok)
+                return;
+              v.set_subscription(s, filter, subscription);
+            });
+        v.metadata_reserved += reservation;
+        s->busy = true;
+        // Admission is success even when the caller does not wait. The callback used to
+        // be the only place that set ok, so wait=false looked like a failed subscribe
+        // and the handler deleted a subscription the journal was about to commit.
+        *r = success();
+        r->present = existed;
+        if (existed)
+          r->subscriptions.emplace_back(filter, previous_sub);
+        return ticket;
+      },
+      wait, false, no_spin);
+  return ret;
 }
 DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64_t epoch,
                                                const std::string& filter)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+  ret = v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
     auto s = v.current(client, epoch);
     if (!s) {
       *r = stale();
@@ -1411,11 +1440,13 @@ DurableStore::Result DurableStore::unsubscribe(const std::string& client, uint64
     s->busy = true;
     return ticket;
   });
+  return ret;
 }
 
 std::vector<DurableStore::Impl::SubscriptionHit> DurableStore::Impl::match(
     const std::string& topic)
 {
+  std::vector<DurableStore::Impl::SubscriptionHit> ret{};
   std::vector<SubscriptionHit> hits;
   auto consider = [&](const IndexedSubscription& indexed) {
     auto found = indexed.session->subscriptions.find(indexed.filter);
@@ -1449,148 +1480,153 @@ std::vector<DurableStore::Impl::SubscriptionHit> DurableStore::Impl::match(
     if (!system && plus != node.children.end())
       todo.emplace_back(plus->second, next);
   }
-  return hits;
+  ret = std::move(hits);
+  return ret;
 }
 DurableStore::Result DurableStore::publish(const std::string& topic, const std::string& wire,
                                            const std::string& sender, int64_t expires,
                                            bool implicit_no_local, bool wait, bool no_spin)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
-    *r = success();
-    if (expires > 0 && expires <= now_ms())
-      return {};
-    struct Selected
-    {
-      std::shared_ptr<Impl::Session> session;
-      bool deliver = false;
-    };
-    std::vector<Selected> selected;
-    std::unordered_map<Impl::Session*, size_t> index;
-    for (const auto& hit : v.match(topic)) {
-      auto found = index.find(hit.session.get());
-      if (found == index.end()) {
-        if (hit.session->busy)
-          throw Deferred();
-        if (!(hit.session->online || hit.session->deadline > now_ms()))
-          continue;
-        index.emplace(hit.session.get(), selected.size());
-        selected.push_back(Selected{hit.session, false});
-        found = index.find(hit.session.get());
-      }
-      const bool sender_hit = hit.session->client == sender;
-      // No Local is applied per subscription before overlapping filters merge.
-      if (!sender_hit || !hit.options.no_local)
-        selected[found->second].deliver = true;
-    }
-    std::vector<std::shared_ptr<Impl::Session>> targets;
-    for (const auto& item : selected) {
-      if (item.session->client == sender && (implicit_no_local || !item.deliver))
-        continue;
-      targets.push_back(item.session);
-    }
-    if (targets.empty())
-      return {};
-    std::vector<std::shared_ptr<Impl::Session>> active, overflows;
-    for (const auto& s : targets) {
-      r->targets.push_back(s->client);  // Also exclude isolated consumers from live fallback.
-      if (s->overflow_sequence) {
-        if (v.config.overflow_policy == "reject")
-          throw journal::AdmissionFull("isolated session requires gap recovery");
-        continue;
-      }
-      const bool full = s->pending.size() >= v.config.max_messages_per_session ||
-                        wire.size() > v.config.max_bytes_per_session ||
-                        s->bytes > v.config.max_bytes_per_session - wire.size();
-      if (full) {
-        if (v.config.overflow_policy == "reject")
-          throw journal::AdmissionFull("persistent client backlog exhausted");
-        overflows.push_back(s);
-      } else
-        active.push_back(s);
-    }
-    std::sort(r->targets.begin(), r->targets.end());
-    const size_t skipped = targets.size() - active.size();
-    targets = std::move(active);
-    r->accepted_targets = targets.size();
-    if (targets.empty() && overflows.empty()) {
-      v.overflow_skipped += skipped;
-      return {};
-    }
-    v.check_metadata(0, v.pending + targets.size(), targets.empty() ? 0 : wire.size());
-    if (!targets.empty() && (targets.size() > v.config.max_messages ||
-                             v.pending > v.config.max_messages - targets.size() ||
-                             wire.size() > v.config.max_bytes / targets.size() ||
-                             v.bytes > v.config.max_bytes - wire.size() * targets.size()))
-      throw journal::AdmissionFull("persistent message capacity exhausted");
-    auto message = std::make_shared<Impl::Message>();
-    message->id = ++v.next_id;
-    message->expires = expires;
-    message->partition = journal::topic_hash(topic) % v.messages.size();
-    message->wire = wire;
-    Encoder e;
-    e.u8(overflows.empty() ? MESSAGE : MESSAGE_WITH_GAPS);
-    e.u64(message->id);
-    e.u64(expires);
-    e.text(wire);
-    e.u32(uint32_t(targets.size()));
-    std::vector<uint16_t> packets;
-    for (const auto& s : targets) {
-      uint16_t packet = s->pending.size() < 65535 ? v.available_packet(s) : 0;
-      packets.push_back(packet);
-      e.text(s->client);
-      e.u64(s->generation);
-      e.u32(packet);
-    }
-    if (!overflows.empty()) {
-      e.u32(uint32_t(overflows.size()));
-      for (const auto& s : overflows) {
-        e.text(s->client);
-        e.u64(s->generation);
-      }
-    }
-    auto ticket = v.enqueue(*v.messages[message->partition], std::move(e.data),
-                            [=, &v](bool ok, const Location& location) {
-                              for (const auto& s : overflows)
-                                s->busy = false;
-                              if (!ok)
-                                return;
-                              for (const auto& s : overflows)
-                                v.mark_overflow(s, message->id);
-                              v.overflow_skipped += skipped;
-                              message->location = location;
-                              message->committed = true;
-                              v.schedule_message(message);
-                              for (const auto& s : targets)
-                                v.notify(s);
-                            });
-    // Fence this transition until the gap and healthy recipients commit together.
-    for (const auto& s : overflows)
-      s->busy = true;
-    for (size_t i = 0; i < targets.size(); ++i) {
-      auto s = targets[i];
-      Impl::DeliveryState entry;
-      entry.message = message;
-      entry.packet = packets[i];
-      s->pending.emplace(message->id, entry);
-      v.reference(message, s);
-      if (entry.packet) {
-        s->packets[entry.packet] = message->id;
-        s->next_packet = uint16_t(entry.packet % 65535 + 1);
-      }
-      s->bytes += wire.size();
-      v.bytes += wire.size();
-      ++v.pending;
-    }
-    return ticket;
-  },
-            wait, false, no_spin);
+  ret = v.call(
+      [&](const std::shared_ptr<Result>& r) -> Ticket {
+        *r = success();
+        if (expires > 0 && expires <= now_ms())
+          return {};
+        struct Selected
+        {
+          std::shared_ptr<Impl::Session> session;
+          bool deliver = false;
+        };
+        std::vector<Selected> selected;
+        std::unordered_map<Impl::Session*, size_t> index;
+        for (const auto& hit : v.match(topic)) {
+          auto found = index.find(hit.session.get());
+          if (found == index.end()) {
+            if (hit.session->busy)
+              throw Deferred();
+            if (!(hit.session->online || hit.session->deadline > now_ms()))
+              continue;
+            index.emplace(hit.session.get(), selected.size());
+            selected.push_back(Selected{hit.session, false});
+            found = index.find(hit.session.get());
+          }
+          const bool sender_hit = hit.session->client == sender;
+          // No Local is applied per subscription before overlapping filters merge.
+          if (!sender_hit || !hit.options.no_local)
+            selected[found->second].deliver = true;
+        }
+        std::vector<std::shared_ptr<Impl::Session>> targets;
+        for (const auto& item : selected) {
+          if (item.session->client == sender && (implicit_no_local || !item.deliver))
+            continue;
+          targets.push_back(item.session);
+        }
+        if (targets.empty())
+          return {};
+        std::vector<std::shared_ptr<Impl::Session>> active, overflows;
+        for (const auto& s : targets) {
+          r->targets.push_back(s->client);  // Also exclude isolated consumers from live fallback.
+          if (s->overflow_sequence) {
+            if (v.config.overflow_policy == "reject")
+              throw journal::AdmissionFull("isolated session requires gap recovery");
+            continue;
+          }
+          const bool full = s->pending.size() >= v.config.max_messages_per_session ||
+                            wire.size() > v.config.max_bytes_per_session ||
+                            s->bytes > v.config.max_bytes_per_session - wire.size();
+          if (full) {
+            if (v.config.overflow_policy == "reject")
+              throw journal::AdmissionFull("persistent client backlog exhausted");
+            overflows.push_back(s);
+          } else
+            active.push_back(s);
+        }
+        std::sort(r->targets.begin(), r->targets.end());
+        const size_t skipped = targets.size() - active.size();
+        targets = std::move(active);
+        r->accepted_targets = targets.size();
+        if (targets.empty() && overflows.empty()) {
+          v.overflow_skipped += skipped;
+          return {};
+        }
+        v.check_metadata(0, v.pending + targets.size(), targets.empty() ? 0 : wire.size());
+        if (!targets.empty() && (targets.size() > v.config.max_messages ||
+                                 v.pending > v.config.max_messages - targets.size() ||
+                                 wire.size() > v.config.max_bytes / targets.size() ||
+                                 v.bytes > v.config.max_bytes - wire.size() * targets.size()))
+          throw journal::AdmissionFull("persistent message capacity exhausted");
+        auto message = std::make_shared<Impl::Message>();
+        message->id = ++v.next_id;
+        message->expires = expires;
+        message->partition = journal::topic_hash(topic) % v.messages.size();
+        message->wire = wire;
+        Encoder e;
+        e.u8(overflows.empty() ? MESSAGE : MESSAGE_WITH_GAPS);
+        e.u64(message->id);
+        e.u64(expires);
+        e.text(wire);
+        e.u32(uint32_t(targets.size()));
+        std::vector<uint16_t> packets;
+        for (const auto& s : targets) {
+          uint16_t packet = s->pending.size() < 65535 ? v.available_packet(s) : 0;
+          packets.push_back(packet);
+          e.text(s->client);
+          e.u64(s->generation);
+          e.u32(packet);
+        }
+        if (!overflows.empty()) {
+          e.u32(uint32_t(overflows.size()));
+          for (const auto& s : overflows) {
+            e.text(s->client);
+            e.u64(s->generation);
+          }
+        }
+        auto ticket = v.enqueue(*v.messages[message->partition], std::move(e.data),
+                                [=, &v](bool ok, const Location& location) {
+                                  for (const auto& s : overflows)
+                                    s->busy = false;
+                                  if (!ok)
+                                    return;
+                                  for (const auto& s : overflows)
+                                    v.mark_overflow(s, message->id);
+                                  v.overflow_skipped += skipped;
+                                  message->location = location;
+                                  message->committed = true;
+                                  v.schedule_message(message);
+                                  for (const auto& s : targets)
+                                    v.notify(s);
+                                });
+        // Fence this transition until the gap and healthy recipients commit together.
+        for (const auto& s : overflows)
+          s->busy = true;
+        for (size_t i = 0; i < targets.size(); ++i) {
+          auto s = targets[i];
+          Impl::DeliveryState entry;
+          entry.message = message;
+          entry.packet = packets[i];
+          s->pending.emplace(message->id, entry);
+          v.reference(message, s);
+          if (entry.packet) {
+            s->packets[entry.packet] = message->id;
+            s->next_packet = uint16_t(entry.packet % 65535 + 1);
+          }
+          s->bytes += wire.size();
+          v.bytes += wire.size();
+          ++v.pending;
+        }
+        return ticket;
+      },
+      wait, false, no_spin);
+  return ret;
 }
 DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epoch, int64_t after,
                                          uint16_t receive_maximum)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+  ret = v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
     auto s = v.current(client, epoch);
     if (!s) {
       *r = stale();
@@ -1690,12 +1726,14 @@ DurableStore::Result DurableStore::fetch(const std::string& client, uint64_t epo
     }
     return ticket;
   });
+  return ret;
 }
 DurableStore::Result DurableStore::begin_delivery(const std::string& client, uint64_t epoch,
                                                   int64_t sequence, uint16_t packet_id)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
+  ret = v.call([&](const std::shared_ptr<Result>& r) -> Ticket {
     auto s = v.current(client, epoch);
     if (!s) {
       *r = stale();
@@ -1710,13 +1748,15 @@ DurableStore::Result DurableStore::begin_delivery(const std::string& client, uin
     *r = success();
     return {};
   });
+  return ret;
 }
 
 DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64_t epoch,
                                                uint16_t packet_id, bool wait_for_commit)
 {
+  DurableStore::Result ret{};
   auto& v = *impl_;
-  return v.call(
+  ret = v.call(
       [&](const std::shared_ptr<Result>& r) -> Ticket {
         auto s = v.current(client, epoch);
         if (!s) {
@@ -1758,6 +1798,7 @@ DurableStore::Result DurableStore::acknowledge(const std::string& client, uint64
         return ticket;
       },
       wait_for_commit);
+  return ret;
 }
 
 DurableStore::Result DurableStore::discard(const std::string& client, uint64_t epoch,
@@ -1789,113 +1830,114 @@ void DurableStore::Impl::replay_control(const std::string& data, bool acknowledg
   uint8_t kind = d.u8();
   if (kind < CONNECT || kind > HEARTBEAT)
     throw std::runtime_error("invalid session journal record");
-  if (acknowledgements != (kind == ACK || kind == CLAIM))
-    return;
-  if (kind == HEARTBEAT) {
-    uint32_t count = d.u32();
-    for (uint32_t i = 0; i < count; ++i) {
+  if (!(acknowledgements != (kind == ACK || kind == CLAIM))) {
+    if (kind == HEARTBEAT) {
+      uint32_t count = d.u32();
+      for (uint32_t i = 0; i < count; ++i) {
+        auto name = d.text();
+        auto generation = d.u64(), epoch = d.u64();
+        int64_t deadline = d.u64();
+        auto found = sessions.find(name);
+        if (found != sessions.end() && found->second->generation == generation &&
+            found->second->epoch == epoch && found->second->online)
+          found->second->deadline = deadline;
+      }
+      d.end();
+    } else {
       auto name = d.text();
-      auto generation = d.u64(), epoch = d.u64();
-      int64_t deadline = d.u64();
-      auto found = sessions.find(name);
-      if (found != sessions.end() && found->second->generation == generation &&
-          found->second->epoch == epoch && found->second->online)
-        found->second->deadline = deadline;
-    }
-    d.end();
-    return;
-  }
-  auto name = d.text();
-  if (kind == CONNECT) {
-    auto owner = d.text();
-    auto generation = d.u64(), epoch = d.u64();
-    auto expiry = d.u32();
-    int64_t deadline = d.u64();
-    bool clean = d.u8();
-    d.end();
-    if (!generation || !epoch)
-      throw std::runtime_error("invalid session generation");
-    next_id = std::max(next_id, std::max(generation, epoch));
-    auto found = sessions.find(name);
-    std::shared_ptr<Session> s = found == sessions.end() ? nullptr : found->second;
-    if (s && (clean || s->generation != generation)) {
-      erase_session(s);
-      s.reset();
-    }
-    if (clean && !expiry)
-      return;
-    if (!s)
-      s = std::make_shared<Session>();
-    s->client = name;
-    s->owner = owner;
-    s->generation = generation;
-    s->epoch = epoch;
-    s->expiry = expiry;
-    s->deadline = deadline;
-    s->online = true;
-    sessions[name] = s;
-    return;
-  }
-  auto generation = d.u64();
-  auto found = sessions.find(name);
-  auto s = (found != sessions.end() && found->second->generation == generation) ? found->second
-                                                                                : nullptr;
-  if (kind == DISCONNECT) {
-    auto epoch = d.u64();
-    auto expiry = d.u32();
-    int64_t deadline = d.u64();
-    if (s && s->epoch == epoch) {
-      s->expiry = expiry;
-      s->deadline = deadline;
-      s->online = false;
-      if (!expiry)
-        erase_session(s);
-    }
-  } else if (kind == SUBSCRIBE) {
-    auto filter = d.text();
-    journal::StoredSubscription sub;
-    sub.qos = d.u8();
-    if (sub.qos > 2)
-      throw std::runtime_error("invalid stored subscription QoS");
-    journal::read_legacy_subscription_options(d, sub);
-    if (s)
-      s->subscriptions[filter] = sub;
-  } else if (kind == UNSUBSCRIBE) {
-    auto filter = d.text();
-    if (s)
-      s->subscriptions.erase(filter);
-  } else if (kind == ACK) {
-    int64_t id = d.u64();
-    uint32_t packet = d.u32();
-    if (!packet || packet > 65535)
-      throw std::runtime_error("invalid stored ACK packet");
-    if (s) {
-      auto entry = s->pending.find(id);
-      if (entry != s->pending.end()) {
-        if (entry->second.packet != packet)
-          throw std::runtime_error("stored ACK refers to a different packet");
-        drop(s, entry);
-      } else
-        s->recovery_acks.push_back(id);
-      s->recovery_claims.erase(id);
-    }
-  } else if (kind == CLAIM) {
-    uint32_t count = d.u32();
-    for (uint32_t i = 0; i < count; ++i) {
-      int64_t id = d.u64();
-      uint32_t packet = d.u32();
-      if (!packet || packet > 65535)
-        throw std::runtime_error("invalid stored packet claim");
-      if (s) {
-        auto entry = s->pending.find(id);
-        if (entry != s->pending.end())
-          entry->second.packet = uint16_t(packet);
-        else
-          s->recovery_claims[id] = uint16_t(packet);
+      if (kind == CONNECT) {
+        auto owner = d.text();
+        auto generation = d.u64(), epoch = d.u64();
+        auto expiry = d.u32();
+        int64_t deadline = d.u64();
+        bool clean = d.u8();
+        d.end();
+        if (!generation || !epoch)
+          throw std::runtime_error("invalid session generation");
+        next_id = std::max(next_id, std::max(generation, epoch));
+        auto found = sessions.find(name);
+        std::shared_ptr<Session> s = found == sessions.end() ? nullptr : found->second;
+        if (s && (clean || s->generation != generation)) {
+          erase_session(s);
+          s.reset();
+        }
+        if (!(clean && !expiry)) {
+          if (!s)
+            s = std::make_shared<Session>();
+          s->client = name;
+          s->owner = owner;
+          s->generation = generation;
+          s->epoch = epoch;
+          s->expiry = expiry;
+          s->deadline = deadline;
+          s->online = true;
+          sessions[name] = s;
+        }
+      } else {
+        auto generation = d.u64();
+        auto found = sessions.find(name);
+        auto s = (found != sessions.end() && found->second->generation == generation)
+                     ? found->second
+                     : nullptr;
+        if (kind == DISCONNECT) {
+          auto epoch = d.u64();
+          auto expiry = d.u32();
+          int64_t deadline = d.u64();
+          if (s && s->epoch == epoch) {
+            s->expiry = expiry;
+            s->deadline = deadline;
+            s->online = false;
+            if (!expiry)
+              erase_session(s);
+          }
+        } else if (kind == SUBSCRIBE) {
+          auto filter = d.text();
+          journal::StoredSubscription sub;
+          sub.qos = d.u8();
+          if (sub.qos > 2)
+            throw std::runtime_error("invalid stored subscription QoS");
+          journal::read_legacy_subscription_options(d, sub);
+          if (s)
+            s->subscriptions[filter] = sub;
+        } else if (kind == UNSUBSCRIBE) {
+          auto filter = d.text();
+          if (s)
+            s->subscriptions.erase(filter);
+        } else if (kind == ACK) {
+          int64_t id = d.u64();
+          uint32_t packet = d.u32();
+          if (!packet || packet > 65535)
+            throw std::runtime_error("invalid stored ACK packet");
+          if (s) {
+            auto entry = s->pending.find(id);
+            if (entry != s->pending.end()) {
+              if (entry->second.packet != packet)
+                throw std::runtime_error("stored ACK refers to a different packet");
+              drop(s, entry);
+            } else
+              s->recovery_acks.push_back(id);
+            s->recovery_claims.erase(id);
+          }
+        } else if (kind == CLAIM) {
+          uint32_t count = d.u32();
+          for (uint32_t i = 0; i < count; ++i) {
+            int64_t id = d.u64();
+            uint32_t packet = d.u32();
+            if (!packet || packet > 65535)
+              throw std::runtime_error("invalid stored packet claim");
+            if (s) {
+              auto entry = s->pending.find(id);
+              if (entry != s->pending.end())
+                entry->second.packet = uint16_t(packet);
+              else
+                s->recovery_claims[id] = uint16_t(packet);
+            }
+          }
+        }
+        d.end();
       }
     }
   }
-  d.end();
 }
 std::shared_ptr<DurableStore::Impl::Message> DurableStore::Impl::decode_message(
     const std::string& data, size_t partition, const Location& location, bool attach)
@@ -1967,13 +2009,13 @@ void DurableStore::Impl::apply_retain_record(const std::string& data)
     auto found = retained.find(record.topic);
     if (found != retained.end())
       erase_retained(found);
-    return;
+  } else {
+    const std::string topic = record.topic;
+    RetainedItem item;
+    item.record = std::make_shared<journal::StoredRetain>(std::move(record));
+    *item.committed = true;
+    set_retained(topic, std::move(item));
   }
-  const std::string topic = record.topic;
-  RetainedItem item;
-  item.record = std::make_shared<journal::StoredRetain>(std::move(record));
-  *item.committed = true;
-  set_retained(topic, std::move(item));
 }
 void DurableStore::Impl::restore_retained()
 {

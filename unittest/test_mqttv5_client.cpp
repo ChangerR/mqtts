@@ -103,40 +103,43 @@ class MQTTv5ClientTest : public ::testing::Test
   // Helper function to check if a port is in use
   static bool is_port_in_use(int port)
   {
+    bool ret = false;
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) return false;
-    
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, test_server_host.c_str(), &addr.sin_addr);
-    
-    int result = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
-    close(sockfd);
-    
-    return result == 0;
+    if (sockfd < 0) {
+      ret = false;
+    } else {
+      struct sockaddr_in addr;
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(port);
+      inet_pton(AF_INET, test_server_host.c_str(), &addr.sin_addr);
+      int result = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+      close(sockfd);
+      ret = result == 0;
+    }
+    return ret;
   }
 
   // Helper function to create a socket connection
   int create_client_socket()
   {
+    int ret = 0;
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-      return -1;
+      ret = -1;
+    } else {
+      struct sockaddr_in server_addr;
+      memset(&server_addr, 0, sizeof(server_addr));
+      server_addr.sin_family = AF_INET;
+      server_addr.sin_port = htons(test_server_port);
+      inet_pton(AF_INET, test_server_host.c_str(), &server_addr.sin_addr);
+      if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        ret = -1;
+      } else {
+        ret = sockfd;
+      }
     }
-
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(test_server_port);
-    inet_pton(AF_INET, test_server_host.c_str(), &server_addr.sin_addr);
-
-    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-      close(sockfd);
-      return -1;
-    }
-
-    return sockfd;
+    return ret;
   }
 
   // Helper function to send data
@@ -156,28 +159,30 @@ class MQTTv5ClientTest : public ::testing::Test
   // Helper function to receive data with timeout
   std::vector<uint8_t> receive_data(int sockfd, size_t max_size = 1024, int timeout_ms = 2000)  // Balanced timeout
   {
+    std::vector<uint8_t> ret{};
     // Set socket timeout
     struct timeval timeout;
     timeout.tv_sec = timeout_ms / 1000;
     timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
       std::cerr << "Failed to set socket timeout" << std::endl;
-      return {};
-    }
-    
-    std::vector<uint8_t> buffer(max_size);
-    ssize_t received = recv(sockfd, buffer.data(), max_size, 0);
-    if (received <= 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        std::cerr << "Receive timeout after " << timeout_ms << "ms" << std::endl;
+      ret = {};
+    } else {
+      std::vector<uint8_t> buffer(max_size);
+      ssize_t received = recv(sockfd, buffer.data(), max_size, 0);
+      if (received <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          std::cerr << "Receive timeout after " << timeout_ms << "ms" << std::endl;
+        } else {
+          std::cerr << "Receive error: " << strerror(errno) << std::endl;
+        }
+        ret = {};
       } else {
-        std::cerr << "Receive error: " << strerror(errno) << std::endl;
+        buffer.resize(received);
+        ret = std::move(buffer);
       }
-      return {};
     }
-    buffer.resize(received);
-    return buffer;
+    return ret;
   }
 
   // Helper function to encode variable length integer
@@ -364,47 +369,50 @@ class MQTTv5ClientTest : public ::testing::Test
   bool parse_connack_packet(const std::vector<uint8_t>& data, bool& session_present,
                             uint8_t& reason_code)
   {
-    if (data.size() < 4)
-      return false;
-
-    // Check packet type
-    if ((data[0] & 0xF0) != 0x20)
-      return false;
-
-    // Parse acknowledge flags
-    session_present = (data[2] & 0x01) != 0;
-
-    // Parse reason code
-    reason_code = data[3];
-
-    return true;
+    bool ret = false;
+    if (data.size() < 4) {
+      ret = false;
+    } else {
+      // Check packet type
+      if ((data[0] & 0xF0) != 0x20) {
+        ret = false;
+      } else {
+        // Parse acknowledge flags
+        session_present = (data[2] & 0x01) != 0;
+        // Parse reason code
+        reason_code = data[3];
+        ret = true;
+      }
+    }
+    return ret;
   }
 
   // Helper function to parse SUBACK packet
   bool parse_suback_packet(const std::vector<uint8_t>& data, uint16_t& packet_id,
                            std::vector<uint8_t>& reason_codes)
   {
-    if (data.size() < 5)
-      return false;
-
-    // Check packet type
-    if ((data[0] & 0xF0) != 0x90)
-      return false;
-
-    // Parse packet ID
-    packet_id = (data[2] << 8) | data[3];
-
-    // Skip properties length (assuming 0 for now)
-    size_t properties_len = data[4];
-    size_t payload_start = 5 + properties_len;
-
-    // Parse reason codes
-    reason_codes.clear();
-    for (size_t i = payload_start; i < data.size(); i++) {
-      reason_codes.push_back(data[i]);
+    bool ret = false;
+    if (data.size() < 5) {
+      ret = false;
+    } else {
+      // Check packet type
+      if ((data[0] & 0xF0) != 0x90) {
+        ret = false;
+      } else {
+        // Parse packet ID
+        packet_id = (data[2] << 8) | data[3];
+        // Skip properties length (assuming 0 for now)
+        size_t properties_len = data[4];
+        size_t payload_start = 5 + properties_len;
+        // Parse reason codes
+        reason_codes.clear();
+        for (size_t i = payload_start; i < data.size(); i++) {
+          reason_codes.push_back(data[i]);
+        }
+        ret = true;
+      }
     }
-
-    return true;
+    return ret;
   }
 
   // Helper function to parse PUBLISH packet
