@@ -229,50 +229,45 @@ class MockRouterServer
   void run()
   {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0)
-      return;
+    if (listen_fd >= 0) {
+      int opt = 1;
+      setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct sockaddr_in addr;
+      memset(&addr, 0, sizeof(addr));
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = INADDR_ANY;
+      addr.sin_port = htons(port_);
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port_);
+      if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(listen_fd);
+      } else if (listen(listen_fd, 10) < 0) {
+        close(listen_fd);
+      } else {
+        while (!should_stop_) {
+          fd_set read_fds;
+          FD_ZERO(&read_fds);
+          FD_SET(listen_fd, &read_fds);
 
-    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-      close(listen_fd);
-      return;
-    }
+          struct timeval timeout;
+          timeout.tv_sec = 0;
+          timeout.tv_usec = 100000;  // 100ms
 
-    if (listen(listen_fd, 10) < 0) {
-      close(listen_fd);
-      return;
-    }
-
-    while (!should_stop_) {
-      fd_set read_fds;
-      FD_ZERO(&read_fds);
-      FD_SET(listen_fd, &read_fds);
-
-      struct timeval timeout;
-      timeout.tv_sec = 0;
-      timeout.tv_usec = 100000;  // 100ms
-
-      int activity = select(listen_fd + 1, &read_fds, nullptr, nullptr, &timeout);
-      if (activity > 0 && FD_ISSET(listen_fd, &read_fds)) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd >= 0) {
-          // 简单的模拟：立即关闭连接
-          close(client_fd);
+          int activity = select(listen_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+          if (activity > 0 && FD_ISSET(listen_fd, &read_fds)) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+            if (client_fd >= 0) {
+              // 简单的模拟：立即关闭连接
+              close(client_fd);
+            }
+          }
         }
+
+        close(listen_fd);
       }
     }
-
-    close(listen_fd);
   }
 
   int port_;

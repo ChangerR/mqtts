@@ -242,6 +242,7 @@ struct DurableStore::Impl
       return *r;
     };
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    Result ret{};
     for (;;) {
       auto r = std::make_shared<Result>();
       Ticket ticket;
@@ -249,8 +250,10 @@ struct DurableStore::Impl
         {
           // A coroutine must never block its event thread behind snapshot work.
           std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
-          if (no_spin && (!guard.owns_lock() || (frozen.load() && !inspect_unavailable)))
-            return deferred_now(r);
+          if (no_spin && (!guard.owns_lock() || (frozen.load() && !inspect_unavailable))) {
+            ret = deferred_now(r);
+            break;
+          }
           if (!guard.owns_lock() && frozen.load())
             throw MaintenancePause();
           if (!guard.owns_lock())
@@ -258,7 +261,8 @@ struct DurableStore::Impl
           if ((failed || stopping) && !inspect_unavailable) {
             r->error = "persistent journal unavailable";
             r->stale = true;
-            return *r;
+            ret = *r;
+            break;
           }
           if (frozen && !inspect_unavailable)
             throw MaintenancePause();
@@ -270,33 +274,42 @@ struct DurableStore::Impl
         }
         if (ticket && !wait)
           r->commit = ticket;
-        return *r;
+        ret = *r;
+        break;
       } catch (const MaintenancePause&) {
-        if (no_spin)
-          return deferred_now(r);
+        if (no_spin) {
+          ret = deferred_now(r);
+          break;
+        }
         deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         runtime::current_runtime().wait(-1, 0, 1);
       } catch (const Deferred&) {
-        if (no_spin)
-          return deferred_now(r);
+        if (no_spin) {
+          ret = deferred_now(r);
+          break;
+        }
         if (std::chrono::steady_clock::now() >= deadline) {
           r->ok = false;
           r->error = "persistent admission timeout";
           r->quota_exceeded = true;
-          return *r;
+          ret = *r;
+          break;
         }
         runtime::current_runtime().wait(-1, 0, 1);
       } catch (const journal::AdmissionFull& e) {
         r->ok = false;
         r->quota_exceeded = true;
         r->error = e.what();
-        return *r;
+        ret = *r;
+        break;
       } catch (const std::exception& e) {
         r->ok = false;
         r->error = e.what();
-        return *r;
+        ret = *r;
+        break;
       }
     }
+    return ret;
   }
   Ticket enqueue(AppendLog& log, std::string data, const AppendLog::Callback& apply,
                  bool wait = true)
@@ -359,14 +372,17 @@ struct DurableStore::Impl
   {
     size_t node = 0, offset = 0;
     std::vector<std::pair<size_t, std::string>> path;
+    bool ret = true;
     for (;;) {
       size_t end = filter.find('/', offset);
       std::string level = filter.substr(offset, end == std::string::npos ? end : end - offset);
       auto found = index[node].children.find(level);
       size_t next;
       if (found == index[node].children.end()) {
-        if (!add)
-          return;
+        if (!add) {
+          ret = false;
+          break;
+        }
         if (free_nodes.empty()) {
           next = index.size();
           index.emplace_back();
@@ -383,18 +399,20 @@ struct DurableStore::Impl
         break;
       offset = end + 1;
     }
-    if (add) {
-      index[node].clients[s->client] = IndexedSubscription{s, filter};
-      return;
-    }
-    index[node].clients.erase(s->client);
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-      if (!index[node].clients.empty() || !index[node].children.empty())
-        break;
-      index[it->first].children.erase(it->second);
-      index[node] = TopicNode();
-      free_nodes.push_back(node);
-      node = it->first;
+    if (ret) {
+      if (add) {
+        index[node].clients[s->client] = IndexedSubscription{s, filter};
+      } else {
+        index[node].clients.erase(s->client);
+        for (auto it = path.rbegin(); it != path.rend(); ++it) {
+          if (!index[node].clients.empty() || !index[node].children.empty())
+            break;
+          index[it->first].children.erase(it->second);
+          index[node] = TopicNode();
+          free_nodes.push_back(node);
+          node = it->first;
+        }
+      }
     }
   }
   void set_subscription(const std::shared_ptr<Session>& s, const std::string& filter,
@@ -583,19 +601,23 @@ struct DurableStore::Impl
   uint16_t available_packet(const std::shared_ptr<Session>& s,
                             const std::set<uint16_t>& reserved = {})
   {
-    if (s->packets.size() + s->live_packet_ids.size() + reserved.size() >= 65535)
-      return 0;
-    uint16_t candidate = s->next_packet;
-    for (size_t i = 0; i < 65535; ++i) {
-      if (!s->packets.count(candidate) && !s->live_packet_ids.count(candidate) &&
-          !reserved.count(candidate))
-        return candidate;
-      candidate = uint16_t(candidate % 65535 + 1);
+    uint16_t ret = 0;
+    if (s->packets.size() + s->live_packet_ids.size() + reserved.size() < 65535) {
+      uint16_t candidate = s->next_packet;
+      for (size_t i = 0; i < 65535; ++i) {
+        if (!s->packets.count(candidate) && !s->live_packet_ids.count(candidate) &&
+            !reserved.count(candidate)) {
+          ret = candidate;
+          break;
+        }
+        candidate = uint16_t(candidate % 65535 + 1);
+      }
     }
-    return 0;
+    return ret;
   }
   DurableStore::PacketIdClaim claim_live(const std::string& client, uint64_t epoch, uint16_t id)
   {
+    DurableStore::PacketIdClaim ret = DurableStore::PacketIdClaim::Busy;
     for (int attempt = 0; attempt < 64; ++attempt) {
       std::unique_lock<std::mutex> guard(mutex, std::try_to_lock);
       if (!guard.owns_lock()) {
@@ -604,19 +626,22 @@ struct DurableStore::Impl
       }
       try {
         auto s = current(client, epoch);
-        if (!s)
-          return DurableStore::PacketIdClaim::Absent;
-        if (!id || s->packets.count(id) || s->live_packet_ids.count(id))
-          return DurableStore::PacketIdClaim::InUse;
-        s->live_packet_ids.insert(id);
-        return DurableStore::PacketIdClaim::Reserved;
+        if (!s) {
+          ret = DurableStore::PacketIdClaim::Absent;
+        } else if (!id || s->packets.count(id) || s->live_packet_ids.count(id)) {
+          ret = DurableStore::PacketIdClaim::InUse;
+        } else {
+          s->live_packet_ids.insert(id);
+          ret = DurableStore::PacketIdClaim::Reserved;
+        }
       } catch (const Deferred&) {
-        return DurableStore::PacketIdClaim::Busy;
+        ret = DurableStore::PacketIdClaim::Busy;
       } catch (const std::bad_alloc&) {
-        return DurableStore::PacketIdClaim::Quota;
+        ret = DurableStore::PacketIdClaim::Quota;
       }
+      break;
     }
-    return DurableStore::PacketIdClaim::Busy;
+    return ret;
   }
   void release_live(const std::string& client, uint64_t epoch, uint16_t id)
   {
@@ -630,7 +655,7 @@ struct DurableStore::Impl
         auto s = current(client, epoch);
         if (s)
           s->live_packet_ids.erase(id);
-        return;
+        break;
       } catch (const Deferred&) {
         continue;
       }
@@ -2381,56 +2406,60 @@ void DurableStore::Impl::checkpoint()
 }
 void DurableStore::Impl::heartbeat()
 {
+  bool ret = true;
   std::lock_guard<std::mutex> guard(mutex);
   if (frozen || failed || stopping)
-    return;
-  expire();
-  std::vector<std::vector<std::shared_ptr<Session>>> shards(states.size());
-  for (const auto& item : sessions)
-    if (item.second->online && !item.second->busy)
-      shards[journal::topic_hash(item.first) % states.size()].push_back(item.second);
-  for (size_t p = 0; p < states.size(); ++p) {
-    const auto& online = shards[p];
-    for (size_t offset = 0; offset < online.size();) {
-      std::vector<std::shared_ptr<Session>> live;
-      size_t record_bytes = 5;
-      while (offset < online.size() && live.size() < 64) {
-        size_t bytes = online[offset]->client.size() + 28;
-        if (record_bytes + bytes + 256 > config.max_request_bytes)
+    ret = false;
+  else {
+    expire();
+    std::vector<std::vector<std::shared_ptr<Session>>> shards(states.size());
+    for (const auto& item : sessions)
+      if (item.second->online && !item.second->busy)
+        shards[journal::topic_hash(item.first) % states.size()].push_back(item.second);
+    for (size_t p = 0; p < states.size() && ret; ++p) {
+      const auto& online = shards[p];
+      for (size_t offset = 0; offset < online.size();) {
+        std::vector<std::shared_ptr<Session>> live;
+        size_t record_bytes = 5;
+        while (offset < online.size() && live.size() < 64) {
+          size_t bytes = online[offset]->client.size() + 28;
+          if (record_bytes + bytes + 256 > config.max_request_bytes)
+            break;
+          live.push_back(online[offset++]);
+          record_bytes += bytes;
+        }
+        if (live.empty())
+          throw std::runtime_error("session identity exceeds heartbeat admission limit");
+        Encoder e;
+        e.u8(HEARTBEAT);
+        e.u32(uint32_t(live.size()));
+        std::vector<uint64_t> epochs;
+        std::vector<int64_t> deadlines;
+        for (const auto& s : live) {
+          epochs.push_back(s->epoch);
+          int64_t deadline = DurableStore::now_ms() + int64_t(s->expiry) * 1000;
+          deadlines.push_back(deadline);
+          e.text(s->client);
+          e.u64(s->generation);
+          e.u64(s->epoch);
+          e.u64(deadline);
+        }
+        try {
+          enqueue(
+              *states[p], std::move(e.data),
+              [=](bool ok, const Location&) {
+                if (ok)
+                  for (size_t i = 0; i < live.size(); ++i)
+                    if (live[i]->epoch == epochs[i] && live[i]->online)
+                      live[i]->deadline = deadlines[i];
+              },
+              false);
+        } catch (const Deferred&) {
+          ret = false;
           break;
-        live.push_back(online[offset++]);
-        record_bytes += bytes;
-      }
-      if (live.empty())
-        throw std::runtime_error("session identity exceeds heartbeat admission limit");
-      Encoder e;
-      e.u8(HEARTBEAT);
-      e.u32(uint32_t(live.size()));
-      std::vector<uint64_t> epochs;
-      std::vector<int64_t> deadlines;
-      for (const auto& s : live) {
-        epochs.push_back(s->epoch);
-        int64_t deadline = DurableStore::now_ms() + int64_t(s->expiry) * 1000;
-        deadlines.push_back(deadline);
-        e.text(s->client);
-        e.u64(s->generation);
-        e.u64(s->epoch);
-        e.u64(deadline);
-      }
-      try {
-        enqueue(
-            *states[p], std::move(e.data),
-            [=](bool ok, const Location&) {
-              if (ok)
-                for (size_t i = 0; i < live.size(); ++i)
-                  if (live[i]->epoch == epochs[i] && live[i]->online)
-                    live[i]->deadline = deadlines[i];
-            },
-            false);
-      } catch (const Deferred&) {
-        return;
-      } catch (const journal::AdmissionFull&) {
-        break;
+        } catch (const journal::AdmissionFull&) {
+          break;
+        }
       }
     }
   }
@@ -2444,7 +2473,7 @@ void DurableStore::Impl::maintain()
     {
       std::unique_lock<std::mutex> guard(mutex);
       if (stopped.wait_for(guard, std::chrono::milliseconds(100), [&] { return stopping; }))
-        return;
+        break;
     }
     try {
       auto now = std::chrono::steady_clock::now();

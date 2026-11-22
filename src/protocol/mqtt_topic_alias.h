@@ -30,39 +30,43 @@ class InboundTopicAliases
   // 成功时 topic 是解析后的主题；调用方还要把报文上的 topic_alias 清零。
   Result apply(bool present, uint16_t alias, uint16_t maximum, MQTTString& topic)
   {
+    Result ret = Result::Unused;
     if (!present) {
-      return Result::Unused;
-    }
-    if (alias == 0 || alias > maximum) {
-      return Result::Invalid;
-    }
-    try {
-      if (!topic.empty()) {
-        MQTTString stored(topic.data(), topic.size(), MQTTStrAllocator(allocator_));
-        Map* table = ensure();
-        if (MQ_ISNULL(table)) {
-          return Result::Quota;
-        }
-        const auto found = table->find(alias);
-        if (found == table->end()) {
-          table->emplace(alias, std::move(stored));
+      ret = Result::Unused;
+    } else if (alias == 0 || alias > maximum) {
+      ret = Result::Invalid;
+    } else {
+      try {
+        if (!topic.empty()) {
+          MQTTString stored(topic.data(), topic.size(), MQTTStrAllocator(allocator_));
+          Map* table = ensure();
+          if (MQ_ISNULL(table)) {
+            ret = Result::Quota;
+          } else {
+            const auto found = table->find(alias);
+            if (found == table->end()) {
+              table->emplace(alias, std::move(stored));
+            } else {
+              found->second.assign(stored.data(), stored.size());
+            }
+            ret = Result::Resolved;
+          }
+        } else if (entries_ == nullptr) {
+          ret = Result::Unknown;
         } else {
-          found->second.assign(stored.data(), stored.size());
+          const auto found = entries_->find(alias);
+          if (found == entries_->end()) {
+            ret = Result::Unknown;
+          } else {
+            topic.assign(found->second.data(), found->second.size());
+            ret = Result::Resolved;
+          }
         }
-        return Result::Resolved;
+      } catch (const std::bad_alloc&) {
+        ret = Result::Quota;
       }
-      if (entries_ == nullptr) {
-        return Result::Unknown;
-      }
-      const auto found = entries_->find(alias);
-      if (found == entries_->end()) {
-        return Result::Unknown;
-      }
-      topic.assign(found->second.data(), found->second.size());
-      return Result::Resolved;
-    } catch (const std::bad_alloc&) {
-      return Result::Quota;
     }
+    return ret;
   }
 
  private:
@@ -70,29 +74,32 @@ class InboundTopicAliases
 
   Map* ensure()
   {
+    Map* ret = NULL;
     if (entries_ != nullptr) {
-      return entries_;
+      ret = entries_;
+    } else if (allocator_ == nullptr) {
+      ret = NULL;
+    } else {
+      void* memory = allocator_->allocate(sizeof(Map));
+      if (memory == nullptr) {
+        ret = NULL;
+      } else {
+        try {
+          entries_ =
+              new (memory) Map(MQTTSTLAllocator<std::pair<const uint16_t, MQTTString>>(allocator_));
+          ret = entries_;
+        } catch (const std::bad_alloc&) {
+          allocator_->deallocate(memory, sizeof(Map));
+          entries_ = NULL;
+          ret = NULL;
+        } catch (...) {
+          allocator_->deallocate(memory, sizeof(Map));
+          entries_ = NULL;
+          throw;
+        }
+      }
     }
-    if (allocator_ == nullptr) {
-      return NULL;
-    }
-    void* memory = allocator_->allocate(sizeof(Map));
-    if (memory == nullptr) {
-      return NULL;
-    }
-    try {
-      entries_ =
-          new (memory) Map(MQTTSTLAllocator<std::pair<const uint16_t, MQTTString>>(allocator_));
-    } catch (const std::bad_alloc&) {
-      allocator_->deallocate(memory, sizeof(Map));
-      entries_ = NULL;
-      return NULL;
-    } catch (...) {
-      allocator_->deallocate(memory, sizeof(Map));
-      entries_ = NULL;
-      throw;
-    }
-    return entries_;
+    return ret;
   }
 
   void reset()

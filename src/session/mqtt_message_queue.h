@@ -250,6 +250,7 @@ class MessageContentCache
                                                 bool retain, bool dup, const Properties& properties,
                                                 const MQTTString& sender_id)
   {
+    SharedMessageContentPtr ret;
     std::string cache_key = generate_cache_key(topic, sender_id, payload.size(), qos);
 
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -257,15 +258,16 @@ class MessageContentCache
     // 查找现有内容
     auto it = content_cache_.find(cache_key);
     if (it != content_cache_.end() && it->second.is_valid()) {
-      return it->second;
+      ret = it->second;
+    } else {
+      // 创建新内容
+      SharedMessageContentPtr new_content(
+          new SharedMessageContent(topic, payload, qos, retain, dup, properties, sender_id));
+      content_cache_[cache_key] = new_content;
+      ret = new_content;
     }
 
-    // 创建新内容
-    SharedMessageContentPtr new_content(
-        new SharedMessageContent(topic, payload, qos, retain, dup, properties, sender_id));
-    content_cache_[cache_key] = new_content;
-
-    return new_content;
+    return ret;
   }
 
   /**

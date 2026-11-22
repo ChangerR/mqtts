@@ -45,33 +45,39 @@ SQLiteConnectionPool::~SQLiteConnectionPool()
 
 int SQLiteConnectionPool::initialize()
 {
+  int ret = MQ_SUCCESS;
   std::unique_lock<std::mutex> lock(pool_mutex_);
 
   if (initialized_) {
-    return MQ_SUCCESS;
-  }
+    ret = MQ_SUCCESS;
+  } else {
+    LOG_INFO("Initializing SQLite connection pool with {} connections",
+             config_.connection_pool_size);
 
-  LOG_INFO("Initializing SQLite connection pool with {} connections", config_.connection_pool_size);
+    pool_.reserve(config_.connection_pool_size);
 
-  pool_.reserve(config_.connection_pool_size);
+    for (int i = 0; i < config_.connection_pool_size; ++i) {
+      sqlite3* db = nullptr;
+      ret = create_connection(&db);
+      if (MQ_FAIL(ret)) {
+        LOG_ERROR("Failed to create SQLite connection {}: {}", i, ret);
+        cleanup();
+        break;
+      }
 
-  for (int i = 0; i < config_.connection_pool_size; ++i) {
-    sqlite3* db = nullptr;
-    int ret = create_connection(&db);
-    if (MQ_FAIL(ret)) {
-      LOG_ERROR("Failed to create SQLite connection {}: {}", i, ret);
-      cleanup();
-      return ret;
+      auto conn = std::make_shared<SQLiteConnection>(db, i);
+      pool_.push_back(conn);
+      available_.push(conn);
     }
 
-    auto conn = std::make_shared<SQLiteConnection>(db, i);
-    pool_.push_back(conn);
-    available_.push(conn);
+    if (MQ_SUCC(ret)) {
+      initialized_ = true;
+      LOG_INFO("SQLite connection pool initialized successfully");
+      ret = MQ_SUCCESS;
+    }
   }
 
-  initialized_ = true;
-  LOG_INFO("SQLite connection pool initialized successfully");
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void SQLiteConnectionPool::cleanup()
@@ -200,28 +206,27 @@ SQLiteAuthProvider::~SQLiteAuthProvider()
 
 int SQLiteAuthProvider::initialize()
 {
+  int ret = MQ_SUCCESS;
   LOG_INFO("Initializing SQLite authentication provider");
 
-  int ret = connection_pool_->initialize();
+  ret = connection_pool_->initialize();
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to initialize SQLite connection pool: {}", ret);
-    return ret;
+  } else {
+    ret = create_tables();
+    if (MQ_FAIL(ret)) {
+      LOG_ERROR("Failed to create SQLite tables: {}", ret);
+    } else {
+      ret = create_indexes();
+      if (MQ_FAIL(ret)) {
+        LOG_ERROR("Failed to create SQLite indexes: {}", ret);
+      } else {
+        LOG_INFO("SQLite authentication provider initialized successfully");
+        ret = MQ_SUCCESS;
+      }
+    }
   }
-
-  ret = create_tables();
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to create SQLite tables: {}", ret);
-    return ret;
-  }
-
-  ret = create_indexes();
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to create SQLite indexes: {}", ret);
-    return ret;
-  }
-
-  LOG_INFO("SQLite authentication provider initialized successfully");
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void SQLiteAuthProvider::cleanup()
@@ -265,33 +270,32 @@ AuthResult SQLiteAuthProvider::check_topic_access(const UserInfo& user_info,
 
 bool SQLiteAuthProvider::is_super_user(const MQTTString& username)
 {
+  bool ret = false;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return false;
+    ret = false;
+  } else {
+    const char* sql = "SELECT is_super_user FROM users WHERE username = ?";
+    sqlite3_stmt* stmt;
+
+    int sql_ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (sql_ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = false;
+    } else {
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        ret = sqlite3_column_int(stmt, 0) != 0;
+      }
+
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
+    }
   }
-
-  const char* sql = "SELECT is_super_user FROM users WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return false;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-
-  bool is_super = false;
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
-    is_super = sqlite3_column_int(stmt, 0) != 0;
-  }
-
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  return is_super;
+  return ret;
 }
 
 AuthStats SQLiteAuthProvider::get_stats() const
@@ -308,28 +312,29 @@ void SQLiteAuthProvider::reset_stats()
 
 bool SQLiteAuthProvider::is_healthy() const
 {
+  bool ret = false;
   if (!connection_pool_) {
-    return false;
+    ret = false;
+  } else {
+    // 尝试获取连接并执行简单查询
+    auto conn = connection_pool_->acquire_connection();
+    if (!conn) {
+      ret = false;
+    } else {
+      sqlite3_stmt* stmt;
+      int sql_ret = sqlite3_prepare_v2(conn->get_db(), "SELECT 1", -1, &stmt, nullptr);
+      ret = (sql_ret == SQLITE_OK);
+
+      if (ret) {
+        sql_ret = sqlite3_step(stmt);
+        ret = (sql_ret == SQLITE_ROW);
+        sqlite3_finalize(stmt);
+      }
+
+      connection_pool_->release_connection(conn);
+    }
   }
-
-  // 尝试获取连接并执行简单查询
-  auto conn = connection_pool_->acquire_connection();
-  if (!conn) {
-    return false;
-  }
-
-  sqlite3_stmt* stmt;
-  int ret = sqlite3_prepare_v2(conn->get_db(), "SELECT 1", -1, &stmt, nullptr);
-  bool healthy = (ret == SQLITE_OK);
-
-  if (healthy) {
-    ret = sqlite3_step(stmt);
-    healthy = (ret == SQLITE_ROW);
-    sqlite3_finalize(stmt);
-  }
-
-  connection_pool_->release_connection(conn);
-  return healthy;
+  return ret;
 }
 
 int SQLiteAuthProvider::add_user(const MQTTString& username, const MQTTString& password,
@@ -657,32 +662,37 @@ int SQLiteAuthProvider::create_tables()
 
 int SQLiteAuthProvider::create_indexes()
 {
+  int ret = MQ_SUCCESS;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return MQ_ERR_DATABASE;
-  }
+    ret = MQ_ERR_DATABASE;
+  } else {
+    const char* indexes[] = {
+        "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
+        "CREATE INDEX IF NOT EXISTS idx_topic_permissions_username ON topic_permissions(username)",
+        "CREATE INDEX IF NOT EXISTS idx_topic_permissions_pattern ON "
+        "topic_permissions(topic_pattern)"};
 
-  const char* indexes[] = {
-      "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-      "CREATE INDEX IF NOT EXISTS idx_topic_permissions_username ON topic_permissions(username)",
-      "CREATE INDEX IF NOT EXISTS idx_topic_permissions_pattern ON "
-      "topic_permissions(topic_pattern)"};
+    char* err_msg = nullptr;
 
-  char* err_msg = nullptr;
+    for (const char* index : indexes) {
+      ret = sqlite3_exec(conn->get_db(), index, nullptr, nullptr, &err_msg);
+      if (ret != SQLITE_OK) {
+        LOG_ERROR("Failed to create index: {}", err_msg);
+        sqlite3_free(err_msg);
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+        break;
+      }
+    }
 
-  for (const char* index : indexes) {
-    int ret = sqlite3_exec(conn->get_db(), index, nullptr, nullptr, &err_msg);
-    if (ret != SQLITE_OK) {
-      LOG_ERROR("Failed to create index: {}", err_msg);
-      sqlite3_free(err_msg);
+    if (ret == SQLITE_OK) {
       connection_pool_->release_connection(conn);
-      return MQ_ERR_DATABASE;
+      ret = MQ_SUCCESS;
     }
   }
-
-  connection_pool_->release_connection(conn);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 std::string SQLiteAuthProvider::hash_password(const std::string& password)
@@ -711,49 +721,51 @@ AuthResult SQLiteAuthProvider::authenticate_user_internal(const MQTTString& user
                                                           const MQTTString& password,
                                                           UserInfo& user_info)
 {
+  AuthResult ret = AuthResult::INTERNAL_ERROR;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire database connection");
-    return AuthResult::INTERNAL_ERROR;
-  }
+    ret = AuthResult::INTERNAL_ERROR;
+  } else {
+    const char* sql = "SELECT password_hash, is_super_user FROM users WHERE username = ?";
+    sqlite3_stmt* stmt;
 
-  const char* sql = "SELECT password_hash, is_super_user FROM users WHERE username = ?";
-  sqlite3_stmt* stmt;
-
-  int ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
-    connection_pool_->release_connection(conn);
-    return AuthResult::INTERNAL_ERROR;
-  }
-
-  sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
-
-  AuthResult result = AuthResult::USER_NOT_FOUND;
-
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
-    const char* stored_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    bool is_super = sqlite3_column_int(stmt, 1) != 0;
-
-    if (verify_password(from_mqtt_string(password), stored_hash)) {
-      result = AuthResult::SUCCESS;
-      user_info.username = username;
-      user_info.is_super_user = is_super;
+    int sql_ret = sqlite3_prepare_v2(conn->get_db(), sql, -1, &stmt, nullptr);
+    if (sql_ret != SQLITE_OK) {
+      LOG_ERROR("Failed to prepare SQL statement: {}", sqlite3_errmsg(conn->get_db()));
+      connection_pool_->release_connection(conn);
+      ret = AuthResult::INTERNAL_ERROR;
     } else {
-      result = AuthResult::INVALID_CREDENTIALS;
+      sqlite3_bind_text(stmt, 1, from_mqtt_string(username).c_str(), -1, SQLITE_STATIC);
+
+      ret = AuthResult::USER_NOT_FOUND;
+
+      if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* stored_hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        bool is_super = sqlite3_column_int(stmt, 1) != 0;
+
+        if (verify_password(from_mqtt_string(password), stored_hash)) {
+          ret = AuthResult::SUCCESS;
+          user_info.username = username;
+          user_info.is_super_user = is_super;
+        } else {
+          ret = AuthResult::INVALID_CREDENTIALS;
+        }
+      }
+
+      sqlite3_finalize(stmt);
+      connection_pool_->release_connection(conn);
     }
   }
-
-  sqlite3_finalize(stmt);
-  connection_pool_->release_connection(conn);
-
-  return result;
+  return ret;
 }
 
 AuthResult SQLiteAuthProvider::check_topic_access_internal(const MQTTString& username,
                                                            const MQTTString& topic,
                                                            Permission permission)
 {
+  AuthResult ret = AuthResult::TOPIC_ACCESS_DENIED;
+  bool cache_hit = false;
   // 检查缓存
   std::string username_str = from_mqtt_string(username);
   std::string topic_str = from_mqtt_string(topic);
@@ -763,38 +775,42 @@ AuthResult SQLiteAuthProvider::check_topic_access_internal(const MQTTString& use
     if (is_topic_cache_valid()) {
       auto it = topic_cache_.user_permissions.find(username_str);
       if (it != topic_cache_.user_permissions.end()) {
+        cache_hit = true;
         // 检查权限
         for (const auto& perm : it->second) {
           if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
             if ((perm.permission == Permission::READWRITE) || (perm.permission == permission)) {
-              return AuthResult::SUCCESS;
+              ret = AuthResult::SUCCESS;
+              break;
             }
           }
         }
-        return AuthResult::TOPIC_ACCESS_DENIED;
       }
     }
   }
 
-  // 缓存未命中，从数据库加载
-  update_topic_cache(username);
+  if (!cache_hit) {
+    // 缓存未命中，从数据库加载
+    update_topic_cache(username);
 
-  // 重新检查缓存
-  {
-    mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
-    auto it = topic_cache_.user_permissions.find(username_str);
-    if (it != topic_cache_.user_permissions.end()) {
-      for (const auto& perm : it->second) {
-        if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
-          if ((perm.permission == Permission::READWRITE) || (perm.permission == permission)) {
-            return AuthResult::SUCCESS;
+    // 重新检查缓存
+    {
+      mqtt::compat::shared_lock<mqtt::compat::shared_mutex> lock(topic_cache_mutex_);
+      auto it = topic_cache_.user_permissions.find(username_str);
+      if (it != topic_cache_.user_permissions.end()) {
+        for (const auto& perm : it->second) {
+          if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
+            if ((perm.permission == Permission::READWRITE) || (perm.permission == permission)) {
+              ret = AuthResult::SUCCESS;
+              break;
+            }
           }
         }
       }
     }
   }
 
-  return AuthResult::TOPIC_ACCESS_DENIED;
+  return ret;
 }
 
 void SQLiteAuthProvider::update_topic_cache(const MQTTString& username)
@@ -843,33 +859,33 @@ bool SQLiteAuthProvider::match_topic_pattern(const std::string& topic, const std
   // 简单的通配符匹配实现
   // + 匹配单个层级
   // # 匹配多个层级
+  bool ret = false;
 
   if (pattern == "#") {
-    return true;  // 匹配所有主题
+    ret = true;  // 匹配所有主题
+  } else if (pattern.find('#') == std::string::npos && pattern.find('+') == std::string::npos) {
+    ret = topic == pattern;  // 精确匹配
+  } else {
+    // 转换为正则表达式
+    std::string regex_pattern = pattern;
+
+    // 转义特殊字符
+    std::regex special_chars{R"([-[\]{}()*+?.,\^$|#\s])"};
+    regex_pattern = std::regex_replace(regex_pattern, special_chars, R"(\$&)");
+
+    // 还原通配符
+    regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\#)"), ".*");
+    regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\\+)"), "[^/]+");
+
+    try {
+      std::regex topic_regex(regex_pattern);
+      ret = std::regex_match(topic, topic_regex);
+    } catch (const std::regex_error& e) {
+      LOG_ERROR("Invalid topic pattern regex: {}", e.what());
+      ret = false;
+    }
   }
-
-  if (pattern.find('#') == std::string::npos && pattern.find('+') == std::string::npos) {
-    return topic == pattern;  // 精确匹配
-  }
-
-  // 转换为正则表达式
-  std::string regex_pattern = pattern;
-
-  // 转义特殊字符
-  std::regex special_chars{R"([-[\]{}()*+?.,\^$|#\s])"};
-  regex_pattern = std::regex_replace(regex_pattern, special_chars, R"(\$&)");
-
-  // 还原通配符
-  regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\#)"), ".*");
-  regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\\+)"), "[^/]+");
-
-  try {
-    std::regex topic_regex(regex_pattern);
-    return std::regex_match(topic, topic_regex);
-  } catch (const std::regex_error& e) {
-    LOG_ERROR("Invalid topic pattern regex: {}", e.what());
-    return false;
-  }
+  return ret;
 }
 
 void SQLiteAuthProvider::update_stats(bool login_success, bool topic_access_granted)

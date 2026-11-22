@@ -110,6 +110,7 @@ class PerformanceAnalyzer
  private:
   int setup_router_service()
   {
+    int ret = 0;
     // 配置路由服务
     MQTTRouterConfig router_config;
     router_config.service_host = "127.0.0.1";
@@ -126,17 +127,15 @@ class PerformanceAnalyzer
     router_service_.reset(new MQTTRouterService(router_config));
 
     if (router_service_->initialize() != 0) {
-      return -1;
+      ret = -1;
+    } else if (router_service_->start() != 0) {
+      ret = -1;
+    } else {
+      // 等待服务启动
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      ret = 0;
     }
-
-    if (router_service_->start() != 0) {
-      return -1;
-    }
-
-    // 等待服务启动
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    return 0;
+    return ret;
   }
 
   void cleanup_router_service()
@@ -416,6 +415,8 @@ void print_usage(const char* program_name)
 
 int main(int argc, char* argv[])
 {
+  int ret = 0;
+  bool stop = false;
   PerformanceAnalyzer::TestConfig config;
 
   // 解析命令行参数
@@ -440,15 +441,22 @@ int main(int argc, char* argv[])
       config.enable_timing_analysis = false;
     } else if (arg == "--help") {
       print_usage(argv[0]);
-      return 0;
+      ret = 0;
+      stop = true;
+      break;
     } else {
       std::cerr << "Unknown option: " << arg << std::endl;
       print_usage(argv[0]);
-      return 1;
+      ret = 1;
+      stop = true;
+      break;
     }
   }
 
   // 创建性能分析器并运行测试
-  PerformanceAnalyzer analyzer(config);
-  return analyzer.run_performance_test();
+  if (!stop) {
+    PerformanceAnalyzer analyzer(config);
+    ret = analyzer.run_performance_test();
+  }
+  return ret;
 }

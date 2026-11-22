@@ -12,9 +12,9 @@ MQTTParser::~MQTTParser() {}
 
 int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** packet)
 {
+  int ret = MQ_SUCCESS;
   building_ = nullptr;
   building_size_ = 0;
-  int ret;
   try {
     ret = dispatch_packet(buffer, length, packet);
   } catch (const std::bad_alloc&) {
@@ -26,7 +26,7 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
     building_size_ = 0;
     *packet = nullptr;
     LOG_WARN("Packet parsing exceeded the connection memory budget");
-    return MQ_ERR_MEMORY_ALLOC;
+    ret = MQ_ERR_MEMORY_ALLOC;
   }
   building_ = nullptr;
   building_size_ = 0;
@@ -35,1084 +35,1199 @@ int MQTTParser::parse_packet(const uint8_t* buffer, size_t length, Packet** pack
 
 int MQTTParser::dispatch_packet(const uint8_t* buffer, size_t length, Packet** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 2) {
     LOG_ERROR("Packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    PacketType type = static_cast<PacketType>(buffer[0] & 0xF0);
+    uint32_t remaining_length;
+    size_t bytes_read;
 
-  PacketType type = static_cast<PacketType>(buffer[0] & 0xF0);
-  uint32_t remaining_length;
-  size_t bytes_read;
-
-  int ret = parse_remaining_length(buffer + 1, length - 1, remaining_length, bytes_read);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    return MQ_ERR_PACKET_INVALID;
+    ret = parse_remaining_length(buffer + 1, length - 1, remaining_length, bytes_read);
+    if (ret != 0) {
+      LOG_ERROR("Failed to parse remaining length");
+      ret = MQ_ERR_PACKET_INVALID;
+    } else if (length < 1 + bytes_read + remaining_length) {
+      LOG_ERROR("Packet incomplete");
+      ret = MQ_ERR_PACKET_INCOMPLETE;
+    } else {
+      switch (type) {
+        case PacketType::CONNECT:
+          // CONNECT packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid CONNECT packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_connect(buffer, length, reinterpret_cast<ConnectPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PUBLISH:
+          return parse_publish(buffer, length, reinterpret_cast<PublishPacket**>(packet));
+        case PacketType::SUBSCRIBE:
+          // SUBSCRIBE packets must have bit 1 set in the fixed header
+          if ((buffer[0] & 0x0F) != 0x02) {
+            LOG_ERROR("Invalid SUBSCRIBE packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_subscribe(buffer, length, reinterpret_cast<SubscribePacket**>(packet));
+          }
+          return ret;
+        case PacketType::UNSUBSCRIBE:
+          // UNSUBSCRIBE packets must have bit 1 set in the fixed header
+          if ((buffer[0] & 0x0F) != 0x02) {
+            LOG_ERROR("Invalid UNSUBSCRIBE packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_unsubscribe(buffer, length, reinterpret_cast<UnsubscribePacket**>(packet));
+          }
+          return ret;
+        case PacketType::CONNACK:
+          // CONNACK packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid CONNACK packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_connack(buffer, length, reinterpret_cast<ConnAckPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PUBACK:
+          // PUBACK packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid PUBACK packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_puback(buffer, length, reinterpret_cast<PubAckPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PUBREC:
+          // PUBREC packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid PUBREC packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_pubrec(buffer, length, reinterpret_cast<PubRecPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PUBREL:
+          // PUBREL packets must have bit 1 set in the fixed header
+          if ((buffer[0] & 0x0F) != 0x02) {
+            LOG_ERROR("Invalid PUBREL packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_pubrel(buffer, length, reinterpret_cast<PubRelPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PUBCOMP:
+          // PUBCOMP packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid PUBCOMP packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_pubcomp(buffer, length, reinterpret_cast<PubCompPacket**>(packet));
+          }
+          return ret;
+        case PacketType::SUBACK:
+          // SUBACK packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid SUBACK packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_suback(buffer, length, reinterpret_cast<SubAckPacket**>(packet));
+          }
+          return ret;
+        case PacketType::UNSUBACK:
+          // UNSUBACK packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid UNSUBACK packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_unsuback(buffer, length, reinterpret_cast<UnsubAckPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PINGREQ:
+          // PINGREQ packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid PINGREQ packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_pingreq(buffer, length, reinterpret_cast<PingReqPacket**>(packet));
+          }
+          return ret;
+        case PacketType::PINGRESP:
+          // PINGRESP packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid PINGRESP packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_pingresp(buffer, length, reinterpret_cast<PingRespPacket**>(packet));
+          }
+          return ret;
+        case PacketType::DISCONNECT:
+          // DISCONNECT packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid DISCONNECT packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_disconnect(buffer, length, reinterpret_cast<DisconnectPacket**>(packet));
+          }
+          return ret;
+        case PacketType::AUTH:
+          // AUTH packets must have exact flags 0x00
+          if ((buffer[0] & 0x0F) != 0x00) {
+            LOG_ERROR("Invalid AUTH packet fixed header flags");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else if (is_legacy_protocol_hint()) {
+            LOG_ERROR("AUTH packet is not supported in MQTT 3.x protocol");
+            ret = MQ_ERR_PACKET_TYPE;
+          } else {
+            ret = parse_auth(buffer, length, reinterpret_cast<AuthPacket**>(packet));
+          }
+          return ret;
+        default:
+          LOG_ERROR("Unsupported packet type: 0x{:02x}", static_cast<uint8_t>(type));
+          return MQ_ERR_PACKET_TYPE;
+      }
+    }
   }
-
-  if (length < 1 + bytes_read + remaining_length) {
-    LOG_ERROR("Packet incomplete");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  switch (type) {
-    case PacketType::CONNECT:
-      // CONNECT packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid CONNECT packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_connect(buffer, length, reinterpret_cast<ConnectPacket**>(packet));
-    case PacketType::PUBLISH:
-      return parse_publish(buffer, length, reinterpret_cast<PublishPacket**>(packet));
-    case PacketType::SUBSCRIBE:
-      // SUBSCRIBE packets must have bit 1 set in the fixed header
-      if ((buffer[0] & 0x0F) != 0x02) {
-        LOG_ERROR("Invalid SUBSCRIBE packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_subscribe(buffer, length, reinterpret_cast<SubscribePacket**>(packet));
-    case PacketType::UNSUBSCRIBE:
-      // UNSUBSCRIBE packets must have bit 1 set in the fixed header
-      if ((buffer[0] & 0x0F) != 0x02) {
-        LOG_ERROR("Invalid UNSUBSCRIBE packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_unsubscribe(buffer, length, reinterpret_cast<UnsubscribePacket**>(packet));
-    case PacketType::CONNACK:
-      // CONNACK packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid CONNACK packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_connack(buffer, length, reinterpret_cast<ConnAckPacket**>(packet));
-    case PacketType::PUBACK:
-      // PUBACK packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid PUBACK packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_puback(buffer, length, reinterpret_cast<PubAckPacket**>(packet));
-    case PacketType::PUBREC:
-      // PUBREC packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid PUBREC packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_pubrec(buffer, length, reinterpret_cast<PubRecPacket**>(packet));
-    case PacketType::PUBREL:
-      // PUBREL packets must have bit 1 set in the fixed header
-      if ((buffer[0] & 0x0F) != 0x02) {
-        LOG_ERROR("Invalid PUBREL packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_pubrel(buffer, length, reinterpret_cast<PubRelPacket**>(packet));
-    case PacketType::PUBCOMP:
-      // PUBCOMP packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid PUBCOMP packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_pubcomp(buffer, length, reinterpret_cast<PubCompPacket**>(packet));
-    case PacketType::SUBACK:
-      // SUBACK packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid SUBACK packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_suback(buffer, length, reinterpret_cast<SubAckPacket**>(packet));
-    case PacketType::UNSUBACK:
-      // UNSUBACK packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid UNSUBACK packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_unsuback(buffer, length, reinterpret_cast<UnsubAckPacket**>(packet));
-    case PacketType::PINGREQ:
-      // PINGREQ packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid PINGREQ packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_pingreq(buffer, length, reinterpret_cast<PingReqPacket**>(packet));
-    case PacketType::PINGRESP:
-      // PINGRESP packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid PINGRESP packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_pingresp(buffer, length, reinterpret_cast<PingRespPacket**>(packet));
-    case PacketType::DISCONNECT:
-      // DISCONNECT packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid DISCONNECT packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_disconnect(buffer, length, reinterpret_cast<DisconnectPacket**>(packet));
-    case PacketType::AUTH:
-      // AUTH packets must have exact flags 0x00
-      if ((buffer[0] & 0x0F) != 0x00) {
-        LOG_ERROR("Invalid AUTH packet fixed header flags");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      if (is_legacy_protocol_hint()) {
-        LOG_ERROR("AUTH packet is not supported in MQTT 3.x protocol");
-        return MQ_ERR_PACKET_TYPE;
-      }
-      return parse_auth(buffer, length, reinterpret_cast<AuthPacket**>(packet));
-    default:
-      LOG_ERROR("Unsupported packet type: 0x{:02x}", static_cast<uint8_t>(type));
-      return MQ_ERR_PACKET_TYPE;
-  }
+  return ret;
 }
 
 int MQTTParser::parse_connect(const uint8_t* buffer, size_t length, ConnectPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 10) {  // Minimum CONNECT packet size
     LOG_ERROR("CONNECT packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    ConnectPacket* connect = begin_packet<ConnectPacket>(allocator_);
+    if (!connect) {
+      LOG_ERROR("Failed to allocate CONNECT packet");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      size_t pos = 0;
+      connect->type = PacketType::CONNECT;
 
-  ConnectPacket* connect =
-      begin_packet<ConnectPacket>(allocator_);
-  if (!connect) {
-    LOG_ERROR("Failed to allocate CONNECT packet");
-    return MQ_ERR_MEMORY_ALLOC;
-  }
+      // 跳过header (1字节)
+      pos++;
 
-  size_t pos = 0;
-  connect->type = PacketType::CONNECT;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret =
-      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // Parse protocol name
-  size_t string_bytes_read = 0;
-  ret = parse_mqtt_string(buffer + pos, length - pos, connect->protocol_name, string_bytes_read);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse protocol name");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += string_bytes_read;
-
-  // Parse protocol version
-  if (pos + 1 > length) {
-    LOG_ERROR("Packet too short for protocol version");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  connect->protocol_version = buffer[pos++];
-
-  // Parse connect flags
-  if (pos + 1 > length) {
-    LOG_ERROR("Packet too short for connect flags");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  uint8_t flags = buffer[pos++];
-  connect->flags.clean_start = (flags >> 1) & 0x01;
-  connect->flags.will_flag = (flags >> 2) & 0x01;
-  connect->flags.will_qos = (flags >> 3) & 0x03;
-  connect->flags.will_retain = (flags >> 5) & 0x01;
-  connect->flags.password_flag = (flags >> 6) & 0x01;
-  connect->flags.username_flag = (flags >> 7) & 0x01;
-  connect->flags.reserved = flags & 0x01;
-  if (connect->flags.reserved != 0) {
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-
-  // Parse keep alive
-  if (pos + 2 > length) {
-    LOG_ERROR("Packet too short for keep alive");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  connect->keep_alive = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  const bool is_v5 = (connect->protocol_version == 5);
-  const bool is_legacy = (connect->protocol_version == 3 || connect->protocol_version == 4);
-
-  if (!is_v5 && !is_legacy) {
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_CONNECT_PROTOCOL;
-  }
-
-  // Parse properties (MQTT v5 only)
-  if (is_v5) {
-    size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + pos, length - pos, connect->properties, properties_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse properties");
-      connect->~ConnectPacket();
-      allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
-    }
-    pos += properties_bytes_read;
-  }
-
-  // Parse client ID
-  string_bytes_read = 0;
-  ret = parse_mqtt_string(buffer + pos, length - pos, connect->client_id, string_bytes_read);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse client ID");
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_CONNECT_CLIENT_ID;
-  }
-  pos += string_bytes_read;
-
-  // Parse will topic and payload if will flag is set
-  if (connect->flags.will_flag) {
-    if (is_v5) {
-      // Parse will properties first (MQTT v5)
-      size_t will_properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, length - pos, connect->will_properties,
-                             will_properties_bytes_read);
+      // 跳过remaining length字段
+      uint32_t remaining_length;
+      size_t remaining_length_bytes;
+      ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                   remaining_length_bytes);
       if (ret != 0) {
-        LOG_ERROR("Failed to parse will properties");
+        LOG_ERROR("Failed to parse remaining length");
         connect->~ConnectPacket();
         allocator_->deallocate(connect, sizeof(ConnectPacket));
-        return MQ_ERR_PACKET_INVALID;
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        pos += remaining_length_bytes;
       }
-      pos += will_properties_bytes_read;
-    }
 
-    // Parse will topic
-    string_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_topic, string_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse will topic");
-      connect->~ConnectPacket();
-      allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pos += string_bytes_read;
+      // Parse protocol name
+      size_t string_bytes_read = 0;
+      if (ret == MQ_SUCCESS) {
+        ret = parse_mqtt_string(buffer + pos, length - pos, connect->protocol_name,
+                                string_bytes_read);
+        if (ret != 0) {
+          LOG_ERROR("Failed to parse protocol name");
+          connect->~ConnectPacket();
+          allocator_->deallocate(connect, sizeof(ConnectPacket));
+          ret = MQ_ERR_PACKET_INVALID;
+        } else {
+          pos += string_bytes_read;
+        }
+      }
 
-    // Parse will payload
-    string_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_payload, string_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse will payload");
-      connect->~ConnectPacket();
-      allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return MQ_ERR_PACKET_INVALID;
+      // Parse protocol version
+      if (ret == MQ_SUCCESS) {
+        if (pos + 1 > length) {
+          LOG_ERROR("Packet too short for protocol version");
+          connect->~ConnectPacket();
+          allocator_->deallocate(connect, sizeof(ConnectPacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          connect->protocol_version = buffer[pos++];
+        }
+      }
+
+      // Parse connect flags
+      if (ret == MQ_SUCCESS) {
+        if (pos + 1 > length) {
+          LOG_ERROR("Packet too short for connect flags");
+          connect->~ConnectPacket();
+          allocator_->deallocate(connect, sizeof(ConnectPacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          uint8_t flags = buffer[pos++];
+          connect->flags.clean_start = (flags >> 1) & 0x01;
+          connect->flags.will_flag = (flags >> 2) & 0x01;
+          connect->flags.will_qos = (flags >> 3) & 0x03;
+          connect->flags.will_retain = (flags >> 5) & 0x01;
+          connect->flags.password_flag = (flags >> 6) & 0x01;
+          connect->flags.username_flag = (flags >> 7) & 0x01;
+          connect->flags.reserved = flags & 0x01;
+          if (connect->flags.reserved != 0) {
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          }
+        }
+      }
+
+      // Parse keep alive
+      if (ret == MQ_SUCCESS) {
+        if (pos + 2 > length) {
+          LOG_ERROR("Packet too short for keep alive");
+          connect->~ConnectPacket();
+          allocator_->deallocate(connect, sizeof(ConnectPacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          connect->keep_alive = (buffer[pos] << 8) | buffer[pos + 1];
+          pos += 2;
+        }
+      }
+
+      if (ret == MQ_SUCCESS) {
+        const bool is_v5 = (connect->protocol_version == 5);
+        const bool is_legacy =
+            (connect->protocol_version == 3 || connect->protocol_version == 4);
+
+        if (!is_v5 && !is_legacy) {
+          connect->~ConnectPacket();
+          allocator_->deallocate(connect, sizeof(ConnectPacket));
+          ret = MQ_ERR_CONNECT_PROTOCOL;
+        }
+
+        // Parse properties (MQTT v5 only)
+        if (ret == MQ_SUCCESS && is_v5) {
+          size_t properties_bytes_read = 0;
+          ret = parse_properties(buffer + pos, length - pos, connect->properties,
+                                 properties_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse properties");
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += properties_bytes_read;
+          }
+        }
+
+        // Parse client ID
+        if (ret == MQ_SUCCESS) {
+          string_bytes_read = 0;
+          ret = parse_mqtt_string(buffer + pos, length - pos, connect->client_id,
+                                  string_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse client ID");
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = MQ_ERR_CONNECT_CLIENT_ID;
+          } else {
+            pos += string_bytes_read;
+          }
+        }
+
+        // Parse will topic and payload if will flag is set
+        if (ret == MQ_SUCCESS && connect->flags.will_flag) {
+          if (is_v5) {
+            // Parse will properties first (MQTT v5)
+            size_t will_properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, length - pos, connect->will_properties,
+                                   will_properties_bytes_read);
+            if (ret != 0) {
+              LOG_ERROR("Failed to parse will properties");
+              connect->~ConnectPacket();
+              allocator_->deallocate(connect, sizeof(ConnectPacket));
+              ret = MQ_ERR_PACKET_INVALID;
+            } else {
+              pos += will_properties_bytes_read;
+            }
+          }
+
+          // Parse will topic
+          if (ret == MQ_SUCCESS) {
+            string_bytes_read = 0;
+            ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_topic,
+                                    string_bytes_read);
+            if (ret != 0) {
+              LOG_ERROR("Failed to parse will topic");
+              connect->~ConnectPacket();
+              allocator_->deallocate(connect, sizeof(ConnectPacket));
+              ret = MQ_ERR_PACKET_INVALID;
+            } else {
+              pos += string_bytes_read;
+            }
+          }
+
+          // Parse will payload
+          if (ret == MQ_SUCCESS) {
+            string_bytes_read = 0;
+            ret = parse_mqtt_string(buffer + pos, length - pos, connect->will_payload,
+                                    string_bytes_read);
+            if (ret != 0) {
+              LOG_ERROR("Failed to parse will payload");
+              connect->~ConnectPacket();
+              allocator_->deallocate(connect, sizeof(ConnectPacket));
+              ret = MQ_ERR_PACKET_INVALID;
+            } else {
+              pos += string_bytes_read;
+            }
+          }
+        }
+
+        // Parse username if username flag is set
+        if (ret == MQ_SUCCESS && connect->flags.username_flag) {
+          string_bytes_read = 0;
+          ret = parse_mqtt_string(buffer + pos, length - pos, connect->username, string_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse username");
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += string_bytes_read;
+          }
+        }
+
+        // Parse password if password flag is set
+        if (ret == MQ_SUCCESS && connect->flags.password_flag) {
+          string_bytes_read = 0;
+          ret = parse_mqtt_string(buffer + pos, length - pos, connect->password, string_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse password");
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += string_bytes_read;
+          }
+        }
+
+        if (ret == MQ_SUCCESS) {
+          if (pos > length) {
+            connect->~ConnectPacket();
+            allocator_->deallocate(connect, sizeof(ConnectPacket));
+            ret = MQ_ERR_PACKET_INCOMPLETE;
+          } else {
+            *packet = connect;
+          }
+        }
+      }
     }
-    pos += string_bytes_read;
   }
-
-  // Parse username if username flag is set
-  if (connect->flags.username_flag) {
-    string_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->username, string_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse username");
-      connect->~ConnectPacket();
-      allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pos += string_bytes_read;
-  }
-
-  // Parse password if password flag is set
-  if (connect->flags.password_flag) {
-    string_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, length - pos, connect->password, string_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse password");
-      connect->~ConnectPacket();
-      allocator_->deallocate(connect, sizeof(ConnectPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pos += string_bytes_read;
-  }
-
-  if (pos > length) {
-    connect->~ConnectPacket();
-    allocator_->deallocate(connect, sizeof(ConnectPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  *packet = connect;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_publish(const uint8_t* buffer, size_t length, PublishPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 2) {
     LOG_ERROR("PUBLISH packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    PublishPacket* publish = begin_packet<PublishPacket>(allocator_);
+    if (!publish) {
+      LOG_ERROR("Failed to allocate PUBLISH packet");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      size_t pos = 0;
+      publish->type = PacketType::PUBLISH;
 
-  PublishPacket* publish =
-      begin_packet<PublishPacket>(allocator_);
-  if (!publish) {
-    LOG_ERROR("Failed to allocate PUBLISH packet");
-    return MQ_ERR_MEMORY_ALLOC;
-  }
+      // Parse flags
+      publish->dup = (buffer[0] >> 3) & 0x01;
+      publish->qos = (buffer[0] >> 1) & 0x03;
+      // Normalize invalid QoS levels to valid ones
+      if (publish->qos > 2) {
+        publish->qos = 2;  // Clamp to maximum valid QoS
+      }
+      publish->retain = buffer[0] & 0x01;
+      pos++;
 
-  size_t pos = 0;
-  publish->type = PacketType::PUBLISH;
+      // Parse remaining length
+      uint32_t remaining_length;
+      size_t remaining_length_bytes;
+      ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                   remaining_length_bytes);
+      if (ret != 0) {
+        LOG_ERROR("Failed to parse remaining length");
+        publish->~PublishPacket();
+        allocator_->deallocate(publish, sizeof(PublishPacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        pos += remaining_length_bytes;
 
-  // Parse flags
-  publish->dup = (buffer[0] >> 3) & 0x01;
-  publish->qos = (buffer[0] >> 1) & 0x03;
-  // Normalize invalid QoS levels to valid ones
-  if (publish->qos > 2) {
-    publish->qos = 2;  // Clamp to maximum valid QoS
-  }
-  publish->retain = buffer[0] & 0x01;
-  pos++;
+        // 记录header + remaining length的总大小
+        size_t header_size = pos;
+        size_t payload_end = header_size + remaining_length;
 
-  // Parse remaining length
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret =
-      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    publish->~PublishPacket();
-    allocator_->deallocate(publish, sizeof(PublishPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
+        // Parse topic name
+        size_t topic_bytes_read = 0;
+        ret = parse_mqtt_string(buffer + pos, length - pos, publish->topic_name, topic_bytes_read);
+        if (ret != 0) {
+          LOG_ERROR("Failed to parse topic name");
+          publish->~PublishPacket();
+          allocator_->deallocate(publish, sizeof(PublishPacket));
+          ret = MQ_ERR_PUBLISH_TOPIC;
+        } else {
+          pos += topic_bytes_read;
+        }
 
-  // 记录header + remaining length的总大小
-  size_t header_size = pos;
-  size_t payload_end = header_size + remaining_length;
+        // Parse packet ID if QoS > 0
+        if (ret == MQ_SUCCESS && publish->qos > 0) {
+          if (pos + 2 > length) {
+            LOG_ERROR("Packet too short for packet ID");
+            publish->~PublishPacket();
+            allocator_->deallocate(publish, sizeof(PublishPacket));
+            ret = MQ_ERR_PACKET_INCOMPLETE;
+          } else {
+            publish->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+            pos += 2;
+          }
+        }
 
-  // Parse topic name
-  size_t topic_bytes_read = 0;
-  ret = parse_mqtt_string(buffer + pos, length - pos, publish->topic_name, topic_bytes_read);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse topic name");
-    publish->~PublishPacket();
-    allocator_->deallocate(publish, sizeof(PublishPacket));
-    return MQ_ERR_PUBLISH_TOPIC;
-  }
-  pos += topic_bytes_read;
+        // Parse properties (MQTT v5 only)
+        if (ret == MQ_SUCCESS && !is_legacy_protocol_hint()) {
+          size_t properties_bytes_read = 0;
+          ret = parse_properties(buffer + pos, length - pos, publish->properties,
+                                 properties_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse properties");
+            publish->~PublishPacket();
+            allocator_->deallocate(publish, sizeof(PublishPacket));
+            ret = ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += properties_bytes_read;
+          }
+        }
 
-  // Parse packet ID if QoS > 0
-  if (publish->qos > 0) {
-    if (pos + 2 > length) {
-      LOG_ERROR("Packet too short for packet ID");
-      publish->~PublishPacket();
-      allocator_->deallocate(publish, sizeof(PublishPacket));
-      return MQ_ERR_PACKET_INCOMPLETE;
+        // Parse payload
+        if (ret == MQ_SUCCESS) {
+          size_t payload_length = remaining_length - (pos - header_size);  // Subtract header length
+          size_t payload_bytes_read = 0;
+          parse_mqtt_binary_data(buffer + pos, payload_length, publish->payload,
+                                 payload_bytes_read);
+          pos += payload_bytes_read;
+
+          *packet = publish;
+        }
+      }
     }
-    publish->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-    pos += 2;
   }
-
-  // Parse properties (MQTT v5 only)
-  if (!is_legacy_protocol_hint()) {
-    size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + pos, length - pos, publish->properties, properties_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse properties");
-      publish->~PublishPacket();
-      allocator_->deallocate(publish, sizeof(PublishPacket));
-      return ret == MQ_ERR_PROTOCOL ? MQ_ERR_PROTOCOL : MQ_ERR_PACKET_INVALID;
-    }
-    pos += properties_bytes_read;
-  }
-
-  // Parse payload
-  size_t payload_length = remaining_length - (pos - header_size);  // Subtract header length
-  size_t payload_bytes_read = 0;
-  parse_mqtt_binary_data(buffer + pos, payload_length, publish->payload, payload_bytes_read);
-  pos += payload_bytes_read;
-
-  *packet = publish;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 namespace {
 int decode_subscription_options(uint8_t raw, bool legacy, SubscriptionOptions& out)
 {
+  int ret = MQ_SUCCESS;
   if (legacy) {
-    if ((raw & 0xFC) != 0)
-      return MQ_ERR_PACKET_INVALID;
+    if ((raw & 0xFC) != 0) {
+      ret = MQ_ERR_PACKET_INVALID;
+    }
   } else if ((raw & 0xC0) != 0 || ((raw >> 4) & 0x03) == 3) {
-    return MQ_ERR_PACKET_INVALID;
+    ret = MQ_ERR_PACKET_INVALID;
   }
-  out = SubscriptionOptions();
-  out.qos = raw & 0x03;
-  out.no_local = !legacy && (raw & 0x04) != 0;
-  out.retain_as_published = !legacy && (raw & 0x08) != 0;
-  out.retain_handling = legacy ? 0 : static_cast<uint8_t>((raw >> 4) & 0x03);
-  return MQ_SUCCESS;
+  if (ret == MQ_SUCCESS) {
+    out = SubscriptionOptions();
+    out.qos = raw & 0x03;
+    out.no_local = !legacy && (raw & 0x04) != 0;
+    out.retain_as_published = !legacy && (raw & 0x08) != 0;
+    out.retain_handling = legacy ? 0 : static_cast<uint8_t>((raw >> 4) & 0x03);
+  }
+  return ret;
 }
 }  // namespace
 
 int MQTTParser::parse_subscribe(const uint8_t* buffer, size_t length, SubscribePacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 5) {  // Minimum SUBSCRIBE packet size
     LOG_ERROR("SUBSCRIBE packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    SubscribePacket* subscribe = begin_packet<SubscribePacket>(allocator_);
+    if (!subscribe) {
+      LOG_ERROR("Failed to allocate SUBSCRIBE packet");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      size_t pos = 0;
+      subscribe->type = PacketType::SUBSCRIBE;
 
-  SubscribePacket* subscribe =
-      begin_packet<SubscribePacket>(allocator_);
-  if (!subscribe) {
-    LOG_ERROR("Failed to allocate SUBSCRIBE packet");
-    return MQ_ERR_MEMORY_ALLOC;
-  }
+      // Skip packet type
+      pos++;
 
-  size_t pos = 0;
-  subscribe->type = PacketType::SUBSCRIBE;
+      // Parse remaining length
+      uint32_t remaining_length;
+      size_t remaining_length_bytes;
+      ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                   remaining_length_bytes);
+      if (ret != 0) {
+        LOG_ERROR("Failed to parse remaining length");
+        subscribe->~SubscribePacket();
+        allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        pos += remaining_length_bytes;
 
-  // Skip packet type
-  pos++;
+        // 记录header + remaining length的总大小
+        size_t header_size = pos;
+        size_t payload_end = header_size + remaining_length;
 
-  // Parse remaining length
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret =
-      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    subscribe->~SubscribePacket();
-    allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
+        // Parse packet ID
+        if (pos + 2 > length) {
+          LOG_ERROR("Packet too short for packet ID");
+          subscribe->~SubscribePacket();
+          allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          subscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+          pos += 2;
+        }
 
-  // 记录header + remaining length的总大小
-  size_t header_size = pos;
-  size_t payload_end = header_size + remaining_length;
+        // Parse properties (MQTT v5 only)
+        if (ret == MQ_SUCCESS && !is_legacy_protocol_hint()) {
+          size_t properties_bytes_read = 0;
+          ret = parse_properties(buffer + pos, payload_end - pos, subscribe->properties,
+                                 properties_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse properties");
+            subscribe->~SubscribePacket();
+            allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += properties_bytes_read;
+          }
+        }
 
-  // Parse packet ID
-  if (pos + 2 > length) {
-    LOG_ERROR("Packet too short for packet ID");
-    subscribe->~SubscribePacket();
-    allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  subscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
+        // Parse subscriptions
+        while (ret == MQ_SUCCESS && pos < payload_end) {
+          MQTTString topic_filter{MQTTStrAllocator(allocator_)};
+          size_t topic_bytes_read = 0;
+          ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, topic_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse topic filter");
+            subscribe->~SubscribePacket();
+            allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+            ret = MQ_ERR_SUBSCRIBE_TOPIC;
+            break;
+          }
+          pos += topic_bytes_read;
 
-  // Parse properties (MQTT v5 only)
-  if (!is_legacy_protocol_hint()) {
-    size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + pos, payload_end - pos, subscribe->properties, properties_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse properties");
-      subscribe->~SubscribePacket();
-      allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return MQ_ERR_PACKET_INVALID;
+          if (pos + 1 > payload_end) {
+            LOG_ERROR("Packet too short for QoS");
+            subscribe->~SubscribePacket();
+            allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+            ret = MQ_ERR_PACKET_INCOMPLETE;
+            break;
+          }
+          SubscriptionOptions options;
+          const int decoded =
+              decode_subscription_options(buffer[pos++], is_legacy_protocol_hint(), options);
+          if (decoded != MQ_SUCCESS) {
+            LOG_ERROR("Invalid subscription options");
+            subscribe->~SubscribePacket();
+            allocator_->deallocate(subscribe, sizeof(SubscribePacket));
+            ret = decoded;
+            break;
+          }
+
+          subscribe->subscriptions.push_back(TopicSubscription(std::move(topic_filter), options));
+        }
+
+        if (ret == MQ_SUCCESS) {
+          *packet = subscribe;
+        }
+      }
     }
-    pos += properties_bytes_read;
   }
-
-  // Parse subscriptions
-  while (pos < payload_end) {
-    MQTTString topic_filter{MQTTStrAllocator(allocator_)};
-    size_t topic_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, topic_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse topic filter");
-      subscribe->~SubscribePacket();
-      allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return MQ_ERR_SUBSCRIBE_TOPIC;
-    }
-    pos += topic_bytes_read;
-
-    if (pos + 1 > payload_end) {
-      LOG_ERROR("Packet too short for QoS");
-      subscribe->~SubscribePacket();
-      allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return MQ_ERR_PACKET_INCOMPLETE;
-    }
-    SubscriptionOptions options;
-    const int decoded =
-        decode_subscription_options(buffer[pos++], is_legacy_protocol_hint(), options);
-    if (decoded != MQ_SUCCESS) {
-      LOG_ERROR("Invalid subscription options");
-      subscribe->~SubscribePacket();
-      allocator_->deallocate(subscribe, sizeof(SubscribePacket));
-      return decoded;
-    }
-
-    subscribe->subscriptions.push_back(TopicSubscription(std::move(topic_filter), options));
-  }
-
-  *packet = subscribe;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_connack(const uint8_t* buffer, size_t length, ConnAckPacket** packet)
 {
-  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
-    return MQ_ERR_PACKET_INVALID;
-  }
+  int ret = MQ_SUCCESS;
+  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
+  if (length < 4) {
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    ConnAckPacket* connack = begin_packet<ConnAckPacket>(allocator_);
+    connack->type = PacketType::CONNACK;
 
-  ConnAckPacket* connack = begin_packet<ConnAckPacket>(allocator_);
-  connack->type = PacketType::CONNACK;
+    size_t pos = 0;
 
-  size_t pos = 0;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    connack->~ConnAckPacket();
-    allocator_->deallocate(connack, sizeof(ConnAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 验证数据长度
-  if (pos + remaining_length > length) {
-    connack->~ConnAckPacket();
-    allocator_->deallocate(connack, sizeof(ConnAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析会话存在标志和原因码
-  if (pos + 2 > length) {
-    connack->~ConnAckPacket();
-    allocator_->deallocate(connack, sizeof(ConnAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  uint8_t ack_flags = buffer[pos];
-  connack->session_present = (ack_flags & 0x01) != 0;
-  if ((ack_flags & 0xFE) != 0) {
-    connack->~ConnAckPacket();
-    allocator_->deallocate(connack, sizeof(ConnAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos++;
-
-  if (is_legacy_protocol_hint()) {
-    connack->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    // 跳过header (1字节)
     pos++;
-    if (remaining_length != 2) {
-      connack->~ConnAckPacket();
-      allocator_->deallocate(connack, sizeof(ConnAckPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    *packet = connack;
-    return MQ_SUCCESS;
-  }
 
-  connack->reason_code = static_cast<ReasonCode>(buffer[pos]);
-  pos++;
-
-  // 计算剩余的属性数据长度
-  size_t properties_length = remaining_length - 2; // 减去会话标志和原因码的2字节
-
-  // 解析属性
-  if (properties_length > 0) {
-    size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + pos, properties_length, connack->properties, properties_bytes_read);
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
     if (ret != 0) {
       connack->~ConnAckPacket();
       allocator_->deallocate(connack, sizeof(ConnAckPacket));
-      return ret;
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
     }
-    if (properties_bytes_read != properties_length) {
-      connack->~ConnAckPacket();
-      allocator_->deallocate(connack, sizeof(ConnAckPacket));
-      return MQ_ERR_PACKET_INVALID;
+
+    // 验证数据长度
+    if (ret == MQ_SUCCESS) {
+      if (pos + remaining_length > length) {
+        connack->~ConnAckPacket();
+        allocator_->deallocate(connack, sizeof(ConnAckPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      }
+    }
+
+    // 解析会话存在标志和原因码
+    if (ret == MQ_SUCCESS) {
+      if (pos + 2 > length) {
+        connack->~ConnAckPacket();
+        allocator_->deallocate(connack, sizeof(ConnAckPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else {
+        uint8_t ack_flags = buffer[pos];
+        connack->session_present = (ack_flags & 0x01) != 0;
+        if ((ack_flags & 0xFE) != 0) {
+          connack->~ConnAckPacket();
+          allocator_->deallocate(connack, sizeof(ConnAckPacket));
+          ret = MQ_ERR_PACKET_INVALID;
+        } else {
+          pos++;
+        }
+      }
+    }
+
+    if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
+      connack->reason_code = static_cast<ReasonCode>(buffer[pos]);
+      pos++;
+      if (remaining_length != 2) {
+        connack->~ConnAckPacket();
+        allocator_->deallocate(connack, sizeof(ConnAckPacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        *packet = connack;
+      }
+    } else if (ret == MQ_SUCCESS) {
+      connack->reason_code = static_cast<ReasonCode>(buffer[pos]);
+      pos++;
+
+      // 计算剩余的属性数据长度
+      size_t properties_length = remaining_length - 2;  // 减去会话标志和原因码的2字节
+
+      // 解析属性
+      if (properties_length > 0) {
+        size_t properties_bytes_read = 0;
+        ret = parse_properties(buffer + pos, properties_length, connack->properties,
+                               properties_bytes_read);
+        if (ret != 0) {
+          connack->~ConnAckPacket();
+          allocator_->deallocate(connack, sizeof(ConnAckPacket));
+        } else if (properties_bytes_read != properties_length) {
+          connack->~ConnAckPacket();
+          allocator_->deallocate(connack, sizeof(ConnAckPacket));
+          ret = MQ_ERR_PACKET_INVALID;
+        }
+      }
+
+      if (ret == MQ_SUCCESS) {
+        *packet = connack;
+      }
     }
   }
-
-  *packet = connack;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_puback(const uint8_t* buffer, size_t length, PubAckPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 4) {
-    return MQ_ERR_PACKET_INVALID;
-  }
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    PubAckPacket* puback = begin_packet<PubAckPacket>(allocator_);
+    puback->type = PacketType::PUBACK;
 
-  PubAckPacket* puback = begin_packet<PubAckPacket>(allocator_);
-  puback->type = PacketType::PUBACK;
+    size_t pos = 0;
 
-  size_t pos = 0;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    puback->~PubAckPacket();
-    allocator_->deallocate(puback, sizeof(PubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-  size_t payload_end = pos + remaining_length;
-  if (payload_end > length) {
-    puback->~PubAckPacket();
-    allocator_->deallocate(puback, sizeof(PubAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > payload_end) {
-    puback->~PubAckPacket();
-    allocator_->deallocate(puback, sizeof(PubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  puback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 2) {
-      puback->~PubAckPacket();
-      allocator_->deallocate(puback, sizeof(PubAckPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    puback->reason_code = ReasonCode::Success;
-    *packet = puback;
-    return MQ_SUCCESS;
-  }
-
-  // 解析原因码
-  if (pos < payload_end) {
-    puback->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    // 跳过header (1字节)
     pos++;
 
-    // 解析属性
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, puback->properties, properties_bytes_read);
-      if (ret != 0) {
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      puback->~PubAckPacket();
+      allocator_->deallocate(puback, sizeof(PubAckPacket));
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
+      size_t payload_end = pos + remaining_length;
+      if (payload_end > length) {
         puback->~PubAckPacket();
         allocator_->deallocate(puback, sizeof(PubAckPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > payload_end) {
+        puback->~PubAckPacket();
+        allocator_->deallocate(puback, sizeof(PubAckPacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        // 解析包ID
+        puback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        if (is_legacy_protocol_hint()) {
+          if (remaining_length != 2) {
+            puback->~PubAckPacket();
+            allocator_->deallocate(puback, sizeof(PubAckPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            puback->reason_code = ReasonCode::Success;
+            *packet = puback;
+          }
+        } else if (pos < payload_end) {
+          // 解析原因码
+          puback->reason_code = static_cast<ReasonCode>(buffer[pos]);
+          pos++;
+
+          // 解析属性
+          if (pos < payload_end) {
+            size_t properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, payload_end - pos, puback->properties,
+                                   properties_bytes_read);
+            if (ret != 0) {
+              puback->~PubAckPacket();
+              allocator_->deallocate(puback, sizeof(PubAckPacket));
+            }
+          }
+          if (ret == MQ_SUCCESS) {
+            *packet = puback;
+          }
+        } else {
+          // 默认原因码
+          puback->reason_code = ReasonCode::Success;
+          *packet = puback;
+        }
       }
     }
-  } else {
-    // 默认原因码
-    puback->reason_code = ReasonCode::Success;
   }
-
-  *packet = puback;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_pubrec(const uint8_t* buffer, size_t length, PubRecPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 4) {
-    return MQ_ERR_PACKET_INVALID;
-  }
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    PubRecPacket* pubrec = begin_packet<PubRecPacket>(allocator_);
+    pubrec->type = PacketType::PUBREC;
 
-  PubRecPacket* pubrec = begin_packet<PubRecPacket>(allocator_);
-  pubrec->type = PacketType::PUBREC;
+    size_t pos = 0;
 
-  size_t pos = 0;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    pubrec->~PubRecPacket();
-    allocator_->deallocate(pubrec, sizeof(PubRecPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-  size_t payload_end = pos + remaining_length;
-  if (payload_end > length) {
-    pubrec->~PubRecPacket();
-    allocator_->deallocate(pubrec, sizeof(PubRecPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > payload_end) {
-    pubrec->~PubRecPacket();
-    allocator_->deallocate(pubrec, sizeof(PubRecPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pubrec->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 2) {
-      pubrec->~PubRecPacket();
-      allocator_->deallocate(pubrec, sizeof(PubRecPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pubrec->reason_code = ReasonCode::Success;
-    *packet = pubrec;
-    return MQ_SUCCESS;
-  }
-
-  // 解析原因码
-  if (pos < payload_end) {
-    pubrec->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    // 跳过header (1字节)
     pos++;
 
-    // 解析属性
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, pubrec->properties, properties_bytes_read);
-      if (ret != 0) {
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      pubrec->~PubRecPacket();
+      allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
+      size_t payload_end = pos + remaining_length;
+      if (payload_end > length) {
         pubrec->~PubRecPacket();
         allocator_->deallocate(pubrec, sizeof(PubRecPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > payload_end) {
+        pubrec->~PubRecPacket();
+        allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        // 解析包ID
+        pubrec->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        if (is_legacy_protocol_hint()) {
+          if (remaining_length != 2) {
+            pubrec->~PubRecPacket();
+            allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pubrec->reason_code = ReasonCode::Success;
+            *packet = pubrec;
+          }
+        } else if (pos < payload_end) {
+          // 解析原因码
+          pubrec->reason_code = static_cast<ReasonCode>(buffer[pos]);
+          pos++;
+
+          // 解析属性
+          if (pos < payload_end) {
+            size_t properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, payload_end - pos, pubrec->properties,
+                                   properties_bytes_read);
+            if (ret != 0) {
+              pubrec->~PubRecPacket();
+              allocator_->deallocate(pubrec, sizeof(PubRecPacket));
+            }
+          }
+          if (ret == MQ_SUCCESS) {
+            *packet = pubrec;
+          }
+        } else {
+          // 默认原因码
+          pubrec->reason_code = ReasonCode::Success;
+          *packet = pubrec;
+        }
       }
     }
-  } else {
-    // 默认原因码
-    pubrec->reason_code = ReasonCode::Success;
   }
-
-  *packet = pubrec;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_pubrel(const uint8_t* buffer, size_t length, PubRelPacket** packet)
 {
-  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
-    return MQ_ERR_PACKET_INVALID;
-  }
+  int ret = MQ_SUCCESS;
+  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
+  if (length < 4) {
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    PubRelPacket* pubrel = begin_packet<PubRelPacket>(allocator_);
+    pubrel->type = PacketType::PUBREL;
 
-  PubRelPacket* pubrel = begin_packet<PubRelPacket>(allocator_);
-  pubrel->type = PacketType::PUBREL;
+    size_t pos = 0;
 
-  size_t pos = 0;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    pubrel->~PubRelPacket();
-    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 验证数据长度
-  if (pos + remaining_length > length) {
-    pubrel->~PubRelPacket();
-    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > length) {
-    pubrel->~PubRelPacket();
-    allocator_->deallocate(pubrel, sizeof(PubRelPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  pubrel->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 2) {
-      pubrel->~PubRelPacket();
-      allocator_->deallocate(pubrel, sizeof(PubRelPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pubrel->reason_code = ReasonCode::Success;
-    *packet = pubrel;
-    return MQ_SUCCESS;
-  }
-
-  // 计算剩余的数据长度
-  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
-
-  // 解析原因码（如果存在）
-  if (pos < payload_end) {
-    pubrel->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    // 跳过header (1字节)
     pos++;
 
-    // 解析属性（如果存在）
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, pubrel->properties, properties_bytes_read);
-      if (ret != 0) {
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      pubrel->~PubRelPacket();
+      allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
+
+      // 验证数据长度
+      if (pos + remaining_length > length) {
         pubrel->~PubRelPacket();
         allocator_->deallocate(pubrel, sizeof(PubRelPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > length) {
+        pubrel->~PubRelPacket();
+        allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else {
+        // 解析包ID
+        pubrel->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        if (is_legacy_protocol_hint()) {
+          if (remaining_length != 2) {
+            pubrel->~PubRelPacket();
+            allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pubrel->reason_code = ReasonCode::Success;
+            *packet = pubrel;
+          }
+        } else {
+          // 计算剩余的数据长度
+          size_t payload_end = pos + remaining_length - 2;  // 减去包ID的2字节
+
+          // 解析原因码（如果存在）
+          if (pos < payload_end) {
+            pubrel->reason_code = static_cast<ReasonCode>(buffer[pos]);
+            pos++;
+
+            // 解析属性（如果存在）
+            if (pos < payload_end) {
+              size_t properties_bytes_read = 0;
+              ret = parse_properties(buffer + pos, payload_end - pos, pubrel->properties,
+                                     properties_bytes_read);
+              if (ret != 0) {
+                pubrel->~PubRelPacket();
+                allocator_->deallocate(pubrel, sizeof(PubRelPacket));
+              }
+            }
+          } else {
+            // 默认原因码
+            pubrel->reason_code = ReasonCode::Success;
+          }
+
+          if (ret == MQ_SUCCESS) {
+            *packet = pubrel;
+          }
+        }
       }
     }
-  } else {
-    // 默认原因码
-    pubrel->reason_code = ReasonCode::Success;
   }
-
-  *packet = pubrel;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_pubcomp(const uint8_t* buffer, size_t length, PubCompPacket** packet)
 {
-  if (length < 4) {  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
-    return MQ_ERR_PACKET_INVALID;
-  }
+  int ret = MQ_SUCCESS;
+  // Fixed header (1 byte) + remaining length (min 1 byte) + variable header (min 2 bytes)
+  if (length < 4) {
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    PubCompPacket* pubcomp = begin_packet<PubCompPacket>(allocator_);
+    pubcomp->type = PacketType::PUBCOMP;
 
-  PubCompPacket* pubcomp = begin_packet<PubCompPacket>(allocator_);
-  pubcomp->type = PacketType::PUBCOMP;
+    size_t pos = 0;
 
-  size_t pos = 0;
-
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    pubcomp->~PubCompPacket();
-    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 验证数据长度
-  if (pos + remaining_length > length) {
-    pubcomp->~PubCompPacket();
-    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > length) {
-    pubcomp->~PubCompPacket();
-    allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  pubcomp->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 2) {
-      pubcomp->~PubCompPacket();
-      allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pubcomp->reason_code = ReasonCode::Success;
-    *packet = pubcomp;
-    return MQ_SUCCESS;
-  }
-
-  // 计算剩余的数据长度
-  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
-
-  // 解析原因码（如果存在）
-  if (pos < payload_end) {
-    pubcomp->reason_code = static_cast<ReasonCode>(buffer[pos]);
+    // 跳过header (1字节)
     pos++;
 
-    // 解析属性（如果存在）
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, pubcomp->properties, properties_bytes_read);
-      if (ret != 0) {
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      pubcomp->~PubCompPacket();
+      allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
+
+      // 验证数据长度
+      if (pos + remaining_length > length) {
         pubcomp->~PubCompPacket();
         allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > length) {
+        pubcomp->~PubCompPacket();
+        allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else {
+        // 解析包ID
+        pubcomp->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        if (is_legacy_protocol_hint()) {
+          if (remaining_length != 2) {
+            pubcomp->~PubCompPacket();
+            allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pubcomp->reason_code = ReasonCode::Success;
+            *packet = pubcomp;
+          }
+        } else {
+          // 计算剩余的数据长度
+          size_t payload_end = pos + remaining_length - 2;  // 减去包ID的2字节
+
+          // 解析原因码（如果存在）
+          if (pos < payload_end) {
+            pubcomp->reason_code = static_cast<ReasonCode>(buffer[pos]);
+            pos++;
+
+            // 解析属性（如果存在）
+            if (pos < payload_end) {
+              size_t properties_bytes_read = 0;
+              ret = parse_properties(buffer + pos, payload_end - pos, pubcomp->properties,
+                                     properties_bytes_read);
+              if (ret != 0) {
+                pubcomp->~PubCompPacket();
+                allocator_->deallocate(pubcomp, sizeof(PubCompPacket));
+              }
+            }
+          } else {
+            // 默认原因码
+            pubcomp->reason_code = ReasonCode::Success;
+          }
+
+          if (ret == MQ_SUCCESS) {
+            *packet = pubcomp;
+          }
+        }
       }
     }
-  } else {
-    // 默认原因码
-    pubcomp->reason_code = ReasonCode::Success;
   }
-
-  *packet = pubcomp;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_suback(const uint8_t* buffer, size_t length, SubAckPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 5) {
-    return MQ_ERR_PACKET_INVALID;
-  }
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    SubAckPacket* suback = begin_packet<SubAckPacket>(allocator_);
+    suback->type = PacketType::SUBACK;
 
-  SubAckPacket* suback = begin_packet<SubAckPacket>(allocator_);
-  suback->type = PacketType::SUBACK;
+    size_t pos = 0;
 
-  size_t pos = 0;
+    // 跳过header (1字节)
+    pos++;
 
-  // 跳过header (1字节)
-  pos++;
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      suback->~SubAckPacket();
+      allocator_->deallocate(suback, sizeof(SubAckPacket));
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
 
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    suback->~SubAckPacket();
-    allocator_->deallocate(suback, sizeof(SubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 验证数据长度
-  if (pos + remaining_length > length) {
-    suback->~SubAckPacket();
-    allocator_->deallocate(suback, sizeof(SubAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > length) {
-    suback->~SubAckPacket();
-    allocator_->deallocate(suback, sizeof(SubAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  suback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  // 计算剩余的数据长度，用于属性和原因码
-  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
-
-  if (!is_legacy_protocol_hint()) {
-    // 解析属性
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, suback->properties,
-                             properties_bytes_read);
-      if (ret != 0) {
+      // 验证数据长度
+      if (pos + remaining_length > length) {
         suback->~SubAckPacket();
         allocator_->deallocate(suback, sizeof(SubAckPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > length) {
+        suback->~SubAckPacket();
+        allocator_->deallocate(suback, sizeof(SubAckPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else {
+        // 解析包ID
+        suback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        // 计算剩余的数据长度，用于属性和原因码
+        size_t payload_end = pos + remaining_length - 2;  // 减去包ID的2字节
+
+        if (!is_legacy_protocol_hint() && pos < payload_end) {
+          // 解析属性
+          size_t properties_bytes_read = 0;
+          ret = parse_properties(buffer + pos, payload_end - pos, suback->properties,
+                                 properties_bytes_read);
+          if (ret != 0) {
+            suback->~SubAckPacket();
+            allocator_->deallocate(suback, sizeof(SubAckPacket));
+          } else {
+            pos += properties_bytes_read;
+          }
+        }
+
+        if (ret == MQ_SUCCESS) {
+          // 解析原因码列表
+          while (pos < payload_end) {
+            suback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
+            pos++;
+          }
+
+          // 验证至少有一个原因码
+          if (suback->reason_codes.empty()) {
+            suback->~SubAckPacket();
+            allocator_->deallocate(suback, sizeof(SubAckPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            *packet = suback;
+          }
+        }
       }
-      pos += properties_bytes_read;
     }
   }
-
-  // 解析原因码列表
-  while (pos < payload_end) {
-    suback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
-    pos++;
-  }
-
-  // 验证至少有一个原因码
-  if (suback->reason_codes.empty()) {
-    suback->~SubAckPacket();
-    allocator_->deallocate(suback, sizeof(SubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-
-  *packet = suback;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_unsuback(const uint8_t* buffer, size_t length, UnsubAckPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 4) {
-    return MQ_ERR_PACKET_INVALID;
-  }
+    ret = MQ_ERR_PACKET_INVALID;
+  } else {
+    UnsubAckPacket* unsuback = begin_packet<UnsubAckPacket>(allocator_);
+    unsuback->type = PacketType::UNSUBACK;
 
-  UnsubAckPacket* unsuback = begin_packet<UnsubAckPacket>(allocator_);
-  unsuback->type = PacketType::UNSUBACK;
+    size_t pos = 0;
 
-  size_t pos = 0;
+    // 跳过header (1字节)
+    pos++;
 
-  // 跳过header (1字节)
-  pos++;
-
-  // 跳过remaining length字段
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    unsuback->~UnsubAckPacket();
-    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 验证数据长度
-  if (pos + remaining_length > length) {
-    unsuback->~UnsubAckPacket();
-    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  // 解析包ID
-  if (pos + 2 > length) {
-    unsuback->~UnsubAckPacket();
-    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  unsuback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 2) {
-      unsuback->~UnsubAckPacket();
-      allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    *packet = unsuback;
-    return MQ_SUCCESS;
-  }
-
-  // 计算剩余的数据长度，用于属性和原因码
-  size_t payload_end = pos + remaining_length - 2; // 减去包ID的2字节
-
-  // 解析属性
-  if (pos < payload_end) {
-    size_t properties_bytes_read = 0;
-    ret = parse_properties(buffer + pos, payload_end - pos, unsuback->properties, properties_bytes_read);
+    // 跳过remaining length字段
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
     if (ret != 0) {
       unsuback->~UnsubAckPacket();
       allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-      return ret;
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
+
+      // 验证数据长度
+      if (pos + remaining_length > length) {
+        unsuback->~UnsubAckPacket();
+        allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (pos + 2 > length) {
+        unsuback->~UnsubAckPacket();
+        allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else {
+        // 解析包ID
+        unsuback->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+        pos += 2;
+
+        if (is_legacy_protocol_hint()) {
+          if (remaining_length != 2) {
+            unsuback->~UnsubAckPacket();
+            allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            *packet = unsuback;
+          }
+        } else {
+          // 计算剩余的数据长度，用于属性和原因码
+          size_t payload_end = pos + remaining_length - 2;  // 减去包ID的2字节
+
+          // 解析属性
+          if (pos < payload_end) {
+            size_t properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, payload_end - pos, unsuback->properties,
+                                   properties_bytes_read);
+            if (ret != 0) {
+              unsuback->~UnsubAckPacket();
+              allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+            } else {
+              pos += properties_bytes_read;
+            }
+          }
+
+          if (ret == MQ_SUCCESS) {
+            // 解析原因码列表
+            while (pos < payload_end) {
+              unsuback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
+              pos++;
+            }
+
+            // 验证至少有一个原因码
+            if (unsuback->reason_codes.empty()) {
+              unsuback->~UnsubAckPacket();
+              allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
+              ret = MQ_ERR_PACKET_INVALID;
+            } else {
+              *packet = unsuback;
+            }
+          }
+        }
+      }
     }
-    pos += properties_bytes_read;
   }
-
-  // 解析原因码列表
-  while (pos < payload_end) {
-    unsuback->reason_codes.push_back(static_cast<ReasonCode>(buffer[pos]));
-    pos++;
-  }
-
-  // 验证至少有一个原因码
-  if (unsuback->reason_codes.empty()) {
-    unsuback->~UnsubAckPacket();
-    allocator_->deallocate(unsuback, sizeof(UnsubAckPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-
-  *packet = unsuback;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_pingreq(const uint8_t* buffer, size_t length, PingReqPacket** packet)
@@ -1133,144 +1248,150 @@ int MQTTParser::parse_pingresp(const uint8_t* buffer, size_t length, PingRespPac
 
 int MQTTParser::parse_disconnect(const uint8_t* buffer, size_t length, DisconnectPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 2) {
     LOG_ERROR("DISCONNECT packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  DisconnectPacket* disconnect =
-      begin_packet<DisconnectPacket>();
-  disconnect->type = PacketType::DISCONNECT;
-  disconnect->reason_code = ReasonCode::NormalDisconnection;
-
-  size_t pos = 0;
-
-  // 跳过包类型字节
-  pos++;
-
-  // 解析剩余长度
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret =
-      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  // 记录payload结束位置
-  size_t payload_end = pos + remaining_length;
-  if (payload_end > length) {
-    LOG_ERROR("Packet too short for payload");
-    allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-
-  if (is_legacy_protocol_hint()) {
-    if (remaining_length != 0) {
-      allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    DisconnectPacket* disconnect = begin_packet<DisconnectPacket>();
+    disconnect->type = PacketType::DISCONNECT;
     disconnect->reason_code = ReasonCode::NormalDisconnection;
-    *packet = disconnect;
-    return MQ_SUCCESS;
-  }
 
-  // 解析原因码 (如果有payload)
-  if (remaining_length > 0) {
-    if (pos >= payload_end) {
-      LOG_ERROR("Packet too short for reason code");
+    size_t pos = 0;
+
+    // 跳过包类型字节
+    pos++;
+
+    // 解析剩余长度
+    uint32_t remaining_length;
+    size_t remaining_length_bytes;
+    ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                 remaining_length_bytes);
+    if (ret != 0) {
+      LOG_ERROR("Failed to parse remaining length");
       allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
-      return MQ_ERR_PACKET_INCOMPLETE;
-    }
-    disconnect->reason_code = static_cast<ReasonCode>(buffer[pos++]);
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      pos += remaining_length_bytes;
 
-    // 解析属性 (如果还有数据)
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, disconnect->properties,
-                             properties_bytes_read);
-      if (ret != 0) {
-        LOG_ERROR("Failed to parse properties");
+      // 记录payload结束位置
+      size_t payload_end = pos + remaining_length;
+      if (payload_end > length) {
+        LOG_ERROR("Packet too short for payload");
         allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
-        return ret;
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+      } else if (is_legacy_protocol_hint()) {
+        if (remaining_length != 0) {
+          allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+          ret = MQ_ERR_PACKET_INVALID;
+        } else {
+          disconnect->reason_code = ReasonCode::NormalDisconnection;
+          *packet = disconnect;
+        }
+      } else if (remaining_length > 0) {
+        // 解析原因码 (如果有payload)
+        if (pos >= payload_end) {
+          LOG_ERROR("Packet too short for reason code");
+          allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          disconnect->reason_code = static_cast<ReasonCode>(buffer[pos++]);
+
+          // 解析属性 (如果还有数据)
+          if (pos < payload_end) {
+            size_t properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, payload_end - pos, disconnect->properties,
+                                   properties_bytes_read);
+            if (ret != 0) {
+              LOG_ERROR("Failed to parse properties");
+              allocator_->deallocate(disconnect, sizeof(DisconnectPacket));
+            } else {
+              pos += properties_bytes_read;
+            }
+          }
+          if (ret == MQ_SUCCESS) {
+            *packet = disconnect;
+          }
+        }
+      } else {
+        *packet = disconnect;
       }
-      pos += properties_bytes_read;
     }
   }
-
-  *packet = disconnect;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_auth(const uint8_t* buffer, size_t length, AuthPacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (is_legacy_protocol_hint()) {
-    return MQ_ERR_PACKET_TYPE;
-  }
-
-  if (length < 2) {
+    ret = MQ_ERR_PACKET_TYPE;
+  } else if (length < 2) {
     LOG_ERROR("AUTH packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    AuthPacket* auth = begin_packet<AuthPacket>(allocator_);
+    if (!auth) {
+      LOG_ERROR("Failed to allocate AUTH packet");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      auth->type = PacketType::AUTH;
 
-  AuthPacket* auth = begin_packet<AuthPacket>(allocator_);
-  if (!auth) {
-    LOG_ERROR("Failed to allocate AUTH packet");
-    return MQ_ERR_MEMORY_ALLOC;
-  }
+      size_t pos = 0;
 
-  auth->type = PacketType::AUTH;
+      // Skip fixed header (packet type + remaining length)
+      pos++;  // Skip packet type byte
 
-  size_t pos = 0;
-
-  // Skip fixed header (packet type + remaining length)
-  pos++; // Skip packet type byte
-
-  // Skip remaining length bytes
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret = parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    auth->~AuthPacket();
-    allocator_->deallocate(auth, sizeof(AuthPacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
-
-  size_t payload_end = pos + remaining_length;
-
-  // Parse reason code if present
-  if (pos < payload_end) {
-    auth->reason_code = static_cast<ReasonCode>(buffer[pos++]);
-
-    // Parse properties if present
-    if (pos < payload_end) {
-      size_t properties_bytes_read = 0;
-      ret = parse_properties(buffer + pos, payload_end - pos, auth->properties, properties_bytes_read);
+      // Skip remaining length bytes
+      uint32_t remaining_length;
+      size_t remaining_length_bytes;
+      ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                   remaining_length_bytes);
       if (ret != 0) {
-        LOG_ERROR("Failed to parse properties");
+        LOG_ERROR("Failed to parse remaining length");
         auth->~AuthPacket();
         allocator_->deallocate(auth, sizeof(AuthPacket));
-        return ret;
-      }
-      pos += properties_bytes_read;
-    }
-  } else {
-    // Default reason code for AUTH packet
-    auth->reason_code = ReasonCode::Success;
-  }
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        pos += remaining_length_bytes;
 
-  *packet = auth;
-  return MQ_SUCCESS;
+        size_t payload_end = pos + remaining_length;
+
+        // Parse reason code if present
+        if (pos < payload_end) {
+          auth->reason_code = static_cast<ReasonCode>(buffer[pos++]);
+
+          // Parse properties if present
+          if (pos < payload_end) {
+            size_t properties_bytes_read = 0;
+            ret = parse_properties(buffer + pos, payload_end - pos, auth->properties,
+                                   properties_bytes_read);
+            if (ret != 0) {
+              LOG_ERROR("Failed to parse properties");
+              auth->~AuthPacket();
+              allocator_->deallocate(auth, sizeof(AuthPacket));
+            } else {
+              pos += properties_bytes_read;
+            }
+          }
+        } else {
+          // Default reason code for AUTH packet
+          auth->reason_code = ReasonCode::Success;
+        }
+
+        if (ret == MQ_SUCCESS) {
+          *packet = auth;
+        }
+      }
+    }
+  }
+  return ret;
 }
 
 int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
                                        uint32_t& remaining_length, size_t& bytes_read)
 {
+  int ret = MQ_SUCCESS;
   remaining_length = 0;
   bytes_read = 0;
   uint32_t multiplier = 1;
@@ -1278,30 +1399,33 @@ int MQTTParser::parse_remaining_length(const uint8_t* buffer, size_t length,
   do {
     if (bytes_read >= length) {
       LOG_ERROR("Packet too short for remaining length");
-      return MQ_ERR_PACKET_INCOMPLETE;
+      ret = MQ_ERR_PACKET_INCOMPLETE;
+      break;
     }
 
     if (bytes_read >= 4) {
       LOG_ERROR("Remaining length encoding too long (max 4 bytes)");
-      return MQ_ERR_PACKET_INVALID;
+      ret = MQ_ERR_PACKET_INVALID;
+      break;
     }
 
     uint8_t byte = buffer[bytes_read++];
     remaining_length += (byte & 0x7F) * multiplier;
-    
+
     if (multiplier > 128 * 128 * 128) {
       LOG_ERROR("Remaining length exceeds maximum value");
-      return MQ_ERR_PACKET_INVALID;
+      ret = MQ_ERR_PACKET_INVALID;
+      break;
     }
-    
+
     multiplier *= 128;
-    
+
     if ((byte & 0x80) == 0) {
       break;
     }
   } while (true);
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::map_string_util_error(int string_util_error) const
@@ -1376,21 +1500,23 @@ int MQTTParser::parse_mqtt_binary_data(const uint8_t* buffer, size_t length, MQT
 int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Properties& properties,
                                  size_t& bytes_read)
 {
+  int ret = MQ_SUCCESS;
   bytes_read = 0;
 
   // 解析属性长度
   uint32_t properties_length = 0;
-  int ret = parse_remaining_length(buffer, length, properties_length, bytes_read);
-  if (ret != 0) {
-    return ret;
+  ret = parse_remaining_length(buffer, length, properties_length, bytes_read);
+  size_t properties_end = 0;
+  if (ret == MQ_SUCCESS) {
+    properties_end = bytes_read + properties_length;
   }
 
-  size_t properties_end = bytes_read + properties_length;
-  
-  while (bytes_read < properties_end) {
+  while (ret == MQ_SUCCESS && bytes_read < properties_end) {
     if (bytes_read >= length) {
-      LOG_ERROR("Properties parsing: buffer overflow, bytes_read={}, length={}", bytes_read, length);
-      return MQ_ERR_PACKET_INVALID;
+      LOG_ERROR("Properties parsing: buffer overflow, bytes_read={}, length={}", bytes_read,
+                length);
+      ret = MQ_ERR_PACKET_INVALID;
+      break;
     }
     
     PropertyType type = static_cast<PropertyType>(buffer[bytes_read++]);
@@ -1410,28 +1536,28 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.content_type,
                                 local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::ResponseTopic: {
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.response_topic,
                                 local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::CorrelationData: {
         size_t local_read = 0;
         std::vector<uint8_t> temp_data;
         ret = parse_binary_data(buffer + bytes_read, length - bytes_read, temp_data, local_read);
-        if (ret != 0)
-          return ret;
-        properties.correlation_data = to_mqtt_bytes(temp_data, allocator_);
-        bytes_read += local_read;
+        if (ret == 0) {
+          properties.correlation_data = to_mqtt_bytes(temp_data, allocator_);
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::SubscriptionIdentifier: {
@@ -1455,9 +1581,9 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read,
                                 properties.assigned_client_identifier, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::ServerKeepAlive:
@@ -1468,19 +1594,19 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read,
                                 properties.authentication_method, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::AuthenticationData: {
         size_t local_read = 0;
         std::vector<uint8_t> temp_data;
         ret = parse_binary_data(buffer + bytes_read, length - bytes_read, temp_data, local_read);
-        if (ret != 0)
-          return ret;
-        properties.authentication_data = to_mqtt_bytes(temp_data, allocator_);
-        bytes_read += local_read;
+        if (ret == 0) {
+          properties.authentication_data = to_mqtt_bytes(temp_data, allocator_);
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::RequestProblemInformation:
@@ -1499,27 +1625,27 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read,
                                 properties.response_information, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::ServerReference: {
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read,
                                 properties.server_reference, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::ReasonString: {
         size_t local_read = 0;
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, properties.reason_string,
                                 local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+        }
         break;
       }
       case PropertyType::ReceiveMaximum:
@@ -1534,11 +1660,12 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
       case PropertyType::TopicAlias:
         if (properties.has_topic_alias) {
           LOG_ERROR("Duplicate Topic Alias property");
-          return MQ_ERR_PROTOCOL;
+          ret = MQ_ERR_PROTOCOL;
+        } else {
+          properties.has_topic_alias = true;
+          properties.topic_alias = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
+          bytes_read += 2;
         }
-        properties.has_topic_alias = true;
-        properties.topic_alias = (buffer[bytes_read] << 8) | buffer[bytes_read + 1];
-        bytes_read += 2;
         break;
       case PropertyType::MaximumQoS:
         properties.maximum_qos = buffer[bytes_read++];
@@ -1552,17 +1679,17 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         MQTTString key{MQTTStrAllocator(allocator_)};
         MQTTString value{MQTTStrAllocator(allocator_)};
         ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, key, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
-        local_read = 0;
-        ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, value, local_read);
-        if (ret != 0)
-          return ret;
-        bytes_read += local_read;
+        if (ret == 0) {
+          bytes_read += local_read;
+          local_read = 0;
+          ret = parse_mqtt_string(buffer + bytes_read, length - bytes_read, value, local_read);
+          if (ret == 0) {
+            bytes_read += local_read;
 
-        // 直接添加MQTTString pair
-        properties.user_properties.push_back(std::make_pair(std::move(key), std::move(value)));
+            // 直接添加MQTTString pair
+            properties.user_properties.push_back(std::make_pair(std::move(key), std::move(value)));
+          }
+        }
         break;
       }
       case PropertyType::MaximumPacketSize:
@@ -1585,16 +1712,22 @@ int MQTTParser::parse_properties(const uint8_t* buffer, size_t length, Propertie
         // According to MQTT v5.0 specification, unknown properties should be ignored
         // However, we cannot safely skip them without knowing their length
         // For now, we'll log a warning and fail gracefully
-        LOG_WARN("Unknown property type: 0x{:02x}, failing packet parsing", static_cast<uint8_t>(type));
-        return MQ_ERR_PACKET_INVALID;
+        LOG_WARN("Unknown property type: 0x{:02x}, failing packet parsing",
+                 static_cast<uint8_t>(type));
+        ret = MQ_ERR_PACKET_INVALID;
+        break;
+    }
+    if (ret != MQ_SUCCESS) {
+      break;
     }
   }
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();  // 重置buffer以便复用
   const bool is_legacy = (packet->protocol_version == 3 || packet->protocol_version == 4);
 
@@ -1611,121 +1744,107 @@ int MQTTParser::serialize_connect(const ConnectPacket* packet, MQTTBuffer& buffe
     total_length += 2 + packet->will_payload.length();  // Will payload
     if (!is_legacy) {
       MQTTBuffer temp_will_props_buffer(allocator_);
-      int will_props_ret = serialize_properties(packet->will_properties, temp_will_props_buffer);
-      if (will_props_ret != 0) {
-        return will_props_ret;
+      ret = serialize_properties(packet->will_properties, temp_will_props_buffer);
+      if (ret == MQ_SUCCESS) {
+        total_length += temp_will_props_buffer.size();
       }
-      total_length += temp_will_props_buffer.size();
     }
   }
 
-  if (packet->flags.username_flag) {
+  if (ret == MQ_SUCCESS && packet->flags.username_flag) {
     total_length += 2 + packet->username.length();  // Username
   }
 
-  if (packet->flags.password_flag) {
+  if (ret == MQ_SUCCESS && packet->flags.password_flag) {
     total_length += 2 + packet->password.length();  // Password
   }
 
-  if (!is_legacy) {
+  if (ret == MQ_SUCCESS && !is_legacy) {
     // Calculate properties length (using a temporary buffer)
     MQTTBuffer temp_props_buffer(allocator_);
-    int props_ret = serialize_properties(packet->properties, temp_props_buffer);
-    if (props_ret != 0) {
-      return props_ret;
+    ret = serialize_properties(packet->properties, temp_props_buffer);
+    if (ret == MQ_SUCCESS) {
+      total_length += temp_props_buffer.size();  // Properties with their variable-length header
     }
-    total_length += temp_props_buffer.size();  // Properties with their variable-length header
   }
 
-  // Reserve buffer space
-  int ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Reserve buffer space
+    ret = buffer.reserve(1 + 4 + total_length);  // 1 for packet type, 4 for remaining length
+  }
 
-  // Packet type
-  ret = buffer.push_back(static_cast<uint8_t>(PacketType::CONNECT));
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Packet type
+    ret = buffer.push_back(static_cast<uint8_t>(PacketType::CONNECT));
+  }
 
-  // Remaining length
-  ret = serialize_remaining_length(total_length, buffer);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Remaining length
+    ret = serialize_remaining_length(total_length, buffer);
+  }
 
-  // Protocol name
-  ret = serialize_mqtt_string(packet->protocol_name, buffer);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Protocol name
+    ret = serialize_mqtt_string(packet->protocol_name, buffer);
+  }
 
-  // Protocol version
-  ret = buffer.push_back(packet->protocol_version);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Protocol version
+    ret = buffer.push_back(packet->protocol_version);
+  }
 
-  // Connect flags
-  uint8_t flags = 0;
-  flags |= packet->flags.clean_start << 1;
-  flags |= packet->flags.will_flag << 2;
-  flags |= packet->flags.will_qos << 3;
-  flags |= packet->flags.will_retain << 5;
-  flags |= packet->flags.password_flag << 6;
-  flags |= packet->flags.username_flag << 7;
-  ret = buffer.push_back(flags);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Connect flags
+    uint8_t flags = 0;
+    flags |= packet->flags.clean_start << 1;
+    flags |= packet->flags.will_flag << 2;
+    flags |= packet->flags.will_qos << 3;
+    flags |= packet->flags.will_retain << 5;
+    flags |= packet->flags.password_flag << 6;
+    flags |= packet->flags.username_flag << 7;
+    ret = buffer.push_back(flags);
+  }
 
-  // Keep alive
-  ret = buffer.push_back((packet->keep_alive >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->keep_alive & 0xFF);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Keep alive
+    ret = buffer.push_back((packet->keep_alive >> 8) & 0xFF);
+  }
+  if (ret == MQ_SUCCESS) {
+    ret = buffer.push_back(packet->keep_alive & 0xFF);
+  }
 
-  if (!is_legacy) {
+  if (ret == MQ_SUCCESS && !is_legacy) {
     // Properties
     ret = serialize_properties(packet->properties, buffer);
-    if (ret != 0)
-      return ret;
   }
 
-  // Client ID
-  ret = serialize_mqtt_string(packet->client_id, buffer);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Client ID
+    ret = serialize_mqtt_string(packet->client_id, buffer);
+  }
 
-  // Will properties, topic and payload
-  if (packet->flags.will_flag) {
+  if (ret == MQ_SUCCESS && packet->flags.will_flag) {
     if (!is_legacy) {
       // Will properties (MQTT v5)
       ret = serialize_properties(packet->will_properties, buffer);
-      if (ret != 0)
-        return ret;
     }
-    
-    ret = serialize_mqtt_string(packet->will_topic, buffer);
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(packet->will_payload, buffer);
-    if (ret != 0)
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = serialize_mqtt_string(packet->will_topic, buffer);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = serialize_mqtt_string(packet->will_payload, buffer);
+    }
   }
 
-  // Username
-  if (packet->flags.username_flag) {
+  if (ret == MQ_SUCCESS && packet->flags.username_flag) {
     ret = serialize_mqtt_string(packet->username, buffer);
-    if (ret != 0)
-      return ret;
   }
 
-  // Password
-  if (packet->flags.password_flag) {
+  if (ret == MQ_SUCCESS && packet->flags.password_flag) {
     ret = serialize_mqtt_string(packet->password, buffer);
-    if (ret != 0)
-      return ret;
   }
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_publish(const PublishPacket* packet, MQTTBuffer& buffer)
@@ -1744,496 +1863,415 @@ int MQTTParser::serialize_publish_header(const MQTTString& topic, uint8_t qos, b
                                          const Properties& properties, size_t payload_size,
                                          MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();  // 重置buffer以便复用
   const bool is_legacy = is_legacy_protocol_hint();
 
   MQTTBuffer temp_properties_buffer(allocator_);
-  int ret = MQ_SUCCESS;
   if (!is_legacy) {
     // First, serialize properties to calculate their actual size
     ret = serialize_properties(properties, temp_properties_buffer);
-    if (ret != 0)
-      return ret;
   }
 
-  // Calculate total length (properties buffer already includes length encoding)
   size_t total_length = 0;
-  total_length += 2 + topic.length();  // Topic name
-  if (qos > 0) {
-    total_length += 2;  // Packet ID
+  if (ret == MQ_SUCCESS) {
+    // Calculate total length (properties buffer already includes length encoding)
+    total_length += 2 + topic.length();  // Topic name
+    if (qos > 0) {
+      total_length += 2;  // Packet ID
+    }
+
+    if (!is_legacy) {
+      // Properties: complete properties buffer (already includes length encoding)
+      total_length += temp_properties_buffer.size();
+    }
+
+    total_length += payload_size;
+    if (total_length > 268435455) {
+      ret = MQ_ERR_PACKET_TOO_LARGE;
+    } else {
+      ret = buffer.reserve(1 + 4 + total_length - payload_size);
+    }
   }
 
-  if (!is_legacy) {
-    // Properties: complete properties buffer (already includes length encoding)
-    total_length += temp_properties_buffer.size();
+  if (ret == MQ_SUCCESS) {
+    // Packet type and flags
+    uint8_t type_flags = static_cast<uint8_t>(PacketType::PUBLISH);
+    type_flags |= dup ? 0x08 : 0x00;
+    type_flags |= (qos & 0x03) << 1;
+    type_flags |= retain ? 0x01 : 0x00;
+    ret = buffer.push_back(type_flags);
   }
 
-  total_length += payload_size;
-  if (total_length > 268435455) {
-    return MQ_ERR_PACKET_TOO_LARGE;
+  if (ret == MQ_SUCCESS) {
+    // Remaining length
+    ret = serialize_remaining_length(static_cast<uint32_t>(total_length), buffer);
   }
 
-  ret = buffer.reserve(1 + 4 + total_length - payload_size);
-  if (ret != 0)
-    return ret;
+  if (ret == MQ_SUCCESS) {
+    // Topic name
+    ret = serialize_mqtt_string(topic, buffer);
+  }
 
-  // Packet type and flags
-  uint8_t type_flags = static_cast<uint8_t>(PacketType::PUBLISH);
-  type_flags |= dup ? 0x08 : 0x00;
-  type_flags |= (qos & 0x03) << 1;
-  type_flags |= retain ? 0x01 : 0x00;
-  ret = buffer.push_back(type_flags);
-  if (ret != 0)
-    return ret;
-
-  // Remaining length
-  ret = serialize_remaining_length(static_cast<uint32_t>(total_length), buffer);
-  if (ret != 0)
-    return ret;
-
-  // Topic name
-  ret = serialize_mqtt_string(topic, buffer);
-  if (ret != 0)
-    return ret;
-
-  // Packet ID
-  if (qos > 0) {
+  if (ret == MQ_SUCCESS && qos > 0) {
+    // Packet ID
     ret = buffer.push_back((packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet_id & 0xFF);
+    }
   }
 
-  if (!is_legacy) {
+  if (ret == MQ_SUCCESS && !is_legacy) {
     // Properties - directly append the complete properties buffer (includes length encoding)
     ret = buffer.append(temp_properties_buffer.data(), temp_properties_buffer.size());
-    if (ret != 0)
-      return ret;
   }
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_connack(const ConnAckPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::CONNACK));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::CONNACK));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0) {
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->session_present ? 0x01 : 0x00);
     }
-    ret = buffer.push_back(packet->session_present ? 0x01 : 0x00);
-    if (ret != 0) {
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(map_reason_code_to_legacy_connack(packet->reason_code));
     }
-    ret = buffer.push_back(map_reason_code_to_legacy_connack(packet->reason_code));
-    if (ret != 0) {
-      return ret;
+  } else if (ret == MQ_SUCCESS) {
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      // 计算剩余长度
+      uint32_t remaining_length = 2;  // 会话存在标志 + 原因码
+      remaining_length += properties_buffer.size();
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
     }
-    return MQ_SUCCESS;
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化会话存在标志和原因码
+      ret = buffer.push_back(packet->session_present ? 0x01 : 0x00);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 会话存在标志 + 原因码
-  remaining_length += properties_buffer.size();
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化会话存在标志和原因码
-  ret = buffer.push_back(packet->session_present ? 0x01 : 0x00);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_puback(const PubAckPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBACK));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBACK));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+  } else if (ret == MQ_SUCCESS) {
+    // 计算剩余长度
+    uint32_t remaining_length = 2;  // 包ID
+
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      remaining_length += properties_buffer.size() + 1;  // +1 for reason code
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化原因码
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 包ID
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size() + 1;  // +1 for reason code
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_pubrec(const PubRecPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREC));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREC));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+  } else if (ret == MQ_SUCCESS) {
+    // 计算剩余长度
+    uint32_t remaining_length = 2;  // 包ID
+
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      remaining_length += properties_buffer.size() + 1;  // +1 for reason code
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化原因码
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 包ID
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size() + 1;  // +1 for reason code
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_pubrel(const PubRelPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREL) | 0x02);  // 设置QoS=1
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBREL) | 0x02);  // 设置QoS=1
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+  } else if (ret == MQ_SUCCESS) {
+    // 计算剩余长度
+    uint32_t remaining_length = 2;  // 包ID
+
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      remaining_length += properties_buffer.size() + 1;  // +1 for reason code
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化原因码
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 包ID
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size() + 1;  // +1 for reason code
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_pubcomp(const PubCompPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBCOMP));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::PUBCOMP));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+  } else if (ret == MQ_SUCCESS) {
+    // 计算剩余长度
+    uint32_t remaining_length = 2;  // 包ID
+
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      remaining_length += properties_buffer.size() + 1;  // +1 for reason code
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化原因码
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 2;  // 包ID
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size() + 1;  // +1 for reason code
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_suback(const SubAckPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBACK));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBACK));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     uint32_t remaining_length = 2 + static_cast<uint32_t>(packet->reason_codes.size());
     ret = serialize_remaining_length(remaining_length, buffer);
-    if (ret != 0) {
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
     }
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
     for (const ReasonCode& reason_code : packet->reason_codes) {
+      if (ret != MQ_SUCCESS) {
+        break;
+      }
       ret = buffer.push_back(map_reason_code_to_legacy_suback(reason_code));
-      if (ret != 0)
-        return ret;
     }
-    return MQ_SUCCESS;
+  } else if (ret == MQ_SUCCESS) {
+    // 序列化属性到临时缓冲区
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
+      uint32_t remaining_length = 2;  // 包ID
+      remaining_length +=
+          static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+      remaining_length += packet->reason_codes.size();      // 原因码列表
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性内容（已包含长度编码）
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
+
+    // 序列化原因码列表
+    for (const ReasonCode& reason_code : packet->reason_codes) {
+      if (ret != MQ_SUCCESS) {
+        break;
+      }
+      ret = buffer.push_back(static_cast<uint8_t>(reason_code));
+    }
   }
-
-  // 序列化属性到临时缓冲区
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
-  uint32_t remaining_length = 2;  // 包ID
-  remaining_length +=
-      static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
-  remaining_length += packet->reason_codes.size();      // 原因码列表
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 添加属性内容（已包含长度编码）
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码列表
-  for (const ReasonCode& reason_code : packet->reason_codes) {
-    ret = buffer.push_back(static_cast<uint8_t>(reason_code));
-    if (ret != 0)
-      return ret;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_unsuback(const UnsubAckPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBACK));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBACK));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = serialize_remaining_length(2, buffer);
-    if (ret != 0) {
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
     }
-    ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->packet_id & 0xFF);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+  } else if (ret == MQ_SUCCESS) {
+    // 序列化属性到临时缓冲区
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
+      uint32_t remaining_length = 2;  // 包ID
+      remaining_length +=
+          static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
+      remaining_length += packet->reason_codes.size();      // 原因码列表
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化包ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性内容（已包含长度编码）
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
+
+    // 序列化原因码列表
+    for (const ReasonCode& reason_code : packet->reason_codes) {
+      if (ret != MQ_SUCCESS) {
+        break;
+      }
+      ret = buffer.push_back(static_cast<uint8_t>(reason_code));
+    }
   }
-
-  // 序列化属性到临时缓冲区
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 计算剩余长度: 包ID(2) + 属性内容（已包含长度编码） + 原因码列表
-  uint32_t remaining_length = 2;  // 包ID
-  remaining_length +=
-      static_cast<uint32_t>(properties_buffer.size());  // 属性内容（已包含长度编码）
-  remaining_length += packet->reason_codes.size();      // 原因码列表
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化包ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  // 添加属性内容（已包含长度编码）
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  // 序列化原因码列表
-  for (const ReasonCode& reason_code : packet->reason_codes) {
-    ret = buffer.push_back(static_cast<uint8_t>(reason_code));
-    if (ret != 0)
-      return ret;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_pingreq(const PingReqPacket* packet, MQTTBuffer& buffer)
@@ -2266,157 +2304,139 @@ int MQTTParser::serialize_pingresp(const PingRespPacket* packet, MQTTBuffer& buf
 
 int MQTTParser::serialize_disconnect(const DisconnectPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::DISCONNECT));
-  if (ret != 0)
-    return ret;
-
-  if (is_legacy_protocol_hint()) {
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::DISCONNECT));
+  if (ret == MQ_SUCCESS && is_legacy_protocol_hint()) {
     ret = buffer.push_back(0x00);
-    if (ret != 0)
-      return ret;
-    return MQ_SUCCESS;
+  } else if (ret == MQ_SUCCESS) {
+    // 计算剩余长度
+    uint32_t remaining_length = 1;  // 原因码
+
+    // 序列化属性
+    MQTTBuffer properties_buffer(allocator_);
+    ret = serialize_properties(packet->properties, properties_buffer);
+    if (ret == MQ_SUCCESS) {
+      remaining_length += properties_buffer.size();
+
+      // 序列化剩余长度
+      ret = serialize_remaining_length(remaining_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 序列化原因码
+      ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // 添加属性
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
   }
-
-  // 计算剩余长度
-  uint32_t remaining_length = 1;  // 原因码
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size();
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_auth(const AuthPacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   if (is_legacy_protocol_hint()) {
-    return MQ_ERR_PACKET_TYPE;
+    ret = MQ_ERR_PACKET_TYPE;
+  } else {
+    buffer.clear();
+    ret = buffer.push_back(static_cast<uint8_t>(PacketType::AUTH));
+    if (ret == MQ_SUCCESS) {
+      // 计算剩余长度
+      uint32_t remaining_length = 1;  // 原因码
+
+      // 序列化属性
+      MQTTBuffer properties_buffer(allocator_);
+      ret = serialize_properties(packet->properties, properties_buffer);
+      if (ret == MQ_SUCCESS) {
+        remaining_length += properties_buffer.size();
+
+        // 序列化剩余长度
+        ret = serialize_remaining_length(remaining_length, buffer);
+      }
+
+      if (ret == MQ_SUCCESS) {
+        // 序列化原因码
+        ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
+      }
+
+      if (ret == MQ_SUCCESS) {
+        // 添加属性
+        ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+      }
+    }
   }
-
-  buffer.clear();
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::AUTH));
-  if (ret != 0)
-    return ret;
-
-  // 计算剩余长度
-  uint32_t remaining_length = 1;  // 原因码
-
-  // 序列化属性
-  MQTTBuffer properties_buffer(allocator_);
-  ret = serialize_properties(packet->properties, properties_buffer);
-  if (ret != 0) {
-    return ret;
-  }
-  remaining_length += properties_buffer.size();
-
-  // 序列化剩余长度
-  ret = serialize_remaining_length(remaining_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
-
-  // 序列化原因码
-  ret = buffer.push_back(static_cast<uint8_t>(packet->reason_code));
-  if (ret != 0)
-    return ret;
-
-  // 添加属性
-  ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-  if (ret != 0)
-    return ret;
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_subscribe(const SubscribePacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
   const bool is_legacy = is_legacy_protocol_hint();
-  
-  // Packet type
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBSCRIBE) | 0x02);  // Set reserved bits
-  if (ret != 0)
-    return ret;
 
-  MQTTBuffer properties_buffer(allocator_);
-  if (!is_legacy) {
-    // Serialize properties
-    ret = serialize_properties(packet->properties, properties_buffer);
-    if (ret != 0) {
-      return ret;
+  // Packet type
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::SUBSCRIBE) | 0x02);  // Set reserved bits
+  if (ret == MQ_SUCCESS) {
+    MQTTBuffer properties_buffer(allocator_);
+    if (!is_legacy) {
+      // Serialize properties
+      ret = serialize_properties(packet->properties, properties_buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Calculate total length
+      size_t total_length = 0;
+      total_length += 2;  // Packet ID
+      if (!is_legacy) {
+        total_length += properties_buffer.size();  // Properties
+      }
+
+      // Subscriptions
+      for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
+        total_length += 2 + packet->subscriptions[i].topic_filter.length();  // Topic filter
+        total_length += 1;                                                    // Options
+      }
+
+      // Remaining length
+      ret = serialize_remaining_length(total_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Packet ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS && !is_legacy) {
+      // Properties
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Subscriptions
+      for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
+        ret = serialize_mqtt_string(packet->subscriptions[i].topic_filter, buffer);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back(packet->subscriptions[i].options.encode());
+        }
+        if (ret != MQ_SUCCESS) {
+          break;
+        }
+      }
     }
   }
-
-  // Calculate total length
-  size_t total_length = 0;
-  total_length += 2;  // Packet ID
-  if (!is_legacy) {
-    total_length += properties_buffer.size();  // Properties
-  }
-
-  // Subscriptions
-  for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
-    total_length += 2 + packet->subscriptions[i].topic_filter.length();  // Topic filter
-    total_length += 1;                                                    // Options
-  }
-
-  // Remaining length
-  ret = serialize_remaining_length(total_length, buffer);
-  if (ret != 0)
-    return ret;
-
-  // Packet ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  if (!is_legacy) {
-    // Properties
-    ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-    if (ret != 0)
-      return ret;
-  }
-
-  // Subscriptions
-  for (size_t i = 0; i < packet->subscriptions.size(); ++i) {
-    ret = serialize_mqtt_string(packet->subscriptions[i].topic_filter, buffer);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(packet->subscriptions[i].options.encode());
-    if (ret != 0)
-      return ret;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTBuffer& buffer)
 {
-  int ret;
+  int ret = MQ_SUCCESS;
   do {
     uint8_t byte = remaining_length % 128;
     remaining_length /= 128;
@@ -2424,10 +2444,11 @@ int MQTTParser::serialize_remaining_length(uint32_t remaining_length, MQTTBuffer
       byte |= 0x80;
     }
     ret = buffer.push_back(byte);
-    if (ret != 0)
-      return ret;
+    if (ret != 0) {
+      break;
+    }
   } while (remaining_length > 0);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_string(const std::string& str, MQTTBuffer& buffer)
@@ -2480,6 +2501,7 @@ int MQTTParser::serialize_mqtt_binary_data(const MQTTByteVector& data, MQTTBuffe
 
 int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   // 第一遍：计算所有属性的总长度
   size_t properties_total_length = 0;
 
@@ -2602,458 +2624,419 @@ int MQTTParser::serialize_properties(const Properties& properties, MQTTBuffer& b
   }
 
   // 序列化属性长度
-  int ret = serialize_remaining_length(properties_total_length, buffer);
-  if (ret != 0) {
-    return ret;
-  }
+  ret = serialize_remaining_length(properties_total_length, buffer);
+  if (ret == MQ_SUCCESS) {
+    // 第二遍：直接序列化所有属性到目标buffer
+    if (ret == MQ_SUCCESS && (properties.payload_format_indicator != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::PayloadFormatIndicator));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(properties.payload_format_indicator);
+      }
+    }
 
-  // 第二遍：直接序列化所有属性到目标buffer
-  if (properties.payload_format_indicator != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::PayloadFormatIndicator));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.payload_format_indicator);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS &&
+        (properties.message_expiry_interval != 0 || properties.has_message_expiry_interval)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MessageExpiryInterval));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.message_expiry_interval >> 24) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back((properties.message_expiry_interval >> 16) & 0xFF);
+          if (ret == MQ_SUCCESS) {
+            ret = buffer.push_back((properties.message_expiry_interval >> 8) & 0xFF);
+            if (ret == MQ_SUCCESS) {
+              ret = buffer.push_back(properties.message_expiry_interval & 0xFF);
+            }
+          }
+        }
+      }
+    }
 
-  if (properties.message_expiry_interval != 0 || properties.has_message_expiry_interval) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MessageExpiryInterval));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.message_expiry_interval >> 24) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.message_expiry_interval >> 16) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.message_expiry_interval >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.message_expiry_interval & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.content_type.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ContentType));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.content_type, buffer);
+      }
+    }
 
-  if (!properties.content_type.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ContentType));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.content_type, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.response_topic.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseTopic));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.response_topic, buffer);
+      }
+    }
 
-  if (!properties.response_topic.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseTopic));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.response_topic, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.correlation_data.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::CorrelationData));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_binary_data(properties.correlation_data, buffer);
+      }
+    }
 
-  if (!properties.correlation_data.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::CorrelationData));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_binary_data(properties.correlation_data, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.subscription_identifier != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifier));
+      if (ret == MQ_SUCCESS) {
+        uint32_t value = properties.subscription_identifier;
+        // 变长整数序列化
+        do {
+          uint8_t byte = value & 0x7F;
+          value >>= 7;
+          if (value != 0) {
+            byte |= 0x80;
+          }
+          ret = buffer.push_back(byte);
+          if (ret != MQ_SUCCESS) {
+            break;
+          }
+        } while (value != 0);
+      }
+    }
 
-  if (properties.subscription_identifier != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifier));
-    if (ret != 0)
-      return ret;
-    uint32_t value = properties.subscription_identifier;
-    // 变长整数序列化
-    do {
-      uint8_t byte = value & 0x7F;
-      value >>= 7;
-      if (value != 0)
-        byte |= 0x80;
-      ret = buffer.push_back(byte);
-      if (ret != 0)
-        return ret;
-    } while (value != 0);
-  }
+    if (ret == MQ_SUCCESS &&
+        (properties.session_expiry_interval != 0 || properties.has_session_expiry_interval)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SessionExpiryInterval));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.session_expiry_interval >> 24) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back((properties.session_expiry_interval >> 16) & 0xFF);
+          if (ret == MQ_SUCCESS) {
+            ret = buffer.push_back((properties.session_expiry_interval >> 8) & 0xFF);
+            if (ret == MQ_SUCCESS) {
+              ret = buffer.push_back(properties.session_expiry_interval & 0xFF);
+            }
+          }
+        }
+      }
+    }
 
-  if (properties.session_expiry_interval != 0 || properties.has_session_expiry_interval) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SessionExpiryInterval));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.session_expiry_interval >> 24) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.session_expiry_interval >> 16) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.session_expiry_interval >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.session_expiry_interval & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.assigned_client_identifier.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AssignedClientIdentifier));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.assigned_client_identifier, buffer);
+      }
+    }
 
-  if (!properties.assigned_client_identifier.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AssignedClientIdentifier));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.assigned_client_identifier, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.server_keep_alive != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerKeepAlive));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.server_keep_alive >> 8) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back(properties.server_keep_alive & 0xFF);
+        }
+      }
+    }
 
-  if (properties.server_keep_alive != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerKeepAlive));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.server_keep_alive >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.server_keep_alive & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.authentication_method.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationMethod));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.authentication_method, buffer);
+      }
+    }
 
-  if (!properties.authentication_method.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationMethod));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.authentication_method, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.authentication_data.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationData));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_binary_data(properties.authentication_data, buffer);
+      }
+    }
 
-  if (!properties.authentication_data.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::AuthenticationData));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_binary_data(properties.authentication_data, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.request_problem_information)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestProblemInformation));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(1);
+      }
+    }
 
-  if (properties.request_problem_information) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestProblemInformation));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(1);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.will_delay_interval != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WillDelayInterval));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.will_delay_interval >> 24) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back((properties.will_delay_interval >> 16) & 0xFF);
+          if (ret == MQ_SUCCESS) {
+            ret = buffer.push_back((properties.will_delay_interval >> 8) & 0xFF);
+            if (ret == MQ_SUCCESS) {
+              ret = buffer.push_back(properties.will_delay_interval & 0xFF);
+            }
+          }
+        }
+      }
+    }
 
-  if (properties.will_delay_interval != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WillDelayInterval));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.will_delay_interval >> 24) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.will_delay_interval >> 16) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.will_delay_interval >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.will_delay_interval & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.request_response_information)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestResponseInformation));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(1);
+      }
+    }
 
-  if (properties.request_response_information) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RequestResponseInformation));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(1);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.response_information.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseInformation));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.response_information, buffer);
+      }
+    }
 
-  if (!properties.response_information.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ResponseInformation));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.response_information, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.server_reference.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerReference));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.server_reference, buffer);
+      }
+    }
 
-  if (!properties.server_reference.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ServerReference));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.server_reference, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.reason_string.empty())) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReasonString));
+      if (ret == MQ_SUCCESS) {
+        ret = serialize_mqtt_string(properties.reason_string, buffer);
+      }
+    }
 
-  if (!properties.reason_string.empty()) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReasonString));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(properties.reason_string, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.receive_maximum != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReceiveMaximum));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.receive_maximum >> 8) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back(properties.receive_maximum & 0xFF);
+        }
+      }
+    }
 
-  if (properties.receive_maximum != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::ReceiveMaximum));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.receive_maximum >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.receive_maximum & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.topic_alias_maximum != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAliasMaximum));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.topic_alias_maximum >> 8) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back(properties.topic_alias_maximum & 0xFF);
+        }
+      }
+    }
 
-  if (properties.topic_alias_maximum != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAliasMaximum));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.topic_alias_maximum >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.topic_alias_maximum & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.topic_alias != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAlias));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.topic_alias >> 8) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back(properties.topic_alias & 0xFF);
+        }
+      }
+    }
 
-  if (properties.topic_alias != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::TopicAlias));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.topic_alias >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.topic_alias & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.maximum_qos != 0 || properties.has_maximum_qos)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumQoS));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(properties.maximum_qos);
+      }
+    }
 
-  if (properties.maximum_qos != 0 || properties.has_maximum_qos) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumQoS));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.maximum_qos);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.retain_available)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RetainAvailable));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(0);
+      }
+    }
 
-  if (!properties.retain_available) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::RetainAvailable));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(0);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS) {
+      for (const MQTTStringPair& prop : properties.user_properties) {
+        ret = buffer.push_back(static_cast<uint8_t>(PropertyType::UserProperty));
+        if (ret != MQ_SUCCESS) {
+          break;
+        }
+        ret = serialize_mqtt_string(prop.first, buffer);
+        if (ret != MQ_SUCCESS) {
+          break;
+        }
+        ret = serialize_mqtt_string(prop.second, buffer);
+        if (ret != MQ_SUCCESS) {
+          break;
+        }
+      }
+    }
 
-  for (const MQTTStringPair& prop : properties.user_properties) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::UserProperty));
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(prop.first, buffer);
-    if (ret != 0)
-      return ret;
-    ret = serialize_mqtt_string(prop.second, buffer);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (properties.maximum_packet_size != 0)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumPacketSize));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back((properties.maximum_packet_size >> 24) & 0xFF);
+        if (ret == MQ_SUCCESS) {
+          ret = buffer.push_back((properties.maximum_packet_size >> 16) & 0xFF);
+          if (ret == MQ_SUCCESS) {
+            ret = buffer.push_back((properties.maximum_packet_size >> 8) & 0xFF);
+            if (ret == MQ_SUCCESS) {
+              ret = buffer.push_back(properties.maximum_packet_size & 0xFF);
+            }
+          }
+        }
+      }
+    }
 
-  if (properties.maximum_packet_size != 0) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::MaximumPacketSize));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.maximum_packet_size >> 24) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.maximum_packet_size >> 16) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back((properties.maximum_packet_size >> 8) & 0xFF);
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(properties.maximum_packet_size & 0xFF);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.wildcard_subscription_available)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WildcardSubscriptionAvailable));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(0);
+      }
+    }
 
-  if (!properties.wildcard_subscription_available) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::WildcardSubscriptionAvailable));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(0);
-    if (ret != 0)
-      return ret;
-  }
+    if (ret == MQ_SUCCESS && (!properties.subscription_identifier_available)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifierAvailable));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(0);
+      }
+    }
 
-  if (!properties.subscription_identifier_available) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SubscriptionIdentifierAvailable));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(0);
-    if (ret != 0)
-      return ret;
+    if (ret == MQ_SUCCESS && (!properties.shared_subscription_available)) {
+      ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SharedSubscriptionAvailable));
+      if (ret == MQ_SUCCESS) {
+        ret = buffer.push_back(0);
+      }
+    }
   }
-
-  if (!properties.shared_subscription_available) {
-    ret = buffer.push_back(static_cast<uint8_t>(PropertyType::SharedSubscriptionAvailable));
-    if (ret != 0)
-      return ret;
-    ret = buffer.push_back(0);
-    if (ret != 0)
-      return ret;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::serialize_unsubscribe(const UnsubscribePacket* packet, MQTTBuffer& buffer)
 {
+  int ret = MQ_SUCCESS;
   buffer.clear();
   const bool is_legacy = is_legacy_protocol_hint();
-  
-  // Packet type
-  int ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBSCRIBE) | 0x02);  // Set reserved bits
-  if (ret != 0)
-    return ret;
 
-  // Serialize properties
-  MQTTBuffer properties_buffer(allocator_);
-  if (!is_legacy) {
-    ret = serialize_properties(packet->properties, properties_buffer);
-    if (ret != 0) {
-      return ret;
+  // Packet type
+  // Set reserved bits
+  ret = buffer.push_back(static_cast<uint8_t>(PacketType::UNSUBSCRIBE) | 0x02);
+  if (ret == MQ_SUCCESS) {
+    // Serialize properties
+    MQTTBuffer properties_buffer(allocator_);
+    if (!is_legacy) {
+      ret = serialize_properties(packet->properties, properties_buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Calculate total length
+      size_t total_length = 0;
+      total_length += 2;  // Packet ID
+      if (!is_legacy) {
+        total_length += properties_buffer.size();  // Properties
+      }
+
+      // Topic filters
+      for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
+        total_length += 2 + packet->topic_filters[i].length();  // Topic filter
+      }
+
+      // Remaining length
+      ret = serialize_remaining_length(total_length, buffer);
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Packet ID
+      ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
+    }
+    if (ret == MQ_SUCCESS) {
+      ret = buffer.push_back(packet->packet_id & 0xFF);
+    }
+
+    if (ret == MQ_SUCCESS && !is_legacy) {
+      // Properties
+      ret = buffer.append(properties_buffer.data(), properties_buffer.size());
+    }
+
+    if (ret == MQ_SUCCESS) {
+      // Topic filters
+      for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
+        ret = serialize_mqtt_string(packet->topic_filters[i], buffer);
+        if (ret != MQ_SUCCESS) {
+          break;
+        }
+      }
     }
   }
-
-  // Calculate total length
-  size_t total_length = 0;
-  total_length += 2;  // Packet ID
-  if (!is_legacy) {
-    total_length += properties_buffer.size();  // Properties
-  }
-
-  // Topic filters
-  for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
-    total_length += 2 + packet->topic_filters[i].length();  // Topic filter
-  }
-
-  // Remaining length
-  ret = serialize_remaining_length(total_length, buffer);
-  if (ret != 0)
-    return ret;
-
-  // Packet ID
-  ret = buffer.push_back((packet->packet_id >> 8) & 0xFF);
-  if (ret != 0)
-    return ret;
-  ret = buffer.push_back(packet->packet_id & 0xFF);
-  if (ret != 0)
-    return ret;
-
-  if (!is_legacy) {
-    // Properties
-    ret = buffer.append(properties_buffer.data(), properties_buffer.size());
-    if (ret != 0)
-      return ret;
-  }
-
-  // Topic filters
-  for (size_t i = 0; i < packet->topic_filters.size(); ++i) {
-    ret = serialize_mqtt_string(packet->topic_filters[i], buffer);
-    if (ret != 0)
-      return ret;
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int MQTTParser::parse_unsubscribe(const uint8_t* buffer, size_t length, UnsubscribePacket** packet)
 {
+  int ret = MQ_SUCCESS;
   if (length < 5) {  // Minimum UNSUBSCRIBE packet size
     LOG_ERROR("UNSUBSCRIBE packet too short");
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    UnsubscribePacket* unsubscribe = begin_packet<UnsubscribePacket>(allocator_);
+    if (!unsubscribe) {
+      LOG_ERROR("Failed to allocate UNSUBSCRIBE packet");
+      ret = MQ_ERR_MEMORY_ALLOC;
+    } else {
+      size_t pos = 0;
+      unsubscribe->type = PacketType::UNSUBSCRIBE;
 
-  UnsubscribePacket* unsubscribe =
-      begin_packet<UnsubscribePacket>(allocator_);
-  if (!unsubscribe) {
-    LOG_ERROR("Failed to allocate UNSUBSCRIBE packet");
-    return MQ_ERR_MEMORY_ALLOC;
-  }
+      // Skip packet type
+      pos++;
 
-  size_t pos = 0;
-  unsubscribe->type = PacketType::UNSUBSCRIBE;
+      // Parse remaining length
+      uint32_t remaining_length;
+      size_t remaining_length_bytes;
+      ret = parse_remaining_length(buffer + pos, length - pos, remaining_length,
+                                   remaining_length_bytes);
+      if (ret != 0) {
+        LOG_ERROR("Failed to parse remaining length");
+        unsubscribe->~UnsubscribePacket();
+        allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+        ret = MQ_ERR_PACKET_INVALID;
+      } else {
+        pos += remaining_length_bytes;
 
-  // Skip packet type
-  pos++;
+        // 记录header + remaining length的总大小
+        size_t header_size = pos;
+        size_t payload_end = header_size + remaining_length;
 
-  // Parse remaining length
-  uint32_t remaining_length;
-  size_t remaining_length_bytes;
-  int ret =
-      parse_remaining_length(buffer + pos, length - pos, remaining_length, remaining_length_bytes);
-  if (ret != 0) {
-    LOG_ERROR("Failed to parse remaining length");
-    unsubscribe->~UnsubscribePacket();
-    allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
-    return MQ_ERR_PACKET_INVALID;
-  }
-  pos += remaining_length_bytes;
+        // Parse packet ID
+        if (pos + 2 > length) {
+          LOG_ERROR("Packet too short for packet ID");
+          unsubscribe->~UnsubscribePacket();
+          allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          unsubscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
+          pos += 2;
+        }
 
-  // 记录header + remaining length的总大小
-  size_t header_size = pos;
-  size_t payload_end = header_size + remaining_length;
+        // Parse properties (MQTT v5 only)
+        if (ret == MQ_SUCCESS && !is_legacy_protocol_hint()) {
+          size_t properties_bytes_read = 0;
+          ret = parse_properties(buffer + pos, payload_end - pos, unsubscribe->properties,
+                                 properties_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse properties");
+            unsubscribe->~UnsubscribePacket();
+            allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+            ret = MQ_ERR_PACKET_INVALID;
+          } else {
+            pos += properties_bytes_read;
+          }
+        }
 
-  // Parse packet ID
-  if (pos + 2 > length) {
-    LOG_ERROR("Packet too short for packet ID");
-    unsubscribe->~UnsubscribePacket();
-    allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
-  unsubscribe->packet_id = (buffer[pos] << 8) | buffer[pos + 1];
-  pos += 2;
+        while (ret == MQ_SUCCESS && pos < payload_end) {
+          // Parse topic filters
+          MQTTString topic_filter{MQTTStrAllocator(allocator_)};
+          size_t topic_bytes_read = 0;
+          ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter,
+                                  topic_bytes_read);
+          if (ret != 0) {
+            LOG_ERROR("Failed to parse topic filter");
+            unsubscribe->~UnsubscribePacket();
+            allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
+            ret = MQ_ERR_PACKET_INVALID;
+            break;
+          }
+          pos += topic_bytes_read;
 
-  // Parse properties (MQTT v5 only)
-  if (!is_legacy_protocol_hint()) {
-    size_t properties_bytes_read = 0;
-    ret =
-        parse_properties(buffer + pos, payload_end - pos, unsubscribe->properties, properties_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse properties");
-      unsubscribe->~UnsubscribePacket();
-      allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
-      return MQ_ERR_PACKET_INVALID;
+          // 直接添加到topic_filters
+          unsubscribe->topic_filters.push_back(std::move(topic_filter));
+        }
+
+        if (ret == MQ_SUCCESS) {
+          *packet = unsubscribe;
+        }
+      }
     }
-    pos += properties_bytes_read;
   }
-
-  // Parse topic filters
-  while (pos < payload_end) {
-    MQTTString topic_filter{MQTTStrAllocator(allocator_)};
-    size_t topic_bytes_read = 0;
-    ret = parse_mqtt_string(buffer + pos, payload_end - pos, topic_filter, topic_bytes_read);
-    if (ret != 0) {
-      LOG_ERROR("Failed to parse topic filter");
-      unsubscribe->~UnsubscribePacket();
-      allocator_->deallocate(unsubscribe, sizeof(UnsubscribePacket));
-      return MQ_ERR_PACKET_INVALID;
-    }
-    pos += topic_bytes_read;
-
-    // 直接添加到topic_filters
-    unsubscribe->topic_filters.push_back(std::move(topic_filter));
-  }
-
-  *packet = unsubscribe;
-  return MQ_SUCCESS;
+  return ret;
 }
 
 uint8_t MQTTParser::map_reason_code_to_legacy_connack(ReasonCode reason_code) const
@@ -3081,18 +3064,20 @@ uint8_t MQTTParser::map_reason_code_to_legacy_connack(ReasonCode reason_code) co
 
 uint8_t MQTTParser::map_reason_code_to_legacy_suback(ReasonCode reason_code) const
 {
+  uint8_t ret = 0x00;
   if (reason_code == ReasonCode::Success || reason_code == ReasonCode::GrantedQoS0) {
-    return 0x00;
+    ret = 0x00;
+  } else {
+    switch (reason_code) {
+      case ReasonCode::GrantedQoS1:
+        return 0x01;
+      case ReasonCode::GrantedQoS2:
+        return 0x02;
+      default:
+        return 0x80;
+    }
   }
-
-  switch (reason_code) {
-    case ReasonCode::GrantedQoS1:
-      return 0x01;
-    case ReasonCode::GrantedQoS2:
-      return 0x02;
-    default:
-      return 0x80;
-  }
+  return ret;
 }
 
 }  // namespace mqtt

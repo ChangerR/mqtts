@@ -301,6 +301,7 @@ void test_pubrec_serialization()
 
 int main()
 {
+  int ret = 0;
   std::cout << "Starting QoS reply mechanism tests\n" << std::endl;
 
   try {
@@ -318,9 +319,10 @@ int main()
     std::cout << "3. QoS 2 PUBLISH packets can be processed and PUBREC can be generated"
               << std::endl;
     std::cout << "4. PUBACK and PUBREC packets can be correctly serialized and parsed" << std::endl;
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "\nTest failed: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

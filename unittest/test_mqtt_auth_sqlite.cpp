@@ -391,6 +391,7 @@ class SQLiteAuthTest
 
 int main()
 {
+  int ret = 0;
   try {
     // 初始化日志系统
     mqtt::Logger::set_level(mqtt::LogLevel::INFO);
@@ -402,9 +403,10 @@ int main()
 
     std::cout << "All SQLite authentication tests passed!" << std::endl;
 
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "Test failed with exception: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

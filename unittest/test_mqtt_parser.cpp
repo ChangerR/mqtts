@@ -102,6 +102,7 @@ void test_parse_subscribe()
 
 int main()
 {
+  int ret = 0;
   std::cout << "开始MQTT解析器测试\n" << std::endl;
 
   try {
@@ -110,9 +111,10 @@ int main()
     test_parse_subscribe();
 
     std::cout << "\n所有测试通过！" << std::endl;
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "\n测试失败: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }
