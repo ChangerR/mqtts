@@ -28,22 +28,35 @@ void split_topic_levels_local(const std::string& value, std::vector<std::string>
 
 bool match_topic_pattern_local(const std::string& topic, const std::string& pattern)
 {
-  if (topic.empty() || pattern.empty())
-    return false;
-  if (topic[0] == '$' && pattern[0] != '$')
-    return false;
-  std::vector<std::string> requested, allowed;
-  split_topic_levels_local(topic, requested);
-  split_topic_levels_local(pattern, allowed);
-  for (size_t i = 0; i < allowed.size(); ++i) {
-    if (allowed[i] == "#")
-      return i + 1 == allowed.size();
-    if (i >= requested.size() || requested[i] == "#")
-      return false;
-    if (allowed[i] != "+" && allowed[i] != requested[i])
-      return false;
+  bool ret = false;
+  if (topic.empty() || pattern.empty()) {
+    ret = false;
+  } else if (topic[0] == '$' && pattern[0] != '$') {
+    ret = false;
+  } else {
+    std::vector<std::string> requested, allowed;
+    split_topic_levels_local(topic, requested);
+    split_topic_levels_local(pattern, allowed);
+    size_t i = 0;
+    for (; i < allowed.size(); ++i) {
+      if (allowed[i] == "#") {
+        ret = i + 1 == allowed.size();
+        break;
+      }
+      if (i >= requested.size() || requested[i] == "#") {
+        ret = false;
+        break;
+      }
+      if (allowed[i] != "+" && allowed[i] != requested[i]) {
+        ret = false;
+        break;
+      }
+    }
+    if (i == allowed.size()) {
+      ret = allowed.size() == requested.size();
+    }
   }
-  return allowed.size() == requested.size();
+  return ret;
 }
 
 }  // namespace
@@ -60,21 +73,24 @@ AuthManager::~AuthManager()
 
 int AuthManager::initialize()
 {
+  int ret = MQ_SUCCESS;
   LOG_INFO("Initializing AuthManager");
 
   std::unique_lock<std::mutex> lock(providers_mutex_);
   for (auto& entry : providers_) {
-    int ret = entry.provider->initialize();
+    ret = entry.provider->initialize();
     if (MQ_FAIL(ret)) {
       LOG_ERROR("Failed to initialize auth provider: {}, error: {}",
                 entry.provider->get_provider_name(), ret);
-      return ret;
+      break;
     }
     LOG_INFO("Successfully initialized auth provider: {}", entry.provider->get_provider_name());
   }
 
-  LOG_INFO("AuthManager initialized successfully with {} providers", providers_.size());
-  return MQ_SUCCESS;
+  if (MQ_SUCCESS == ret) {
+    LOG_INFO("AuthManager initialized successfully with {} providers", providers_.size());
+  }
+  return ret;
 }
 
 void AuthManager::cleanup()
@@ -93,29 +109,33 @@ void AuthManager::cleanup()
 
 int AuthManager::add_provider(std::unique_ptr<IAuthProvider> provider, int priority)
 {
+  int ret = MQ_SUCCESS;
   if (!provider) {
     LOG_ERROR("Cannot add null auth provider");
-    return MQ_ERR_INVALID_ARGS;
-  }
+    ret = MQ_ERR_INVALID_ARGS;
+  } else {
+    const char* provider_name = provider->get_provider_name();
+    LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
 
-  const char* provider_name = provider->get_provider_name();
-  LOG_INFO("Adding auth provider: {} with priority: {}", provider_name, priority);
+    std::unique_lock<std::mutex> lock(providers_mutex_);
 
-  std::unique_lock<std::mutex> lock(providers_mutex_);
+    // 检查是否已存在同名提供者
+    for (const auto& entry : providers_) {
+      if (std::string(entry.provider->get_provider_name()) == provider_name) {
+        LOG_ERROR("Auth provider with name '{}' already exists", provider_name);
+        ret = MQ_ERR_INVALID_ARGS;
+        break;
+      }
+    }
 
-  // 检查是否已存在同名提供者
-  for (const auto& entry : providers_) {
-    if (std::string(entry.provider->get_provider_name()) == provider_name) {
-      LOG_ERROR("Auth provider with name '{}' already exists", provider_name);
-      return MQ_ERR_INVALID_ARGS;
+    if (MQ_SUCCESS == ret) {
+      providers_.emplace_back(std::move(provider), priority);
+      sort_providers_by_priority();
+
+      LOG_INFO("Successfully added auth provider: {}", provider_name);
     }
   }
-
-  providers_.emplace_back(std::move(provider), priority);
-  sort_providers_by_priority();
-
-  LOG_INFO("Successfully added auth provider: {}", provider_name);
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int AuthManager::remove_provider(const std::string& provider_name)
@@ -143,55 +163,67 @@ AuthResult AuthManager::authenticate_user(const MQTTString& username, const MQTT
                                           const MQTTString& client_id, const MQTTString& client_ip,
                                           uint16_t client_port, UserInfo& user_info)
 {
+  AuthResult ret = AuthResult::INTERNAL_ERROR;
   // 清理过期缓存
   cleanup_expired_cache();
 
   const auto providers = providers_snapshot();
-  if (providers.empty())
-    return AuthResult::ACCESS_DENIED;
-
-  // 按优先级尝试各个提供者
-  AuthResult last_result = AuthResult::INTERNAL_ERROR;
-  for (const auto& entry : providers) {
-    if (!entry.provider->is_healthy()) {
-      LOG_WARN("Auth provider '{}' is not healthy, skipping", entry.provider->get_provider_name());
-      continue;
-    }
-
-    LOG_DEBUG("Trying auth provider: {}", entry.provider->get_provider_name());
-
-    AuthResult result = entry.provider->authenticate_user(username, password, client_id, client_ip,
-                                                          client_port, user_info);
-
-    if (result == AuthResult::SUCCESS) {
-      LOG_INFO("User '{}' authenticated successfully using provider: {}",
-               from_mqtt_string(username), entry.provider->get_provider_name());
-
-      user_info.provider_name = entry.provider->get_provider_name();
-
-      // 缓存成功结果
-      if (cache_enabled_) {
-        std::string cache_key = make_cache_key(username, client_id);
-        put_to_cache(cache_key, result, user_info);
+  if (providers.empty()) {
+    ret = AuthResult::ACCESS_DENIED;
+  } else {
+    // 按优先级尝试各个提供者
+    AuthResult last_result = AuthResult::INTERNAL_ERROR;
+    bool resolved = false;
+    for (const auto& entry : providers) {
+      if (!entry.provider->is_healthy()) {
+        LOG_WARN("Auth provider '{}' is not healthy, skipping",
+                 entry.provider->get_provider_name());
+        continue;
       }
 
-      return result;
+      LOG_DEBUG("Trying auth provider: {}", entry.provider->get_provider_name());
+
+      AuthResult result = entry.provider->authenticate_user(username, password, client_id,
+                                                            client_ip, client_port, user_info);
+
+      if (result == AuthResult::SUCCESS) {
+        LOG_INFO("User '{}' authenticated successfully using provider: {}",
+                 from_mqtt_string(username), entry.provider->get_provider_name());
+
+        user_info.provider_name = entry.provider->get_provider_name();
+
+        // 缓存成功结果
+        if (cache_enabled_) {
+          std::string cache_key = make_cache_key(username, client_id);
+          put_to_cache(cache_key, result, user_info);
+        }
+
+        ret = result;
+        resolved = true;
+        break;
+      }
+
+      if (result == AuthResult::USER_NOT_FOUND) {
+        // 用户不存在，尝试下一个提供者
+        last_result = result;
+        continue;
+      }
+
+      // 其他错误（如密码错误），不再尝试其他提供者
+      LOG_WARN("User '{}' authentication failed with provider '{}': {}",
+               from_mqtt_string(username), entry.provider->get_provider_name(),
+               static_cast<int>(result));
+      ret = result;
+      resolved = true;
+      break;
     }
 
-    if (result == AuthResult::USER_NOT_FOUND) {
-      // 用户不存在，尝试下一个提供者
-      last_result = result;
-      continue;
+    if (!resolved) {
+      LOG_WARN("User '{}' authentication failed with all providers", from_mqtt_string(username));
+      ret = last_result;
     }
-
-    // 其他错误（如密码错误），不再尝试其他提供者
-    LOG_WARN("User '{}' authentication failed with provider '{}': {}", from_mqtt_string(username),
-             entry.provider->get_provider_name(), static_cast<int>(result));
-    return result;
   }
-
-  LOG_WARN("User '{}' authentication failed with all providers", from_mqtt_string(username));
-  return last_result;
+  return ret;
 }
 
 int AuthManager::authenticate_user(const MQTTString& username, const MQTTString& password,
@@ -279,50 +311,59 @@ int AuthManager::authenticate_user(const MQTTString& username, const MQTTString&
 AuthResult AuthManager::check_topic_access(const UserInfo& user_info, const MQTTString& topic,
                                            Permission permission)
 {
+  AuthResult ret = AuthResult::ACCESS_DENIED;
   // 超级用户拥有所有权限
   if (user_info.is_super_user) {
     LOG_DEBUG("Super user '{}' granted access to topic: {}", from_mqtt_string(user_info.username),
               from_mqtt_string(topic));
-    return AuthResult::SUCCESS;
-  }
+    ret = AuthResult::SUCCESS;
+  } else {
+    const auto providers = providers_snapshot();
 
-  const auto providers = providers_snapshot();
+    if (providers.empty()) {
+      LOG_WARN("No auth providers configured for topic access check");
+      ret = AuthResult::ACCESS_DENIED;
+    } else {
+      // 按优先级检查各个提供者
+      bool resolved = false;
+      for (const auto& entry : providers) {
+        if (!user_info.provider_name.empty() &&
+            user_info.provider_name != entry.provider->get_provider_name())
+          continue;
+        if (!entry.provider->is_healthy()) {
+          continue;
+        }
 
-  if (providers.empty()) {
-    LOG_WARN("No auth providers configured for topic access check");
-    return AuthResult::ACCESS_DENIED;
-  }
+        AuthResult result = entry.provider->check_topic_access(user_info, topic, permission);
 
-  // 按优先级检查各个提供者
-  for (const auto& entry : providers) {
-    if (!user_info.provider_name.empty() &&
-        user_info.provider_name != entry.provider->get_provider_name())
-      continue;
-    if (!entry.provider->is_healthy()) {
-      continue;
+        if (result == AuthResult::SUCCESS) {
+          LOG_DEBUG("User '{}' granted {} access to topic '{}' by provider: {}",
+                    from_mqtt_string(user_info.username), static_cast<int>(permission),
+                    from_mqtt_string(topic), entry.provider->get_provider_name());
+          ret = result;
+          resolved = true;
+          break;
+        }
+
+        if (result != AuthResult::USER_NOT_FOUND) {
+          // 明确拒绝，不再尝试其他提供者
+          LOG_DEBUG("User '{}' denied {} access to topic '{}' by provider: {}",
+                    from_mqtt_string(user_info.username), static_cast<int>(permission),
+                    from_mqtt_string(topic), entry.provider->get_provider_name());
+          ret = result;
+          resolved = true;
+          break;
+        }
+      }
+
+      if (!resolved) {
+        LOG_WARN("No provider handled topic access check for user '{}', topic '{}'",
+                 from_mqtt_string(user_info.username), from_mqtt_string(topic));
+        ret = AuthResult::ACCESS_DENIED;
+      }
     }
-
-    AuthResult result = entry.provider->check_topic_access(user_info, topic, permission);
-
-    if (result == AuthResult::SUCCESS) {
-      LOG_DEBUG("User '{}' granted {} access to topic '{}' by provider: {}",
-                from_mqtt_string(user_info.username), static_cast<int>(permission),
-                from_mqtt_string(topic), entry.provider->get_provider_name());
-      return result;
-    }
-
-    if (result != AuthResult::USER_NOT_FOUND) {
-      // 明确拒绝，不再尝试其他提供者
-      LOG_DEBUG("User '{}' denied {} access to topic '{}' by provider: {}",
-                from_mqtt_string(user_info.username), static_cast<int>(permission),
-                from_mqtt_string(topic), entry.provider->get_provider_name());
-      return result;
-    }
   }
-
-  LOG_WARN("No provider handled topic access check for user '{}', topic '{}'",
-           from_mqtt_string(user_info.username), from_mqtt_string(topic));
-  return AuthResult::ACCESS_DENIED;
+  return ret;
 }
 
 int AuthManager::check_topic_access(const ClientAuthContext& auth_context, const MQTTString& topic,
@@ -337,33 +378,41 @@ int AuthManager::check_topic_access(const ClientAuthContext& auth_context, const
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
   if ((auth_context.expires_at_ms && now >= auth_context.expires_at_ms) ||
-      (auth_context.user_info.expires_at_ms && now >= auth_context.user_info.expires_at_ms))
-    return ret;
-  if (permission == Permission::WRITE && topic_str.find_first_of("+#") != std::string::npos)
-    return ret;
-  for (const auto& entry : providers_snapshot()) {
-    if (auth_context.user_info.provider_name == entry.provider->get_provider_name() &&
-        entry.provider->requires_online_authorization()) {
-      auth_result = entry.provider->is_healthy() ? entry.provider->check_topic_access(
-                                                       auth_context.user_info, topic, permission)
-                                                 : AuthResult::INTERNAL_ERROR;
-      return ret;
-    }
-  }
-  if (auth_context.is_super_user) {
-    auth_result = AuthResult::SUCCESS;
-  } else if (!auth_context.acl_rules.empty()) {
-    for (size_t i = 0; i < auth_context.acl_rules.size() && !matched; ++i) {
-      const TopicAclRule& rule = auth_context.acl_rules[i];
-      if (match_topic_pattern_local(topic_str, from_mqtt_string(rule.topic_pattern))) {
-        matched = true;
-        if (rule.permission == Permission::READWRITE || rule.permission == permission) {
-          auth_result = AuthResult::SUCCESS;
-        }
+      (auth_context.user_info.expires_at_ms && now >= auth_context.user_info.expires_at_ms)) {
+    ret = MQ_SUCCESS;
+  } else if (permission == Permission::WRITE &&
+             topic_str.find_first_of("+#") != std::string::npos) {
+    ret = MQ_SUCCESS;
+  } else {
+    bool resolved = false;
+    for (const auto& entry : providers_snapshot()) {
+      if (auth_context.user_info.provider_name == entry.provider->get_provider_name() &&
+          entry.provider->requires_online_authorization()) {
+        auth_result = entry.provider->is_healthy() ? entry.provider->check_topic_access(
+                                                         auth_context.user_info, topic, permission)
+                                                   : AuthResult::INTERNAL_ERROR;
+        ret = MQ_SUCCESS;
+        resolved = true;
+        break;
       }
     }
-  } else {
-    auth_result = check_topic_access(auth_context.user_info, topic, permission);
+    if (!resolved) {
+      if (auth_context.is_super_user) {
+        auth_result = AuthResult::SUCCESS;
+      } else if (!auth_context.acl_rules.empty()) {
+        for (size_t i = 0; i < auth_context.acl_rules.size() && !matched; ++i) {
+          const TopicAclRule& rule = auth_context.acl_rules[i];
+          if (match_topic_pattern_local(topic_str, from_mqtt_string(rule.topic_pattern))) {
+            matched = true;
+            if (rule.permission == Permission::READWRITE || rule.permission == permission) {
+              auth_result = AuthResult::SUCCESS;
+            }
+          }
+        }
+      } else {
+        auth_result = check_topic_access(auth_context.user_info, topic, permission);
+      }
+    }
   }
 
   return ret;
@@ -372,6 +421,7 @@ int AuthManager::check_topic_access(const ClientAuthContext& auth_context, const
 int AuthManager::check_delivery(const ClientAuthContext& context, const MQTTString& topic,
                                 std::shared_ptr<AuthorizationRequest>& pending, AuthResult& result)
 {
+  int ret = MQ_SUCCESS;
   result = AuthResult::ACCESS_DENIED;
   const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
@@ -379,19 +429,26 @@ int AuthManager::check_delivery(const ClientAuthContext& context, const MQTTStri
   if ((context.expires_at_ms && now >= context.expires_at_ms) ||
       (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) {
     pending.reset();
-    return MQ_SUCCESS;
-  }
-  for (const auto& entry : providers_snapshot()) {
-    if (context.user_info.provider_name == entry.provider->get_provider_name() &&
-        entry.provider->requires_online_authorization()) {
-      result = entry.provider->is_healthy()
-                   ? entry.provider->check_delivery_access(context.user_info, topic, pending)
-                   : AuthResult::INTERNAL_ERROR;
-      return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    bool resolved = false;
+    for (const auto& entry : providers_snapshot()) {
+      if (context.user_info.provider_name == entry.provider->get_provider_name() &&
+          entry.provider->requires_online_authorization()) {
+        result = entry.provider->is_healthy()
+                     ? entry.provider->check_delivery_access(context.user_info, topic, pending)
+                     : AuthResult::INTERNAL_ERROR;
+        ret = MQ_SUCCESS;
+        resolved = true;
+        break;
+      }
+    }
+    if (!resolved) {
+      pending.reset();
+      ret = check_topic_access(context, topic, Permission::READ, result);
     }
   }
-  pending.reset();
-  return check_topic_access(context, topic, Permission::READ, result);
+  return ret;
 }
 
 std::map<std::string, AuthStats> AuthManager::get_all_stats() const
@@ -409,31 +466,41 @@ std::map<std::string, AuthStats> AuthManager::get_all_stats() const
 int AuthManager::check_publish(const ClientAuthContext& context, const MQTTString& topic,
                                const MQTTByteVector& payload, AuthResult& result)
 {
+  int ret = MQ_SUCCESS;
   result = AuthResult::ACCESS_DENIED;
   const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
   if ((context.expires_at_ms && now >= context.expires_at_ms) ||
-      (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms))
-    return MQ_SUCCESS;
-  if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos)
-    return MQ_SUCCESS;
-  for (const auto& entry : providers_snapshot()) {
-    if (context.user_info.provider_name == entry.provider->get_provider_name() &&
-        entry.provider->requires_online_authorization()) {
-      result = entry.provider->is_healthy()
-                   ? entry.provider->check_publish(context.user_info, topic, payload)
-                   : AuthResult::INTERNAL_ERROR;
-      return MQ_SUCCESS;
+      (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) {
+    ret = MQ_SUCCESS;
+  } else if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos) {
+    ret = MQ_SUCCESS;
+  } else {
+    bool resolved = false;
+    for (const auto& entry : providers_snapshot()) {
+      if (context.user_info.provider_name == entry.provider->get_provider_name() &&
+          entry.provider->requires_online_authorization()) {
+        result = entry.provider->is_healthy()
+                     ? entry.provider->check_publish(context.user_info, topic, payload)
+                     : AuthResult::INTERNAL_ERROR;
+        ret = MQ_SUCCESS;
+        resolved = true;
+        break;
+      }
+    }
+    if (!resolved) {
+      ret = check_topic_access(context, topic, Permission::WRITE, result);
     }
   }
-  return check_topic_access(context, topic, Permission::WRITE, result);
+  return ret;
 }
 
 int AuthManager::check_publish(const ClientAuthContext& context, const MQTTString& topic,
                                const MQTTByteVector& payload,
                                std::shared_ptr<AuthorizationRequest>& pending, AuthResult& result)
 {
+  int ret = MQ_SUCCESS;
   result = AuthResult::ACCESS_DENIED;
   const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
@@ -441,25 +508,32 @@ int AuthManager::check_publish(const ClientAuthContext& context, const MQTTStrin
   if ((context.expires_at_ms && now >= context.expires_at_ms) ||
       (context.user_info.expires_at_ms && now >= context.user_info.expires_at_ms)) {
     pending.reset();
-    return MQ_SUCCESS;
-  }
-  if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos) {
+    ret = MQ_SUCCESS;
+  } else if (from_mqtt_string(topic).find_first_of("+#") != std::string::npos) {
     pending.reset();
-    return MQ_SUCCESS;
-  }
-  for (const auto& entry : providers_snapshot()) {
-    if (context.user_info.provider_name == entry.provider->get_provider_name() &&
-        entry.provider->requires_online_authorization()) {
-      result = entry.provider->is_healthy()
-                   ? entry.provider->begin_publish_check(context.user_info, topic, payload, pending)
-                   : AuthResult::INTERNAL_ERROR;
-      if (result != AuthResult::PENDING)
-        pending.reset();
-      return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    bool resolved = false;
+    for (const auto& entry : providers_snapshot()) {
+      if (context.user_info.provider_name == entry.provider->get_provider_name() &&
+          entry.provider->requires_online_authorization()) {
+        result = entry.provider->is_healthy()
+                     ? entry.provider->begin_publish_check(context.user_info, topic, payload,
+                                                           pending)
+                     : AuthResult::INTERNAL_ERROR;
+        if (result != AuthResult::PENDING)
+          pending.reset();
+        ret = MQ_SUCCESS;
+        resolved = true;
+        break;
+      }
+    }
+    if (!resolved) {
+      pending.reset();
+      ret = check_topic_access(context, topic, Permission::WRITE, result);
     }
   }
-  pending.reset();
-  return check_topic_access(context, topic, Permission::WRITE, result);
+  return ret;
 }
 
 void AuthManager::set_cache_enabled(bool enabled, int cache_ttl_seconds)

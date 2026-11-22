@@ -58,29 +58,31 @@ class AuthAdmin
 
   int init_sqlite(const std::string& db_path)
   {
+    int ret = MQ_SUCCESS;
 #ifdef HAVE_SQLITE3
     SQLiteAuthConfig config;
     config.db_path = db_path;
     config.connection_pool_size = 3;
 
     sqlite_provider_ = std::make_unique<SQLiteAuthProvider>(config, allocator_);
-    int ret = sqlite_provider_->initialize();
+    ret = sqlite_provider_->initialize();
     if (MQ_FAIL(ret)) {
       std::cerr << "Failed to initialize SQLite auth provider: " << ret << std::endl;
-      return ret;
+    } else {
+      std::cout << "SQLite auth provider initialized successfully" << std::endl;
+      ret = MQ_SUCCESS;
     }
-
-    std::cout << "SQLite auth provider initialized successfully" << std::endl;
-    return MQ_SUCCESS;
 #else
     std::cerr << "SQLite support not compiled in. Please install libsqlite3-dev and recompile."
               << std::endl;
-    return -1;
+    ret = -1;
 #endif
+    return ret;
   }
 
   int init_redis(const std::string& host, int port, const std::string& password = "")
   {
+    int ret = MQ_SUCCESS;
 #ifdef HAVE_HIREDIS
     RedisAuthConfig config;
     config.host = host;
@@ -89,19 +91,19 @@ class AuthAdmin
     config.connection_pool_size = 3;
 
     redis_provider_ = std::make_unique<RedisAuthProvider>(config, allocator_);
-    int ret = redis_provider_->initialize();
+    ret = redis_provider_->initialize();
     if (MQ_FAIL(ret)) {
       std::cerr << "Failed to initialize Redis auth provider: " << ret << std::endl;
-      return ret;
+    } else {
+      std::cout << "Redis auth provider initialized successfully" << std::endl;
+      ret = MQ_SUCCESS;
     }
-
-    std::cout << "Redis auth provider initialized successfully" << std::endl;
-    return MQ_SUCCESS;
 #else
     std::cerr << "Redis support not compiled in. Please install libhiredis-dev and recompile."
               << std::endl;
-    return -1;
+    ret = -1;
 #endif
+    return ret;
   }
 
   void show_help()
@@ -223,6 +225,7 @@ class AuthAdmin
   int add_topic_permission(const std::string& username, const std::string& topic_pattern,
                            const std::string& permission)
   {
+    int ret = 0;
     Permission perm;
     if (permission == "read") {
       perm = Permission::READ;
@@ -233,32 +236,34 @@ class AuthAdmin
     } else {
       std::cerr << "Invalid permission: " << permission << " (use read/write/readwrite)"
                 << std::endl;
-      return -1;
+      ret = -1;
     }
 
-    MQTTString mqtt_username = to_mqtt_string(username, allocator_);
-    MQTTString mqtt_topic = to_mqtt_string(topic_pattern, allocator_);
+    if (ret == 0) {
+      MQTTString mqtt_username = to_mqtt_string(username, allocator_);
+      MQTTString mqtt_topic = to_mqtt_string(topic_pattern, allocator_);
 
-    int ret = -1;
+      ret = -1;
 
 #ifdef HAVE_SQLITE3
-    if (sqlite_provider_) {
-      ret = sqlite_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
-    }
+      if (sqlite_provider_) {
+        ret = sqlite_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
+      }
 #endif
 #ifdef HAVE_HIREDIS
-    if (redis_provider_) {
-      ret = redis_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
-    }
+      if (redis_provider_) {
+        ret = redis_provider_->add_topic_permission(mqtt_username, mqtt_topic, perm);
+      }
 #endif
 
-    if (MQ_SUCC(ret)) {
-      std::cout << "Topic permission added: " << username << " -> " << topic_pattern << " ("
-                << permission << ")" << std::endl;
-    } else if (ret == -1) {
-      std::cerr << "No provider initialized" << std::endl;
-    } else {
-      std::cerr << "Failed to add topic permission: " << ret << std::endl;
+      if (MQ_SUCC(ret)) {
+        std::cout << "Topic permission added: " << username << " -> " << topic_pattern << " ("
+                  << permission << ")" << std::endl;
+      } else if (ret == -1) {
+        std::cerr << "No provider initialized" << std::endl;
+      } else {
+        std::cerr << "Failed to add topic permission: " << ret << std::endl;
+      }
     }
 
     return ret;
@@ -386,52 +391,56 @@ class AuthAdmin
   int test_topic_permission(const std::string& username, const std::string& topic,
                             const std::string& permission)
   {
+    int ret = 0;
     auto provider = get_current_provider();
     if (!provider) {
       std::cerr << "No provider initialized" << std::endl;
-      return -1;
-    }
-
-    Permission perm;
-    if (permission == "read") {
-      perm = Permission::READ;
-    } else if (permission == "write") {
-      perm = Permission::WRITE;
-    } else if (permission == "readwrite") {
-      perm = Permission::READWRITE;
+      ret = -1;
     } else {
-      std::cerr << "Invalid permission: " << permission << " (use read/write/readwrite)"
-                << std::endl;
-      return -1;
+      Permission perm;
+      if (permission == "read") {
+        perm = Permission::READ;
+      } else if (permission == "write") {
+        perm = Permission::WRITE;
+      } else if (permission == "readwrite") {
+        perm = Permission::READWRITE;
+      } else {
+        std::cerr << "Invalid permission: " << permission << " (use read/write/readwrite)"
+                  << std::endl;
+        ret = -1;
+      }
+
+      if (ret == 0) {
+        UserInfo user_info(allocator_);
+        user_info.username = to_mqtt_string(username, allocator_);
+        user_info.is_super_user = provider->is_super_user(user_info.username);
+
+        MQTTString mqtt_topic = to_mqtt_string(topic, allocator_);
+
+        AuthResult result = provider->check_topic_access(user_info, mqtt_topic, perm);
+
+        std::cout << "Topic permission test for user '" << username << "' on topic '" << topic
+                  << "' with permission '" << permission << "': ";
+
+        switch (result) {
+          case AuthResult::SUCCESS:
+            std::cout << "GRANTED" << std::endl;
+            break;
+          case AuthResult::TOPIC_ACCESS_DENIED:
+            std::cout << "DENIED" << std::endl;
+            break;
+          case AuthResult::USER_NOT_FOUND:
+            std::cout << "USER NOT FOUND" << std::endl;
+            break;
+          default:
+            std::cout << "ERROR" << std::endl;
+            break;
+        }
+
+        ret = result == AuthResult::SUCCESS ? 0 : -1;
+      }
     }
-
-    UserInfo user_info(allocator_);
-    user_info.username = to_mqtt_string(username, allocator_);
-    user_info.is_super_user = provider->is_super_user(user_info.username);
-
-    MQTTString mqtt_topic = to_mqtt_string(topic, allocator_);
-
-    AuthResult result = provider->check_topic_access(user_info, mqtt_topic, perm);
-
-    std::cout << "Topic permission test for user '" << username << "' on topic '" << topic
-              << "' with permission '" << permission << "': ";
-
-    switch (result) {
-      case AuthResult::SUCCESS:
-        std::cout << "GRANTED" << std::endl;
-        break;
-      case AuthResult::TOPIC_ACCESS_DENIED:
-        std::cout << "DENIED" << std::endl;
-        break;
-      case AuthResult::USER_NOT_FOUND:
-        std::cout << "USER NOT FOUND" << std::endl;
-        break;
-      default:
-        std::cout << "ERROR" << std::endl;
-        break;
-    }
-
-    return result == AuthResult::SUCCESS ? 0 : -1;
+    return ret;
   }
 
  private:
@@ -445,142 +454,159 @@ class AuthAdmin
 
   IAuthProvider* get_current_provider()
   {
+    IAuthProvider* ret = nullptr;
 #ifdef HAVE_SQLITE3
-    if (sqlite_provider_)
-      return sqlite_provider_.get();
+    if (sqlite_provider_) {
+      ret = sqlite_provider_.get();
+    }
 #endif
 #ifdef HAVE_HIREDIS
-    if (redis_provider_)
-      return redis_provider_.get();
+    if (ret == nullptr && redis_provider_) {
+      ret = redis_provider_.get();
+    }
 #endif
-    return nullptr;
+    return ret;
   }
 };
 
 int main(int argc, char* argv[])
 {
+  int ret = 0;
   // 日志系统通过单例自动初始化
 
   AuthAdmin admin;
 
   if (argc < 3) {
     admin.show_help();
-    return 1;
-  }
-
-  std::string provider_type = argv[1];
-  std::string command = argv[2];
-
-  // 初始化提供者
-  if (provider_type == "sqlite") {
-    if (argc < 4) {
-      std::cerr << "SQLite provider requires database path" << std::endl;
-      return 1;
-    }
-    std::string db_path = argv[3];
-    if (admin.init_sqlite(db_path) != MQ_SUCCESS) {
-      return 1;
-    }
-    // 跳过provider参数
-    argv += 2;
-    argc -= 2;
-  } else if (provider_type == "redis") {
-    if (argc < 5) {
-      std::cerr << "Redis provider requires host and port" << std::endl;
-      return 1;
-    }
-    std::string host = argv[3];
-    int port = std::atoi(argv[4]);
-    std::string password = (argc > 5) ? argv[5] : "";
-
-    if (admin.init_redis(host, port, password) != MQ_SUCCESS) {
-      return 1;
-    }
-
-    // 跳过provider参数
-    int skip = password.empty() ? 3 : 4;
-    argv += skip;
-    argc -= skip;
+    ret = 1;
   } else {
-    std::cerr << "Unknown provider: " << provider_type << std::endl;
-    admin.show_help();
-    return 1;
-  }
+    std::string provider_type = argv[1];
+    std::string command = argv[2];
 
-  // 执行命令
-  try {
-    if (command == "add-user") {
+    // 初始化提供者
+    if (provider_type == "sqlite") {
       if (argc < 4) {
-        std::cerr << "add-user requires username and password" << std::endl;
-        return 1;
+        std::cerr << "SQLite provider requires database path" << std::endl;
+        ret = 1;
+      } else {
+        std::string db_path = argv[3];
+        if (admin.init_sqlite(db_path) != MQ_SUCCESS) {
+          ret = 1;
+        } else {
+          // 跳过provider参数
+          argv += 2;
+          argc -= 2;
+        }
       }
-      std::string username = argv[2];
-      std::string password = argv[3];
-      bool is_super = (argc > 4 && std::string(argv[4]) == "super");
-      return admin.add_user(username, password, is_super);
-
-    } else if (command == "remove-user") {
-      if (argc < 3) {
-        std::cerr << "remove-user requires username" << std::endl;
-        return 1;
-      }
-      return admin.remove_user(argv[2]);
-
-    } else if (command == "update-password") {
-      if (argc < 4) {
-        std::cerr << "update-password requires username and new password" << std::endl;
-        return 1;
-      }
-      return admin.update_password(argv[2], argv[3]);
-
-    } else if (command == "add-topic") {
+    } else if (provider_type == "redis") {
       if (argc < 5) {
-        std::cerr << "add-topic requires username, topic pattern, and permission" << std::endl;
-        return 1;
+        std::cerr << "Redis provider requires host and port" << std::endl;
+        ret = 1;
+      } else {
+        std::string host = argv[3];
+        int port = std::atoi(argv[4]);
+        std::string password = (argc > 5) ? argv[5] : "";
+
+        if (admin.init_redis(host, port, password) != MQ_SUCCESS) {
+          ret = 1;
+        } else {
+          // 跳过provider参数
+          int skip = password.empty() ? 3 : 4;
+          argv += skip;
+          argc -= skip;
+        }
       }
-      return admin.add_topic_permission(argv[2], argv[3], argv[4]);
-
-    } else if (command == "remove-topic") {
-      if (argc < 4) {
-        std::cerr << "remove-topic requires username and topic pattern" << std::endl;
-        return 1;
-      }
-      return admin.remove_topic_permission(argv[2], argv[3]);
-
-    } else if (command == "clear-topics") {
-      if (argc < 3) {
-        std::cerr << "clear-topics requires username" << std::endl;
-        return 1;
-      }
-      return admin.clear_topics(argv[2]);
-
-    } else if (command == "list-stats") {
-      admin.show_stats();
-      return 0;
-
-    } else if (command == "test-auth") {
-      if (argc < 4) {
-        std::cerr << "test-auth requires username and password" << std::endl;
-        return 1;
-      }
-      return admin.test_authentication(argv[2], argv[3]);
-
-    } else if (command == "test-topic") {
-      if (argc < 5) {
-        std::cerr << "test-topic requires username, topic, and permission" << std::endl;
-        return 1;
-      }
-      return admin.test_topic_permission(argv[2], argv[3], argv[4]);
-
     } else {
-      std::cerr << "Unknown command: " << command << std::endl;
+      std::cerr << "Unknown provider: " << provider_type << std::endl;
       admin.show_help();
-      return 1;
+      ret = 1;
     }
-  } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << std::endl;
-    return 1;
+
+    // 执行命令
+    if (ret == 0) {
+      try {
+        if (command == "add-user") {
+          if (argc < 4) {
+            std::cerr << "add-user requires username and password" << std::endl;
+            ret = 1;
+          } else {
+            std::string username = argv[2];
+            std::string password = argv[3];
+            bool is_super = (argc > 4 && std::string(argv[4]) == "super");
+            ret = admin.add_user(username, password, is_super);
+          }
+
+        } else if (command == "remove-user") {
+          if (argc < 3) {
+            std::cerr << "remove-user requires username" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.remove_user(argv[2]);
+          }
+
+        } else if (command == "update-password") {
+          if (argc < 4) {
+            std::cerr << "update-password requires username and new password" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.update_password(argv[2], argv[3]);
+          }
+
+        } else if (command == "add-topic") {
+          if (argc < 5) {
+            std::cerr << "add-topic requires username, topic pattern, and permission" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.add_topic_permission(argv[2], argv[3], argv[4]);
+          }
+
+        } else if (command == "remove-topic") {
+          if (argc < 4) {
+            std::cerr << "remove-topic requires username and topic pattern" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.remove_topic_permission(argv[2], argv[3]);
+          }
+
+        } else if (command == "clear-topics") {
+          if (argc < 3) {
+            std::cerr << "clear-topics requires username" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.clear_topics(argv[2]);
+          }
+
+        } else if (command == "list-stats") {
+          admin.show_stats();
+          ret = 0;
+
+        } else if (command == "test-auth") {
+          if (argc < 4) {
+            std::cerr << "test-auth requires username and password" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.test_authentication(argv[2], argv[3]);
+          }
+
+        } else if (command == "test-topic") {
+          if (argc < 5) {
+            std::cerr << "test-topic requires username, topic, and permission" << std::endl;
+            ret = 1;
+          } else {
+            ret = admin.test_topic_permission(argv[2], argv[3], argv[4]);
+          }
+
+        } else {
+          std::cerr << "Unknown command: " << command << std::endl;
+          admin.show_help();
+          ret = 1;
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        ret = 1;
+      }
+    }
   }
 
-  return 0;
+  return ret;
 }

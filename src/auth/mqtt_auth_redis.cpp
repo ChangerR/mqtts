@@ -89,41 +89,45 @@ RedisConnectionPool::~RedisConnectionPool()
 
 int RedisConnectionPool::initialize()
 {
+  int ret = 0;
   std::unique_lock<std::mutex> lock(pool_mutex_);
 
   if (initialized_) {
-    return MQ_SUCCESS;
-  }
+    ret = MQ_SUCCESS;
+  } else {
+    LOG_INFO("Initializing Redis connection pool with {} connections to {}:{}",
+             config_.connection_pool_size, config_.host, config_.port);
 
-  LOG_INFO("Initializing Redis connection pool with {} connections to {}:{}",
-           config_.connection_pool_size, config_.host, config_.port);
+    pool_.reserve(config_.connection_pool_size);
 
-  pool_.reserve(config_.connection_pool_size);
+    for (int i = 0; i < config_.connection_pool_size; ++i) {
+      redisContext* ctx = create_connection();
+      if (!ctx) {
+        LOG_ERROR("Failed to create Redis connection {}", i);
+        cleanup();
+        ret = MQ_ERR_CONNECT;
+        break;
+      }
 
-  for (int i = 0; i < config_.connection_pool_size; ++i) {
-    redisContext* ctx = create_connection();
-    if (!ctx) {
-      LOG_ERROR("Failed to create Redis connection {}", i);
-      cleanup();
-      return MQ_ERR_CONNECT;
+      ret = configure_connection(ctx);
+      if (MQ_FAIL(ret)) {
+        LOG_ERROR("Failed to configure Redis connection {}: {}", i, ret);
+        redisFree(ctx);
+        cleanup();
+        break;
+      }
+
+      auto conn = std::make_shared<RedisConnection>(ctx, i);
+      pool_.push_back(conn);
+      available_.push(conn);
     }
 
-    int ret = configure_connection(ctx);
-    if (MQ_FAIL(ret)) {
-      LOG_ERROR("Failed to configure Redis connection {}: {}", i, ret);
-      redisFree(ctx);
-      cleanup();
-      return ret;
+    if (ret == MQ_SUCCESS) {
+      initialized_ = true;
+      LOG_INFO("Redis connection pool initialized successfully");
     }
-
-    auto conn = std::make_shared<RedisConnection>(ctx, i);
-    pool_.push_back(conn);
-    available_.push(conn);
   }
-
-  initialized_ = true;
-  LOG_INFO("Redis connection pool initialized successfully");
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void RedisConnectionPool::cleanup()
@@ -143,43 +147,46 @@ void RedisConnectionPool::cleanup()
 
 std::shared_ptr<RedisConnection> RedisConnectionPool::acquire_connection()
 {
+  std::shared_ptr<RedisConnection> ret = nullptr;
   std::unique_lock<std::mutex> lock(pool_mutex_);
 
   if (!initialized_) {
     LOG_ERROR("Connection pool not initialized");
-    return nullptr;
-  }
+    ret = nullptr;
+  } else {
+    // 等待可用连接
+    pool_cv_.wait(lock, [this] { return !available_.empty(); });
 
-  // 等待可用连接
-  pool_cv_.wait(lock, [this] { return !available_.empty(); });
+    auto conn = available_.front();
+    available_.pop();
 
-  auto conn = available_.front();
-  available_.pop();
+    conn->set_busy(true);
+    conn->update_last_used();
 
-  conn->set_busy(true);
-  conn->update_last_used();
+    // 检查连接健康状态
+    if (!conn->is_connected()) {
+      LOG_WARN("Redis connection {} is disconnected, attempting reconnect", conn->get_id());
 
-  // 检查连接健康状态
-  if (!conn->is_connected()) {
-    LOG_WARN("Redis connection {} is disconnected, attempting reconnect", conn->get_id());
-
-    // 尝试重新连接
-    redisContext* new_ctx = create_connection();
-    if (new_ctx && configure_connection(new_ctx) == MQ_SUCCESS) {
-      // 替换连接
-      conn = std::make_shared<RedisConnection>(new_ctx, conn->get_id());
-      conn->set_busy(true);
-      conn->update_last_used();
-    } else {
-      if (new_ctx) {
-        redisFree(new_ctx);
+      // 尝试重新连接
+      redisContext* new_ctx = create_connection();
+      if (new_ctx && configure_connection(new_ctx) == MQ_SUCCESS) {
+        // 替换连接
+        conn = std::make_shared<RedisConnection>(new_ctx, conn->get_id());
+        conn->set_busy(true);
+        conn->update_last_used();
+        ret = conn;
+      } else {
+        if (new_ctx) {
+          redisFree(new_ctx);
+        }
+        LOG_ERROR("Failed to reconnect Redis connection {}", conn->get_id());
+        ret = nullptr;
       }
-      LOG_ERROR("Failed to reconnect Redis connection {}", conn->get_id());
-      return nullptr;
+    } else {
+      ret = conn;
     }
   }
-
-  return conn;
+  return ret;
 }
 
 void RedisConnectionPool::release_connection(std::shared_ptr<RedisConnection> conn)
@@ -237,6 +244,7 @@ redisContext* RedisConnectionPool::create_connection()
 
 int RedisConnectionPool::configure_connection(redisContext* ctx)
 {
+  int ret = 0;
   redisReply* reply = nullptr;
 
   // 认证
@@ -246,24 +254,26 @@ int RedisConnectionPool::configure_connection(redisContext* ctx)
       LOG_ERROR("Redis authentication failed: {}", reply ? reply->str : "connection error");
       if (reply)
         freeReplyObject(reply);
-      return MQ_ERR_AUTH;
+      ret = MQ_ERR_AUTH;
+    } else {
+      freeReplyObject(reply);
     }
-    freeReplyObject(reply);
   }
 
   // 选择数据库
-  if (config_.database != 0) {
+  if (ret == MQ_SUCCESS && config_.database != 0) {
     reply = (redisReply*)redisCommand(ctx, "SELECT %d", config_.database);
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
       LOG_ERROR("Redis SELECT database failed: {}", reply ? reply->str : "connection error");
       if (reply)
         freeReplyObject(reply);
-      return MQ_ERR_DATABASE;
+      ret = MQ_ERR_DATABASE;
+    } else {
+      freeReplyObject(reply);
     }
-    freeReplyObject(reply);
   }
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 //==============================================================================
@@ -283,22 +293,23 @@ RedisAuthProvider::~RedisAuthProvider()
 
 int RedisAuthProvider::initialize()
 {
+  int ret = 0;
   LOG_INFO("Initializing Redis authentication provider");
 
-  int ret = connection_pool_->initialize();
+  ret = connection_pool_->initialize();
   if (MQ_FAIL(ret)) {
     LOG_ERROR("Failed to initialize Redis connection pool: {}", ret);
-    return ret;
+  } else {
+    // 测试连接
+    if (!connection_pool_->test_connection()) {
+      LOG_ERROR("Redis connection test failed");
+      ret = MQ_ERR_CONNECT;
+    } else {
+      LOG_INFO("Redis authentication provider initialized successfully");
+      ret = MQ_SUCCESS;
+    }
   }
-
-  // 测试连接
-  if (!connection_pool_->test_connection()) {
-    LOG_ERROR("Redis connection test failed");
-    return MQ_ERR_CONNECT;
-  }
-
-  LOG_INFO("Redis authentication provider initialized successfully");
-  return MQ_SUCCESS;
+  return ret;
 }
 
 void RedisAuthProvider::cleanup()
@@ -342,20 +353,20 @@ AuthResult RedisAuthProvider::check_topic_access(const UserInfo& user_info, cons
 
 bool RedisAuthProvider::is_super_user(const MQTTString& username)
 {
+  bool ret = false;
   // 先检查本地缓存
   UserCache::UserInfo user_info;
   if (get_from_local_cache(username, user_info)) {
     update_stats(false, false, true);  // 缓存命中
-    return user_info.is_super_user;
+    ret = user_info.is_super_user;
+  } else {
+    // 从Redis加载
+    if (load_user_from_redis(username, user_info) == MQ_SUCCESS) {
+      put_to_local_cache(username, user_info);
+      ret = user_info.is_super_user;
+    }
   }
-
-  // 从Redis加载
-  if (load_user_from_redis(username, user_info) == MQ_SUCCESS) {
-    put_to_local_cache(username, user_info);
-    return user_info.is_super_user;
-  }
-
-  return false;
+  return ret;
 }
 
 AuthStats RedisAuthProvider::get_stats() const
@@ -378,65 +389,73 @@ bool RedisAuthProvider::is_healthy() const
 int RedisAuthProvider::add_user(const MQTTString& username, const MQTTString& password,
                                 bool is_super_user, int ttl_seconds)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
-  }
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string password_hash = hash_password(from_mqtt_string(password));
+    std::string user_key = make_user_key(username);
 
-  std::string password_hash = hash_password(from_mqtt_string(password));
-  std::string user_key = make_user_key(username);
-
-  // 使用Redis事务确保原子性
-  redisReply* reply = execute_command(conn, "MULTI");
-  if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 设置用户信息
-  reply = execute_command(conn,
-                          "HMSET %s password_hash %s is_super_user %d created_at %d updated_at %d",
-                          user_key.c_str(), password_hash.c_str(), is_super_user ? 1 : 0,
-                          static_cast<int>(time(nullptr)), static_cast<int>(time(nullptr)));
-  if (check_redis_reply(reply, "HMSET") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    execute_command(conn, "DISCARD");
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 设置TTL
-  if (ttl_seconds > 0) {
-    reply = execute_command(conn, "EXPIRE %s %d", user_key.c_str(), ttl_seconds);
-    if (check_redis_reply(reply, "EXPIRE") != MQ_SUCCESS) {
+    // 使用Redis事务确保原子性
+    redisReply* reply = execute_command(conn, "MULTI");
+    if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
       free_redis_reply(reply);
-      execute_command(conn, "DISCARD");
       connection_pool_->release_connection(conn);
-      return MQ_ERR_DATABASE;
+      ret = MQ_ERR_DATABASE;
+    } else {
+      free_redis_reply(reply);
+
+      // 设置用户信息
+      reply = execute_command(
+          conn, "HMSET %s password_hash %s is_super_user %d created_at %d updated_at %d",
+          user_key.c_str(), password_hash.c_str(), is_super_user ? 1 : 0,
+          static_cast<int>(time(nullptr)), static_cast<int>(time(nullptr)));
+      if (check_redis_reply(reply, "HMSET") != MQ_SUCCESS) {
+        free_redis_reply(reply);
+        execute_command(conn, "DISCARD");
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+      } else {
+        free_redis_reply(reply);
+
+        // 设置TTL
+        if (ttl_seconds > 0) {
+          reply = execute_command(conn, "EXPIRE %s %d", user_key.c_str(), ttl_seconds);
+          if (check_redis_reply(reply, "EXPIRE") != MQ_SUCCESS) {
+            free_redis_reply(reply);
+            execute_command(conn, "DISCARD");
+            connection_pool_->release_connection(conn);
+            ret = MQ_ERR_DATABASE;
+          } else {
+            free_redis_reply(reply);
+          }
+        }
+
+        if (ret == MQ_SUCCESS) {
+          // 执行事务
+          reply = execute_command(conn, "EXEC");
+          if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
+            free_redis_reply(reply);
+            connection_pool_->release_connection(conn);
+            ret = MQ_ERR_DATABASE;
+          } else {
+            free_redis_reply(reply);
+
+            connection_pool_->release_connection(conn);
+
+            // 清除本地缓存
+            remove_from_local_cache(username);
+
+            LOG_INFO("User '{}' added to Redis successfully", from_mqtt_string(username));
+            ret = MQ_SUCCESS;
+          }
+        }
+      }
     }
-    free_redis_reply(reply);
   }
-
-  // 执行事务
-  reply = execute_command(conn, "EXEC");
-  if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  connection_pool_->release_connection(conn);
-
-  // 清除本地缓存
-  remove_from_local_cache(username);
-
-  LOG_INFO("User '{}' added to Redis successfully", from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int RedisAuthProvider::remove_user(const MQTTString& username)
@@ -622,100 +641,113 @@ int RedisAuthProvider::clear_user_permissions(const MQTTString& username)
 int RedisAuthProvider::get_user_permissions(const MQTTString& username,
                                             std::vector<TopicPermission>& permissions)
 {
+  int ret = 0;
   // 先检查本地缓存
   UserCache::UserInfo user_info;
   if (get_from_local_cache(username, user_info)) {
     permissions = user_info.permissions;
     update_stats(false, false, true);  // 缓存命中
-    return MQ_SUCCESS;
+    ret = MQ_SUCCESS;
+  } else {
+    // 从Redis加载
+    ret = load_user_permissions_from_redis(username, permissions);
+    if (ret == MQ_SUCCESS) {
+      // 更新本地缓存
+      user_info.permissions = permissions;
+      user_info.expire_time =
+          std::chrono::steady_clock::now() + std::chrono::seconds(config_.cache_ttl_seconds);
+      put_to_local_cache(username, user_info);
+    }
   }
-
-  // 从Redis加载
-  int result = load_user_permissions_from_redis(username, permissions);
-  if (result == MQ_SUCCESS) {
-    // 更新本地缓存
-    user_info.permissions = permissions;
-    user_info.expire_time =
-        std::chrono::steady_clock::now() + std::chrono::seconds(config_.cache_ttl_seconds);
-    put_to_local_cache(username, user_info);
-  }
-
-  return result;
+  return ret;
 }
 
 int RedisAuthProvider::set_user_permissions(const MQTTString& username,
                                             const std::vector<TopicPermission>& permissions,
                                             int ttl_seconds)
 {
+  int ret = 0;
   auto conn = connection_pool_->acquire_connection();
   if (!conn) {
     LOG_ERROR("Failed to acquire Redis connection");
-    return MQ_ERR_CONNECT;
-  }
+    ret = MQ_ERR_CONNECT;
+  } else {
+    std::string permissions_key = make_permissions_key(username);
 
-  std::string permissions_key = make_permissions_key(username);
-
-  // 使用事务确保原子性
-  redisReply* reply = execute_command(conn, "MULTI");
-  if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 清空现有权限
-  reply = execute_command(conn, "DEL %s", permissions_key.c_str());
-  if (check_redis_reply(reply, "DEL") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    execute_command(conn, "DISCARD");
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  // 添加新权限
-  for (const auto& perm : permissions) {
-    std::string permission_value = from_mqtt_string(perm.topic_pattern) + ":" +
-                                   std::to_string(static_cast<int>(perm.permission));
-    reply = execute_command(conn, "SADD %s %s", permissions_key.c_str(), permission_value.c_str());
-    if (check_redis_reply(reply, "SADD") != MQ_SUCCESS) {
+    // 使用事务确保原子性
+    redisReply* reply = execute_command(conn, "MULTI");
+    if (check_redis_reply(reply, "MULTI") != MQ_SUCCESS) {
       free_redis_reply(reply);
-      execute_command(conn, "DISCARD");
       connection_pool_->release_connection(conn);
-      return MQ_ERR_DATABASE;
-    }
-    free_redis_reply(reply);
-  }
-
-  // 设置TTL
-  if (ttl_seconds > 0) {
-    reply = execute_command(conn, "EXPIRE %s %d", permissions_key.c_str(), ttl_seconds);
-    if (check_redis_reply(reply, "EXPIRE") != MQ_SUCCESS) {
+      ret = MQ_ERR_DATABASE;
+    } else {
       free_redis_reply(reply);
-      execute_command(conn, "DISCARD");
-      connection_pool_->release_connection(conn);
-      return MQ_ERR_DATABASE;
+
+      // 清空现有权限
+      reply = execute_command(conn, "DEL %s", permissions_key.c_str());
+      if (check_redis_reply(reply, "DEL") != MQ_SUCCESS) {
+        free_redis_reply(reply);
+        execute_command(conn, "DISCARD");
+        connection_pool_->release_connection(conn);
+        ret = MQ_ERR_DATABASE;
+      } else {
+        free_redis_reply(reply);
+
+        // 添加新权限
+        for (const auto& perm : permissions) {
+          std::string permission_value = from_mqtt_string(perm.topic_pattern) + ":" +
+                                         std::to_string(static_cast<int>(perm.permission));
+          reply = execute_command(conn, "SADD %s %s", permissions_key.c_str(),
+                                  permission_value.c_str());
+          if (check_redis_reply(reply, "SADD") != MQ_SUCCESS) {
+            free_redis_reply(reply);
+            execute_command(conn, "DISCARD");
+            connection_pool_->release_connection(conn);
+            ret = MQ_ERR_DATABASE;
+            break;
+          }
+          free_redis_reply(reply);
+        }
+
+        if (ret == MQ_SUCCESS) {
+          // 设置TTL
+          if (ttl_seconds > 0) {
+            reply = execute_command(conn, "EXPIRE %s %d", permissions_key.c_str(), ttl_seconds);
+            if (check_redis_reply(reply, "EXPIRE") != MQ_SUCCESS) {
+              free_redis_reply(reply);
+              execute_command(conn, "DISCARD");
+              connection_pool_->release_connection(conn);
+              ret = MQ_ERR_DATABASE;
+            } else {
+              free_redis_reply(reply);
+            }
+          }
+
+          if (ret == MQ_SUCCESS) {
+            // 执行事务
+            reply = execute_command(conn, "EXEC");
+            if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
+              free_redis_reply(reply);
+              connection_pool_->release_connection(conn);
+              ret = MQ_ERR_DATABASE;
+            } else {
+              free_redis_reply(reply);
+
+              connection_pool_->release_connection(conn);
+
+              // 清除本地缓存
+              remove_from_local_cache(username);
+
+              LOG_INFO("Set {} permissions for user '{}'", permissions.size(),
+                       from_mqtt_string(username));
+              ret = MQ_SUCCESS;
+            }
+          }
+        }
+      }
     }
-    free_redis_reply(reply);
   }
-
-  // 执行事务
-  reply = execute_command(conn, "EXEC");
-  if (check_redis_reply(reply, "EXEC") != MQ_SUCCESS) {
-    free_redis_reply(reply);
-    connection_pool_->release_connection(conn);
-    return MQ_ERR_DATABASE;
-  }
-  free_redis_reply(reply);
-
-  connection_pool_->release_connection(conn);
-
-  // 清除本地缓存
-  remove_from_local_cache(username);
-
-  LOG_INFO("Set {} permissions for user '{}'", permissions.size(), from_mqtt_string(username));
-  return MQ_SUCCESS;
+  return ret;
 }
 
 std::string RedisAuthProvider::hash_password(const std::string& password)
@@ -759,6 +791,7 @@ AuthResult RedisAuthProvider::authenticate_user_internal(const MQTTString& usern
                                                          const MQTTString& password,
                                                          UserInfo& user_info)
 {
+  AuthResult ret = AuthResult::INTERNAL_ERROR;
   // 先检查本地缓存
   UserCache::UserInfo cached_user;
   if (get_from_local_cache(username, cached_user)) {
@@ -766,54 +799,56 @@ AuthResult RedisAuthProvider::authenticate_user_internal(const MQTTString& usern
       user_info.username = username;
       user_info.is_super_user = cached_user.is_super_user;
       update_stats(true, false, true);  // 登录成功，缓存命中
-      return AuthResult::SUCCESS;
+      ret = AuthResult::SUCCESS;
     } else {
       update_stats(false, false, true);  // 登录失败，缓存命中
-      return AuthResult::INVALID_CREDENTIALS;
+      ret = AuthResult::INVALID_CREDENTIALS;
+    }
+  } else {
+    // 从Redis加载用户信息
+    if (load_user_from_redis(username, cached_user) != MQ_SUCCESS) {
+      ret = AuthResult::USER_NOT_FOUND;
+    } else {
+      // 验证密码
+      if (verify_password(from_mqtt_string(password), cached_user.password_hash)) {
+        user_info.username = username;
+        user_info.is_super_user = cached_user.is_super_user;
+
+        // 缓存用户信息
+        put_to_local_cache(username, cached_user);
+
+        ret = AuthResult::SUCCESS;
+      } else {
+        ret = AuthResult::INVALID_CREDENTIALS;
+      }
     }
   }
-
-  // 从Redis加载用户信息
-  if (load_user_from_redis(username, cached_user) != MQ_SUCCESS) {
-    return AuthResult::USER_NOT_FOUND;
-  }
-
-  // 验证密码
-  if (verify_password(from_mqtt_string(password), cached_user.password_hash)) {
-    user_info.username = username;
-    user_info.is_super_user = cached_user.is_super_user;
-
-    // 缓存用户信息
-    put_to_local_cache(username, cached_user);
-
-    return AuthResult::SUCCESS;
-  } else {
-    return AuthResult::INVALID_CREDENTIALS;
-  }
+  return ret;
 }
 
 AuthResult RedisAuthProvider::check_topic_access_internal(const MQTTString& username,
                                                           const MQTTString& topic,
                                                           Permission permission)
 {
+  AuthResult ret = AuthResult::TOPIC_ACCESS_DENIED;
   std::vector<TopicPermission> permissions;
   int result = get_user_permissions(username, permissions);
   if (result != MQ_SUCCESS) {
-    return AuthResult::USER_NOT_FOUND;
-  }
+    ret = AuthResult::USER_NOT_FOUND;
+  } else {
+    std::string topic_str = from_mqtt_string(topic);
 
-  std::string topic_str = from_mqtt_string(topic);
-
-  // 检查权限
-  for (const auto& perm : permissions) {
-    if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
-      if ((perm.permission == Permission::READWRITE) || (perm.permission == permission)) {
-        return AuthResult::SUCCESS;
+    // 检查权限
+    for (const auto& perm : permissions) {
+      if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
+        if ((perm.permission == Permission::READWRITE) || (perm.permission == permission)) {
+          ret = AuthResult::SUCCESS;
+          break;
+        }
       }
     }
   }
-
-  return AuthResult::TOPIC_ACCESS_DENIED;
+  return ret;
 }
 
 int RedisAuthProvider::load_user_from_redis(const MQTTString& username,
@@ -935,36 +970,36 @@ void RedisAuthProvider::cleanup_expired_local_cache()
 
 bool RedisAuthProvider::match_topic_pattern(const std::string& topic, const std::string& pattern)
 {
+  bool ret = false;
   // 简单的通配符匹配实现
   // + 匹配单个层级
   // # 匹配多个层级
 
   if (pattern == "#") {
-    return true;  // 匹配所有主题
+    ret = true;  // 匹配所有主题
+  } else if (pattern.find('#') == std::string::npos && pattern.find('+') == std::string::npos) {
+    ret = topic == pattern;  // 精确匹配
+  } else {
+    // 转换为正则表达式
+    std::string regex_pattern = pattern;
+
+    // 转义特殊字符
+    std::regex special_chars{R"([-[\]{}()*+?.,\^$|#\s])"};
+    regex_pattern = std::regex_replace(regex_pattern, special_chars, R"(\$&)");
+
+    // 还原通配符
+    regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\#)"), ".*");
+    regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\\+)"), "[^/]+");
+
+    try {
+      std::regex topic_regex(regex_pattern);
+      ret = std::regex_match(topic, topic_regex);
+    } catch (const std::regex_error& e) {
+      LOG_ERROR("Invalid topic pattern regex: {}", e.what());
+      ret = false;
+    }
   }
-
-  if (pattern.find('#') == std::string::npos && pattern.find('+') == std::string::npos) {
-    return topic == pattern;  // 精确匹配
-  }
-
-  // 转换为正则表达式
-  std::string regex_pattern = pattern;
-
-  // 转义特殊字符
-  std::regex special_chars{R"([-[\]{}()*+?.,\^$|#\s])"};
-  regex_pattern = std::regex_replace(regex_pattern, special_chars, R"(\$&)");
-
-  // 还原通配符
-  regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\#)"), ".*");
-  regex_pattern = std::regex_replace(regex_pattern, std::regex(R"(\\\+)"), "[^/]+");
-
-  try {
-    std::regex topic_regex(regex_pattern);
-    return std::regex_match(topic, topic_regex);
-  } catch (const std::regex_error& e) {
-    LOG_ERROR("Invalid topic pattern regex: {}", e.what());
-    return false;
-  }
+  return ret;
 }
 
 void RedisAuthProvider::update_stats(bool login_success, bool topic_access_granted, bool cache_hit)

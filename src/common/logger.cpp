@@ -47,11 +47,14 @@ void clear_trace_id()
 
 const std::string& current_trace_id()
 {
+  const std::string* ret = &g_default_trace_id;
   const std::string* trace_id = get_trace_id_ptr();
   if (trace_id == NULL || trace_id->empty()) {
-    return g_default_trace_id;
+    ret = &g_default_trace_id;
+  } else {
+    ret = trace_id;
   }
-  return *trace_id;
+  return *ret;
 }
 }  // namespace mqtt_log_ctx
 
@@ -95,6 +98,7 @@ Logger::~Logger()
 
 int Logger::configure(const mqtt::LogConfig& config)
 {
+  int ret = 0;
   try {
     // 设置日志级别
     spdlog::level::level_enum level = string_to_level(config.level);
@@ -150,11 +154,12 @@ int Logger::configure(const mqtt::LogConfig& config)
     LOG_INFO("日志系统配置完成: 级别={}, 控制台输出=是{}, 立即刷新={}", config.level, file_info,
              config.flush_immediately ? "是" : "否");
 
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "配置日志系统失败: " << e.what() << std::endl;
-    return -1;
+    ret = -1;
   }
+  return ret;
 }
 
 spdlog::level::level_enum Logger::string_to_level(const std::string& level_str)

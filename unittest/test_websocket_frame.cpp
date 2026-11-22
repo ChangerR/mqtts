@@ -514,6 +514,7 @@ void test_oversized_frame_rejected_from_header()
 
 int main()
 {
+  int ret = 0;
   std::cout << "Starting WebSocket frame parser tests\n" << std::endl;
 
   try {
@@ -536,9 +537,10 @@ int main()
     test_oversized_frame_rejected_from_header();
 
     std::cout << "\n✓ All WebSocket frame tests passed!" << std::endl;
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "\n✗ Test failed: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

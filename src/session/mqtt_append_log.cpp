@@ -153,24 +153,27 @@ void atomic_file(const std::string& path, const std::string& data)
 }
 std::string read_file(const std::string& path, size_t maximum)
 {
+  std::string ret;
   int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0 && errno == ENOENT)
-    return {};
-  check(fd >= 0, "open journal file");
-  try {
-    struct stat st
-    {
-    };
-    check(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
-              uint64_t(st.st_size) <= maximum,
-          "journal file size");
-    auto result = read_at(fd, 0, size_t(st.st_size));
-    close(fd);
-    return result;
-  } catch (...) {
-    close(fd);
-    throw;
+  if (fd < 0 && errno == ENOENT) {
+    ret = {};
+  } else {
+    check(fd >= 0, "open journal file");
+    try {
+      struct stat st
+      {
+      };
+      check(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+                uint64_t(st.st_size) <= maximum,
+            "journal file size");
+      ret = read_at(fd, 0, size_t(st.st_size));
+      close(fd);
+    } catch (...) {
+      close(fd);
+      throw;
+    }
   }
+  return ret;
 }
 Completion::Completion(bool waiter)
 {

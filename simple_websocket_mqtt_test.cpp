@@ -105,57 +105,69 @@ std::vector<uint8_t> create_websocket_frame(uint8_t opcode, const std::string& p
 // Parse WebSocket frame
 bool parse_websocket_frame(const uint8_t* data, size_t len, uint8_t& opcode, std::string& payload)
 {
+  bool ret = false;
   if (len < 2) {
-    return false;
-  }
+    ret = false;
+  } else {
+    uint8_t byte0 = data[0];
+    bool fin = (byte0 & 0x80) != 0;
+    opcode = byte0 & 0x0F;
 
-  uint8_t byte0 = data[0];
-  bool fin = (byte0 & 0x80) != 0;
-  opcode = byte0 & 0x0F;
+    uint8_t byte1 = data[1];
+    bool masked = (byte1 & 0x80) != 0;
+    uint64_t payload_len = byte1 & 0x7F;
 
-  uint8_t byte1 = data[1];
-  bool masked = (byte1 & 0x80) != 0;
-  uint64_t payload_len = byte1 & 0x7F;
+    size_t offset = 2;
+    bool header_ok = true;
 
-  size_t offset = 2;
-
-  if (payload_len == 126) {
-    if (len < offset + 2)
-      return false;
-    payload_len = (static_cast<uint64_t>(data[offset]) << 8) | data[offset + 1];
-    offset += 2;
-  } else if (payload_len == 127) {
-    if (len < offset + 8)
-      return false;
-    payload_len = 0;
-    for (int i = 0; i < 8; i++) {
-      payload_len = (payload_len << 8) | data[offset + i];
+    if (payload_len == 126) {
+      if (len < offset + 2) {
+        header_ok = false;
+      } else {
+        payload_len = (static_cast<uint64_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+      }
+    } else if (payload_len == 127) {
+      if (len < offset + 8) {
+        header_ok = false;
+      } else {
+        payload_len = 0;
+        for (int i = 0; i < 8; i++) {
+          payload_len = (payload_len << 8) | data[offset + i];
+        }
+        offset += 8;
+      }
     }
-    offset += 8;
-  }
 
-  uint8_t mask[4] = {0};
-  if (masked) {
-    if (len < offset + 4)
-      return false;
-    memcpy(mask, data + offset, 4);
-    offset += 4;
-  }
+    if (!header_ok) {
+      ret = false;
+    } else {
+      uint8_t mask[4] = {0};
+      if (masked && len < offset + 4) {
+        ret = false;
+      } else {
+        if (masked) {
+          memcpy(mask, data + offset, 4);
+          offset += 4;
+        }
 
-  if (len < offset + payload_len) {
-    return false;
-  }
-
-  payload.clear();
-  for (size_t i = 0; i < payload_len; i++) {
-    uint8_t byte = data[offset + i];
-    if (masked) {
-      byte ^= mask[i % 4];
+        if (len < offset + payload_len) {
+          ret = false;
+        } else {
+          payload.clear();
+          for (size_t i = 0; i < payload_len; i++) {
+            uint8_t byte = data[offset + i];
+            if (masked) {
+              byte ^= mask[i % 4];
+            }
+            payload.push_back(byte);
+          }
+          ret = fin;
+        }
+      }
     }
-    payload.push_back(byte);
   }
-
-  return fin;
+  return ret;
 }
 
 class WebSocketMQTTClient
@@ -278,59 +290,61 @@ class WebSocketMQTTClient
 
   bool receive_message(std::string& topic, std::string& payload, int timeout_ms = 5000)
   {
+    bool ret = false;
     if (!connected_) {
-      return false;
-    }
+      ret = false;
+    } else {
+      // Set timeout
+      struct timeval tv;
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
+      setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // Set timeout
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      // Read data
+      uint8_t buffer[65536];
+      ssize_t n = recv(sockfd_, buffer, sizeof(buffer), 0);
 
-    // Read data
-    uint8_t buffer[65536];
-    ssize_t n = recv(sockfd_, buffer, sizeof(buffer), 0);
+      if (n <= 0) {
+        ret = false;
+      } else {
+        // Parse WebSocket frame
+        uint8_t opcode;
+        std::string frame_payload;
+        if (!parse_websocket_frame(buffer, n, opcode, frame_payload)) {
+          std::cerr << "Failed to parse frame" << std::endl;
+          ret = false;
+        } else {
+          // Handle different frame types
+          if (opcode == 0x01) {  // TEXT frame
+            // Parse JSON
+            size_t topic_pos = frame_payload.find("\"topic\":\"");
+            if (topic_pos != std::string::npos) {
+              topic_pos += 9;
+              size_t topic_end = frame_payload.find("\"", topic_pos);
+              topic = frame_payload.substr(topic_pos, topic_end - topic_pos);
+            }
 
-    if (n <= 0) {
-      return false;
-    }
+            size_t payload_pos = frame_payload.find("\"payload\":\"");
+            if (payload_pos != std::string::npos) {
+              payload_pos += 11;
+              size_t payload_end = frame_payload.find("\"", payload_pos);
+              payload = frame_payload.substr(payload_pos, payload_end - payload_pos);
+            }
 
-    // Parse WebSocket frame
-    uint8_t opcode;
-    std::string frame_payload;
-    if (!parse_websocket_frame(buffer, n, opcode, frame_payload)) {
-      std::cerr << "Failed to parse frame" << std::endl;
-      return false;
-    }
-
-    // Handle different frame types
-    if (opcode == 0x01) {  // TEXT frame
-      // Parse JSON
-      size_t topic_pos = frame_payload.find("\"topic\":\"");
-      if (topic_pos != std::string::npos) {
-        topic_pos += 9;
-        size_t topic_end = frame_payload.find("\"", topic_pos);
-        topic = frame_payload.substr(topic_pos, topic_end - topic_pos);
+            std::cout << "Received message on topic '" << topic << "': " << payload << std::endl;
+            ret = true;
+          } else if (opcode == 0x09) {  // PING
+            // Send PONG
+            std::vector<uint8_t> pong = create_websocket_frame(0x0A, frame_payload);
+            send(sockfd_, pong.data(), pong.size(), 0);
+            ret = receive_message(topic, payload, timeout_ms);
+          } else {
+            ret = false;
+          }
+        }
       }
-
-      size_t payload_pos = frame_payload.find("\"payload\":\"");
-      if (payload_pos != std::string::npos) {
-        payload_pos += 11;
-        size_t payload_end = frame_payload.find("\"", payload_pos);
-        payload = frame_payload.substr(payload_pos, payload_end - payload_pos);
-      }
-
-      std::cout << "Received message on topic '" << topic << "': " << payload << std::endl;
-      return true;
-    } else if (opcode == 0x09) {  // PING
-      // Send PONG
-      std::vector<uint8_t> pong = create_websocket_frame(0x0A, frame_payload);
-      send(sockfd_, pong.data(), pong.size(), 0);
-      return receive_message(topic, payload, timeout_ms);
     }
-
-    return false;
+    return ret;
   }
 
   bool send_ping()

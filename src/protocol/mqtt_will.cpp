@@ -66,22 +66,19 @@ uint32_t effective_will_delay_seconds(bool persistent, uint32_t will_delay_secon
 WillConnectDecision validate_will_connect(uint8_t will_qos, bool will_retain, const std::string& topic,
                                          uint8_t qos_limit, bool retain_available)
 {
-  WillConnectDecision decision;
-  if (topic.empty() || topic.find('+') != std::string::npos || topic.find('#') != std::string::npos) {
-    decision.accept = false;
-    decision.reason = ReasonCode::ProtocolError;
-    return decision;
+  WillConnectDecision ret;
+  if (topic.empty() || topic.find('+') != std::string::npos ||
+      topic.find('#') != std::string::npos) {
+    ret.accept = false;
+    ret.reason = ReasonCode::ProtocolError;
+  } else if (will_qos > qos_limit) {
+    ret.accept = false;
+    ret.reason = ReasonCode::QoSNotSupported;
+  } else if (will_retain && !retain_available) {
+    ret.accept = false;
+    ret.reason = ReasonCode::RetainNotSupported;
   }
-  if (will_qos > qos_limit) {
-    decision.accept = false;
-    decision.reason = ReasonCode::QoSNotSupported;
-    return decision;
-  }
-  if (will_retain && !retain_available) {
-    decision.accept = false;
-    decision.reason = ReasonCode::RetainNotSupported;
-  }
-  return decision;
+  return ret;
 }
 
 WillBody will_body_from_connect(const ConnectPacket& packet)
@@ -138,132 +135,150 @@ CopiedAuth::~CopiedAuth()
 
 bool copy_auth_context(const auth::ClientAuthContext& source, CopiedAuth& out)
 {
+  bool ret = false;
   try {
     CopiedAuth copied;
     copied.allocator.reset(new MQTTAllocator("will-auth", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0));
     void* memory = copied.allocator->allocate(sizeof(auth::ClientAuthContext));
     if (!memory) {
-      return false;
+      ret = false;
+    } else {
+      auth::ClientAuthContext* context =
+          new (memory) auth::ClientAuthContext(copied.allocator.get());
+      copied.context = context;
+      context->user_info.username.assign(source.user_info.username.begin(),
+                                         source.user_info.username.end());
+      context->user_info.client_id.assign(source.user_info.client_id.begin(),
+                                          source.user_info.client_id.end());
+      context->user_info.client_ip.assign(source.user_info.client_ip.begin(),
+                                          source.user_info.client_ip.end());
+      context->user_info.client_port = source.user_info.client_port;
+      context->user_info.is_super_user = source.user_info.is_super_user;
+      context->user_info.expires_at_ms = source.user_info.expires_at_ms;
+      context->user_info.provider_name = source.user_info.provider_name;
+      context->user_info.authorization_session = source.user_info.authorization_session;
+      for (size_t i = 0; i < source.acl_rules.size(); ++i) {
+        auth::TopicAclRule rule(copied.allocator.get());
+        rule.topic_pattern.assign(source.acl_rules[i].topic_pattern.begin(),
+                                  source.acl_rules[i].topic_pattern.end());
+        rule.permission = source.acl_rules[i].permission;
+        rule.max_qos = source.acl_rules[i].max_qos;
+        context->acl_rules.push_back(std::move(rule));
+      }
+      context->acl_version = source.acl_version;
+      context->expires_at_ms = source.expires_at_ms;
+      context->is_super_user = source.is_super_user;
+      out = std::move(copied);
+      ret = out.context != nullptr;
     }
-    auth::ClientAuthContext* context = new (memory) auth::ClientAuthContext(copied.allocator.get());
-    copied.context = context;
-    context->user_info.username.assign(source.user_info.username.begin(), source.user_info.username.end());
-    context->user_info.client_id.assign(source.user_info.client_id.begin(), source.user_info.client_id.end());
-    context->user_info.client_ip.assign(source.user_info.client_ip.begin(), source.user_info.client_ip.end());
-    context->user_info.client_port = source.user_info.client_port;
-    context->user_info.is_super_user = source.user_info.is_super_user;
-    context->user_info.expires_at_ms = source.user_info.expires_at_ms;
-    context->user_info.provider_name = source.user_info.provider_name;
-    context->user_info.authorization_session = source.user_info.authorization_session;
-    for (size_t i = 0; i < source.acl_rules.size(); ++i) {
-      auth::TopicAclRule rule(copied.allocator.get());
-      rule.topic_pattern.assign(source.acl_rules[i].topic_pattern.begin(),
-                                source.acl_rules[i].topic_pattern.end());
-      rule.permission = source.acl_rules[i].permission;
-      rule.max_qos = source.acl_rules[i].max_qos;
-      context->acl_rules.push_back(std::move(rule));
-    }
-    context->acl_version = source.acl_version;
-    context->expires_at_ms = source.expires_at_ms;
-    context->is_super_user = source.is_super_user;
-    out = std::move(copied);
-    return out.context != nullptr;
   } catch (const std::exception&) {
-    return false;
+    ret = false;
   }
+  return ret;
 }
 
 WillPublishOutcome publish_will(GlobalSessionManager* sessions, auth::AuthManager* auth_manager,
                                 const auth::ClientAuthContext* auth, const std::string& forward_client_id,
                                 const WillBody& body, const std::function<bool()>& still_current)
 {
+  WillPublishOutcome ret = WillPublishOutcome::Published;
   if (!sessions || forward_client_id.empty() || body.topic.empty()) {
-    return WillPublishOutcome::Rejected;
-  }
-  if (still_current && !still_current()) {
-    return WillPublishOutcome::Cancelled;
-  }
-  runtime::current_runtime().enable_async_syscalls();
-  try {
-    MQTTAllocator scratch("will-publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
-    MQTTString topic = to_mqtt_string(body.topic, &scratch);
-    MQTTByteVector payload = to_mqtt_bytes(body.payload, &scratch);
-    if (auth_manager) {
-      if (!auth) {
-        return WillPublishOutcome::Rejected;
-      }
-      std::shared_ptr<auth::AuthorizationRequest> pending;
-      auth::AuthResult result = auth::AuthResult::ACCESS_DENIED;
-      auth_manager->check_publish(*auth, topic, payload, pending, result);
-      const std::chrono::steady_clock::time_point deadline =
-          std::chrono::steady_clock::now() + std::chrono::milliseconds(kWillAuthWaitMs);
-      while (result == auth::AuthResult::PENDING && std::chrono::steady_clock::now() < deadline) {
-        if (still_current && !still_current()) {
-          return WillPublishOutcome::Cancelled;
-        }
-        runtime::current_runtime().wait(-1, 0, 1);
-        if (pending) {
-          result = pending->poll(auth->user_info, topic);
+    ret = WillPublishOutcome::Rejected;
+  } else if (still_current && !still_current()) {
+    ret = WillPublishOutcome::Cancelled;
+  } else {
+    runtime::current_runtime().enable_async_syscalls();
+    try {
+      MQTTAllocator scratch("will-publish", MQTTMemoryTag::MEM_TAG_SESSION_MANAGER, 0);
+      MQTTString topic = to_mqtt_string(body.topic, &scratch);
+      MQTTByteVector payload = to_mqtt_bytes(body.payload, &scratch);
+      if (auth_manager) {
+        if (!auth) {
+          ret = WillPublishOutcome::Rejected;
         } else {
+          std::shared_ptr<auth::AuthorizationRequest> pending;
+          auth::AuthResult result = auth::AuthResult::ACCESS_DENIED;
           auth_manager->check_publish(*auth, topic, payload, pending, result);
+          const std::chrono::steady_clock::time_point deadline =
+              std::chrono::steady_clock::now() + std::chrono::milliseconds(kWillAuthWaitMs);
+          while (result == auth::AuthResult::PENDING &&
+                 std::chrono::steady_clock::now() < deadline) {
+            if (still_current && !still_current()) {
+              ret = WillPublishOutcome::Cancelled;
+              break;
+            }
+            runtime::current_runtime().wait(-1, 0, 1);
+            if (pending) {
+              result = pending->poll(auth->user_info, topic);
+            } else {
+              auth_manager->check_publish(*auth, topic, payload, pending, result);
+            }
+          }
+          if (ret == WillPublishOutcome::Published) {
+            if (still_current && !still_current()) {
+              ret = WillPublishOutcome::Cancelled;
+            } else if (result != auth::AuthResult::SUCCESS) {
+              LOG_INFO("Discarding will for {} on topic {}: authorization {}",
+                       forward_client_id, body.topic, static_cast<int>(result));
+              ret = WillPublishOutcome::Rejected;
+            }
+          }
         }
       }
-      if (still_current && !still_current()) {
-        return WillPublishOutcome::Cancelled;
-      }
-      if (result != auth::AuthResult::SUCCESS) {
-        LOG_INFO("Discarding will for {} on topic {}: authorization {}", forward_client_id, body.topic,
-                 static_cast<int>(result));
-        return WillPublishOutcome::Rejected;
-      }
-    }
 
-    PublishPacket packet(&scratch);
-    packet.type = PacketType::PUBLISH;
-    packet.dup = false;
-    packet.qos = body.qos;
-    packet.retain = body.retain;
-    packet.packet_id = 0;
-    packet.topic_name = topic;
-    packet.payload = payload;
-    if (body.payload_format != 0) {
-      packet.properties.payload_format_indicator = body.payload_format;
-    }
-    if (body.has_message_expiry) {
-      packet.properties.has_message_expiry_interval = true;
-      packet.properties.message_expiry_interval = body.message_expiry;
-    }
-    if (!body.content_type.empty()) {
-      assign_string(packet.properties.content_type, body.content_type);
-    }
-    if (!body.response_topic.empty()) {
-      assign_string(packet.properties.response_topic, body.response_topic);
-    }
-    if (!body.correlation_data.empty()) {
-      packet.properties.correlation_data.assign(body.correlation_data.begin(), body.correlation_data.end());
-    }
-    for (size_t i = 0; i < body.user_properties.size(); ++i) {
-      packet.properties.user_properties.emplace_back(
-          to_mqtt_string(body.user_properties[i].first, &scratch),
-          to_mqtt_string(body.user_properties[i].second, &scratch));
-    }
-    packet.properties.will_delay_interval = 0;
-    packet.properties.topic_alias = 0;
-    packet.properties.has_topic_alias = false;
+      if (ret == WillPublishOutcome::Published) {
+        PublishPacket packet(&scratch);
+        packet.type = PacketType::PUBLISH;
+        packet.dup = false;
+        packet.qos = body.qos;
+        packet.retain = body.retain;
+        packet.packet_id = 0;
+        packet.topic_name = topic;
+        packet.payload = payload;
+        if (body.payload_format != 0) {
+          packet.properties.payload_format_indicator = body.payload_format;
+        }
+        if (body.has_message_expiry) {
+          packet.properties.has_message_expiry_interval = true;
+          packet.properties.message_expiry_interval = body.message_expiry;
+        }
+        if (!body.content_type.empty()) {
+          assign_string(packet.properties.content_type, body.content_type);
+        }
+        if (!body.response_topic.empty()) {
+          assign_string(packet.properties.response_topic, body.response_topic);
+        }
+        if (!body.correlation_data.empty()) {
+          packet.properties.correlation_data.assign(body.correlation_data.begin(),
+                                                    body.correlation_data.end());
+        }
+        for (size_t i = 0; i < body.user_properties.size(); ++i) {
+          packet.properties.user_properties.emplace_back(
+              to_mqtt_string(body.user_properties[i].first, &scratch),
+              to_mqtt_string(body.user_properties[i].second, &scratch));
+        }
+        packet.properties.will_delay_interval = 0;
+        packet.properties.topic_alias = 0;
+        packet.properties.has_topic_alias = false;
 
-    MQTTString sender = to_mqtt_string(forward_client_id, &scratch);
-    const int forwarded = sessions->forward_publish_via_router(topic, packet, sender);
-    if (forwarded < 0) {
-      LOG_WARN("Will publish for {} on topic {} failed: {}", forward_client_id, body.topic, forwarded);
-      return WillPublishOutcome::Rejected;
+        MQTTString sender = to_mqtt_string(forward_client_id, &scratch);
+        const int forwarded = sessions->forward_publish_via_router(topic, packet, sender);
+        if (forwarded < 0) {
+          LOG_WARN("Will publish for {} on topic {} failed: {}", forward_client_id, body.topic,
+                   forwarded);
+          ret = WillPublishOutcome::Rejected;
+        } else {
+          LOG_INFO("Published will for {} on topic {} to {} recipients", forward_client_id,
+                   body.topic, forwarded);
+          ret = WillPublishOutcome::Published;
+        }
+      }
+    } catch (const std::exception& error) {
+      LOG_WARN("Will publish for {} failed: {}", forward_client_id, error.what());
+      ret = WillPublishOutcome::Rejected;
     }
-    LOG_INFO("Published will for {} on topic {} to {} recipients", forward_client_id, body.topic,
-             forwarded);
-    return WillPublishOutcome::Published;
-  } catch (const std::exception& error) {
-    LOG_WARN("Will publish for {} failed: {}", forward_client_id, error.what());
-    return WillPublishOutcome::Rejected;
   }
+  return ret;
 }
 
 void WillScheduler::schedule(std::unique_ptr<Entry> entry)

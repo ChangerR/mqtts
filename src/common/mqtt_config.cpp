@@ -8,12 +8,14 @@ namespace {
 
 bool key_in(const std::vector<const char*>& keys, const std::string& key)
 {
+  bool ret = false;
   for (const char* item : keys) {
     if (key == item) {
-      return true;
+      ret = true;
+      break;
     }
   }
-  return false;
+  return ret;
 }
 
 const std::vector<const char*> kServerKeys = {"bind_address", "port", "max_connections", "backlog",
@@ -211,6 +213,7 @@ void ConfigManager::audit_config(const YAML::Node& root)
 
 int ConfigManager::load_from_file(const std::string& config_file)
 {
+  int ret = 0;
   warnings_.clear();
   last_error_.clear();
   try {
@@ -294,25 +297,25 @@ int ConfigManager::load_from_file(const std::string& config_file)
     }
     if (!last_error_.empty()) {
       LOG_ERROR("配置验证失败");
-      return -1;
+      ret = -1;
+    } else {
+      // 验证配置
+      ret = validate();
+      if (ret != 0) {
+        LOG_ERROR("配置验证失败");
+      } else {
+        LOG_INFO("配置文件加载成功: {}", config_file);
+      }
     }
-    // 验证配置
-    int ret = validate();
-    if (ret != 0) {
-      LOG_ERROR("配置验证失败");
-      return ret;
-    }
-
-    LOG_INFO("配置文件加载成功: {}", config_file);
-    return 0;
 
   } catch (const YAML::Exception& e) {
     LOG_ERROR("YAML解析错误: {}", e.what());
-    return -1;
+    ret = -1;
   } catch (const std::exception& e) {
     LOG_ERROR("配置文件加载失败: {}", e.what());
-    return -1;
+    ret = -1;
   }
+  return ret;
 }
 
 int ConfigManager::validate()

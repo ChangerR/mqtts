@@ -270,6 +270,7 @@ void test_performance_comparison(TestFramework& test)
 
 int main()
 {
+  int ret = 0;
   std::cout << "MQTT会话管理器优化测试" << std::endl;
   std::cout << "======================" << std::endl;
 
@@ -288,14 +289,15 @@ int main()
 
     if (test.all_passed()) {
       std::cout << "\n所有测试通过！MQTT会话管理器优化实现正确。" << std::endl;
-      return 0;
+      ret = 0;
     } else {
       std::cout << "\n部分测试失败，请检查实现。" << std::endl;
-      return 1;
+      ret = 1;
     }
 
   } catch (const std::exception& e) {
     std::cerr << "测试过程中发生异常: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

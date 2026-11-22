@@ -21,6 +21,8 @@ class MQTTv5ClientTest : public ::testing::Test
  protected:
   static void SetUpTestSuite() 
   {
+    bool ret = false;
+
     // Test configuration
     test_server_host = "127.0.0.1";
     test_server_port = 1884;
@@ -51,13 +53,16 @@ class MQTTv5ClientTest : public ::testing::Test
           std::this_thread::sleep_for(std::chrono::milliseconds(100));
           if (is_port_in_use(test_server_port)) {
             std::cout << "MQTT server is ready for testing" << std::endl;
-            return;
+            ret = true;
+            break;
           }
         }
-        
-        std::cerr << "Failed to start MQTT server within timeout" << std::endl;
-        kill(server_pid, SIGTERM);
-        server_pid = -1;
+
+        if (!ret) {
+          std::cerr << "Failed to start MQTT server within timeout" << std::endl;
+          kill(server_pid, SIGTERM);
+          server_pid = -1;
+        }
       } else {
         std::cerr << "Failed to fork process for MQTT server" << std::endl;
         server_pid = -1;
@@ -145,15 +150,17 @@ class MQTTv5ClientTest : public ::testing::Test
   // Helper function to send data
   bool send_data(int sockfd, const std::vector<uint8_t>& data)
   {
+    bool ret = true;
     size_t total_sent = 0;
     while (total_sent < data.size()) {
       ssize_t sent = send(sockfd, data.data() + total_sent, data.size() - total_sent, 0);
       if (sent <= 0) {
-        return false;
+        ret = false;
+        break;
       }
       total_sent += sent;
     }
-    return true;
+    return ret;
   }
 
   // Helper function to receive data with timeout
@@ -420,53 +427,70 @@ class MQTTv5ClientTest : public ::testing::Test
                             std::vector<uint8_t>& payload, uint8_t& qos, bool& retain, bool& dup,
                             uint16_t& packet_id)
   {
-    if (data.size() < 3)
-      return false;
+    bool ret = false;
+    if (data.size() < 3) {
+      ret = false;
+    } else {
+      // Check packet type
+      if ((data[0] & 0xF0) != 0x30) {
+        ret = false;
+      } else {
+        // Parse flags
+        dup = (data[0] & 0x08) != 0;
+        qos = (data[0] & 0x06) >> 1;
+        retain = (data[0] & 0x01) != 0;
 
-    // Check packet type
-    if ((data[0] & 0xF0) != 0x30)
-      return false;
+        // Parse remaining length
+        size_t remaining_length = data[1];  // Simplified for single byte
+        size_t pos = 2;
 
-    // Parse flags
-    dup = (data[0] & 0x08) != 0;
-    qos = (data[0] & 0x06) >> 1;
-    retain = (data[0] & 0x01) != 0;
+        // Parse topic name
+        if (pos + 2 > data.size()) {
+          ret = false;
+        } else {
+          uint16_t topic_len = (data[pos] << 8) | data[pos + 1];
+          pos += 2;
 
-    // Parse remaining length
-    size_t remaining_length = data[1];  // Simplified for single byte
-    size_t pos = 2;
+          if (pos + topic_len > data.size()) {
+            ret = false;
+          } else {
+            topic = std::string(data.begin() + pos, data.begin() + pos + topic_len);
+            pos += topic_len;
 
-    // Parse topic name
-    if (pos + 2 > data.size())
-      return false;
-    uint16_t topic_len = (data[pos] << 8) | data[pos + 1];
-    pos += 2;
+            // Parse packet ID (for QoS > 0)
+            if (qos > 0) {
+              if (pos + 2 > data.size()) {
+                ret = false;
+              } else {
+                packet_id = (data[pos] << 8) | data[pos + 1];
+                pos += 2;
+                ret = true;
+              }
+            } else {
+              ret = true;
+            }
 
-    if (pos + topic_len > data.size())
-      return false;
-    topic = std::string(data.begin() + pos, data.begin() + pos + topic_len);
-    pos += topic_len;
+            if (ret) {
+              // Skip properties (assuming 0 for now)
+              if (pos >= data.size()) {
+                ret = false;
+              } else {
+                uint8_t properties_len = data[pos];
+                pos += 1 + properties_len;
 
-    // Parse packet ID (for QoS > 0)
-    if (qos > 0) {
-      if (pos + 2 > data.size())
-        return false;
-      packet_id = (data[pos] << 8) | data[pos + 1];
-      pos += 2;
+                // Parse payload
+                if (pos < data.size()) {
+                  payload = std::vector<uint8_t>(data.begin() + pos, data.end());
+                }
+
+                ret = true;
+              }
+            }
+          }
+        }
+      }
     }
-
-    // Skip properties (assuming 0 for now)
-    if (pos >= data.size())
-      return false;
-    uint8_t properties_len = data[pos];
-    pos += 1 + properties_len;
-
-    // Parse payload
-    if (pos < data.size()) {
-      payload = std::vector<uint8_t>(data.begin() + pos, data.end());
-    }
-
-    return true;
+    return ret;
   }
 
  protected:

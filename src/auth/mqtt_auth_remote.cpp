@@ -153,27 +153,38 @@ struct Job
 
   Decision validate(Decision value) const
   {
-    if (current && !current())
-      return Decision();
-    if (value.expires_at && value.expires_at <= wall_ms())
-      return denied();
-    return value;
+    Decision ret;
+    if (current && !current()) {
+      ret = Decision();
+    } else if (value.expires_at && value.expires_at <= wall_ms()) {
+      ret = denied();
+    } else {
+      ret = value;
+    }
+    return ret;
   }
 
   Decision poll()
   {
-    if (current && !current())
-      return Decision();
-    std::lock_guard<std::mutex> lock(mutex);
-    if (finished) {
-      if (decision.expires_at && decision.expires_at <= wall_ms())
-        return denied();
-      return decision;
+    Decision ret;
+    if (current && !current()) {
+      ret = Decision();
+    } else {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (finished) {
+        if (decision.expires_at && decision.expires_at <= wall_ms()) {
+          ret = denied();
+        } else {
+          ret = decision;
+        }
+      } else {
+        Decision value;
+        if (monotonic_ms() < deadline)
+          value.result = AuthResult::PENDING;
+        ret = value;
+      }
     }
-    Decision value;
-    if (monotonic_ms() < deadline)
-      value.result = AuthResult::PENDING;
-    return value;
+    return ret;
   }
 
   void finish(Decision value)
@@ -196,28 +207,42 @@ struct Job
   }
   Decision wait()
   {
+    Decision ret;
     const auto signal = std::make_shared<Signal>();
+    bool waiting = false;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (finished)
-        return validate(decision);
-      if (signal->fd < 0 || waiters.size() >= 64)
-        return Decision();
-      waiters.push_back(signal);
+      if (finished) {
+        ret = validate(decision);
+      } else if (signal->fd < 0 || waiters.size() >= 64) {
+        ret = Decision();
+      } else {
+        waiters.push_back(signal);
+        waiting = true;
+      }
     }
-    for (;;) {
-      const auto now = monotonic_ms();
-      if (now >= deadline)
-        break;
-      // Each waiter owns a descriptor: libco and multiple threads can safely
-      // wait for the same single-flight request without sharing poll state.
-      runtime::current_runtime().wait_readable(signal->fd, static_cast<int>(deadline - now));
-      std::lock_guard<std::mutex> lock(mutex);
-      if (finished)
-        return validate(decision);
+    if (waiting) {
+      bool done = false;
+      for (;;) {
+        const auto now = monotonic_ms();
+        if (now >= deadline)
+          break;
+        // Each waiter owns a descriptor: libco and multiple threads can safely
+        // wait for the same single-flight request without sharing poll state.
+        runtime::current_runtime().wait_readable(signal->fd, static_cast<int>(deadline - now));
+        std::lock_guard<std::mutex> lock(mutex);
+        if (finished) {
+          ret = validate(decision);
+          done = true;
+          break;
+        }
+      }
+      if (!done) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ret = finished ? validate(decision) : Decision();
+      }
     }
-    std::lock_guard<std::mutex> lock(mutex);
-    return finished ? validate(decision) : Decision();
+    return ret;
   }
 };
 
@@ -236,11 +261,15 @@ struct PendingPublish : AuthorizationRequest
   }
   AuthResult poll(const UserInfo& user, const MQTTString& destination) override
   {
+    AuthResult ret = AuthResult::ACCESS_DENIED;
     if (session != user.authorization_session || username != from_mqtt_string(user.username) ||
         client_id != from_mqtt_string(user.client_id) || topic != from_mqtt_string(destination) ||
-        (user.expires_at_ms && user.expires_at_ms <= wall_ms()))
-      return AuthResult::ACCESS_DENIED;
-    return job->poll().result;
+        (user.expires_at_ms && user.expires_at_ms <= wall_ms())) {
+      ret = AuthResult::ACCESS_DENIED;
+    } else {
+      ret = job->poll().result;
+    }
+    return ret;
   }
 };
 
@@ -259,11 +288,15 @@ struct PendingDelivery : AuthorizationRequest
   }
   AuthResult poll(const UserInfo& user, const MQTTString& destination) override
   {
+    AuthResult ret = AuthResult::ACCESS_DENIED;
     if (session != user.authorization_session || username != from_mqtt_string(user.username) ||
         client_id != from_mqtt_string(user.client_id) || topic != from_mqtt_string(destination) ||
-        (user.expires_at_ms && user.expires_at_ms <= wall_ms()))
-      return AuthResult::ACCESS_DENIED;
-    return job->poll().result;
+        (user.expires_at_ms && user.expires_at_ms <= wall_ms())) {
+      ret = AuthResult::ACCESS_DENIED;
+    } else {
+      ret = job->poll().result;
+    }
+    return ret;
   }
 };
 }  // namespace
@@ -347,23 +380,25 @@ struct RemoteAuthProvider::Impl
 
   bool number(const char* name, uint64_t fallback, uint64_t low, uint64_t high, uint64_t& out)
   {
+    bool ret = true;
     out = fallback;
     auto it = settings.find(name);
-    if (it == settings.end())
-      return true;
-    size_t used = 0;
-    unsigned long long value = 0;
-    try {
-      value = std::stoull(it->second, &used);
-    } catch (const std::invalid_argument&) {
-      return false;
-    } catch (const std::out_of_range&) {
-      return false;
+    if (it != settings.end()) {
+      size_t used = 0;
+      unsigned long long value = 0;
+      try {
+        value = std::stoull(it->second, &used);
+      } catch (const std::invalid_argument&) {
+        ret = false;
+      } catch (const std::out_of_range&) {
+        ret = false;
+      }
+      if (ret && (used != it->second.size() || value < low || value > high))
+        ret = false;
+      if (ret)
+        out = value;
     }
-    if (used != it->second.size() || value < low || value > high)
-      return false;
-    out = value;
-    return true;
+    return ret;
   }
   bool circuit_admit()
   {
@@ -394,119 +429,139 @@ struct RemoteAuthProvider::Impl
   Json http(CURL* curl, const std::string& url, const std::string& body, uint64_t deadline,
             bool version_check = false)
   {
-    if (!curl || stopping || deadline <= monotonic_ms())
-      return Json();
-    // Version polling has a reserved worker. Its failures do not prevent a
-    // healthy authorization endpoint from validating new identities.
-    if (!version_check && !circuit_admit()) {
-      ++stats.rejected;
-      return Json();
+    Json ret;
+    if (!curl || stopping || deadline <= monotonic_ms()) {
+      ret = Json();
+    } else {
+      // Version polling has a reserved worker. Its failures do not prevent a
+      // healthy authorization endpoint from validating new identities.
+      if (!version_check && !circuit_admit()) {
+        ++stats.rejected;
+        ret = Json();
+      } else {
+        ++stats.requests;
+        const auto now = monotonic_ms();
+        const auto remaining = deadline > now ? deadline - now : 1;
+        std::string response;
+        curl_easy_reset(curl);  // Retains libcurl's connection/DNS/TLS-session caches.
+        curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        headers = curl_slist_append(headers, ("X-Broker-Token: " + token).c_str());
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(remaining));
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        if (settings.count("ca_file") && !settings.at("ca_file").empty())
+          curl_easy_setopt(curl, CURLOPT_CAINFO, settings.at("ca_file").c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, read_response);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        const auto result = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        curl_slist_free_all(headers);
+        Json data;
+        if (result == CURLE_OK && status == 200)
+          data = Json::parse(response, nullptr, false);
+        bool healthy = data.is_object();
+        if (healthy && !version_check) {
+          auto value = data.find("result");
+          healthy = value != data.end() && value->is_string() &&
+                    (*value == "allow" || *value == "deny");
+        }
+        if (!version_check)
+          circuit_result(healthy);
+        if (!healthy) {
+          ++stats.failures;
+          ret = Json();
+        } else {
+          ret = data;
+        }
+      }
     }
-    ++stats.requests;
-    const auto now = monotonic_ms();
-    const auto remaining = deadline > now ? deadline - now : 1;
-    std::string response;
-    curl_easy_reset(curl);  // Retains libcurl's connection/DNS/TLS-session caches.
-    curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, ("X-Broker-Token: " + token).c_str());
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(remaining));
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    if (settings.count("ca_file") && !settings.at("ca_file").empty())
-      curl_easy_setopt(curl, CURLOPT_CAINFO, settings.at("ca_file").c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, read_response);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    const auto result = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_slist_free_all(headers);
-    Json data;
-    if (result == CURLE_OK && status == 200)
-      data = Json::parse(response, nullptr, false);
-    bool healthy = data.is_object();
-    if (healthy && !version_check) {
-      auto value = data.find("result");
-      healthy =
-          value != data.end() && value->is_string() && (*value == "allow" || *value == "deny");
-    }
-    if (!version_check)
-      circuit_result(healthy);
-    if (!healthy) {
-      ++stats.failures;
-      return Json();
-    }
-    return data;
+    return ret;
   }
   Decision parse(const Json& data)
   {
-    Decision result;
-    if (!data.is_object())
-      return result;
-    try {
-      result.authoritative = true;
-      result.result =
-          data.at("result") == "allow" ? AuthResult::SUCCESS : AuthResult::ACCESS_DENIED;
-      if (data.contains("expire_at")) {
-        if (!data["expire_at"].is_number_integer())
-          return Decision();
-        const auto value = data["expire_at"].get<int64_t>();
-        if (value <= 0 ||
-            static_cast<uint64_t>(value) > std::numeric_limits<uint64_t>::max() / 1000)
-          return Decision();
-        result.expires_at = static_cast<uint64_t>(value) * 1000;
-        if (result.expires_at <= wall_ms())
-          result.result = AuthResult::ACCESS_DENIED;
+    Decision ret;
+    if (!data.is_object()) {
+      ret = Decision();
+    } else {
+      try {
+        ret.authoritative = true;
+        ret.result =
+            data.at("result") == "allow" ? AuthResult::SUCCESS : AuthResult::ACCESS_DENIED;
+        bool ok = true;
+        if (data.contains("expire_at")) {
+          if (!data["expire_at"].is_number_integer()) {
+            ret = Decision();
+            ok = false;
+          } else {
+            const auto value = data["expire_at"].get<int64_t>();
+            if (value <= 0 ||
+                static_cast<uint64_t>(value) > std::numeric_limits<uint64_t>::max() / 1000) {
+              ret = Decision();
+              ok = false;
+            } else {
+              ret.expires_at = static_cast<uint64_t>(value) * 1000;
+              if (ret.expires_at <= wall_ms())
+                ret.result = AuthResult::ACCESS_DENIED;
+            }
+          }
+        }
+        if (ok) {
+          // Both operator and policy service must explicitly permit decision reuse.
+          auto ttl = data.find("cache_ttl_ms");
+          if (fresh_limit && ttl != data.end() && ttl->is_number_unsigned()) {
+            ret.fresh_ms = std::min<uint64_t>(fresh_limit, ttl->get<uint64_t>());
+            ret.max_age_ms = ret.fresh_ms;
+            auto maximum = data.find("cache_max_age_ms");
+            if (maximum != data.end() && maximum->is_number_unsigned())
+              ret.max_age_ms = std::min<uint64_t>(age_limit, maximum->get<uint64_t>());
+            ret.fresh_ms = std::min(ret.fresh_ms, ret.max_age_ms);
+            if (ret.result != AuthResult::SUCCESS)
+              ret.max_age_ms = ret.fresh_ms = std::min<uint64_t>(1000, ret.fresh_ms);
+          }
+          if (data.contains("cache_revision") && data["cache_revision"].is_string()) {
+            ret.revision = data["cache_revision"].get<std::string>();
+            if (ret.revision.size() > 128)
+              ret = Decision();
+          }
+        }
+      } catch (...) {
+        ret = Decision();
       }
-      // Both operator and policy service must explicitly permit decision reuse.
-      auto ttl = data.find("cache_ttl_ms");
-      if (fresh_limit && ttl != data.end() && ttl->is_number_unsigned()) {
-        result.fresh_ms = std::min<uint64_t>(fresh_limit, ttl->get<uint64_t>());
-        result.max_age_ms = result.fresh_ms;
-        auto maximum = data.find("cache_max_age_ms");
-        if (maximum != data.end() && maximum->is_number_unsigned())
-          result.max_age_ms = std::min<uint64_t>(age_limit, maximum->get<uint64_t>());
-        result.fresh_ms = std::min(result.fresh_ms, result.max_age_ms);
-        if (result.result != AuthResult::SUCCESS)
-          result.max_age_ms = result.fresh_ms = std::min<uint64_t>(1000, result.fresh_ms);
-      }
-      if (data.contains("cache_revision") && data["cache_revision"].is_string()) {
-        result.revision = data["cache_revision"].get<std::string>();
-        if (result.revision.size() > 128)
-          return Decision();
-      }
-      return result;
-    } catch (...) {
-      return Decision();
     }
+    return ret;
   }
   Decision parse(const pb::Decision& value)
   {
-    Decision result;
+    Decision ret;
     if ((value.outcome() != pb::ALLOW && value.outcome() != pb::DENY) ||
-        value.cache_revision().size() > 128)
-      return result;
-    result.authoritative = true;
-    result.result = value.outcome() == pb::ALLOW ? AuthResult::SUCCESS : AuthResult::ACCESS_DENIED;
-    result.expires_at = value.expires_at_ms();
-    if (result.expires_at && result.expires_at <= wall_ms())
-      result.result = AuthResult::ACCESS_DENIED;
-    result.fresh_ms = std::min<uint64_t>(fresh_limit, value.cache_ttl_ms());
-    result.max_age_ms = std::min<uint64_t>(age_limit, value.cache_max_age_ms());
-    result.fresh_ms = std::min(result.fresh_ms, result.max_age_ms);
-    if (result.result != AuthResult::SUCCESS)
-      result.max_age_ms = result.fresh_ms = std::min<uint64_t>(1000, result.fresh_ms);
-    result.revision = value.cache_revision();
-    return result;
+        value.cache_revision().size() > 128) {
+      ret = Decision();
+    } else {
+      ret.authoritative = true;
+      ret.result =
+          value.outcome() == pb::ALLOW ? AuthResult::SUCCESS : AuthResult::ACCESS_DENIED;
+      ret.expires_at = value.expires_at_ms();
+      if (ret.expires_at && ret.expires_at <= wall_ms())
+        ret.result = AuthResult::ACCESS_DENIED;
+      ret.fresh_ms = std::min<uint64_t>(fresh_limit, value.cache_ttl_ms());
+      ret.max_age_ms = std::min<uint64_t>(age_limit, value.cache_max_age_ms());
+      ret.fresh_ms = std::min(ret.fresh_ms, ret.max_age_ms);
+      if (ret.result != AuthResult::SUCCESS)
+        ret.max_age_ms = ret.fresh_ms = std::min<uint64_t>(1000, ret.fresh_ms);
+      ret.revision = value.cache_revision();
+    }
+    return ret;
   }
   void rpc_context(grpc::ClientContext& context, uint64_t deadline)
   {
@@ -732,38 +787,56 @@ struct RemoteAuthProvider::Impl
   }
   Decision await_job(const std::shared_ptr<Job>& job, std::shared_ptr<Job>* deferred)
   {
-    if (!deferred)
-      return job->wait();
-    *deferred = job;
-    return job->poll();
+    Decision ret;
+    if (!deferred) {
+      ret = job->wait();
+    } else {
+      *deferred = job;
+      ret = job->poll();
+    }
+    return ret;
   }
   Decision fetch(const std::string& url, const std::string& body,
                  std::shared_ptr<Job>* deferred = nullptr, const std::string& username = "")
   {
-    if (!initialized || body.size() > 8192 + (include_payload ? 4 * ((payload_limit + 2) / 3) : 0))
-      return Decision();
-    const auto deadline = monotonic_ms() + timeout;
-    const bool bootstrap = std::atomic_load(&revision)->empty();
-    for (int attempt = 0; attempt < 2; ++attempt) {
-      const auto job = std::make_shared<Job>();
-      job->url = url;
-      job->body = body;
-      job->deadline = deadline;
-      const auto scope = scope_for(username);
-      job->current = fence(scope, epoch->load(), scope_epochs->values[scope].load());
-      if (!enqueue(job))
-        return Decision();
-      const auto result = await_job(job, deferred);
-      // The first revision poll may fence a concurrent CONNECT at startup.
-      // Revalidate once within the original deadline, never reuse that result.
-      if (!deferred && bootstrap && !attempt && !job->current() && monotonic_ms() < deadline)
-        continue;
-      return result;
+    Decision ret;
+    if (!initialized ||
+        body.size() > 8192 + (include_payload ? 4 * ((payload_limit + 2) / 3) : 0)) {
+      ret = Decision();
+    } else {
+      const auto deadline = monotonic_ms() + timeout;
+      const bool bootstrap = std::atomic_load(&revision)->empty();
+      bool done = false;
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto job = std::make_shared<Job>();
+        job->url = url;
+        job->body = body;
+        job->deadline = deadline;
+        const auto scope = scope_for(username);
+        job->current = fence(scope, epoch->load(), scope_epochs->values[scope].load());
+        if (!enqueue(job)) {
+          ret = Decision();
+          done = true;
+          break;
+        }
+        const auto result = await_job(job, deferred);
+        // The first revision poll may fence a concurrent CONNECT at startup.
+        // Revalidate once within the original deadline, never reuse that result.
+        if (!deferred && bootstrap && !attempt && !job->current() && monotonic_ms() < deadline)
+          continue;
+        ret = result;
+        done = true;
+        break;
+      }
+      if (!done)
+        ret = Decision();
     }
-    return Decision();
+    return ret;
   }
   std::string payload_key(const MQTTByteVector& payload)
   {
+    std::string ret;
+    bool matched = false;
     if (!ignored_fields.empty()) {
       // Ignore only explicitly declared non-policy fields. Unknown fields,
       // aliases and all identity-bearing fields remain in the digest. Duplicate
@@ -790,158 +863,179 @@ struct RemoteAuthProvider::Impl
         if (!depth_limited && !ambiguous && parsed.is_object()) {
           for (const auto& field : ignored_fields)
             parsed.erase(field);
-          return digest(parsed.dump());
+          ret = digest(parsed.dump());
+          matched = true;
         }
       } catch (const Json::exception&) {
       } catch (const std::invalid_argument&) {
       }
     }
-    return digest(payload.data(), payload.size());
+    if (!matched)
+      ret = digest(payload.data(), payload.size());
+    return ret;
   }
   Decision authorize(const UserInfo& user, const std::string& topic, const char* action,
                      const MQTTByteVector* payload, std::shared_ptr<Job>* deferred = nullptr)
   {
-    Decision rejected;
-    if (!initialized)
-      return rejected;
-    if ((user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
-        (payload && payload->size() > payload_limit))
-      return denied();
-    const auto body = [&]() {
-      if (grpc_mode) {
-        pb::AuthorizeRequest value;
-        value.set_username(from_mqtt_string(user.username));
-        value.set_client_id(from_mqtt_string(user.client_id));
-        value.set_action(std::string(action) == "publish" ? pb::PUBLISH : pb::SUBSCRIBE);
-        value.set_topic(topic);
+    Decision ret;
+    if (!initialized) {
+      ret = Decision();
+    } else if ((user.expires_at_ms && user.expires_at_ms <= wall_ms()) ||
+               (payload && payload->size() > payload_limit)) {
+      ret = denied();
+    } else {
+      const auto body = [&]() {
+        if (grpc_mode) {
+          pb::AuthorizeRequest value;
+          value.set_username(from_mqtt_string(user.username));
+          value.set_client_id(from_mqtt_string(user.client_id));
+          value.set_action(std::string(action) == "publish" ? pb::PUBLISH : pb::SUBSCRIBE);
+          value.set_topic(topic);
+          if (payload) {
+            value.set_has_payload(true);
+            value.set_payload(payload->data(), payload->size());
+          }
+          return value.SerializeAsString();
+        }
+        Json value = {{"username", from_mqtt_string(user.username)},
+                      {"clientid", from_mqtt_string(user.client_id)},
+                      {"action", action},
+                      {"topic", topic}};
         if (payload) {
-          value.set_has_payload(true);
-          value.set_payload(payload->data(), payload->size());
+          value["payload_encoding"] = "base64";
+          value["payload"] = base64(*payload);
         }
-        return value.SerializeAsString();
-      }
-      Json value = {{"username", from_mqtt_string(user.username)},
-                    {"clientid", from_mqtt_string(user.client_id)},
-                    {"action", action},
-                    {"topic", topic}};
-      if (payload) {
-        value["payload_encoding"] = "base64";
-        value["payload"] = base64(*payload);
-      }
-      return value.dump();
-    };
-    const auto username = from_mqtt_string(user.username);
-    if (!fresh_limit)
-      return fetch(settings.at("authorization_url"), body(), deferred, username);
-    std::string key = Json::array({user.authorization_session, from_mqtt_string(user.username),
-                                   from_mqtt_string(user.client_id), action, topic})
-                          .dump();
-    if (payload)
-      key += payload_key(*payload);
-    key = digest(key);
-    auto& shard = shards[static_cast<unsigned char>(key[0]) % shards.size()];
-    std::shared_ptr<Job> job;
-    Decision cached;
-    bool hit = false, create = false;
-    const auto now = monotonic_ms();
-    const auto captured_epoch = epoch->load();
-    const auto scope = scope_for(username);
-    const auto captured_scope = scope_epochs->values[scope].load();
-    {
-      std::lock_guard<std::mutex> lock(shard.mutex);
-      auto found = shard.entries.find(key);
-      if (found != shard.entries.end()) {
-        if (now < found->second.expires && found->second.epoch == epoch->load() &&
-            found->second.scope_epoch == scope_epochs->values[scope].load()) {
-          hit = true;
-          cached = found->second.decision;
-          shard.lru.splice(shard.lru.begin(), shard.lru, found->second.lru);
-          ++stats.hits;
-          if (now < found->second.fresh_until)
-            return cached;
-          ++stats.stale;
-          if (now < found->second.retry_after)
-            return cached;
-        } else {
-          shard.lru.erase(found->second.lru);
-          shard.entries.erase(found);
-        }
-      }
-      if (!hit)
-        ++stats.misses;
-      auto pending = shard.pending.find(key);
-      if (pending != shard.pending.end())
-        job = pending->second;
-      else if (shard.pending.size() < queue_capacity + worker_count) {
-        job = std::make_shared<Job>();
-        job->deadline = job->started + timeout;
-        job->current = fence(scope, captured_epoch, captured_scope);
-        shard.pending.emplace(key, job);
-        create = true;
-      }
-    }
-    if (!job)
-      return hit ? cached : rejected;
-    if (create) {
-      if (hit)
-        ++stats.refreshes;
-      job->url = settings.at("authorization_url");
-      const uint64_t session_expiry = user.expires_at_ms;
-      const uint64_t started = job->started;
-      job->complete = [this, &shard, key, captured_epoch, captured_scope, scope, session_expiry,
-                       started](Decision result) {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.pending.erase(key);
-        if (captured_epoch != epoch->load() || captured_scope != scope_epochs->values[scope].load())
-          return Decision();
-        auto existing = shard.entries.find(key);
-        if (!result.authoritative) {
-          if (existing != shard.entries.end())
-            existing->second.retry_after = monotonic_ms() + cooldown;
-          return result;  // A failure never extends a previously granted lease.
-        }
-        if (existing != shard.entries.end()) {
-          shard.lru.erase(existing->second.lru);
-          shard.entries.erase(existing);
-        }
-        const auto current = std::atomic_load(&revision);
-        if (!settings.at("cache_version_url").empty() &&
-            (result.revision.empty() || (!current->empty() && result.revision != *current)))
-          return result;
-        uint64_t expires = started + result.max_age_ms;
-        const uint64_t real_now = wall_ms(), mono_now = monotonic_ms();
-        for (const auto bound : {session_expiry, result.expires_at}) {
-          if (bound)
-            expires = std::min(expires, mono_now + (bound > real_now ? bound - real_now : 0));
-        }
-        if (!result.fresh_ms || expires <= mono_now)
-          return result;
-        while (shard.entries.size() >= cache_capacity / shards.size()) {
-          shard.entries.erase(shard.lru.back());
-          shard.lru.pop_back();
-          ++stats.evictions;
-        }
-        shard.lru.push_front(key);
-        CacheEntry entry;
-        entry.decision = result;
-        entry.expires = expires;
-        entry.epoch = captured_epoch;
-        entry.scope_epoch = captured_scope;
-        entry.fresh_until = std::min(started + result.fresh_ms, expires);
-        entry.lru = shard.lru.begin();
-        shard.entries.emplace(key, std::move(entry));
-        return result;
+        return value.dump();
       };
-      try {
-        job->body = body();
-      } catch (...) {
-        job->finish(Decision());
-        return hit ? cached : rejected;
+      const auto username = from_mqtt_string(user.username);
+      if (!fresh_limit) {
+        ret = fetch(settings.at("authorization_url"), body(), deferred, username);
+      } else {
+        std::string key = Json::array({user.authorization_session, from_mqtt_string(user.username),
+                                       from_mqtt_string(user.client_id), action, topic})
+                              .dump();
+        if (payload)
+          key += payload_key(*payload);
+        key = digest(key);
+        auto& shard = shards[static_cast<unsigned char>(key[0]) % shards.size()];
+        std::shared_ptr<Job> job;
+        Decision cached;
+        bool hit = false, create = false;
+        const auto now = monotonic_ms();
+        const auto captured_epoch = epoch->load();
+        const auto scope = scope_for(username);
+        const auto captured_scope = scope_epochs->values[scope].load();
+        bool done = false;
+        {
+          std::lock_guard<std::mutex> lock(shard.mutex);
+          auto found = shard.entries.find(key);
+          if (found != shard.entries.end()) {
+            if (now < found->second.expires && found->second.epoch == epoch->load() &&
+                found->second.scope_epoch == scope_epochs->values[scope].load()) {
+              hit = true;
+              cached = found->second.decision;
+              shard.lru.splice(shard.lru.begin(), shard.lru, found->second.lru);
+              ++stats.hits;
+              if (now < found->second.fresh_until) {
+                ret = cached;
+                done = true;
+              } else {
+                ++stats.stale;
+                if (now < found->second.retry_after) {
+                  ret = cached;
+                  done = true;
+                }
+              }
+            } else {
+              shard.lru.erase(found->second.lru);
+              shard.entries.erase(found);
+            }
+          }
+          if (!done) {
+            if (!hit)
+              ++stats.misses;
+            auto pending = shard.pending.find(key);
+            if (pending != shard.pending.end())
+              job = pending->second;
+            else if (shard.pending.size() < queue_capacity + worker_count) {
+              job = std::make_shared<Job>();
+              job->deadline = job->started + timeout;
+              job->current = fence(scope, captured_epoch, captured_scope);
+              shard.pending.emplace(key, job);
+              create = true;
+            }
+          }
+        }
+        if (!done && !job)
+          ret = hit ? cached : Decision();
+        if (!done && job && create) {
+          if (hit)
+            ++stats.refreshes;
+          job->url = settings.at("authorization_url");
+          const uint64_t session_expiry = user.expires_at_ms;
+          const uint64_t started = job->started;
+          job->complete = [this, &shard, key, captured_epoch, captured_scope, scope,
+                           session_expiry, started](Decision result) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.pending.erase(key);
+            if (captured_epoch != epoch->load() ||
+                captured_scope != scope_epochs->values[scope].load())
+              return Decision();
+            auto existing = shard.entries.find(key);
+            if (!result.authoritative) {
+              if (existing != shard.entries.end())
+                existing->second.retry_after = monotonic_ms() + cooldown;
+              return result;  // A failure never extends a previously granted lease.
+            }
+            if (existing != shard.entries.end()) {
+              shard.lru.erase(existing->second.lru);
+              shard.entries.erase(existing);
+            }
+            const auto current = std::atomic_load(&revision);
+            if (!settings.at("cache_version_url").empty() &&
+                (result.revision.empty() || (!current->empty() && result.revision != *current)))
+              return result;
+            uint64_t expires = started + result.max_age_ms;
+            const uint64_t real_now = wall_ms(), mono_now = monotonic_ms();
+            for (const auto bound : {session_expiry, result.expires_at}) {
+              if (bound)
+                expires = std::min(expires, mono_now + (bound > real_now ? bound - real_now : 0));
+            }
+            if (!result.fresh_ms || expires <= mono_now)
+              return result;
+            while (shard.entries.size() >= cache_capacity / shards.size()) {
+              shard.entries.erase(shard.lru.back());
+              shard.lru.pop_back();
+              ++stats.evictions;
+            }
+            shard.lru.push_front(key);
+            CacheEntry entry;
+            entry.decision = result;
+            entry.expires = expires;
+            entry.epoch = captured_epoch;
+            entry.scope_epoch = captured_scope;
+            entry.fresh_until = std::min(started + result.fresh_ms, expires);
+            entry.lru = shard.lru.begin();
+            shard.entries.emplace(key, std::move(entry));
+            return result;
+          };
+          try {
+            job->body = body();
+          } catch (...) {
+            job->finish(Decision());
+            ret = hit ? cached : Decision();
+            done = true;
+          }
+          if (!done &&
+              (job->body.size() > 8192 + (payload ? 4 * ((payload_limit + 2) / 3) : 0) ||
+               !enqueue(job)))
+            job->finish(Decision());
+        }
+        if (!done && job)
+          ret = hit ? cached : await_job(job, deferred);
       }
-      if (job->body.size() > 8192 + (payload ? 4 * ((payload_limit + 2) / 3) : 0) || !enqueue(job))
-        job->finish(Decision());
     }
-    return hit ? cached : await_job(job, deferred);
+    return ret;
   }
 };
 
@@ -956,180 +1050,240 @@ RemoteAuthProvider::~RemoteAuthProvider()
 }
 int RemoteAuthProvider::initialize()
 {
+  int ret = MQ_SUCCESS;
   auto& p = *impl_;
-  if (p.initialized)
-    return MQ_SUCCESS;
-  p.token.clear();
-  p.ignored_fields.clear();
-  static const std::unordered_set<std::string> common = {"token_file",
-                                                         "token_env",
-                                                         "ca_file",
-                                                         "timeout_ms",
-                                                         "publish_payload",
-                                                         "max_payload_bytes",
-                                                         "cache_ttl_ms",
-                                                         "cache_max_age_ms",
-                                                         "cache_max_entries",
-                                                         "cache_version_interval_ms",
-                                                         "publish_cache_ignored_fields",
-                                                         "failure_cooldown_ms"};
-  static const std::unordered_set<std::string> http_settings = {
-      "authentication_url", "authorization_url",   "cache_version_url",
-      "http_workers",       "http_queue_capacity", "http_queue_bytes"};
-  static const std::unordered_set<std::string> rpc_settings = {
-      "endpoint",        "insecure",           "client_cert_file", "client_key_file",
-      "rpc_workers",     "rpc_queue_capacity", "rpc_queue_bytes",  "batch_max_requests",
-      "batch_max_bytes", "batch_wait_ms"};
-  for (const auto& setting : p.settings)
-    if (!common.count(setting.first) &&
-        !(p.grpc_mode ? rpc_settings : http_settings).count(setting.first))
-      return MQ_ERR_INVALID_ARGS;
-  static const CURLcode ready = curl_global_init(CURL_GLOBAL_DEFAULT);
-  if (ready != CURLE_OK)
-    return MQ_ERR_INVALID_ARGS;
-  if (p.grpc_mode) {
-    if (p.settings["endpoint"].empty() || p.settings["endpoint"].size() > 1024 ||
-        p.settings["endpoint"].find_first_of("\r\n") != std::string::npos)
-      return MQ_ERR_INVALID_ARGS;
-    p.settings["authentication_url"] = "authenticate";
-    p.settings["authorization_url"] = "authorize";
-    p.settings["cache_version_url"] = "revision";
-  } else if (!valid_url(p.settings["authentication_url"]) ||
-             !valid_url(p.settings["authorization_url"]))
-    return MQ_ERR_INVALID_ARGS;
-  try {
-    uint64_t parsed = 0;
-    if (!p.number("timeout_ms", 2000, 100, 10000, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.timeout = parsed;
-    if (!p.number("max_payload_bytes", 1048576, 1, 16777216, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.payload_limit = static_cast<size_t>(parsed);
-    if (!p.number("cache_ttl_ms", 0, 0, 300000, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.fresh_limit = parsed;
-    if (!p.number("cache_max_age_ms", 300000, 1, 300000, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.age_limit = parsed;
-    if (!p.number("cache_max_entries", 16384, 16, 1048576, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.cache_capacity = static_cast<size_t>(parsed);
-    if (!p.number(p.grpc_mode ? "rpc_workers" : "http_workers", 4, 1, 16, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.worker_count = static_cast<size_t>(parsed);
-    if (!p.number(p.grpc_mode ? "rpc_queue_capacity" : "http_queue_capacity", 64, 1, 4096, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.queue_capacity = static_cast<size_t>(parsed);
-    if (!p.number(p.grpc_mode ? "rpc_queue_bytes" : "http_queue_bytes", 16777216, 8192, 134217728,
-                  parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.queue_byte_limit = static_cast<size_t>(parsed);
-    if (!p.number("failure_cooldown_ms", 1000, 100, 30000, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.cooldown = parsed;
-    if (!p.number("cache_version_interval_ms", 250, 100, 60000, parsed))
-      return MQ_ERR_INVALID_ARGS;
-    p.version_interval = parsed;
-    if (p.fresh_limit > p.age_limit)
-      return MQ_ERR_INVALID_ARGS;
-    if (!p.grpc_mode && !p.settings["cache_version_url"].empty() &&
-        (!p.fresh_limit || !valid_url(p.settings["cache_version_url"])))
-      return MQ_ERR_INVALID_ARGS;
-    const auto mode = p.settings.find("publish_payload");
-    if (mode != p.settings.end() && mode->second != "none" &&
-        mode->second != (p.grpc_mode ? "bytes" : "base64"))
-      return MQ_ERR_INVALID_ARGS;
-    p.include_payload =
-        mode != p.settings.end() && mode->second == (p.grpc_mode ? "bytes" : "base64");
-    if (p.settings.count("publish_cache_ignored_fields")) {
-      const auto fields = Json::parse(p.settings.at("publish_cache_ignored_fields"));
-      if (!p.include_payload || !p.fresh_limit || !fields.is_array() || fields.size() > 32)
-        return MQ_ERR_INVALID_ARGS;
-      for (const auto& field : fields) {
-        if (!field.is_string() || field.get<std::string>().empty() ||
-            field.get<std::string>().size() > 128)
-          return MQ_ERR_INVALID_ARGS;
-        p.ignored_fields.push_back(field.get<std::string>());
+  if (p.initialized) {
+    ret = MQ_SUCCESS;
+  } else {
+    p.token.clear();
+    p.ignored_fields.clear();
+    static const std::unordered_set<std::string> common = {"token_file",
+                                                           "token_env",
+                                                           "ca_file",
+                                                           "timeout_ms",
+                                                           "publish_payload",
+                                                           "max_payload_bytes",
+                                                           "cache_ttl_ms",
+                                                           "cache_max_age_ms",
+                                                           "cache_max_entries",
+                                                           "cache_version_interval_ms",
+                                                           "publish_cache_ignored_fields",
+                                                           "failure_cooldown_ms"};
+    static const std::unordered_set<std::string> http_settings = {
+        "authentication_url", "authorization_url",   "cache_version_url",
+        "http_workers",       "http_queue_capacity", "http_queue_bytes"};
+    static const std::unordered_set<std::string> rpc_settings = {
+        "endpoint",        "insecure",           "client_cert_file", "client_key_file",
+        "rpc_workers",     "rpc_queue_capacity", "rpc_queue_bytes",  "batch_max_requests",
+        "batch_max_bytes", "batch_wait_ms"};
+    for (const auto& setting : p.settings) {
+      if (!common.count(setting.first) &&
+          !(p.grpc_mode ? rpc_settings : http_settings).count(setting.first)) {
+        ret = MQ_ERR_INVALID_ARGS;
+        break;
       }
     }
-    if (!p.settings["token_file"].empty()) {
-      std::ifstream file(p.settings["token_file"]);
-      std::getline(file, p.token);
-    } else if (!p.settings["token_env"].empty()) {
-      const char* value = std::getenv(p.settings["token_env"].c_str());
-      if (value)
-        p.token = value;
+    if (ret == MQ_SUCCESS) {
+      static const CURLcode ready = curl_global_init(CURL_GLOBAL_DEFAULT);
+      if (ready != CURLE_OK)
+        ret = MQ_ERR_INVALID_ARGS;
     }
-  } catch (...) {
-    return MQ_ERR_INVALID_ARGS;
-  }
-  if (!p.token.empty() && p.token.back() == '\r')
-    p.token.pop_back();
-  if (p.token.size() < 32 || p.token.size() > 4096 ||
-      p.token.find_first_of("\r\n") != std::string::npos)
-    return MQ_ERR_INVALID_ARGS;
-  if (p.grpc_mode) {
-    try {
-      uint64_t parsed = 0;
-      if (!p.number("batch_max_requests", 32, 1, 64, parsed))
-        return MQ_ERR_INVALID_ARGS;
-      p.batch_size = static_cast<size_t>(parsed);
-      if (!p.number("batch_max_bytes", 4194304, 16384, 4194304, parsed))
-        return MQ_ERR_INVALID_ARGS;
-      p.batch_bytes = static_cast<size_t>(parsed);
-      if (!p.number("batch_wait_ms", 1, 0, 10, parsed))
-        return MQ_ERR_INVALID_ARGS;
-      p.batch_wait = parsed;
-      if (p.payload_limit > 1048576 || p.payload_limit + 8192 > p.batch_bytes)
-        return MQ_ERR_INVALID_ARGS;
-      const auto file_contents = [](const std::string& path, std::string& out) {
-        std::ifstream file(path, std::ios::binary);
-        if (!file)
-          return false;
-        out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-        return true;
-      };
-      std::shared_ptr<grpc::ChannelCredentials> credentials;
-      if (p.settings["insecure"] == "true") {
-        if (!p.settings["ca_file"].empty() || !p.settings["client_cert_file"].empty() ||
-            !p.settings["client_key_file"].empty())
-          return MQ_ERR_INVALID_ARGS;
-        credentials = grpc::InsecureChannelCredentials();
-      } else {
-        if (!p.settings["insecure"].empty() && p.settings["insecure"] != "false")
-          return MQ_ERR_INVALID_ARGS;
-        grpc::SslCredentialsOptions tls;
-        if (!p.settings["ca_file"].empty() &&
-            !file_contents(p.settings["ca_file"], tls.pem_root_certs))
-          return MQ_ERR_INVALID_ARGS;
-        if (!p.settings["client_cert_file"].empty() || !p.settings["client_key_file"].empty()) {
-          if (!file_contents(p.settings["client_cert_file"], tls.pem_cert_chain) ||
-              !file_contents(p.settings["client_key_file"], tls.pem_private_key))
-            return MQ_ERR_INVALID_ARGS;
+    if (ret == MQ_SUCCESS) {
+      if (p.grpc_mode) {
+        if (p.settings["endpoint"].empty() || p.settings["endpoint"].size() > 1024 ||
+            p.settings["endpoint"].find_first_of("\r\n") != std::string::npos) {
+          ret = MQ_ERR_INVALID_ARGS;
+        } else {
+          p.settings["authentication_url"] = "authenticate";
+          p.settings["authorization_url"] = "authorize";
+          p.settings["cache_version_url"] = "revision";
         }
-        credentials = grpc::SslCredentials(tls);
+      } else if (!valid_url(p.settings["authentication_url"]) ||
+                 !valid_url(p.settings["authorization_url"])) {
+        ret = MQ_ERR_INVALID_ARGS;
       }
-      grpc::ChannelArguments args;
-      args.SetMaxReceiveMessageSize(4194304);
-      args.SetMaxSendMessageSize(4194304);
-      p.stub = pb::Authorization::NewStub(
-          grpc::CreateCustomChannel(p.settings["endpoint"], credentials, args));
-    } catch (...) {
-      return MQ_ERR_INVALID_ARGS;
+    }
+    if (ret == MQ_SUCCESS) {
+      try {
+        uint64_t parsed = 0;
+        if (!p.number("timeout_ms", 2000, 100, 10000, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        else
+          p.timeout = parsed;
+        if (ret == MQ_SUCCESS && !p.number("max_payload_bytes", 1048576, 1, 16777216, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.payload_limit = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS && !p.number("cache_ttl_ms", 0, 0, 300000, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.fresh_limit = parsed;
+        if (ret == MQ_SUCCESS && !p.number("cache_max_age_ms", 300000, 1, 300000, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.age_limit = parsed;
+        if (ret == MQ_SUCCESS && !p.number("cache_max_entries", 16384, 16, 1048576, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.cache_capacity = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS &&
+            !p.number(p.grpc_mode ? "rpc_workers" : "http_workers", 4, 1, 16, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.worker_count = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS &&
+            !p.number(p.grpc_mode ? "rpc_queue_capacity" : "http_queue_capacity", 64, 1, 4096,
+                      parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.queue_capacity = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS &&
+            !p.number(p.grpc_mode ? "rpc_queue_bytes" : "http_queue_bytes", 16777216, 8192,
+                      134217728, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.queue_byte_limit = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS && !p.number("failure_cooldown_ms", 1000, 100, 30000, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.cooldown = parsed;
+        if (ret == MQ_SUCCESS && !p.number("cache_version_interval_ms", 250, 100, 60000, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.version_interval = parsed;
+        if (ret == MQ_SUCCESS && p.fresh_limit > p.age_limit)
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS && !p.grpc_mode && !p.settings["cache_version_url"].empty() &&
+            (!p.fresh_limit || !valid_url(p.settings["cache_version_url"])))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS) {
+          const auto mode = p.settings.find("publish_payload");
+          if (mode != p.settings.end() && mode->second != "none" &&
+              mode->second != (p.grpc_mode ? "bytes" : "base64")) {
+            ret = MQ_ERR_INVALID_ARGS;
+          } else {
+            p.include_payload =
+                mode != p.settings.end() && mode->second == (p.grpc_mode ? "bytes" : "base64");
+            if (p.settings.count("publish_cache_ignored_fields")) {
+              const auto fields = Json::parse(p.settings.at("publish_cache_ignored_fields"));
+              if (!p.include_payload || !p.fresh_limit || !fields.is_array() ||
+                  fields.size() > 32) {
+                ret = MQ_ERR_INVALID_ARGS;
+              } else {
+                for (const auto& field : fields) {
+                  if (!field.is_string() || field.get<std::string>().empty() ||
+                      field.get<std::string>().size() > 128) {
+                    ret = MQ_ERR_INVALID_ARGS;
+                    break;
+                  }
+                  p.ignored_fields.push_back(field.get<std::string>());
+                }
+              }
+            }
+            if (ret == MQ_SUCCESS) {
+              if (!p.settings["token_file"].empty()) {
+                std::ifstream file(p.settings["token_file"]);
+                std::getline(file, p.token);
+              } else if (!p.settings["token_env"].empty()) {
+                const char* value = std::getenv(p.settings["token_env"].c_str());
+                if (value)
+                  p.token = value;
+              }
+            }
+          }
+        }
+      } catch (...) {
+        ret = MQ_ERR_INVALID_ARGS;
+      }
+    }
+    if (ret == MQ_SUCCESS) {
+      if (!p.token.empty() && p.token.back() == '\r')
+        p.token.pop_back();
+      if (p.token.size() < 32 || p.token.size() > 4096 ||
+          p.token.find_first_of("\r\n") != std::string::npos)
+        ret = MQ_ERR_INVALID_ARGS;
+    }
+    if (ret == MQ_SUCCESS && p.grpc_mode) {
+      try {
+        uint64_t parsed = 0;
+        if (!p.number("batch_max_requests", 32, 1, 64, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        else
+          p.batch_size = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS && !p.number("batch_max_bytes", 4194304, 16384, 4194304, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.batch_bytes = static_cast<size_t>(parsed);
+        if (ret == MQ_SUCCESS && !p.number("batch_wait_ms", 1, 0, 10, parsed))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS)
+          p.batch_wait = parsed;
+        if (ret == MQ_SUCCESS &&
+            (p.payload_limit > 1048576 || p.payload_limit + 8192 > p.batch_bytes))
+          ret = MQ_ERR_INVALID_ARGS;
+        if (ret == MQ_SUCCESS) {
+          const auto file_contents = [](const std::string& path, std::string& out) {
+            std::ifstream file(path, std::ios::binary);
+            if (!file)
+              return false;
+            out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            return true;
+          };
+          std::shared_ptr<grpc::ChannelCredentials> credentials;
+          if (p.settings["insecure"] == "true") {
+            if (!p.settings["ca_file"].empty() || !p.settings["client_cert_file"].empty() ||
+                !p.settings["client_key_file"].empty()) {
+              ret = MQ_ERR_INVALID_ARGS;
+            } else {
+              credentials = grpc::InsecureChannelCredentials();
+            }
+          } else {
+            if (!p.settings["insecure"].empty() && p.settings["insecure"] != "false") {
+              ret = MQ_ERR_INVALID_ARGS;
+            } else {
+              grpc::SslCredentialsOptions tls;
+              if (!p.settings["ca_file"].empty() &&
+                  !file_contents(p.settings["ca_file"], tls.pem_root_certs)) {
+                ret = MQ_ERR_INVALID_ARGS;
+              }
+              if (ret == MQ_SUCCESS && (!p.settings["client_cert_file"].empty() ||
+                                        !p.settings["client_key_file"].empty())) {
+                if (!file_contents(p.settings["client_cert_file"], tls.pem_cert_chain) ||
+                    !file_contents(p.settings["client_key_file"], tls.pem_private_key))
+                  ret = MQ_ERR_INVALID_ARGS;
+              }
+              if (ret == MQ_SUCCESS)
+                credentials = grpc::SslCredentials(tls);
+            }
+          }
+          if (ret == MQ_SUCCESS) {
+            grpc::ChannelArguments args;
+            args.SetMaxReceiveMessageSize(4194304);
+            args.SetMaxSendMessageSize(4194304);
+            p.stub = pb::Authorization::NewStub(
+                grpc::CreateCustomChannel(p.settings["endpoint"], credentials, args));
+          }
+        }
+      } catch (...) {
+        ret = MQ_ERR_INVALID_ARGS;
+      }
+    }
+    if (ret == MQ_SUCCESS) {
+      p.stopping = false;
+      try {
+        for (size_t i = 0; i < p.worker_count; ++i)
+          p.workers.emplace_back([&p] { p.worker(); });
+        if (!p.settings["cache_version_url"].empty())
+          p.version_worker = std::thread([&p] { p.watch_version(); });
+      } catch (...) {
+        cleanup();
+        ret = MQ_ERR_INVALID_ARGS;
+      }
+      if (ret == MQ_SUCCESS)
+        p.initialized = true;
     }
   }
-  p.stopping = false;
-  try {
-    for (size_t i = 0; i < p.worker_count; ++i)
-      p.workers.emplace_back([&p] { p.worker(); });
-    if (!p.settings["cache_version_url"].empty())
-      p.version_worker = std::thread([&p] { p.watch_version(); });
-  } catch (...) {
-    cleanup();
-    return MQ_ERR_INVALID_ARGS;
-  }
-  p.initialized = true;
-  return MQ_SUCCESS;
+  return ret;
 }
 void RemoteAuthProvider::cleanup()
 {
@@ -1205,19 +1359,23 @@ AuthResult RemoteAuthProvider::authenticate_user(const MQTTString& username,
 AuthResult RemoteAuthProvider::check_topic_access(const UserInfo& user, const MQTTString& topic,
                                                   Permission permission)
 {
-  if (permission != Permission::READ && permission != Permission::WRITE)
-    return AuthResult::ACCESS_DENIED;
-  auto& p = *impl_;
-  ++p.stats.checks;
-  Decision result;
-  try {
-    result = p.authorize(user, from_mqtt_string(topic),
-                         permission == Permission::READ ? "subscribe" : "publish", nullptr);
-  } catch (...) {
+  AuthResult ret = AuthResult::ACCESS_DENIED;
+  if (permission != Permission::READ && permission != Permission::WRITE) {
+    ret = AuthResult::ACCESS_DENIED;
+  } else {
+    auto& p = *impl_;
+    ++p.stats.checks;
+    Decision result;
+    try {
+      result = p.authorize(user, from_mqtt_string(topic),
+                           permission == Permission::READ ? "subscribe" : "publish", nullptr);
+    } catch (...) {
+    }
+    if (result.result == AuthResult::SUCCESS)
+      ++p.stats.allowed;
+    ret = result.result;
   }
-  if (result.result == AuthResult::SUCCESS)
-    ++p.stats.allowed;
-  return result.result;
+  return ret;
 }
 AuthResult RemoteAuthProvider::check_publish(const UserInfo& user, const MQTTString& topic,
                                              const MQTTByteVector& payload)
@@ -1238,62 +1396,64 @@ AuthResult RemoteAuthProvider::begin_publish_check(const UserInfo& user, const M
                                                    const MQTTByteVector& payload,
                                                    std::shared_ptr<AuthorizationRequest>& pending)
 {
+  AuthResult ret = AuthResult::INTERNAL_ERROR;
   auto& p = *impl_;
   if (!p.initialized) {
     pending.reset();
-    return AuthResult::INTERNAL_ERROR;
-  }
-  AuthResult result = AuthResult::INTERNAL_ERROR;
-  try {
-    if (pending)
-      result = pending->poll(user, topic);
-    else {
-      ++p.stats.checks;
-      std::shared_ptr<Job> job;
-      result = p.authorize(user, from_mqtt_string(topic), "publish",
-                           p.include_payload ? &payload : nullptr, &job)
-                   .result;
-      if (result == AuthResult::PENDING)
-        pending = std::make_shared<PendingPublish>(job, user, topic);
+    ret = AuthResult::INTERNAL_ERROR;
+  } else {
+    try {
+      if (pending)
+        ret = pending->poll(user, topic);
+      else {
+        ++p.stats.checks;
+        std::shared_ptr<Job> job;
+        ret = p.authorize(user, from_mqtt_string(topic), "publish",
+                          p.include_payload ? &payload : nullptr, &job)
+                  .result;
+        if (ret == AuthResult::PENDING)
+          pending = std::make_shared<PendingPublish>(job, user, topic);
+      }
+    } catch (...) {
+      ret = AuthResult::INTERNAL_ERROR;
     }
-  } catch (...) {
-    result = AuthResult::INTERNAL_ERROR;
+    if (ret != AuthResult::PENDING) {
+      pending.reset();
+      if (ret == AuthResult::SUCCESS)
+        ++p.stats.allowed;
+    }
   }
-  if (result != AuthResult::PENDING) {
-    pending.reset();
-    if (result == AuthResult::SUCCESS)
-      ++p.stats.allowed;
-  }
-  return result;
+  return ret;
 }
 AuthResult RemoteAuthProvider::check_delivery_access(const UserInfo& user, const MQTTString& topic,
                                                      std::shared_ptr<AuthorizationRequest>& pending)
 {
+  AuthResult ret = AuthResult::INTERNAL_ERROR;
   auto& p = *impl_;
   if (!p.initialized) {
     pending.reset();
-    return AuthResult::INTERNAL_ERROR;
-  }
-  AuthResult result = AuthResult::INTERNAL_ERROR;
-  try {
-    if (pending)
-      result = pending->poll(user, topic);
-    else {
-      ++p.stats.checks;
-      std::shared_ptr<Job> job;
-      result = p.authorize(user, from_mqtt_string(topic), "subscribe", nullptr, &job).result;
-      if (result == AuthResult::PENDING)
-        pending = std::make_shared<PendingDelivery>(job, user, topic);
+    ret = AuthResult::INTERNAL_ERROR;
+  } else {
+    try {
+      if (pending)
+        ret = pending->poll(user, topic);
+      else {
+        ++p.stats.checks;
+        std::shared_ptr<Job> job;
+        ret = p.authorize(user, from_mqtt_string(topic), "subscribe", nullptr, &job).result;
+        if (ret == AuthResult::PENDING)
+          pending = std::make_shared<PendingDelivery>(job, user, topic);
+      }
+    } catch (...) {
+      ret = AuthResult::INTERNAL_ERROR;
     }
-  } catch (...) {
-    result = AuthResult::INTERNAL_ERROR;
+    if (ret != AuthResult::PENDING) {
+      pending.reset();
+      if (ret == AuthResult::SUCCESS)
+        ++p.stats.allowed;
+    }
   }
-  if (result != AuthResult::PENDING) {
-    pending.reset();
-    if (result == AuthResult::SUCCESS)
-      ++p.stats.allowed;
-  }
-  return result;
+  return ret;
 }
 AuthStats RemoteAuthProvider::get_stats() const
 {

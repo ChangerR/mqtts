@@ -46,23 +46,25 @@ class MQTTSTLAllocator
 
   pointer allocate(size_type n)
   {
+    pointer ret = nullptr;
     if (n == 0) {
-      return nullptr;
+      ret = nullptr;
+    } else {
+      MQTTAllocator* alloc = get_effective_allocator();
+
+      if (!alloc) {
+        // Fallback to standard allocator if our custom allocator is not available
+        ret = static_cast<pointer>(std::malloc(n * sizeof(T)));
+      } else {
+        void* ptr = alloc->allocate(n * sizeof(T));
+        if (!ptr) {
+          throw std::bad_alloc();
+        }
+
+        ret = static_cast<pointer>(ptr);
+      }
     }
-    
-    MQTTAllocator* alloc = get_effective_allocator();
-    
-    if (!alloc) {
-      // Fallback to standard allocator if our custom allocator is not available
-      return static_cast<pointer>(std::malloc(n * sizeof(T)));
-    }
-    
-    void* ptr = alloc->allocate(n * sizeof(T));
-    if (!ptr) {
-      throw std::bad_alloc();
-    }
-    
-    return static_cast<pointer>(ptr);
+    return ret;
   }
 
   void deallocate(pointer p, size_type n)
@@ -95,16 +97,18 @@ class MQTTSTLAllocator
   // 获取实际使用的分配器（如果allocator_为空，返回root allocator）
   MQTTAllocator* get_effective_allocator() const
   {
+    MQTTAllocator* ret = nullptr;
     if (allocator_) {
-      return allocator_;
+      ret = allocator_;
+    } else {
+      // Use try-catch to handle potential shutdown issues
+      try {
+        ret = MQTTMemoryManager::get_instance().get_root_allocator();
+      } catch (...) {
+        ret = nullptr;
+      }
     }
-    
-    // Use try-catch to handle potential shutdown issues
-    try {
-      return MQTTMemoryManager::get_instance().get_root_allocator();
-    } catch (...) {
-      return nullptr;
-    }
+    return ret;
   }
 
   template <typename U>

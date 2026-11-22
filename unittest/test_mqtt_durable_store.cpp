@@ -590,10 +590,13 @@ static void test_incremental_routing_and_expiry(const std::string& path)
 
 static bool has_retained(const DurableStore& store, const std::string& topic, const std::string& payload)
 {
+  bool ret = false;
   for (const auto& m : store.retained_messages())
-    if (m.topic == topic && m.payload == payload)
-      return true;
-  return false;
+    if (m.topic == topic && m.payload == payload) {
+      ret = true;
+      break;
+    }
+  return ret;
 }
 
 static mqtt::PersistenceConfig retain_config(const std::string& path)
@@ -661,15 +664,18 @@ static void test_legacy_retain_encodings(const std::string& path)
 // wait=false only reserves bytes, so this finishes before the 1 s pressure checkpoint.
 static void fill_retain_log(DurableStore& store)
 {
+  bool ret = false;
   for (int i = 0; i < 10000; ++i) {
     auto filled = store.clear_retained("a", false);
     if (!filled.ok) {
       assert(filled.quota_exceeded);
       assert(filled.error.find("disk") != std::string::npos);
-      return;
+      ret = true;
+      break;
     }
   }
-  assert(!"retain log never filled");
+  if (!ret)
+    assert(!"retain log never filled");
 }
 
 // Regression: a refused replace or clear used to erase the committed value, and the

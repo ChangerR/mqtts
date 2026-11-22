@@ -24,42 +24,44 @@ static const size_t kRetainedPendingCapacity = 64 * 1024;
 static int mqtt_packet_total_length(const uint8_t* data, size_t data_len, size_t max_packet,
                                     size_t& total_len)
 {
+  int ret = MQ_ERR_PACKET_INVALID;
   total_len = 0;
   if (!data || data_len < 2) {
-    return MQ_ERR_PACKET_INCOMPLETE;
-  }
+    ret = MQ_ERR_PACKET_INCOMPLETE;
+  } else {
+    // Byte 0 is packet type+flags, remaining length starts at byte 1.
+    uint32_t remaining_length = 0;
+    uint32_t multiplier = 1;
+    size_t remaining_length_bytes = 0;
+    const size_t max_remaining_length_bytes = 4;
 
-  // Byte 0 is packet type+flags, remaining length starts at byte 1.
-  uint32_t remaining_length = 0;
-  uint32_t multiplier = 1;
-  size_t remaining_length_bytes = 0;
-  const size_t max_remaining_length_bytes = 4;
-
-  while (remaining_length_bytes < max_remaining_length_bytes) {
-    const size_t idx = 1 + remaining_length_bytes;
-    if (idx >= data_len) {
-      return MQ_ERR_PACKET_INCOMPLETE;
-    }
-
-    uint8_t encoded = data[idx];
-    remaining_length += static_cast<uint32_t>(encoded & 0x7F) * multiplier;
-    remaining_length_bytes++;
-
-    if ((encoded & 0x80) == 0) {
-      total_len = 1 + remaining_length_bytes + static_cast<size_t>(remaining_length);
-      if (max_packet != 0 && total_len > max_packet) {
-        return MQ_ERR_PACKET_TOO_LARGE;
+    while (remaining_length_bytes < max_remaining_length_bytes) {
+      const size_t idx = 1 + remaining_length_bytes;
+      if (idx >= data_len) {
+        ret = MQ_ERR_PACKET_INCOMPLETE;
+        break;
       }
-      if (data_len < total_len) {
-        return MQ_ERR_PACKET_INCOMPLETE;
+
+      uint8_t encoded = data[idx];
+      remaining_length += static_cast<uint32_t>(encoded & 0x7F) * multiplier;
+      remaining_length_bytes++;
+
+      if ((encoded & 0x80) == 0) {
+        total_len = 1 + remaining_length_bytes + static_cast<size_t>(remaining_length);
+        if (max_packet != 0 && total_len > max_packet) {
+          ret = MQ_ERR_PACKET_TOO_LARGE;
+        } else if (data_len < total_len) {
+          ret = MQ_ERR_PACKET_INCOMPLETE;
+        } else {
+          ret = MQ_SUCCESS;
+        }
+        break;
       }
-      return MQ_SUCCESS;
+
+      multiplier *= 128;
     }
-
-    multiplier *= 128;
   }
-
-  return MQ_ERR_PACKET_INVALID;
+  return ret;
 }
 
 static bool is_supported_protocol_name_version(const mqtt::MQTTString& protocol_name,
@@ -141,33 +143,36 @@ static bool json_get_int(const std::string& json, const std::string& key, int& v
 
 static bool json_get_bool(const std::string& json, const std::string& key, bool& value)
 {
+  bool ret = false;
   std::string search_key = "\"" + key + "\"";
   size_t key_pos = json.find(search_key);
   if (key_pos == std::string::npos) {
-    return false;
-  }
+    ret = false;
+  } else {
+    // Find the colon
+    size_t colon_pos = json.find(':', key_pos);
+    if (colon_pos == std::string::npos) {
+      ret = false;
+    } else {
+      // Skip whitespace
+      size_t value_start = colon_pos + 1;
+      while (value_start < json.length() &&
+             (json[value_start] == ' ' || json[value_start] == '\t')) {
+        value_start++;
+      }
 
-  // Find the colon
-  size_t colon_pos = json.find(':', key_pos);
-  if (colon_pos == std::string::npos) {
-    return false;
+      if (json.substr(value_start, 4) == "true") {
+        value = true;
+        ret = true;
+      } else if (json.substr(value_start, 5) == "false") {
+        value = false;
+        ret = true;
+      } else {
+        ret = false;
+      }
+    }
   }
-
-  // Skip whitespace
-  size_t value_start = colon_pos + 1;
-  while (value_start < json.length() && (json[value_start] == ' ' || json[value_start] == '\t')) {
-    value_start++;
-  }
-
-  if (json.substr(value_start, 4) == "true") {
-    value = true;
-    return true;
-  } else if (json.substr(value_start, 5) == "false") {
-    value = false;
-    return true;
-  }
-
-  return false;
+  return ret;
 }
 
 // Base64 encode/decode
@@ -238,10 +243,12 @@ WebSocketMQTTBridge::WebSocketMQTTBridge(MQTTAllocator* allocator, MessageFormat
 
 const mqtt::ProtocolLimits& WebSocketMQTTBridge::effective_limits() const
 {
-  if (protocol_limits_)
-    return *protocol_limits_;
-  static const mqtt::ProtocolLimits defaults = mqtt::ProtocolLimits::defaults();
-  return defaults;
+  const mqtt::ProtocolLimits* ret = protocol_limits_;
+  if (!ret) {
+    static const mqtt::ProtocolLimits defaults = mqtt::ProtocolLimits::defaults();
+    ret = &defaults;
+  }
+  return *ret;
 }
 
 void WebSocketMQTTBridge::fill_connack(mqtt::ConnAckPacket& connack,
@@ -399,105 +406,106 @@ WebSocketProtocolHandler* WebSocketMQTTBridge::get_handler(const std::string& cl
 int WebSocketMQTTBridge::handle_websocket_text(const std::string& client_id,
                                                const std::string& message)
 {
+  int ret = MQ_SUCCESS;
   if (session_manager_)
     session_manager_->note_bytes_received(message.size());
   stats_.ws_messages_received++;
-  if (auth_manager_)
-    return MQ_ERR_CONNECT_NOT_AUTHORIZED;  // Authenticated mode uses MQTT CONNECT, never legacy
-                                           // text commands.
+  if (auth_manager_) {
+    ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;  // Authenticated mode uses MQTT CONNECT, never legacy
+                                          // text commands.
+  } else {
+    LOG_DEBUG("Handling WebSocket text message from {}: {}", client_id, message);
 
-  LOG_DEBUG("Handling WebSocket text message from {}: {}", client_id, message);
-
-  int ret = MQ_SUCCESS;
-
-  switch (format_) {
-    case MessageFormat::JSON: {
-      // Check if this is a control operation (subscribe/unsubscribe) or publish
-      std::string type;
-      if (json_get_string(message, "type", type)) {
-        // Handle control operations
-        if (type == "subscribe") {
-          std::string topic;
-          if (!json_get_string(message, "topic", topic)) {
-            LOG_ERROR("Missing 'topic' field in subscribe JSON");
-            stats_.translation_errors++;
-            return MQ_ERR_PROTOCOL;
-          }
-          int qos = 0;
-          json_get_int(message, "qos", qos);
-          mqtt::SubscriptionOptions options;
-          options.qos = static_cast<uint8_t>(qos);
-          bool existed = false;
-          mqtt::RetainMatchResult retained_match;
-          if (session_manager_) {
-            mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
-            ret = subscribe_topic(client_id, topic, options, &existed);
-            if (ret == MQ_SUCCESS &&
-                mqtt::retain_handling_delivers(options.retain_handling, existed)) {
-              retained_match = session_manager_->match_retained(topic);
+    switch (format_) {
+      case MessageFormat::JSON: {
+        // Check if this is a control operation (subscribe/unsubscribe) or publish
+        std::string type;
+        if (json_get_string(message, "type", type)) {
+          // Handle control operations
+          if (type == "subscribe") {
+            std::string topic;
+            if (!json_get_string(message, "topic", topic)) {
+              LOG_ERROR("Missing 'topic' field in subscribe JSON");
+              stats_.translation_errors++;
+              ret = MQ_ERR_PROTOCOL;
+            } else {
+              int qos = 0;
+              json_get_int(message, "qos", qos);
+              mqtt::SubscriptionOptions options;
+              options.qos = static_cast<uint8_t>(qos);
+              bool existed = false;
+              mqtt::RetainMatchResult retained_match;
+              if (session_manager_) {
+                mqtt::RetainReplayGuard retained_replay = session_manager_->lock_retain_replay();
+                ret = subscribe_topic(client_id, topic, options, &existed);
+                if (ret == MQ_SUCCESS &&
+                    mqtt::retain_handling_delivers(options.retain_handling, existed)) {
+                  retained_match = session_manager_->match_retained(topic);
+                }
+              } else {
+                ret = subscribe_topic(client_id, topic, options, &existed);
+              }
+              if (ret == MQ_SUCCESS && session_manager_) {
+                session_manager_->enqueue_retained_snapshot(
+                    mqtt::to_mqtt_string(client_id, allocator_), 0, options, existed,
+                    std::move(retained_match));
+              }
+            }
+          } else if (type == "unsubscribe") {
+            std::string topic;
+            if (!json_get_string(message, "topic", topic)) {
+              LOG_ERROR("Missing 'topic' field in unsubscribe JSON");
+              stats_.translation_errors++;
+              ret = MQ_ERR_PROTOCOL;
+            } else {
+              ret = unsubscribe_topic(client_id, topic);
             }
           } else {
-            ret = subscribe_topic(client_id, topic, options, &existed);
-          }
-          if (ret == MQ_SUCCESS && session_manager_) {
-            session_manager_->enqueue_retained_snapshot(mqtt::to_mqtt_string(client_id, allocator_),
-                                                        0, options, existed,
-                                                        std::move(retained_match));
-          }
-        } else if (type == "unsubscribe") {
-          std::string topic;
-          if (!json_get_string(message, "topic", topic)) {
-            LOG_ERROR("Missing 'topic' field in unsubscribe JSON");
+            LOG_ERROR("Unknown operation type: {}", type);
             stats_.translation_errors++;
-            return MQ_ERR_PROTOCOL;
+            ret = MQ_ERR_PROTOCOL;
           }
-          ret = unsubscribe_topic(client_id, topic);
         } else {
-          LOG_ERROR("Unknown operation type: {}", type);
-          stats_.translation_errors++;
-          return MQ_ERR_PROTOCOL;
+          // No type field - assume it's a publish operation (backward compatibility)
+          std::string topic;
+          std::vector<uint8_t> payload;
+          uint8_t qos = 0;
+          bool retain = false;
+
+          ret = parse_json_message(message, topic, payload, qos, retain);
+          if (MQ_FAIL(ret)) {
+            LOG_ERROR("Failed to parse JSON message: {}", ret);
+            stats_.translation_errors++;
+          } else {
+            // Count at ingestion, including later authorization or quota failure.
+            if (session_manager_)
+              session_manager_->note_publish_received(payload.size());
+            ret = publish_message(client_id, topic, payload, qos, retain);
+          }
         }
-      } else {
-        // No type field - assume it's a publish operation (backward compatibility)
+      } break;
+
+      case MessageFormat::TEXT_PROTOCOL: {
         std::string topic;
         std::vector<uint8_t> payload;
-        uint8_t qos = 0;
-        bool retain = false;
 
-        ret = parse_json_message(message, topic, payload, qos, retain);
+        ret = parse_text_protocol(message, topic, payload);
         if (MQ_FAIL(ret)) {
-          LOG_ERROR("Failed to parse JSON message: {}", ret);
+          LOG_ERROR("Failed to parse text protocol message: {}", ret);
           stats_.translation_errors++;
-          return ret;
+        } else {
+          if (session_manager_)
+            session_manager_->note_publish_received(payload.size());
+          ret = publish_message(client_id, topic, payload, 0, false);
         }
+      } break;
 
-        // Count at ingestion, including later authorization or quota failure.
-        if (session_manager_)
-          session_manager_->note_publish_received(payload.size());
-        ret = publish_message(client_id, topic, payload, qos, retain);
-      }
-    } break;
-
-    case MessageFormat::TEXT_PROTOCOL: {
-      std::string topic;
-      std::vector<uint8_t> payload;
-
-      ret = parse_text_protocol(message, topic, payload);
-      if (MQ_FAIL(ret)) {
-        LOG_ERROR("Failed to parse text protocol message: {}", ret);
+      default:
+        LOG_ERROR("Unsupported message format for text message");
         stats_.translation_errors++;
-        return ret;
-      }
-
-      if (session_manager_)
-        session_manager_->note_publish_received(payload.size());
-      ret = publish_message(client_id, topic, payload, 0, false);
-    } break;
-
-    default:
-      LOG_ERROR("Unsupported message format for text message");
-      stats_.translation_errors++;
-      return MQ_ERR_INVALID_STATE;
+        ret = MQ_ERR_INVALID_STATE;
+        break;
+    }
   }
 
   return ret;
@@ -512,6 +520,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id,
 int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, const uint8_t* data,
                                                  size_t len)
 {
+  int ret = MQ_SUCCESS;
   stats_.ws_messages_received++;
 
   LOG_DEBUG("Handling WebSocket binary data from {}: {} bytes", client_id, len);
@@ -519,14 +528,13 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
   if (format_ != MessageFormat::MQTT_PACKET) {
     LOG_ERROR("Binary messages only supported in MQTT_PACKET format");
     stats_.translation_errors++;
-    return MQ_ERR_INVALID_STATE;
+    ret = MQ_ERR_INVALID_STATE;
+  } else {
+    pending_binary_buffers_[client_id].insert(pending_binary_buffers_[client_id].end(), data,
+                                              data + len);
   }
 
-  pending_binary_buffers_[client_id].insert(pending_binary_buffers_[client_id].end(), data,
-                                            data + len);
-
-  int ret = MQ_SUCCESS;
-  while (true) {
+  while (ret == MQ_SUCCESS) {
     // Packet handlers may unregister the client (DISCONNECT, takeover), which drops this buffer.
     auto pending_it = pending_binary_buffers_.find(client_id);
     if (pending_it == pending_binary_buffers_.end() || pending_it->second.empty()) {
@@ -544,7 +552,8 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
       }
       LOG_TRACE("MQTT packet for client {} is incomplete, buffered {} bytes", client_id,
                 pending.size());
-      return MQ_SUCCESS;
+      ret = MQ_SUCCESS;
+      break;
     }
 
     if (ret == MQ_ERR_PACKET_TOO_LARGE) {
@@ -555,7 +564,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
       if (auto* socket_handler = get_handler(client_id)) {
         socket_handler->close_connection();
       }
-      return ret;
+      break;
     }
 
     if (MQ_FAIL(ret)) {
@@ -566,7 +575,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         session_manager_->note_malformed_disconnect();
       }
       (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::MalformedPacket);
-      return ret;
+      break;
     }
 
     if (session_manager_)
@@ -594,7 +603,7 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
       const mqtt::ReasonCode reason = (ret == MQ_ERR_PROTOCOL) ? mqtt::ReasonCode::ProtocolError
                                                                : mqtt::ReasonCode::MalformedPacket;
       (void)send_mqtt_disconnect(client_id, reason);
-      return ret;
+      break;
     }
 
     if (version_it == client_protocol_versions_.end() &&
@@ -607,7 +616,8 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         session_manager_->note_malformed_disconnect();
       }
       (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
-      return MQ_ERR_PROTOCOL;
+      ret = MQ_ERR_PROTOCOL;
+      break;
     }
 
     // Handle different packet types
@@ -740,11 +750,11 @@ int WebSocketMQTTBridge::handle_websocket_binary(const std::string& client_id, c
         }
         (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
       }
-      return ret;
+      break;
     }
   }
 
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketMQTTBridge::parse_json_message(const std::string& json, std::string& topic,
@@ -846,64 +856,65 @@ int WebSocketMQTTBridge::parse_mqtt_packet(const uint8_t* data, size_t len, mqtt
 int WebSocketMQTTBridge::handle_mqtt_publish(const std::string& client_id,
                                              const mqtt::PublishPacket& packet)
 {
+  int ret = MQ_SUCCESS;
   stats_.mqtt_messages_received++;
   if (!topic_allowed(client_id, mqtt::from_mqtt_string(packet.topic_name),
-                     mqtt::auth::Permission::READ))
-    return MQ_ERR_CONNECT_NOT_AUTHORIZED;
+                     mqtt::auth::Permission::READ)) {
+    ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+  } else {
+    LOG_DEBUG("Forwarding MQTT publish to WebSocket client {}: topic={}, qos={}", client_id,
+              packet.topic_name, packet.qos);
 
-  LOG_DEBUG("Forwarding MQTT publish to WebSocket client {}: topic={}, qos={}", client_id,
-            packet.topic_name, packet.qos);
+    WebSocketProtocolHandler* handler = get_handler(client_id);
+    if (!handler || !handler->is_connected()) {
+      LOG_WARN("No active WebSocket handler for client {}", client_id);
+      ret = MQ_ERR_SESSION_INVALID_HANDLER;
+    } else {
+      uint64_t text_bytes = 0;
 
-  WebSocketProtocolHandler* handler = get_handler(client_id);
-  if (!handler || !handler->is_connected()) {
-    LOG_WARN("No active WebSocket handler for client {}", client_id);
-    return MQ_ERR_SESSION_INVALID_HANDLER;
-  }
+      switch (format_) {
+        case MessageFormat::JSON: {
+          std::string topic_str = mqtt::from_mqtt_string(packet.topic_name);
+          std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
+          std::string json =
+              format_json_message(topic_str, payload_vec, packet.qos, packet.retain);
+          text_bytes = json.size();
+          ret = handler->send_text(json);
+        } break;
 
-  int ret = MQ_SUCCESS;
-  uint64_t text_bytes = 0;
+        case MessageFormat::TEXT_PROTOCOL: {
+          std::string topic_str = mqtt::from_mqtt_string(packet.topic_name);
+          std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
+          std::string text = format_text_protocol(topic_str, payload_vec);
+          text_bytes = text.size();
+          ret = handler->send_text(text);
+        } break;
 
-  switch (format_) {
-    case MessageFormat::JSON: {
-      std::string topic_str = mqtt::from_mqtt_string(packet.topic_name);
-      std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
-      std::string json = format_json_message(topic_str, payload_vec, packet.qos, packet.retain);
-      text_bytes = json.size();
-      ret = handler->send_text(json);
-    } break;
+        case MessageFormat::MQTT_PACKET: {
+          mqtt::PublishPacket outbound(allocator_);
+          outbound.type = mqtt::PacketType::PUBLISH;
+          outbound.dup = packet.dup;
+          outbound.qos = packet.qos;
+          outbound.retain = packet.retain;
+          outbound.packet_id = packet.packet_id;
+          outbound.topic_name =
+              mqtt::to_mqtt_string(mqtt::from_mqtt_string(packet.topic_name), allocator_);
+          std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
+          outbound.payload = mqtt::to_mqtt_bytes(payload_vec, allocator_);
+          ret = send_serialized_mqtt_packet(client_id, outbound);
+        } break;
+      }
 
-    case MessageFormat::TEXT_PROTOCOL: {
-      std::string topic_str = mqtt::from_mqtt_string(packet.topic_name);
-      std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
-      std::string text = format_text_protocol(topic_str, payload_vec);
-      text_bytes = text.size();
-      ret = handler->send_text(text);
-    } break;
-
-    case MessageFormat::MQTT_PACKET: {
-      mqtt::PublishPacket outbound(allocator_);
-      outbound.type = mqtt::PacketType::PUBLISH;
-      outbound.dup = packet.dup;
-      outbound.qos = packet.qos;
-      outbound.retain = packet.retain;
-      outbound.packet_id = packet.packet_id;
-      outbound.topic_name =
-          mqtt::to_mqtt_string(mqtt::from_mqtt_string(packet.topic_name), allocator_);
-      std::vector<uint8_t> payload_vec(packet.payload.begin(), packet.payload.end());
-      outbound.payload = mqtt::to_mqtt_bytes(payload_vec, allocator_);
-      ret = send_serialized_mqtt_packet(client_id, outbound);
-    } break;
-  }
-
-  if (MQ_SUCC(ret)) {
-    stats_.mqtt_messages_sent++;
-    if (session_manager_) {
-      session_manager_->note_publish_sent(packet.payload.size());
-      if (text_bytes > 0)
-        session_manager_->note_bytes_sent(text_bytes);
+      if (MQ_SUCC(ret)) {
+        stats_.mqtt_messages_sent++;
+        if (session_manager_) {
+          session_manager_->note_publish_sent(packet.payload.size());
+          if (text_bytes > 0)
+            session_manager_->note_bytes_sent(text_bytes);
+        }
+      }
     }
   }
-
   return ret;
 }
 
@@ -995,55 +1006,58 @@ int WebSocketMQTTBridge::publish_message(const std::string& client_id, const std
                                          const std::vector<uint8_t>& payload, uint8_t qos,
                                          bool retain, const mqtt::Properties& properties)
 {
+  int ret = MQ_SUCCESS;
   if (retain && !effective_limits().retain_available) {
     auto handler = handlers_.find(client_id);
     if (handler != handlers_.end() && handler->second) {
       handler->second->close_connection();
     }
-    return MQ_ERR_FLOW_CLOSED;
+    ret = MQ_ERR_FLOW_CLOSED;
   }
-  if (auth_manager_) {
+  if (ret == MQ_SUCCESS && auth_manager_) {
     const auto found = auth_contexts_.find(client_id);
-    if (found == auth_contexts_.end())
-      return MQ_ERR_CONNECT_NOT_AUTHORIZED;
-    const auto context = found->second;
-    mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
-    auth_manager_->check_publish(*context, mqtt::to_mqtt_string(topic, allocator_),
-                                 mqtt::to_mqtt_bytes(payload, allocator_), result);
-    if (result != mqtt::auth::AuthResult::SUCCESS) {
-      const bool denied = result == mqtt::auth::AuthResult::ACCESS_DENIED ||
-                          result == mqtt::auth::AuthResult::INVALID_CREDENTIALS ||
-                          result == mqtt::auth::AuthResult::USER_NOT_FOUND;
-      return denied ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_AUTH_UNAVAILABLE;
+    if (found == auth_contexts_.end()) {
+      ret = MQ_ERR_CONNECT_NOT_AUTHORIZED;
+    } else {
+      const auto context = found->second;
+      mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+      auth_manager_->check_publish(*context, mqtt::to_mqtt_string(topic, allocator_),
+                                   mqtt::to_mqtt_bytes(payload, allocator_), result);
+      if (result != mqtt::auth::AuthResult::SUCCESS) {
+        const bool denied = result == mqtt::auth::AuthResult::ACCESS_DENIED ||
+                            result == mqtt::auth::AuthResult::INVALID_CREDENTIALS ||
+                            result == mqtt::auth::AuthResult::USER_NOT_FOUND;
+        ret = denied ? MQ_ERR_CONNECT_NOT_AUTHORIZED : MQ_ERR_AUTH_UNAVAILABLE;
+      }
     }
   }
-  if (!session_manager_) {
+  if (ret == MQ_SUCCESS && !session_manager_) {
     LOG_ERROR("Session manager not initialized");
-    return MQ_ERR_SESSION_MANAGER_NOT_READY;
+    ret = MQ_ERR_SESSION_MANAGER_NOT_READY;
   }
+  if (ret == MQ_SUCCESS) {
+    LOG_DEBUG("Publishing MQTT message from WebSocket client {}: topic={}, qos={}", client_id,
+              topic, qos);
 
-  LOG_DEBUG("Publishing MQTT message from WebSocket client {}: topic={}, qos={}", client_id, topic,
-            qos);
+    // Create MQTT publish packet
+    mqtt::PublishPacket packet(allocator_);
+    packet.topic_name = mqtt::to_mqtt_string(topic, allocator_);
+    packet.payload = mqtt::to_mqtt_bytes(payload, allocator_);
+    packet.qos = qos;
+    packet.retain = retain;
+    packet.dup = false;
+    packet.properties = properties;
 
-  // Create MQTT publish packet
-  mqtt::PublishPacket packet(allocator_);
-  packet.topic_name = mqtt::to_mqtt_string(topic, allocator_);
-  packet.payload = mqtt::to_mqtt_bytes(payload, allocator_);
-  packet.qos = qos;
-  packet.retain = retain;
-  packet.dup = false;
-  packet.properties = properties;
+    // Forward to MQTT broker via session manager
+    mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic, allocator_);
+    mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
+    ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
 
-  // Forward to MQTT broker via session manager
-  mqtt::MQTTString mqtt_topic = mqtt::to_mqtt_string(topic, allocator_);
-  mqtt::MQTTString mqtt_client_id = mqtt::to_mqtt_string(client_id, allocator_);
-  int ret = session_manager_->forward_publish_by_topic(mqtt_topic, packet, mqtt_client_id);
-
-  if (ret >= 0) {
-    stats_.mqtt_messages_sent++;
-    return MQ_SUCCESS;  // Session manager returns the recipient count.
+    if (ret >= 0) {
+      stats_.mqtt_messages_sent++;
+      ret = MQ_SUCCESS;  // Session manager returns the recipient count.
+    }
   }
-
   return ret;
 }
 
@@ -1074,6 +1088,7 @@ bool WebSocketMQTTBridge::topic_allowed(const std::string& client_id, const std:
 int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id,
                                              const mqtt::ConnectPacket* packet)
 {
+  int ret = 0;
   LOG_INFO("Received MQTT CONNECT from WebSocket client {} (mqtt_client_id='{}')", client_id,
            mqtt::from_mqtt_string(packet->client_id));
 
@@ -1090,12 +1105,12 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id,
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
     fill_connack(connack, packet);
-    int ret = send_serialized_mqtt_packet(client_id, connack);
+    ret = send_serialized_mqtt_packet(client_id, connack);
     client_protocol_versions_.erase(client_id);
-    return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
-  }
-
-  if ((packet->protocol_version == 3 || packet->protocol_version == 4) && !allow_mqtt3x_) {
+    if (ret == MQ_SUCCESS) {
+      ret = MQ_ERR_CONNECT_PROTOCOL;
+    }
+  } else if ((packet->protocol_version == 3 || packet->protocol_version == 4) && !allow_mqtt3x_) {
     LOG_WARN("WebSocket client {} uses MQTT 3.x while it is disabled", client_id);
     client_protocol_versions_[client_id] = packet->protocol_version;
     mqtt::ConnAckPacket connack(allocator_);
@@ -1103,121 +1118,126 @@ int WebSocketMQTTBridge::handle_mqtt_connect(const std::string& client_id,
     connack.session_present = false;
     connack.reason_code = mqtt::ReasonCode::UnsupportedProtocolVersion;
     fill_connack(connack, packet);
-    int ret = send_serialized_mqtt_packet(client_id, connack);
+    ret = send_serialized_mqtt_packet(client_id, connack);
     client_protocol_versions_.erase(client_id);
-    return (ret == MQ_SUCCESS) ? MQ_ERR_CONNECT_PROTOCOL : ret;
-  }
-
-  if (client_protocol_versions_.count(client_id)) {
+    if (ret == MQ_SUCCESS) {
+      ret = MQ_ERR_CONNECT_PROTOCOL;
+    }
+  } else if (client_protocol_versions_.count(client_id)) {
     if (session_manager_) {
       session_manager_->note_malformed_disconnect();
     }
     (void)send_mqtt_disconnect(client_id, mqtt::ReasonCode::ProtocolError);
-    return MQ_ERR_PROTOCOL;
-  }
-  client_protocol_versions_[client_id] = packet->protocol_version;
-  mqtt::ConnAckPacket connack(allocator_);
-  connack.type = mqtt::PacketType::CONNACK;
-  connack.session_present = false;
-  connack.reason_code = mqtt::ReasonCode::Success;
-  if (packet->protocol_version >= 5 &&
-      ((packet->properties.has_receive_maximum && packet->properties.receive_maximum == 0) ||
-       (packet->properties.has_maximum_packet_size &&
-        packet->properties.maximum_packet_size == 0))) {
-    LOG_WARN("WebSocket client {} uses Receive Maximum or Maximum Packet Size 0", client_id);
-    connack.reason_code = mqtt::ReasonCode::ProtocolError;
-    send_serialized_mqtt_packet(client_id, connack);
-    client_protocol_versions_.erase(client_id);
-    if (auto* socket_handler = get_handler(client_id)) {
-      socket_handler->close_connection();
-    }
-    return MQ_ERR_PROTOCOL;
-  }
-  if (session_manager_ && session_manager_->durable_store()) {
-    // Persistent consumers use TCP; reject unsupported WS session semantics.
-    if ((packet->protocol_version < 5 && !packet->flags.clean_start) ||
-        packet->properties.session_expiry_interval)
-      connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
-  }
-  if (packet->client_id.empty())
-    connack.reason_code = mqtt::ReasonCode::ClientIdentifierNotValid;
-  if (packet->flags.will_flag && connack.reason_code == mqtt::ReasonCode::Success) {
-    uint8_t qos_limit = effective_limits().max_qos;
-    auto session = session_handlers_.find(client_id);
-    if (session != session_handlers_.end() && session->second) {
-      qos_limit = session->second->granted_qos_limit();
-    }
-    const mqtt::WillConnectDecision decision = mqtt::validate_will_connect(
-        packet->flags.will_qos, packet->flags.will_retain != 0,
-        mqtt::from_mqtt_string(packet->will_topic), qos_limit, effective_limits().retain_available);
-    if (!decision.accept) {
-      LOG_WARN("CONNECT will rejected for WebSocket client {} reason 0x{:02x}", client_id,
-               static_cast<uint8_t>(decision.reason));
-      connack.reason_code = decision.reason;
-    }
-  }
-  if (auth_manager_ && connack.reason_code == mqtt::ReasonCode::Success) {
-    auto context = std::make_shared<mqtt::auth::ClientAuthContext>(allocator_);
-    mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
-    mqtt::MQTTString address{mqtt::MQTTStrAllocator(allocator_)};
-    const int authenticated = auth_manager_->authenticate_user(
-        packet->username, packet->password, packet->client_id, address, 0, result, *context);
-    if (authenticated != MQ_SUCCESS || result != mqtt::auth::AuthResult::SUCCESS) {
-      connack.reason_code = mqtt::ReasonCode::NotAuthorized;
+    ret = MQ_ERR_PROTOCOL;
+  } else {
+    client_protocol_versions_[client_id] = packet->protocol_version;
+    mqtt::ConnAckPacket connack(allocator_);
+    connack.type = mqtt::PacketType::CONNACK;
+    connack.session_present = false;
+    connack.reason_code = mqtt::ReasonCode::Success;
+    if (packet->protocol_version >= 5 &&
+        ((packet->properties.has_receive_maximum && packet->properties.receive_maximum == 0) ||
+         (packet->properties.has_maximum_packet_size &&
+          packet->properties.maximum_packet_size == 0))) {
+      LOG_WARN("WebSocket client {} uses Receive Maximum or Maximum Packet Size 0", client_id);
+      connack.reason_code = mqtt::ReasonCode::ProtocolError;
+      send_serialized_mqtt_packet(client_id, connack);
+      client_protocol_versions_.erase(client_id);
+      if (auto* socket_handler = get_handler(client_id)) {
+        socket_handler->close_connection();
+      }
+      ret = MQ_ERR_PROTOCOL;
     } else {
-      auth_contexts_[client_id] = std::move(context);
-    }
-  }
-  fill_connack(connack, packet);
-  if (connack.reason_code == mqtt::ReasonCode::Success && session_manager_) {
-    auto found = session_handlers_.find(client_id);
-    mqtt::MQTTProtocolHandler* session_handler =
-        found == session_handlers_.end() ? nullptr : found->second;
-    if (session_handler) {
-      const std::string mqtt_id = mqtt::from_mqtt_string(packet->client_id);
-      const int registered = session_manager_->register_session(
-          mqtt::to_mqtt_string(mqtt_id, allocator_), session_handler);
-      if (registered != MQ_SUCCESS) {
-        connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
+      if (session_manager_ && session_manager_->durable_store()) {
+        // Persistent consumers use TCP; reject unsupported WS session semantics.
+        if ((packet->protocol_version < 5 && !packet->flags.clean_start) ||
+            packet->properties.session_expiry_interval)
+          connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
+      }
+      if (packet->client_id.empty())
+        connack.reason_code = mqtt::ReasonCode::ClientIdentifierNotValid;
+      if (packet->flags.will_flag && connack.reason_code == mqtt::ReasonCode::Success) {
+        uint8_t qos_limit = effective_limits().max_qos;
+        auto session = session_handlers_.find(client_id);
+        if (session != session_handlers_.end() && session->second) {
+          qos_limit = session->second->granted_qos_limit();
+        }
+        const mqtt::WillConnectDecision decision = mqtt::validate_will_connect(
+            packet->flags.will_qos, packet->flags.will_retain != 0,
+            mqtt::from_mqtt_string(packet->will_topic), qos_limit,
+            effective_limits().retain_available);
+        if (!decision.accept) {
+          LOG_WARN("CONNECT will rejected for WebSocket client {} reason 0x{:02x}", client_id,
+                   static_cast<uint8_t>(decision.reason));
+          connack.reason_code = decision.reason;
+        }
+      }
+      if (auth_manager_ && connack.reason_code == mqtt::ReasonCode::Success) {
+        auto context = std::make_shared<mqtt::auth::ClientAuthContext>(allocator_);
+        mqtt::auth::AuthResult result = mqtt::auth::AuthResult::ACCESS_DENIED;
+        mqtt::MQTTString address{mqtt::MQTTStrAllocator(allocator_)};
+        const int authenticated = auth_manager_->authenticate_user(
+            packet->username, packet->password, packet->client_id, address, 0, result, *context);
+        if (authenticated != MQ_SUCCESS || result != mqtt::auth::AuthResult::SUCCESS) {
+          connack.reason_code = mqtt::ReasonCode::NotAuthorized;
+        } else {
+          auth_contexts_[client_id] = std::move(context);
+        }
+      }
+      fill_connack(connack, packet);
+      if (connack.reason_code == mqtt::ReasonCode::Success && session_manager_) {
+        auto found = session_handlers_.find(client_id);
+        mqtt::MQTTProtocolHandler* session_handler =
+            found == session_handlers_.end() ? nullptr : found->second;
+        if (session_handler) {
+          const std::string mqtt_id = mqtt::from_mqtt_string(packet->client_id);
+          const int registered = session_manager_->register_session(
+              mqtt::to_mqtt_string(mqtt_id, allocator_), session_handler);
+          if (registered != MQ_SUCCESS) {
+            connack.reason_code = mqtt::ReasonCode::ServerUnavailable;
+          } else {
+            mqtt_client_ids_[client_id] = mqtt_id;
+            // 旧连接清理已经结束。在下一次让出之前取消或立刻到期它的延迟遗嘱。
+            session_manager_->will_scheduler().observe_connect(mqtt_id,
+                                                               packet->flags.clean_start != 0);
+            try {
+              remember_connection_will(client_id, mqtt_id, packet);
+            } catch (const std::bad_alloc&) {
+              LOG_WARN("Will allocation failed for WebSocket client {}", mqtt_id);
+              session_manager_->unregister_session(mqtt::to_mqtt_string(mqtt_id, allocator_));
+              mqtt_client_ids_.erase(client_id);
+              connection_wills_.erase(client_id);
+              connack.reason_code = mqtt::ReasonCode::QuotaExceeded;
+            }
+          }
+        }
+      }
+      if (connack.reason_code != mqtt::ReasonCode::Success) {
+        send_serialized_mqtt_packet(client_id, connack);
+        client_protocol_versions_.erase(client_id);
+        auth_contexts_.erase(client_id);
+        ret = connack.reason_code == mqtt::ReasonCode::ServerUnavailable
+                  ? MQ_ERR_TIMEOUT_V2
+                  : MQ_ERR_CONNECT_NOT_AUTHORIZED;
       } else {
-        mqtt_client_ids_[client_id] = mqtt_id;
-        // 旧连接清理已经结束。在下一次让出之前取消或立刻到期它的延迟遗嘱。
-        session_manager_->will_scheduler().observe_connect(mqtt_id, packet->flags.clean_start != 0);
-        try {
-          remember_connection_will(client_id, mqtt_id, packet);
-        } catch (const std::bad_alloc&) {
-          LOG_WARN("Will allocation failed for WebSocket client {}", mqtt_id);
-          session_manager_->unregister_session(mqtt::to_mqtt_string(mqtt_id, allocator_));
-          mqtt_client_ids_.erase(client_id);
-          connection_wills_.erase(client_id);
-          connack.reason_code = mqtt::ReasonCode::QuotaExceeded;
+        if (auto* handler = get_handler(client_id)) {
+          handler->observe_mqtt_connect(mqtt::negotiated_keep_alive_seconds(
+              packet->keep_alive, effective_limits().keep_alive_max, packet->protocol_version));
+        }
+        auto session = session_handlers_.find(client_id);
+        if (session != session_handlers_.end() && session->second) {
+          session->second->observe_client_flow(packet->protocol_version,
+                                               packet->properties.receive_maximum,
+                                               packet->properties.maximum_packet_size);
+          session->second->set_client_id(
+              mqtt::to_mqtt_string(mqtt::from_mqtt_string(packet->client_id), allocator_));
+        }
+        ret = send_serialized_mqtt_packet(client_id, connack);
+        if (MQ_FAIL(ret)) {
+          client_protocol_versions_.erase(client_id);
         }
       }
     }
-  }
-  if (connack.reason_code != mqtt::ReasonCode::Success) {
-    send_serialized_mqtt_packet(client_id, connack);
-    client_protocol_versions_.erase(client_id);
-    auth_contexts_.erase(client_id);
-    return connack.reason_code == mqtt::ReasonCode::ServerUnavailable
-               ? MQ_ERR_TIMEOUT_V2
-               : MQ_ERR_CONNECT_NOT_AUTHORIZED;
-  }
-  if (auto* handler = get_handler(client_id)) {
-    handler->observe_mqtt_connect(mqtt::negotiated_keep_alive_seconds(
-        packet->keep_alive, effective_limits().keep_alive_max, packet->protocol_version));
-  }
-  auto session = session_handlers_.find(client_id);
-  if (session != session_handlers_.end() && session->second) {
-    session->second->observe_client_flow(packet->protocol_version,
-                                         packet->properties.receive_maximum,
-                                         packet->properties.maximum_packet_size);
-    session->second->set_client_id(
-        mqtt::to_mqtt_string(mqtt::from_mqtt_string(packet->client_id), allocator_));
-  }
-  int ret = send_serialized_mqtt_packet(client_id, connack);
-  if (MQ_FAIL(ret)) {
-    client_protocol_versions_.erase(client_id);
   }
   return ret;
 }
@@ -1348,6 +1368,7 @@ int WebSocketMQTTBridge::handle_mqtt_unsubscribe(const std::string& client_id,
 int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id,
                                                     mqtt::PublishPacket* packet)
 {
+  int ret = MQ_SUCCESS;
   // Receipt is independent of authorization, quota, and durable QoS 2 rejection.
   if (session_manager_)
     session_manager_->note_publish_received(packet->payload.size());
@@ -1361,96 +1382,100 @@ int WebSocketMQTTBridge::handle_mqtt_publish_packet(const std::string& client_id
     return err;
   };
   if (!flow || !packet) {
-    return close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
-  }
-  const mqtt::InboundTopicAliases::Result alias = flow->apply_inbound_topic_alias(packet);
-  const mqtt::ReasonCode alias_reason = mqtt::inbound_alias_disconnect_reason(alias);
-  if (alias_reason != mqtt::ReasonCode::Success) {
-    LOG_WARN("Inbound topic alias rejected for WebSocket client {} reason 0x{:02x}", client_id,
-             static_cast<uint8_t>(alias_reason));
-    return close_flow(alias_reason, MQ_ERR_FLOW_CLOSED);
-  }
-  if (packet->qos > 2 || ((packet->qos == 1 || packet->qos == 2) && packet->packet_id == 0)) {
-    return close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
-  }
-  if (packet->retain && !effective_limits().retain_available) {
-    return close_flow(mqtt::ReasonCode::RetainNotSupported, MQ_ERR_FLOW_CLOSED);
-  }
-  if (flow && packet->qos > flow->granted_qos_limit()) {
-    return close_flow(mqtt::ReasonCode::QoSNotSupported, MQ_ERR_FLOW_CLOSED);
-  }
-  if (!flow && packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
-    return close_flow(mqtt::ReasonCode::QoSNotSupported, MQ_ERR_PUBLISH_QOS);
-  }
-  bool qos2_tracked = false;
-  if (flow && packet->qos == 2) {
-    switch (flow->admit_inbound_qos2(packet->packet_id)) {
-      case mqtt::ConnectionFlow::Qos2Admit::Duplicate: {
-        mqtt::PubRecPacket pubrec(allocator_);
-        pubrec.type = mqtt::PacketType::PUBREC;
-        pubrec.packet_id = packet->packet_id;
-        pubrec.reason_code = mqtt::ReasonCode::Success;
-        return send_serialized_mqtt_packet(client_id, pubrec);
+    ret = close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+  } else {
+    const mqtt::InboundTopicAliases::Result alias = flow->apply_inbound_topic_alias(packet);
+    const mqtt::ReasonCode alias_reason = mqtt::inbound_alias_disconnect_reason(alias);
+    if (alias_reason != mqtt::ReasonCode::Success) {
+      LOG_WARN("Inbound topic alias rejected for WebSocket client {} reason 0x{:02x}", client_id,
+               static_cast<uint8_t>(alias_reason));
+      ret = close_flow(alias_reason, MQ_ERR_FLOW_CLOSED);
+    } else if (packet->qos > 2 ||
+               ((packet->qos == 1 || packet->qos == 2) && packet->packet_id == 0)) {
+      ret = close_flow(mqtt::ReasonCode::ProtocolError, MQ_ERR_FLOW_CLOSED);
+    } else if (packet->retain && !effective_limits().retain_available) {
+      ret = close_flow(mqtt::ReasonCode::RetainNotSupported, MQ_ERR_FLOW_CLOSED);
+    } else if (flow && packet->qos > flow->granted_qos_limit()) {
+      ret = close_flow(mqtt::ReasonCode::QoSNotSupported, MQ_ERR_FLOW_CLOSED);
+    } else if (!flow && packet->qos == 2 && session_manager_ && session_manager_->durable_store()) {
+      ret = close_flow(mqtt::ReasonCode::QoSNotSupported, MQ_ERR_PUBLISH_QOS);
+    } else {
+      bool qos2_tracked = false;
+      bool qos2_finished = false;
+      if (flow && packet->qos == 2) {
+        switch (flow->admit_inbound_qos2(packet->packet_id)) {
+          case mqtt::ConnectionFlow::Qos2Admit::Duplicate: {
+            mqtt::PubRecPacket pubrec(allocator_);
+            pubrec.type = mqtt::PacketType::PUBREC;
+            pubrec.packet_id = packet->packet_id;
+            pubrec.reason_code = mqtt::ReasonCode::Success;
+            ret = send_serialized_mqtt_packet(client_id, pubrec);
+            qos2_finished = true;
+            break;
+          }
+          case mqtt::ConnectionFlow::Qos2Admit::Exceeded:
+            return close_flow(mqtt::ReasonCode::ReceiveMaximumExceeded, MQ_ERR_FLOW_CLOSED);
+          case mqtt::ConnectionFlow::Qos2Admit::Forward:
+            qos2_tracked = true;
+            break;
+        }
       }
-      case mqtt::ConnectionFlow::Qos2Admit::Exceeded:
-        return close_flow(mqtt::ReasonCode::ReceiveMaximumExceeded, MQ_ERR_FLOW_CLOSED);
-      case mqtt::ConnectionFlow::Qos2Admit::Forward:
-        qos2_tracked = true;
-        break;
+      if (!qos2_finished) {
+        std::string topic = mqtt::from_mqtt_string(packet->topic_name);
+        std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
+        // 转发会在同一条连接的预算里再放一份载荷。先释放解析器那份，否则接近上限的 PUBLISH 会 bad_alloc。
+        {
+          mqtt::MQTTByteVector released(packet->payload.get_allocator());
+          packet->payload.swap(released);
+        }
+        ret = publish_message(client_id, topic, payload, packet->qos, packet->retain,
+                              packet->properties);
+        const auto protocol = client_protocol_versions_.find(client_id);
+        const bool negative_ack =
+            protocol != client_protocol_versions_.end() && protocol->second >= 5 &&
+            (packet->qos == 1 || packet->qos == 2) &&
+            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED || ret == MQ_ERR_AUTH_UNAVAILABLE ||
+             ret == MQ_ERR_PUBLISH_QUOTA);
+        if (ret != MQ_SUCCESS && !negative_ack) {
+          if (qos2_tracked && flow)
+            flow->release_inbound_qos2(packet->packet_id);
+          auto handler = handlers_.find(client_id);
+          if (handler != handlers_.end())
+            handler->second->close_connection();
+        } else {
+          if (ret != MQ_SUCCESS && qos2_tracked && flow) {
+            flow->release_inbound_qos2(packet->packet_id);
+          }
+
+          if (packet->qos == 1) {
+            mqtt::PubAckPacket puback(allocator_);
+            puback.type = mqtt::PacketType::PUBACK;
+            puback.packet_id = packet->packet_id;
+            puback.reason_code =
+                ret == MQ_SUCCESS
+                    ? mqtt::ReasonCode::Success
+                    : (ret == MQ_ERR_PUBLISH_QUOTA
+                           ? mqtt::ReasonCode::QuotaExceeded
+                           : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED
+                                  ? mqtt::ReasonCode::NotAuthorized
+                                  : mqtt::ReasonCode::UnspecifiedError));
+            ret = send_serialized_mqtt_packet(client_id, puback);
+          } else if (packet->qos == 2) {
+            mqtt::PubRecPacket pubrec(allocator_);
+            pubrec.type = mqtt::PacketType::PUBREC;
+            pubrec.packet_id = packet->packet_id;
+            pubrec.reason_code =
+                ret == MQ_SUCCESS
+                    ? mqtt::ReasonCode::Success
+                    : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized
+                                                           : mqtt::ReasonCode::UnspecifiedError);
+            ret = send_serialized_mqtt_packet(client_id, pubrec);
+          }
+        }
+      }
     }
   }
-  std::string topic = mqtt::from_mqtt_string(packet->topic_name);
-  std::vector<uint8_t> payload(packet->payload.begin(), packet->payload.end());
-  // 转发会在同一条连接的预算里再放一份载荷。先释放解析器那份，否则接近上限的 PUBLISH 会 bad_alloc。
-  {
-    mqtt::MQTTByteVector released(packet->payload.get_allocator());
-    packet->payload.swap(released);
-  }
-  int ret =
-      publish_message(client_id, topic, payload, packet->qos, packet->retain, packet->properties);
-  const auto protocol = client_protocol_versions_.find(client_id);
-  const bool negative_ack = protocol != client_protocol_versions_.end() && protocol->second >= 5 &&
-                            (packet->qos == 1 || packet->qos == 2) &&
-                            (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ||
-                             ret == MQ_ERR_AUTH_UNAVAILABLE || ret == MQ_ERR_PUBLISH_QUOTA);
-  if (ret != MQ_SUCCESS && !negative_ack) {
-    if (qos2_tracked && flow)
-      flow->release_inbound_qos2(packet->packet_id);
-    auto handler = handlers_.find(client_id);
-    if (handler != handlers_.end())
-      handler->second->close_connection();
-    return ret;
-  }
-  if (ret != MQ_SUCCESS && qos2_tracked && flow) {
-    flow->release_inbound_qos2(packet->packet_id);
-  }
-
-  if (packet->qos == 1) {
-    mqtt::PubAckPacket puback(allocator_);
-    puback.type = mqtt::PacketType::PUBACK;
-    puback.packet_id = packet->packet_id;
-    puback.reason_code =
-        ret == MQ_SUCCESS
-            ? mqtt::ReasonCode::Success
-            : (ret == MQ_ERR_PUBLISH_QUOTA
-                   ? mqtt::ReasonCode::QuotaExceeded
-                   : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED ? mqtt::ReasonCode::NotAuthorized
-                                                           : mqtt::ReasonCode::UnspecifiedError));
-    return send_serialized_mqtt_packet(client_id, puback);
-  }
-
-  if (packet->qos == 2) {
-    mqtt::PubRecPacket pubrec(allocator_);
-    pubrec.type = mqtt::PacketType::PUBREC;
-    pubrec.packet_id = packet->packet_id;
-    pubrec.reason_code = ret == MQ_SUCCESS ? mqtt::ReasonCode::Success
-                                           : (ret == MQ_ERR_CONNECT_NOT_AUTHORIZED
-                                                  ? mqtt::ReasonCode::NotAuthorized
-                                                  : mqtt::ReasonCode::UnspecifiedError);
-    return send_serialized_mqtt_packet(client_id, pubrec);
-  }
-
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketMQTTBridge::handle_mqtt_pingreq(const std::string& client_id)
@@ -1513,6 +1538,7 @@ void WebSocketMQTTBridge::dispose_will(const std::string& transport_id)
 int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id,
                                                 const mqtt::DisconnectPacket* packet)
 {
+  int ret = MQ_SUCCESS;
   LOG_INFO("Received MQTT DISCONNECT from WebSocket client {} reason 0x{:02x}", client_id,
            packet ? static_cast<uint8_t>(packet->reason_code) : 0);
   auto found = connection_wills_.find(client_id);
@@ -1526,98 +1552,44 @@ int WebSocketMQTTBridge::handle_mqtt_disconnect(const std::string& client_id,
       if (handler != handlers_.end() && handler->second) {
         handler->second->close_connection();
       }
-      return MQ_ERR_PACKET_INVALID;
+      ret = MQ_ERR_PACKET_INVALID;
+    } else {
+      if (packet->properties.has_session_expiry_interval) {
+        found->second.session_expiry_seconds = packet->properties.session_expiry_interval;
+      }
+      found->second.discard = packet->reason_code == mqtt::ReasonCode::NormalDisconnection;
     }
-    if (packet->properties.has_session_expiry_interval) {
-      found->second.session_expiry_seconds = packet->properties.session_expiry_interval;
+  }
+  if (ret == MQ_SUCCESS) {
+    WebSocketProtocolHandler* handler = get_handler(client_id);
+    unregister_handler(client_id);
+    if (handler) {
+      handler->close_connection();
     }
-    found->second.discard = packet->reason_code == mqtt::ReasonCode::NormalDisconnection;
   }
-  WebSocketProtocolHandler* handler = get_handler(client_id);
-  unregister_handler(client_id);
-  if (handler) {
-    handler->close_connection();
-  }
-  return MQ_SUCCESS;
+  return ret;
 }
 
 int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_id,
                                                      mqtt::Packet& packet)
 {
+  int ret = MQ_ERR_SESSION_INVALID_HANDLER;
   WebSocketProtocolHandler* handler = get_handler(client_id);
   if (!handler || !handler->is_connected()) {
     LOG_WARN("No active WebSocket handler for client {}", client_id);
-    return MQ_ERR_SESSION_INVALID_HANDLER;
-  }
-
-  mqtt::MQTTParser parser(allocator_);
-  auto version_it = client_protocol_versions_.find(client_id);
-  if (version_it != client_protocol_versions_.end()) {
-    parser.set_protocol_version_hint(version_it->second);
+    ret = MQ_ERR_SESSION_INVALID_HANDLER;
   } else {
-    parser.set_protocol_version_hint(5);
-  }
-  mqtt::MQTTBuffer serialized(allocator_);
-  int ret = MQ_ERR_PACKET_TYPE;
+    mqtt::MQTTParser parser(allocator_);
+    auto version_it = client_protocol_versions_.find(client_id);
+    if (version_it != client_protocol_versions_.end()) {
+      parser.set_protocol_version_hint(version_it->second);
+    } else {
+      parser.set_protocol_version_hint(5);
+    }
+    mqtt::MQTTBuffer serialized(allocator_);
+    ret = MQ_ERR_PACKET_TYPE;
+    bool supported = true;
 
-  switch (packet.type) {
-    case mqtt::PacketType::CONNACK:
-      ret = parser.serialize_connack(reinterpret_cast<const mqtt::ConnAckPacket*>(&packet),
-                                     serialized);
-      break;
-    case mqtt::PacketType::SUBACK:
-      ret =
-          parser.serialize_suback(reinterpret_cast<const mqtt::SubAckPacket*>(&packet), serialized);
-      break;
-    case mqtt::PacketType::UNSUBACK:
-      ret = parser.serialize_unsuback(reinterpret_cast<const mqtt::UnsubAckPacket*>(&packet),
-                                      serialized);
-      break;
-    case mqtt::PacketType::PINGRESP:
-      ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet),
-                                      serialized);
-      break;
-    case mqtt::PacketType::DISCONNECT:
-      ret = parser.serialize_disconnect(reinterpret_cast<const mqtt::DisconnectPacket*>(&packet),
-                                        serialized);
-      break;
-    case mqtt::PacketType::PUBACK:
-      ret =
-          parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet), serialized);
-      break;
-    case mqtt::PacketType::PUBREC:
-      ret =
-          parser.serialize_pubrec(reinterpret_cast<const mqtt::PubRecPacket*>(&packet), serialized);
-      break;
-    case mqtt::PacketType::PUBREL:
-      ret =
-          parser.serialize_pubrel(reinterpret_cast<const mqtt::PubRelPacket*>(&packet), serialized);
-      break;
-    case mqtt::PacketType::PUBCOMP:
-      ret = parser.serialize_pubcomp(reinterpret_cast<const mqtt::PubCompPacket*>(&packet),
-                                     serialized);
-      break;
-    case mqtt::PacketType::PUBLISH:
-      ret = parser.serialize_publish(reinterpret_cast<const mqtt::PublishPacket*>(&packet),
-                                     serialized);
-      break;
-    default:
-      LOG_ERROR("Unsupported packet type for WebSocket binary serialization: 0x{:02x}",
-                static_cast<uint8_t>(packet.type));
-      return MQ_ERR_PACKET_TYPE;
-  }
-
-  if (MQ_FAIL(ret)) {
-    LOG_ERROR("Failed to serialize MQTT packet type 0x{:02x}: {}",
-              static_cast<uint8_t>(packet.type), ret);
-    return ret;
-  }
-
-  auto session = session_handlers_.find(client_id);
-  mqtt::MQTTProtocolHandler* flow = session == session_handlers_.end() ? nullptr : session->second;
-  if (flow && flow->outbound_exceeds_client_maximum(serialized.size())) {
-    mqtt::MQTTProtocolHandler::omit_optional_outbound_properties(packet.properties);
-    serialized.clear();
     switch (packet.type) {
       case mqtt::PacketType::CONNACK:
         ret = parser.serialize_connack(reinterpret_cast<const mqtt::ConnAckPacket*>(&packet),
@@ -1636,8 +1608,8 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
                                         serialized);
         break;
       case mqtt::PacketType::DISCONNECT:
-        ret = parser.serialize_disconnect(reinterpret_cast<const mqtt::DisconnectPacket*>(&packet),
-                                          serialized);
+        ret = parser.serialize_disconnect(
+            reinterpret_cast<const mqtt::DisconnectPacket*>(&packet), serialized);
         break;
       case mqtt::PacketType::PUBACK:
         ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet),
@@ -1660,25 +1632,87 @@ int WebSocketMQTTBridge::send_serialized_mqtt_packet(const std::string& client_i
                                        serialized);
         break;
       default:
-        return MQ_ERR_PACKET_TYPE;
+        LOG_ERROR("Unsupported packet type for WebSocket binary serialization: 0x{:02x}",
+                  static_cast<uint8_t>(packet.type));
+        ret = MQ_ERR_PACKET_TYPE;
+        supported = false;
+        break;
     }
-    if (MQ_FAIL(ret))
-      return ret;
-    if (flow->outbound_exceeds_client_maximum(serialized.size())) {
-      LOG_WARN("Not sending {}-byte WebSocket MQTT packet to {}, client maximum is smaller",
-               serialized.size(), client_id);
-      if (auto* socket_handler = get_handler(client_id))
-        socket_handler->close_connection();
-      return MQ_ERR_PACKET_TOO_LARGE;
-    }
-  }
 
-  std::vector<uint8_t> payload(serialized.data(), serialized.data() + serialized.size());
-  ret = handler->send_binary(payload);
-  if (MQ_SUCC(ret)) {
-    stats_.ws_messages_sent++;
-    if (session_manager_)
-      session_manager_->note_bytes_sent(payload.size());
+    if (supported && MQ_FAIL(ret)) {
+      LOG_ERROR("Failed to serialize MQTT packet type 0x{:02x}: {}",
+                static_cast<uint8_t>(packet.type), ret);
+    }
+    if (supported && MQ_SUCC(ret)) {
+      auto session = session_handlers_.find(client_id);
+      mqtt::MQTTProtocolHandler* flow =
+          session == session_handlers_.end() ? nullptr : session->second;
+      if (flow && flow->outbound_exceeds_client_maximum(serialized.size())) {
+        mqtt::MQTTProtocolHandler::omit_optional_outbound_properties(packet.properties);
+        serialized.clear();
+        switch (packet.type) {
+          case mqtt::PacketType::CONNACK:
+            ret = parser.serialize_connack(reinterpret_cast<const mqtt::ConnAckPacket*>(&packet),
+                                           serialized);
+            break;
+          case mqtt::PacketType::SUBACK:
+            ret = parser.serialize_suback(reinterpret_cast<const mqtt::SubAckPacket*>(&packet),
+                                          serialized);
+            break;
+          case mqtt::PacketType::UNSUBACK:
+            ret = parser.serialize_unsuback(reinterpret_cast<const mqtt::UnsubAckPacket*>(&packet),
+                                            serialized);
+            break;
+          case mqtt::PacketType::PINGRESP:
+            ret = parser.serialize_pingresp(reinterpret_cast<const mqtt::PingRespPacket*>(&packet),
+                                            serialized);
+            break;
+          case mqtt::PacketType::DISCONNECT:
+            ret = parser.serialize_disconnect(
+                reinterpret_cast<const mqtt::DisconnectPacket*>(&packet), serialized);
+            break;
+          case mqtt::PacketType::PUBACK:
+            ret = parser.serialize_puback(reinterpret_cast<const mqtt::PubAckPacket*>(&packet),
+                                          serialized);
+            break;
+          case mqtt::PacketType::PUBREC:
+            ret = parser.serialize_pubrec(reinterpret_cast<const mqtt::PubRecPacket*>(&packet),
+                                          serialized);
+            break;
+          case mqtt::PacketType::PUBREL:
+            ret = parser.serialize_pubrel(reinterpret_cast<const mqtt::PubRelPacket*>(&packet),
+                                          serialized);
+            break;
+          case mqtt::PacketType::PUBCOMP:
+            ret = parser.serialize_pubcomp(reinterpret_cast<const mqtt::PubCompPacket*>(&packet),
+                                           serialized);
+            break;
+          case mqtt::PacketType::PUBLISH:
+            ret = parser.serialize_publish(reinterpret_cast<const mqtt::PublishPacket*>(&packet),
+                                           serialized);
+            break;
+          default:
+            return MQ_ERR_PACKET_TYPE;
+        }
+        if (MQ_SUCC(ret) && flow->outbound_exceeds_client_maximum(serialized.size())) {
+          LOG_WARN("Not sending {}-byte WebSocket MQTT packet to {}, client maximum is smaller",
+                   serialized.size(), client_id);
+          if (auto* socket_handler = get_handler(client_id))
+            socket_handler->close_connection();
+          ret = MQ_ERR_PACKET_TOO_LARGE;
+        }
+      }
+
+      if (MQ_SUCC(ret)) {
+        std::vector<uint8_t> payload(serialized.data(), serialized.data() + serialized.size());
+        ret = handler->send_binary(payload);
+        if (MQ_SUCC(ret)) {
+          stats_.ws_messages_sent++;
+          if (session_manager_)
+            session_manager_->note_bytes_sent(payload.size());
+        }
+      }
+    }
   }
   return ret;
 }

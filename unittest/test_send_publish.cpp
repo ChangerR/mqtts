@@ -579,6 +579,7 @@ void test_persistent_connection_has_one_packet_id_owner()
 
 int main()
 {
+  int ret = 0;
   std::cout << "Starting MQTT PUBLISH packet serialization tests\n" << std::endl;
 
   try {
@@ -598,9 +599,10 @@ int main()
     std::cout << "This verifies that MQTTProtocolHandler::send_publish() correctly serializes "
                  "PUBLISH packets."
               << std::endl;
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "\nTest failed: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

@@ -68,21 +68,20 @@ class RedisAuthTest
 
   bool check_redis_availability()
   {
+    bool ret = true;
     std::cout << "Checking Redis availability..." << std::endl;
 
-    int ret = provider_->initialize();
-    if (MQ_FAIL(ret)) {
-      std::cout << "Redis initialization failed: " << ret << std::endl;
-      return false;
-    }
-
-    if (!provider_->is_healthy()) {
+    int init_ret = provider_->initialize();
+    if (MQ_FAIL(init_ret)) {
+      std::cout << "Redis initialization failed: " << init_ret << std::endl;
+      ret = false;
+    } else if (!provider_->is_healthy()) {
       std::cout << "Redis health check failed" << std::endl;
-      return false;
+      ret = false;
+    } else {
+      std::cout << "✓ Redis server is available" << std::endl;
     }
-
-    std::cout << "✓ Redis server is available" << std::endl;
-    return true;
+    return ret;
   }
 
   void cleanup_test_data()
@@ -520,6 +519,7 @@ class RedisAuthTest
 
 int main()
 {
+  int ret = 0;
   try {
     // 初始化日志系统
     mqtt::Logger::set_level(mqtt::LogLevel::INFO);
@@ -530,10 +530,9 @@ int main()
     test.run_all_tests();
 
     std::cout << "All Redis authentication tests passed!" << std::endl;
-
-    return 0;
   } catch (const std::exception& e) {
     std::cerr << "Test failed with exception: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }

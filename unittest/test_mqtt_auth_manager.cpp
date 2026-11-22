@@ -50,6 +50,7 @@ class MockAuthProvider : public IAuthProvider
                                const MQTTString& client_id, const MQTTString& client_ip,
                                uint16_t client_port, UserInfo& user_info) override
   {
+    AuthResult ret = AuthResult::SUCCESS;
     stats_.total_login_attempts++;
 
     std::string user_str = from_mqtt_string(username);
@@ -58,55 +59,58 @@ class MockAuthProvider : public IAuthProvider
     auto it = test_users_.find(user_str);
     if (it == test_users_.end()) {
       stats_.failed_logins++;
-      return AuthResult::USER_NOT_FOUND;
+      ret = AuthResult::USER_NOT_FOUND;
+    } else {
+      // 简单的密码验证（明文比较用于测试）
+      if (pass_str != user_str + "_password") {
+        stats_.failed_logins++;
+        ret = AuthResult::INVALID_CREDENTIALS;
+      } else {
+        user_info.username = username;
+        user_info.client_id = client_id;
+        user_info.client_ip = client_ip;
+        user_info.client_port = client_port;
+        user_info.is_super_user = it->second.is_super_user;
+
+        stats_.successful_logins++;
+      }
     }
-
-    // 简单的密码验证（明文比较用于测试）
-    if (pass_str != user_str + "_password") {
-      stats_.failed_logins++;
-      return AuthResult::INVALID_CREDENTIALS;
-    }
-
-    user_info.username = username;
-    user_info.client_id = client_id;
-    user_info.client_ip = client_ip;
-    user_info.client_port = client_port;
-    user_info.is_super_user = it->second.is_super_user;
-
-    stats_.successful_logins++;
-    return AuthResult::SUCCESS;
+    return ret;
   }
 
   AuthResult check_topic_access(const UserInfo& user_info, const MQTTString& topic,
                                 Permission permission) override
   {
+    AuthResult ret = AuthResult::SUCCESS;
     stats_.total_topic_checks++;
 
     if (user_info.is_super_user) {
       stats_.topic_access_granted++;
-      return AuthResult::SUCCESS;
-    }
+    } else {
+      std::string user_str = from_mqtt_string(user_info.username);
+      std::string topic_str = from_mqtt_string(topic);
 
-    std::string user_str = from_mqtt_string(user_info.username);
-    std::string topic_str = from_mqtt_string(topic);
-
-    auto it = test_permissions_.find(user_str);
-    if (it == test_permissions_.end()) {
-      stats_.topic_access_denied++;
-      return AuthResult::TOPIC_ACCESS_DENIED;
-    }
-
-    for (const auto& perm : it->second) {
-      if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
-        if (perm.permission == Permission::READWRITE || perm.permission == permission) {
-          stats_.topic_access_granted++;
-          return AuthResult::SUCCESS;
+      auto it = test_permissions_.find(user_str);
+      if (it == test_permissions_.end()) {
+        stats_.topic_access_denied++;
+        ret = AuthResult::TOPIC_ACCESS_DENIED;
+      } else {
+        ret = AuthResult::TOPIC_ACCESS_DENIED;
+        for (const auto& perm : it->second) {
+          if (match_topic_pattern(topic_str, from_mqtt_string(perm.topic_pattern))) {
+            if (perm.permission == Permission::READWRITE || perm.permission == permission) {
+              stats_.topic_access_granted++;
+              ret = AuthResult::SUCCESS;
+              break;
+            }
+          }
+        }
+        if (ret != AuthResult::SUCCESS) {
+          stats_.topic_access_denied++;
         }
       }
     }
-
-    stats_.topic_access_denied++;
-    return AuthResult::TOPIC_ACCESS_DENIED;
+    return ret;
   }
 
   int get_user_permissions(const MQTTString& username,
@@ -503,6 +507,7 @@ void test_auth_manager_error_handling()
 
 int main()
 {
+  int ret = 0;
   try {
     // 初始化日志系统
     // mqtt::Logger::set_level(mqtt::LogLevel::INFO);
@@ -521,9 +526,10 @@ int main()
     // 清理内存管理
     // mqtt::MQTTMemoryManager::get_instance().cleanup();
 
-    return 0;
+    ret = 0;
   } catch (const std::exception& e) {
     std::cerr << "Test failed with exception: " << e.what() << std::endl;
-    return 1;
+    ret = 1;
   }
+  return ret;
 }
